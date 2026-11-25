@@ -56508,11 +56508,10 @@ impl Connection {
                 if !self.table_name_is_virtual(&name.name))
                 && !table_or_subquery_in_attached_schema(source)
         };
-        // A lone inner or cross join written without a constraint is joined
-        // by its WHERE clause (`FROM p, t WHERE t.id = p.k`).
+        // Inner or cross joins written without a constraint are joined by the
+        // WHERE clause (`FROM p, t WHERE t.id = p.k` or 3+ table comma joins).
         let joined_by_where = |join: &fsqlite_ast::JoinClause| {
-            from.joins.len() == 1
-                && join.constraint.is_none()
+            join.constraint.is_none()
                 && matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Cross)
                 && where_clause.is_some()
         };

@@ -954,6 +954,69 @@ impl TableSchema {
         })
     }
 
+    /// Find the best direct-lookup ASC index led by `col_name` matching
+    /// `comparison_collation`, returning `(index, is_unique_single_col, prefix_probe)`.
+    ///
+    /// Preference order:
+    /// 1. Unique single-column index (`is_unique = true, prefix_probe = false`)
+    /// 2. Non-unique single-column index (`is_unique = false, prefix_probe = false`)
+    /// 3. Composite index led by `col_name` (`is_unique = false, prefix_probe = true`)
+    #[must_use]
+    pub fn join_lookup_index_for_column(
+        &self,
+        col_name: &str,
+        comparison_collation: Option<&str>,
+    ) -> Option<(&IndexSchema, bool, bool)> {
+        if self.without_rowid {
+            return None;
+        }
+        let col_collation = self
+            .column_index(col_name)
+            .and_then(|ci| self.columns[ci].collation.as_deref());
+        let collation_matches = |idx: &IndexSchema| {
+            let effective = idx.key_term_collation(0).or(col_collation);
+            collation_names_equivalent(comparison_collation, effective)
+        };
+        if let Some(idx) = self.indexes.iter().find(|idx| {
+            idx.is_unique
+                && idx.columns.len() == 1
+                && idx.supports_direct_column_lookup()
+                && !idx.key_term_descending(0)
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+                && collation_matches(idx)
+        }) {
+            return Some((idx, true, false));
+        }
+        if let Some(idx) = self.indexes.iter().find(|idx| {
+            idx.columns.len() == 1
+                && idx.supports_direct_column_lookup()
+                && !idx.key_term_descending(0)
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+                && collation_matches(idx)
+        }) {
+            return Some((idx, false, false));
+        }
+        self.indexes
+            .iter()
+            .find(|idx| {
+                idx.supports_direct_column_lookup()
+                    && idx.columns.len() > 1
+                    && !idx.key_term_descending(0)
+                    && idx
+                        .columns
+                        .first()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+                    && collation_matches(idx)
+            })
+            .map(|idx| (idx, false, true))
+    }
+
     /// STRICT type-check pattern for `Opcode::TypeCheck` (`I`,`N`,`R`,`T`,`L`,`A`).
     #[must_use]
     pub fn strict_type_pattern(&self) -> Option<String> {
@@ -13937,19 +14000,19 @@ fn codegen_join_aggregate_select(
             let TableOrSubquery::Table { name, alias, .. } = &join.table else {
                 return Err(unsupported());
             };
-            let (Some(JoinConstraint::On(on_expr)), false, JoinKind::Inner | JoinKind::Left) = (
-                join.constraint.as_ref(),
-                join.join_type.natural,
-                join.join_type.kind,
-            ) else {
+            if join.join_type.natural {
                 return Err(unsupported());
+            }
+            let (kind, on_expr) = match (join.constraint.as_ref(), join.join_type.kind) {
+                (Some(JoinConstraint::On(on_expr)), kind @ (JoinKind::Inner | JoinKind::Left)) => {
+                    (kind, Some(on_expr))
+                }
+                (None, JoinKind::Inner | JoinKind::Cross) if where_clause.is_some() => {
+                    (JoinKind::Inner, None)
+                }
+                _ => return Err(unsupported()),
             };
-            join_tables.push((
-                find_table(schema, &name.name)?,
-                alias.clone(),
-                join.join_type.kind,
-                Some(on_expr),
-            ));
+            join_tables.push((find_table(schema, &name.name)?, alias.clone(), kind, on_expr));
         }
         let tables: Vec<_> = std::iter::once((left_table, left_alias))
             .chain(
@@ -13969,7 +14032,8 @@ fn codegen_join_aggregate_select(
         }) {
             return Err(unsupported());
         }
-        let Some(plan) = resolve_multi_join_lookup_plan(left_table, left_alias, &join_tables)
+        let Some(plan) =
+            resolve_multi_join_lookup_plan(left_table, left_alias, &join_tables, where_clause)
         else {
             return Err(unsupported());
         };
@@ -13977,7 +14041,6 @@ fn codegen_join_aggregate_select(
             b,
             stmt,
             columns,
-            where_clause,
             left_table,
             left_alias,
             &join_tables,
@@ -16400,18 +16463,13 @@ fn codegen_single_join_lookup_select(
     Ok(())
 }
 
-/// Plan for a multi-table join where every right-side table can be reached
-/// via a single-row lookup (rowid or indexed equality) against columns
-/// already bound by an earlier table in the chain.
-///
-/// This is the generalisation of [`SingleJoinLookupPlan`] to N tables and
-/// is the key fast-path for the kind of "fact table joined to multiple
-/// dimension tables" query that the FTS rebuild in bd_zjisk issue #62
-/// hits: scanning the single largest table once and doing O(1) index
-/// seeks into every dimension table turns a 4-table Cartesian blowup
-/// (reported at 600× the C SQLite baseline) into O(N) work.
+/// Plan for a multi-table join where every right-side table is reached via a
+/// rowid lookup or an indexed equality lookup (unique or non-unique, single-
+/// column or leading composite prefix) against an already-bound table.
 struct MultiJoinLookupPlan<'a> {
     steps: Vec<MultiJoinLookupStep<'a>>,
+    /// Remaining `WHERE` conjuncts not consumed as join-equality lookups.
+    where_terms: Vec<&'a Expr>,
 }
 
 struct MultiJoinLookupStep<'a> {
@@ -16420,30 +16478,155 @@ struct MultiJoinLookupStep<'a> {
     /// 1..=i = join_tables[0..i]) carries the probe expression.
     probe_table_index: usize,
     probe_source: SortKeySource,
+    /// Optional affinity coercion applied to the probe before `SeekGE`
+    /// (e.g. TEXT probe into an INTEGER index -> NUMERIC `'C'`).
+    probe_affinity: Option<char>,
     lookup_target: SingleJoinLookupTarget<'a>,
+    /// True when the lookup matches at most one row (rowid or unique
+    /// single-column index), so no `Next` duplicate-run loop is needed.
+    is_unique_lookup: bool,
+    /// True when probing a composite index's leading column with a 1-field
+    /// prefix record instead of a 2-field `[key, i64::MIN]` record.
+    prefix_probe: bool,
+    /// Additional conjunctive predicates from this step's `ON` clause that
+    /// were not consumed as the lookup key.
+    on_residual: Vec<&'a Expr>,
 }
 
-/// Try to resolve every join in the chain to a single-row lookup against
-/// an earlier table.  Returns `None` if any join cannot be expressed as a
-/// lookup — in that case the caller falls back to the existing nested-
-/// loop `Rewind`/`Next` scan path.
+/// Rank of a multi-join step lookup candidate (higher is preferred).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MultiJoinCandidateRank {
+    CompositeIndex = 1,
+    NonUniqueSingleIndex = 2,
+    UniqueSingleIndex = 3,
+    Rowid = 4,
+}
+
+/// A candidate equality lookup for one step of a multi-join chain.
+struct MultiJoinEqCandidate<'a> {
+    rank: MultiJoinCandidateRank,
+    probe_table_index: usize,
+    probe_source: SortKeySource,
+    probe_affinity: Option<char>,
+    lookup_target: SingleJoinLookupTarget<'a>,
+    is_unique_lookup: bool,
+    prefix_probe: bool,
+}
+
+/// Resolve an equality `left = right` between `right_table` and one of the
+/// already-bound `tables`, returning the best lookup step candidate.
+fn resolve_multi_join_eq_candidate<'a>(
+    left: &'a Expr,
+    right: &'a Expr,
+    tables: &[(&'a TableSchema, Option<&'a str>)],
+    right_table: &'a TableSchema,
+    right_alias: Option<&'a str>,
+) -> Option<MultiJoinEqCandidate<'a>> {
+    // Reject unqualified columns that match more than one table in scope so
+    // the general validator reports the ambiguity cleanly.
+    let comparison_tables: Vec<(&TableSchema, Option<&str>)> = tables
+        .iter()
+        .copied()
+        .chain(std::iter::once((right_table, right_alias)))
+        .collect();
+    let is_ambiguous = |expr: &Expr| {
+        let inner = match expr {
+            Expr::Collate { expr, .. } => expr.as_ref(),
+            _ => expr,
+        };
+        let Expr::Column(col_ref, _) = inner else {
+            return false;
+        };
+        if col_ref.table.is_some() {
+            return false;
+        }
+        comparison_tables
+            .iter()
+            .filter(|(t, a)| resolve_column_ref(inner, t, *a).is_some())
+            .count()
+            > 1
+    };
+    if is_ambiguous(left) || is_ambiguous(right) {
+        return None;
+    }
+
+    let mut found: Option<(usize, SortKeySource, SortKeySource)> = None;
+    for (probe_idx, (probe_table, probe_alias)) in tables.iter().enumerate() {
+        if let (Some(left_probe), Some(right_lookup)) = (
+            resolve_column_ref(left, probe_table, *probe_alias),
+            resolve_column_ref(right, right_table, right_alias),
+        ) {
+            found = Some((probe_idx, left_probe, right_lookup));
+            break;
+        }
+        if let (Some(left_lookup), Some(right_probe)) = (
+            resolve_column_ref(left, right_table, right_alias),
+            resolve_column_ref(right, probe_table, *probe_alias),
+        ) {
+            found = Some((probe_idx, right_probe, left_lookup));
+            break;
+        }
+    }
+
+    let (probe_table_index, probe_source, lookup_source) = found?;
+    let comparison_collation = join_lookup_effective_collation(left, right, &comparison_tables);
+
+    match lookup_source {
+        SortKeySource::Rowid => Some(MultiJoinEqCandidate {
+            rank: MultiJoinCandidateRank::Rowid,
+            probe_table_index,
+            probe_source,
+            probe_affinity: None,
+            lookup_target: SingleJoinLookupTarget::Rowid,
+            is_unique_lookup: true,
+            prefix_probe: false,
+        }),
+        SortKeySource::Column(col_idx) => {
+            let probe_affinity = match join_lookup_column_pair_probe(
+                tables.get(probe_table_index)?.0,
+                &probe_source,
+                right_table,
+                col_idx,
+            )? {
+                JoinLookupProbe::Raw => None,
+                JoinLookupProbe::Coerce(affinity) => Some(affinity),
+                JoinLookupProbe::RawThenNumericText => return None,
+            };
+            let column_name = &right_table.columns.get(col_idx)?.name;
+            let (index, is_unique_lookup, prefix_probe) =
+                right_table.join_lookup_index_for_column(column_name, comparison_collation)?;
+            let rank = if is_unique_lookup {
+                MultiJoinCandidateRank::UniqueSingleIndex
+            } else if prefix_probe {
+                MultiJoinCandidateRank::CompositeIndex
+            } else {
+                MultiJoinCandidateRank::NonUniqueSingleIndex
+            };
+            Some(MultiJoinEqCandidate {
+                rank,
+                probe_table_index,
+                probe_source,
+                probe_affinity,
+                lookup_target: SingleJoinLookupTarget::Index(index),
+                is_unique_lookup,
+                prefix_probe,
+            })
+        }
+        SortKeySource::Expression(_) => None,
+    }
+}
+
+/// Try to resolve every join in the chain to a rowid or indexed equality
+/// lookup (unique or non-unique) against an already-bound table.
 ///
 /// Restrictions (conservatively applied):
-/// - Every join must be INNER or LEFT.
-/// - Every join's ON clause must be a single `expr_a = expr_b` BinaryOp,
-///   where one side is a column of the new right table (the lookup
-///   target) and the other is a column of an already-bound table
-///   (the probe source).
-/// - The lookup target must be the rowid (INTEGER PRIMARY KEY) or a
-///   single-column index on the right table.
-/// - **At most one LEFT JOIN is allowed, and it must be the final step
-///   in the chain.**  Anything else is refused so the codegen below can
-///   emit a single trailing null-row block without having to re-run
-///   later steps with a NullRow-poisoned probe cursor — which is
-///   genuinely hard to get right in the general case and is not needed
-///   for the bd_zjisk issue #62 repro (that query is INNER + INNER +
-///   terminal LEFT).  Non-terminal LEFT JOINs and chains with more
-///   than one LEFT fall back to the scan path.
+/// - Every join must be INNER (or CROSS with WHERE) or a terminal LEFT JOIN.
+/// - Every join's ON clause (or WHERE clause for a constraintless INNER/CROSS
+///   join) must contain at least one `col_a = col_b` conjunct joining the new
+///   right table's rowid or indexed column to an already-bound table.
+/// - **At most one LEFT JOIN is allowed, and it must be the final step in the
+///   chain.** Non-terminal LEFT JOINs stay on the general path.
+#[allow(clippy::too_many_lines)]
 fn resolve_multi_join_lookup_plan<'a>(
     left_table: &'a TableSchema,
     left_alias: Option<&'a str>,
@@ -16453,11 +16636,11 @@ fn resolve_multi_join_lookup_plan<'a>(
         fsqlite_ast::JoinKind,
         Option<&'a Expr>,
     )],
+    where_clause: Option<&'a Expr>,
 ) -> Option<MultiJoinLookupPlan<'a>> {
     use fsqlite_ast::{BinaryOp, JoinKind};
 
-    // We need at least one join — the single-join path handles the 1
-    // case already with its own (sort-capable) codegen.
+    // We need at least two joins — the single-join path handles the 1-join case.
     if join_tables.len() < 2 {
         return None;
     }
@@ -16468,6 +16651,12 @@ fn resolve_multi_join_lookup_plan<'a>(
     if left_table.without_rowid || join_tables.iter().any(|(table, ..)| table.without_rowid) {
         return None;
     }
+
+    let mut where_conjuncts: Vec<&'a Expr> = Vec::new();
+    if let Some(where_expr) = where_clause {
+        collect_conjunctive_terms(where_expr, &mut where_conjuncts);
+    }
+    let mut used_where = vec![false; where_conjuncts.len()];
 
     // Build the running table list so each step can resolve its probe
     // against any already-bound table.
@@ -16481,97 +16670,92 @@ fn resolve_multi_join_lookup_plan<'a>(
     for (step_idx, (right_table, right_alias_opt, join_kind, on_expr)) in
         join_tables.iter().enumerate()
     {
-        match join_kind {
-            JoinKind::Inner => {}
-            // Only the final step in the chain may be a LEFT JOIN — see
-            // the doc comment above.  A LEFT miss jumps to a trailing
-            // null-row block that emits the row with NULLs for the
-            // left-joined table's columns and then runs the outer Next.
-            // Allowing a non-terminal LEFT JOIN would require re-running
-            // the rest of the chain from that null-row block against the
-            // remaining probe cursors, which the current code does not
-            // implement.
-            JoinKind::Left if step_idx == last_index => {}
+        let normalized_kind = match (join_kind, on_expr) {
+            (JoinKind::Inner, _) | (JoinKind::Cross, None) => JoinKind::Inner,
+            (JoinKind::Left, Some(_)) if step_idx == last_index => JoinKind::Left,
             _ => return None,
-        }
-        let on_expr = (*on_expr)?;
-        let Expr::BinaryOp {
-            left,
-            op: BinaryOp::Eq,
-            right,
-            ..
-        } = on_expr
-        else {
-            return None;
         };
-
         let right_alias = right_alias_opt.as_deref();
-        let mut found: Option<(usize, SortKeySource, SortKeySource)> = None;
 
-        // Try each already-bound table as the probe source; first hit wins.
-        // Because LEFT JOINs are only allowed as the terminal step, no
-        // already-bound table in this loop can be a LEFT-joined table —
-        // we therefore do not need to track LEFT-joined state separately.
-        for (probe_idx, (probe_table, probe_alias)) in tables.iter().enumerate() {
-            if let (Some(left_probe), Some(right_lookup)) = (
-                resolve_column_ref(left, probe_table, *probe_alias),
-                resolve_column_ref(right, right_table, right_alias),
-            ) {
-                found = Some((probe_idx, left_probe, right_lookup));
-                break;
-            }
-            if let (Some(left_lookup), Some(right_probe)) = (
-                resolve_column_ref(left, right_table, right_alias),
-                resolve_column_ref(right, probe_table, *probe_alias),
-            ) {
-                found = Some((probe_idx, right_probe, left_lookup));
-                break;
-            }
-        }
-
-        let (probe_table_index, probe_source, lookup_source) = found?;
-        let comparison_tables = tables
-            .iter()
-            .copied()
-            .chain(std::iter::once((*right_table, right_alias)))
-            .collect::<Vec<_>>();
-        let comparison_collation = join_lookup_effective_collation(left, right, &comparison_tables);
-
-        let lookup_target = match lookup_source {
-            SortKeySource::Rowid => SingleJoinLookupTarget::Rowid,
-            SortKeySource::Column(col_idx) => {
-                // The chain emitter probes with the raw value, so it takes only
-                // pairs whose comparison converts nothing.
-                if !matches!(
-                    join_lookup_column_pair_probe(
-                        tables.get(probe_table_index)?.0,
-                        &probe_source,
+        let (chosen, on_residual): (MultiJoinEqCandidate<'a>, Vec<&'a Expr>) =
+            if let Some(on_expr) = *on_expr {
+                let mut on_conjuncts = Vec::new();
+                collect_conjunctive_terms(on_expr, &mut on_conjuncts);
+                let mut best: Option<(usize, MultiJoinEqCandidate<'a>)> = None;
+                for (idx, term) in on_conjuncts.iter().enumerate() {
+                    let Expr::BinaryOp {
+                        left,
+                        op: BinaryOp::Eq,
+                        right,
+                        ..
+                    } = term
+                    else {
+                        continue;
+                    };
+                    if let Some(cand) = resolve_multi_join_eq_candidate(
+                        left,
+                        right,
+                        &tables,
                         right_table,
-                        col_idx,
-                    )?,
-                    JoinLookupProbe::Raw
-                ) {
-                    return None;
+                        right_alias,
+                    ) && best
+                        .as_ref()
+                        .is_none_or(|(_, prev)| cand.rank > prev.rank)
+                    {
+                        best = Some((idx, cand));
+                    }
                 }
-                let column_name = &right_table.columns.get(col_idx)?.name;
-                // The multi-join fast path is only correct when the probe key
-                // yields at most one row. Pick any direct-lookup single-column
-                // UNIQUE index on the join key instead of blindly taking the
-                // first leftmost-column index; otherwise a preceding non-unique
-                // sibling index would disable the fast path even when a safe
-                // unique lookup exists.
-                let index = right_table
-                    .unique_single_column_index_for_column(column_name, comparison_collation)?;
-                SingleJoinLookupTarget::Index(index)
-            }
-            SortKeySource::Expression(_) => return None,
-        };
+                let (chosen_idx, cand) = best?;
+                let on_residual: Vec<&'a Expr> = on_conjuncts
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(idx, term)| (idx != chosen_idx).then_some(term))
+                    .collect();
+                (cand, on_residual)
+            } else {
+                // Constraintless INNER / comma / CROSS join: pick a join equality
+                // from the remaining WHERE conjuncts.
+                let mut best: Option<(usize, MultiJoinEqCandidate<'a>)> = None;
+                for (idx, term) in where_conjuncts.iter().enumerate() {
+                    if used_where[idx] {
+                        continue;
+                    }
+                    let Expr::BinaryOp {
+                        left,
+                        op: BinaryOp::Eq,
+                        right,
+                        ..
+                    } = term
+                    else {
+                        continue;
+                    };
+                    if let Some(cand) = resolve_multi_join_eq_candidate(
+                        left,
+                        right,
+                        &tables,
+                        right_table,
+                        right_alias,
+                    ) && best
+                        .as_ref()
+                        .is_none_or(|(_, prev)| cand.rank > prev.rank)
+                    {
+                        best = Some((idx, cand));
+                    }
+                }
+                let (chosen_idx, cand) = best?;
+                used_where[chosen_idx] = true;
+                (cand, Vec::new())
+            };
 
         steps.push(MultiJoinLookupStep {
-            join_kind: *join_kind,
-            probe_table_index,
-            probe_source,
-            lookup_target,
+            join_kind: normalized_kind,
+            probe_table_index: chosen.probe_table_index,
+            probe_source: chosen.probe_source,
+            probe_affinity: chosen.probe_affinity,
+            lookup_target: chosen.lookup_target,
+            is_unique_lookup: chosen.is_unique_lookup,
+            prefix_probe: chosen.prefix_probe,
+            on_residual,
         });
 
         // Record the new table in the accumulator before the next step
@@ -16579,23 +16763,281 @@ fn resolve_multi_join_lookup_plan<'a>(
         tables.push((right_table, right_alias));
     }
 
-    Some(MultiJoinLookupPlan { steps })
+    let where_terms = where_conjuncts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, term)| (!used_where[idx]).then_some(term))
+        .collect();
+
+    Some(MultiJoinLookupPlan { steps, where_terms })
 }
 
-/// Emit bytecode for a multi-join query where every join is a single-row
-/// lookup.  The outer loop rewinds the driver once and, inside the loop
-/// body, every right-side table is reached with a direct `SeekRowid`
-/// (rowid lookup) or `SeekGE` on an index cursor — no nested Rewind/Next
-/// loops.  This is the O(N) fast path that avoids the Cartesian blowup
-/// in the general `codegen_join_select` scan path.
-/// With `aggregates`, fold each matched or null-extended row into the
-/// accumulators and emit only the final aggregate row.
+/// Highest table index in `all_tables` referenced by `expr` (conservatively
+/// returns `all_tables.len() - 1` for ambiguous/unknown columns or subqueries).
+fn expr_max_join_table_index(expr: &Expr, all_tables: &[(&TableSchema, Option<&str>)]) -> usize {
+    let last = all_tables.len().saturating_sub(1);
+    let rec = |e: &Expr| expr_max_join_table_index(e, all_tables);
+    match expr {
+        Expr::Literal(..) | Expr::BoundOuterValue { .. } | Expr::Placeholder(..) => 0,
+        Expr::Column(col_ref, _) => {
+            let qualifier = col_ref.table.as_deref();
+            let mut matched = None;
+            for (idx, (table, alias)) in all_tables.iter().enumerate() {
+                let qualifier_ok = qualifier
+                    .is_none_or(|q| join_qualifier_matches(Some(q), table, *alias));
+                if qualifier_ok
+                    && (table.column_index(&col_ref.column).is_some()
+                        || table.resolves_to_hidden_rowid(&col_ref.column))
+                {
+                    if matched.is_some() {
+                        return last;
+                    }
+                    matched = Some(idx);
+                }
+            }
+            matched.unwrap_or(last)
+        }
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => rec(left).max(rec(right)),
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => rec(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => rec(inner).max(rec(low)).max(rec(high)),
+        Expr::In {
+            expr: inner, set, ..
+        } => match set {
+            InSet::List(items) => items.iter().fold(rec(inner), |acc, item| acc.max(rec(item))),
+            InSet::Subquery(_) | InSet::Table(_) => last,
+        },
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => rec(inner)
+            .max(rec(pattern))
+            .max(escape.as_deref().map_or(0, rec)),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let mut m = operand.as_deref().map_or(0, rec);
+            for (w, t) in whens {
+                m = m.max(rec(w)).max(rec(t));
+            }
+            m.max(else_expr.as_deref().map_or(0, rec))
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if over.is_some() {
+                return last;
+            }
+            let mut m = match args {
+                FunctionArgs::Star => 0,
+                FunctionArgs::List(items) => items.iter().fold(0, |acc, item| acc.max(rec(item))),
+            };
+            for term in order_by {
+                m = m.max(rec(&term.expr));
+            }
+            m.max(filter.as_deref().map_or(0, rec))
+        }
+        Expr::RowValue(items, _) => items.iter().fold(0, |acc, item| acc.max(rec(item))),
+        Expr::Exists { .. } | Expr::Subquery(..) | Expr::Raise { .. } => last,
+    }
+}
+
+/// Emit bytecode for a multi-table lookup join where each step reaches the next
+/// table via rowid seek, unique index seek, or non-unique secondary-index
+/// lookup loop (bd-knibh).
+///
+/// Unique steps perform O(1) seeks with no nested loop; non-unique index steps
+/// push a `LoopFrame` whose `Next` advances through the matching key run before
+/// backtracking to the enclosing loop. A terminal `LEFT JOIN` (unique or
+/// non-unique) tracks a per-enclosing-row match flag and emits a `NullRow`
+/// tuple when no inner match survives `ON`.
+///
+/// With `aggregates`, folds each surviving row directly into `AggStep` and
+/// emits a single finalized aggregate row at `done_label`.
+/// Extract a rowid range seek (`lower` / `upper` bounds) on the driving table
+/// (`all_tables[0]`) from conjunctive WHERE terms for `codegen_multi_join_lookup_select`.
+///
+/// Returns `(range, covers_all_terms)` where `covers_all_terms == true` means
+/// every term in `terms` was an exact non-overlapping rowid range bound and
+/// does not need to be re-evaluated inside the loop. When `covers_all_terms`
+/// is false (or `allow_non_literal` is false), only integer-literal bounds are
+/// accepted so anonymous `?` parameter indices are never perturbed.
+#[allow(clippy::too_many_lines)]
+fn extract_multi_join_driver_rowid_range<'a>(
+    terms: &[&'a Expr],
+    all_tables: &[(&TableSchema, Option<&str>)],
+    allow_non_literal: bool,
+) -> Option<(RowidRangeTarget<'a>, bool)> {
+    let (driver_table, driver_alias) = *all_tables.first()?;
+    if driver_table.without_rowid || terms.is_empty() {
+        return None;
+    }
+    // Reject unqualified rowid references that also resolve in another joined
+    // table so ambiguity stays on the validator path.
+    let is_unambiguous_driver_rowid = |expr: &Expr| -> bool {
+        if !is_rowid_expr(expr, Some(driver_table), driver_alias) {
+            return false;
+        }
+        if let Expr::Column(col_ref, _) = expr
+            && col_ref.table.is_none()
+            && all_tables
+                .iter()
+                .skip(1)
+                .any(|(t, a)| resolve_column_ref(expr, t, *a).is_some())
+        {
+            return false;
+        }
+        true
+    };
+
+    let mut target = RowidRangeTarget::default();
+    let mut has_residual = false;
+    for &term in terms {
+        match term {
+            Expr::BinaryOp {
+                left,
+                op: fsqlite_ast::BinaryOp::Eq,
+                right,
+                ..
+            } if is_unambiguous_driver_rowid(left)
+                && matches!(right.as_ref(), Expr::Literal(Literal::Integer(_), _)) =>
+            {
+                let exact_lower = target.lower.is_none();
+                let exact_upper = target.upper.is_none();
+                let bound = RowidRangeBound {
+                    rowid_expr: left,
+                    expr: right,
+                    inclusive: true,
+                };
+                merge_residual_rowid_range_bound(&mut target, RowidRangeSlot::Lower, bound);
+                merge_residual_rowid_range_bound(&mut target, RowidRangeSlot::Upper, bound);
+                if !exact_lower || !exact_upper {
+                    has_residual = true;
+                }
+            }
+            Expr::BinaryOp {
+                left,
+                op: fsqlite_ast::BinaryOp::Eq,
+                right,
+                ..
+            } if is_unambiguous_driver_rowid(right)
+                && matches!(left.as_ref(), Expr::Literal(Literal::Integer(_), _)) =>
+            {
+                let exact_lower = target.lower.is_none();
+                let exact_upper = target.upper.is_none();
+                let bound = RowidRangeBound {
+                    rowid_expr: right,
+                    expr: left,
+                    inclusive: true,
+                };
+                merge_residual_rowid_range_bound(&mut target, RowidRangeSlot::Lower, bound);
+                merge_residual_rowid_range_bound(&mut target, RowidRangeSlot::Upper, bound);
+                if !exact_lower || !exact_upper {
+                    has_residual = true;
+                }
+            }
+            Expr::BinaryOp {
+                left, op, right, ..
+            } => {
+                if let Some((slot, bound)) = extract_rowid_range_bound(
+                    left,
+                    *op,
+                    right,
+                    Some(driver_table),
+                    driver_alias,
+                ) && is_unambiguous_driver_rowid(bound.rowid_expr)
+                {
+                    let slot_taken = match slot {
+                        RowidRangeSlot::Lower => target.lower.is_some(),
+                        RowidRangeSlot::Upper => target.upper.is_some(),
+                    };
+                    merge_residual_rowid_range_bound(&mut target, slot, bound);
+                    if slot_taken {
+                        has_residual = true;
+                    }
+                } else {
+                    has_residual = true;
+                }
+            }
+            Expr::Between {
+                expr: operand,
+                low,
+                high,
+                not: false,
+                ..
+            } if is_unambiguous_driver_rowid(operand)
+                && is_rowid_range_constant(low)
+                && is_rowid_range_constant(high) =>
+            {
+                if target.lower.is_some() || target.upper.is_some() {
+                    has_residual = true;
+                }
+                merge_residual_rowid_range_bound(
+                    &mut target,
+                    RowidRangeSlot::Lower,
+                    RowidRangeBound {
+                        rowid_expr: operand,
+                        expr: low,
+                        inclusive: true,
+                    },
+                );
+                merge_residual_rowid_range_bound(
+                    &mut target,
+                    RowidRangeSlot::Upper,
+                    RowidRangeBound {
+                        rowid_expr: operand,
+                        expr: high,
+                        inclusive: true,
+                    },
+                );
+            }
+            _ => {
+                has_residual = true;
+            }
+        }
+    }
+    if target.lower.is_none() && target.upper.is_none() {
+        return None;
+    }
+    // Require integer-literal bounds so driver range seeks never alter
+    // parameter numbering or non-integer bound coercion (e.g. `WHERE id > ?1`).
+    let is_int_lit = |b: &Option<RowidRangeBound<'a>>| {
+        b.as_ref()
+            .is_none_or(|bound| matches!(bound.expr, Expr::Literal(Literal::Integer(_), _)))
+    };
+    if !is_int_lit(&target.lower) || !is_int_lit(&target.upper) {
+        return None;
+    }
+    let covers_all = allow_non_literal && !has_residual;
+    rowid_range_fast_path_is_safe(target).then_some((target, covers_all))
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn codegen_multi_join_lookup_select(
     b: &mut ProgramBuilder,
     stmt: &SelectStatement,
     columns: &[ResultColumn],
-    where_clause: Option<&Expr>,
     left_table: &TableSchema,
     left_alias: Option<&str>,
     join_tables: &[(
@@ -16609,6 +17051,12 @@ fn codegen_multi_join_lookup_select(
     aggregates: &[JoinAggregateTerm<'_>],
 ) -> Result<(), CodegenError> {
     use fsqlite_ast::JoinKind;
+
+    struct MultiJoinLoopFrame {
+        advance_label: Label,
+        idx_cursor: i32,
+        loop_top: usize,
+    }
 
     debug_assert_eq!(plan.steps.len(), join_tables.len());
     // The aggregate form emits its one row after the loop; nothing routes a
@@ -16629,6 +17077,7 @@ fn codegen_multi_join_lookup_select(
     let all_tables: Vec<(&TableSchema, Option<&str>)> = std::iter::once((left_table, left_alias))
         .chain(join_tables.iter().map(|(t, a, _, _)| (*t, a.as_deref())))
         .collect();
+    let last_table_index = all_tables.len() - 1;
 
     let out_col_count = resolve_join_output_count(columns, &all_tables);
     let out_regs = b.alloc_regs(out_col_count as i32);
@@ -16639,6 +17088,57 @@ fn codegen_multi_join_lookup_select(
         }
         base
     });
+
+    // Partition WHERE conjuncts by the earliest table index at which all
+    // referenced tables are bound (only when no anonymous `?` placeholders
+    // exist so hoisting can never swap anonymous parameter indices).
+    let can_hoist_where = !plan
+        .where_terms
+        .iter()
+        .any(|term| count_anon_placeholders(term) > 0);
+    let mut where_at_table: Vec<Vec<&Expr>> = vec![Vec::new(); all_tables.len()];
+    for &term in &plan.where_terms {
+        let bucket = if can_hoist_where {
+            expr_max_join_table_index(term, &all_tables)
+        } else {
+            last_table_index
+        };
+        where_at_table[bucket].push(term);
+    }
+
+    // Determine for each step whether its table B-tree row must be fetched via
+    // SeekRowid. An aggregate index lookup whose table columns are never read
+    // (e.g. `SELECT count(*) ... JOIN leaf ON leaf.k = m.k`) reads only the
+    // index entry.
+    let seek_table_row: Vec<bool> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            if matches!(step.lookup_target, SingleJoinLookupTarget::Rowid) || accum_base.is_none() {
+                return true;
+            }
+            let table_idx = i + 1;
+            let (table, alias) = all_tables[table_idx];
+            plan.steps
+                .iter()
+                .skip(i + 1)
+                .any(|later| later.probe_table_index == table_idx)
+                || plan.steps.iter().any(|s| {
+                    s.on_residual
+                        .iter()
+                        .any(|expr| expr_references_scan(expr, table, alias))
+                })
+                || plan
+                    .where_terms
+                    .iter()
+                    .any(|expr| expr_references_scan(expr, table, alias))
+                || aggregates.iter().any(|term| {
+                    term.arg
+                        .is_some_and(|arg| expr_references_scan(arg, table, alias))
+                })
+        })
+        .collect();
 
     // Open data cursors for every table.  Cursor id = table index in
     // all_tables (the convention emit_join_expr already relies on).
@@ -16710,105 +17210,397 @@ fn codegen_multi_join_lookup_select(
         None
     };
     let limit = emit_join_output_limit(b, stmt, done_label);
-    // Single outer rewind over the driver.
+
+    // Pre-allocate each step's probe register block outside the loops and hoist
+    // the constant `i64::MIN` rowid floor for 2-field single-column index seeks.
+    let mut step_probe_bases: Vec<i32> = Vec::with_capacity(plan.steps.len());
+    for (i, step) in plan.steps.iter().enumerate() {
+        let needs_rowid_floor = index_cursors[i].is_some() && !step.prefix_probe;
+        let probe_base = b.alloc_regs(if needs_rowid_floor { 2 } else { 1 });
+        if needs_rowid_floor {
+            b.emit_op(
+                Opcode::Int64,
+                0,
+                probe_base + 1,
+                0,
+                P4::Int64(i64::MIN),
+                0,
+            );
+        }
+        step_probe_bases.push(probe_base);
+    }
+
+    // Extract an optional driving-table rowid range (`WHERE c.id <= 2000`,
+    // `WHERE c.id BETWEEN ... AND ...`, `WHERE c.id = <int>`) so the outer
+    // loop seeks directly to the lower bound and exits immediately past the
+    // upper bound instead of scanning the full driving table.
+    let driver_rowid_range = if can_hoist_where {
+        extract_multi_join_driver_rowid_range(&where_at_table[0], &all_tables, true)
+    } else {
+        extract_multi_join_driver_rowid_range(&plan.where_terms, &all_tables, false)
+    };
+    let (driver_lower_reg, driver_upper_reg, driver_upper_cmp) =
+        if let Some((range, _)) = driver_rowid_range {
+            let lower_reg = range.lower.map(|bound| {
+                let reg = b.alloc_reg();
+                emit_expr(b, bound.expr, reg, None);
+                b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+                reg
+            });
+            let upper_reg = range.upper.map(|bound| {
+                let reg = b.alloc_reg();
+                emit_expr(b, bound.expr, reg, None);
+                b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+                reg
+            });
+            let upper_cmp = range.upper.map(|bound| {
+                resolved_rowid_range_comparison(
+                    left_table,
+                    left_alias,
+                    std::slice::from_ref(left_table),
+                    bound,
+                )
+            });
+            (lower_reg, upper_reg, upper_cmp)
+        } else {
+            (None, None, None)
+        };
+
+    // Single outer seek/rewind over the driver.
     let next_left_label = b.emit_label();
-    let row_done_label = b.emit_label();
-    b.emit_jump_to_label(Opcode::Rewind, left_cursor, 0, done_label, P4::None, 0);
+    let outer_advance_label = b.emit_label();
+    if let Some((range, _)) = driver_rowid_range
+        && let Some(bound) = range.lower
+    {
+        let seek_opcode = if bound.inclusive {
+            Opcode::SeekGE
+        } else {
+            Opcode::SeekGT
+        };
+        b.emit_jump_to_label(
+            seek_opcode,
+            left_cursor,
+            driver_lower_reg.expect("driver lower bound register exists"),
+            done_label,
+            P4::None,
+            0,
+        );
+    } else {
+        b.emit_jump_to_label(Opcode::Rewind, left_cursor, 0, done_label, P4::None, 0);
+    }
     b.resolve_label(next_left_label);
 
-    // Emit each lookup in order.  For INNER joins a miss jumps to
-    // row_done_label (skip this outer row entirely).  For the terminal
-    // LEFT JOIN (if any) a miss jumps to `left_null_label` — a block
-    // emitted past the main result row that NullRow-poisons the LEFT
-    // table's cursor and re-emits the row with NULLs.
-    //
-    // `resolve_multi_join_lookup_plan` guarantees that a LEFT join can
-    // only appear as the final step, so a miss never has to skip any
-    // remaining INNER probes.
-    let left_null_label = if plan
+    if let Some((range, _)) = driver_rowid_range
+        && let Some(bound) = range.upper
+    {
+        let current_rowid_reg = b.alloc_reg();
+        let stop_opcode = if bound.inclusive {
+            Opcode::Gt
+        } else {
+            Opcode::Ge
+        };
+        b.emit_op(Opcode::Rowid, left_cursor, current_rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(
+            stop_opcode,
+            driver_upper_reg.expect("driver upper bound register exists"),
+            current_rowid_reg,
+            done_label,
+            driver_upper_cmp
+                .as_ref()
+                .map_or(P4::None, |c| c.collation_p4.clone()),
+            driver_upper_cmp.as_ref().map_or(0, |c| c.cmp_p5),
+        );
+    }
+
+    // Filter driver-only WHERE conjuncts before probing any inner tables
+    // (skip when the rowid range already enforced all of them exactly).
+    let skip_driver_where = driver_rowid_range.is_some_and(|(_, covers_all)| covers_all);
+    if !skip_driver_where {
+        for &term in &where_at_table[0] {
+            let cond_reg = b.alloc_reg();
+            emit_join_expr(b, term, cond_reg, &all_tables, ctx)?;
+            b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, outer_advance_label, P4::None, 0);
+        }
+    }
+
+    let mut current_advance = outer_advance_label;
+    let mut loop_stack: Vec<MultiJoinLoopFrame> = Vec::new();
+    let terminal_is_left = plan
         .steps
         .last()
-        .is_some_and(|step| matches!(step.join_kind, JoinKind::Left))
-    {
-        Some(b.emit_label())
-    } else {
-        None
-    };
+        .is_some_and(|step| matches!(step.join_kind, JoinKind::Left));
 
-    // Both the all-lookups-landed path and the trailing LEFT JOIN null
-    // block use the same output helper, including aggregate accumulation.
+    let emit_probe_value =
+        |b: &mut ProgramBuilder, step: &MultiJoinLookupStep<'_>, probe_base: i32| {
+            let probe_cursor = step.probe_table_index as i32;
+            let probe_scan = ScanCtx {
+                cursor: probe_cursor,
+                table: all_tables[step.probe_table_index].0,
+                table_alias: all_tables[step.probe_table_index].1,
+                schema: None,
+                register_base: None,
+                secondaries: &[],
+            };
+            emit_resolved_column(b, &step.probe_source, probe_cursor, probe_base, &probe_scan);
+            if let Some(affinity) = step.probe_affinity {
+                b.emit_op(
+                    Opcode::Affinity,
+                    probe_base,
+                    1,
+                    0,
+                    P4::Affinity(affinity.to_string()),
+                    0,
+                );
+            }
+        };
+
+    let last_step_idx = plan.steps.len() - 1;
     for (i, step) in plan.steps.iter().enumerate() {
         let right_cursor = (i + 1) as i32;
-        // Tables that have been bound by the time we emit step i.
-        // probe_table_index is always < i + 1 by construction.
-        let probe_tables = &all_tables[..=step.probe_table_index];
+        let probe_base = step_probe_bases[i];
+        let table_where_terms = &where_at_table[i + 1];
 
-        // Reserve the complete index probe before reading the source. A
-        // VIRTUAL generated column can allocate temporary registers while
-        // computing its value, but MakeRecord still needs adjacent key and
-        // rowid-floor registers.
-        let probe_base = b.alloc_regs(if index_cursors[i].is_some() { 2 } else { 1 });
-        let probe_cursor = step.probe_table_index as i32;
-        let probe_scan = ScanCtx {
-            cursor: probe_cursor,
-            table: probe_tables[step.probe_table_index].0,
-            table_alias: probe_tables[step.probe_table_index].1,
-            schema: None,
-            register_base: None,
-            secondaries: &[],
-        };
-        emit_resolved_column(b, &step.probe_source, probe_cursor, probe_base, &probe_scan);
+        if matches!(step.join_kind, JoinKind::Left) {
+            debug_assert_eq!(i, last_step_idx);
+            let left_matched_reg = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0, left_matched_reg, 0, P4::None, 0);
+            let after_search_label = b.emit_label();
+            let final_where_placeholder_base;
 
-        // A LEFT-join miss (only allowed on the last step) jumps to the
-        // trailing null-row block.  Every other miss skips the whole row.
-        let miss_label = if matches!(step.join_kind, JoinKind::Left) {
-            left_null_label.expect("LEFT JOIN step must have allocated its null label")
-        } else {
-            row_done_label
-        };
+            emit_probe_value(b, step, probe_base);
 
-        // NULL probe → miss.  (C SQLite treats NULL = X as "unknown" and
-        // therefore as not matching, so the row is skipped.)
-        b.emit_jump_to_label(Opcode::IsNull, probe_base, 0, miss_label, P4::None, 0);
+            match &step.lookup_target {
+                SingleJoinLookupTarget::Auto { .. } => {
+                    return Err(CodegenError::Unsupported(
+                        "multi-join lookup step has no automatic index".to_owned(),
+                    ));
+                }
+                SingleJoinLookupTarget::Rowid => {
+                    // SeekRowid natively jumps on NULL, non-integer REAL/TEXT,
+                    // and BLOB, while coercing exact numeric values ('2', 2.0)
+                    // identically to IsNull + MustBeInt.
+                    b.emit_jump_to_label(
+                        Opcode::SeekRowid,
+                        right_cursor,
+                        probe_base,
+                        after_search_label,
+                        P4::None,
+                        0,
+                    );
+                    emit_join_on_residual(b, &step.on_residual, after_search_label, &all_tables, ctx)?;
+                    final_where_placeholder_base = b.current_anon_placeholder();
+                    b.emit_op(Opcode::Integer, 1, left_matched_reg, 0, P4::None, 0);
+                    for &term in table_where_terms {
+                        let cond_reg = b.alloc_reg();
+                        emit_join_expr(b, term, cond_reg, &all_tables, ctx)?;
+                        b.emit_jump_to_label(
+                            Opcode::IfNot,
+                            cond_reg,
+                            1,
+                            after_search_label,
+                            P4::None,
+                            0,
+                        );
+                    }
+                    emit_join_lookup_match(
+                        b,
+                        columns,
+                        out_regs,
+                        &all_tables,
+                        ctx,
+                        sorter,
+                        &stmt.order_by,
+                        aggregates,
+                        accum_base,
+                        limit,
+                    )?;
+                }
+                SingleJoinLookupTarget::Index(index) => {
+                    b.emit_jump_to_label(
+                        Opcode::IsNull,
+                        probe_base,
+                        0,
+                        after_search_label,
+                        P4::None,
+                        0,
+                    );
+                    let idx_cursor =
+                        index_cursors[i].expect("index lookup step must have an index cursor");
+                    let right_table = all_tables[i + 1].0;
+                    let comparison_p4 = index
+                        .key_term_collation(0)
+                        .or_else(|| {
+                            index
+                                .columns
+                                .first()
+                                .and_then(|c| right_table.column_index(c))
+                                .and_then(|ci| right_table.columns[ci].collation.as_deref())
+                        })
+                        .filter(|coll| !coll.eq_ignore_ascii_case("BINARY"))
+                        .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+                    let probe_fields = if step.prefix_probe { 1 } else { 2 };
+                    let probe_record_reg = b.alloc_reg();
+                    b.emit_op(
+                        Opcode::MakeRecord,
+                        probe_base,
+                        probe_fields,
+                        probe_record_reg,
+                        P4::None,
+                        0,
+                    );
+                    b.emit_jump_to_label(
+                        Opcode::SeekGE,
+                        idx_cursor,
+                        probe_record_reg,
+                        after_search_label,
+                        P4::None,
+                        0,
+                    );
+                    let loop_top = b.current_addr();
+                    let idx_key_reg = b.alloc_reg();
+                    b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
+                    b.emit_jump_to_label(
+                        Opcode::Ne,
+                        probe_base,
+                        idx_key_reg,
+                        after_search_label,
+                        comparison_p4,
+                        0,
+                    );
+                    let match_advance = if step.is_unique_lookup {
+                        after_search_label
+                    } else {
+                        b.emit_label()
+                    };
+                    if seek_table_row[i] {
+                        let rowid_reg = b.alloc_reg();
+                        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+                        b.emit_jump_to_label(
+                            Opcode::SeekRowid,
+                            right_cursor,
+                            rowid_reg,
+                            match_advance,
+                            P4::None,
+                            0,
+                        );
+                    }
+                    emit_join_on_residual(b, &step.on_residual, match_advance, &all_tables, ctx)?;
+                    final_where_placeholder_base = b.current_anon_placeholder();
+                    b.emit_op(Opcode::Integer, 1, left_matched_reg, 0, P4::None, 0);
+                    for &term in table_where_terms {
+                        let cond_reg = b.alloc_reg();
+                        emit_join_expr(b, term, cond_reg, &all_tables, ctx)?;
+                        b.emit_jump_to_label(
+                            Opcode::IfNot,
+                            cond_reg,
+                            1,
+                            match_advance,
+                            P4::None,
+                            0,
+                        );
+                    }
+                    emit_join_lookup_match(
+                        b,
+                        columns,
+                        out_regs,
+                        &all_tables,
+                        ctx,
+                        sorter,
+                        &stmt.order_by,
+                        aggregates,
+                        accum_base,
+                        limit,
+                    )?;
+                    if !step.is_unique_lookup {
+                        b.resolve_label(match_advance);
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        b.emit_op(Opcode::Next, idx_cursor, loop_top as i32, 0, P4::None, 0);
+                    }
+                }
+            }
+
+            // Null-row block for terminal LEFT JOIN when no right row matched ON.
+            b.resolve_label(after_search_label);
+            b.emit_jump_to_label(
+                Opcode::IfPos,
+                left_matched_reg,
+                0,
+                current_advance,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::NullRow, right_cursor, 0, 0, P4::None, 0);
+            b.set_next_anon_placeholder(final_where_placeholder_base);
+            for &term in table_where_terms {
+                let cond_reg = b.alloc_reg();
+                emit_join_expr(b, term, cond_reg, &all_tables, ctx)?;
+                b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, current_advance, P4::None, 0);
+            }
+            emit_join_lookup_match(
+                b,
+                columns,
+                out_regs,
+                &all_tables,
+                ctx,
+                sorter,
+                &stmt.order_by,
+                aggregates,
+                accum_base,
+                limit,
+            )?;
+            continue;
+        }
+
+        // INNER step: probe and seek (unique or non-unique index loop).
+        emit_probe_value(b, step, probe_base);
 
         match &step.lookup_target {
-            // Multi-join steps resolve their plans without automatic indexes.
             SingleJoinLookupTarget::Auto { .. } => {
                 return Err(CodegenError::Unsupported(
                     "multi-join lookup step has no automatic index".to_owned(),
                 ));
             }
             SingleJoinLookupTarget::Rowid => {
-                // 2.5 or 'abc' names no rowid; '2' names rowid 2 (SQLite's seek).
-                b.emit_jump_to_label(Opcode::MustBeInt, probe_base, 0, miss_label, P4::None, 0);
+                // SeekRowid natively jumps on NULL, non-integer REAL/TEXT, and
+                // BLOB, while coercing exact numeric values ('2', 2.0)
+                // identically to IsNull + MustBeInt.
                 b.emit_jump_to_label(
                     Opcode::SeekRowid,
                     right_cursor,
                     probe_base,
-                    miss_label,
+                    current_advance,
                     P4::None,
                     0,
                 );
+                emit_join_on_residual(b, &step.on_residual, current_advance, &all_tables, ctx)?;
+                for &term in table_where_terms {
+                    let cond_reg = b.alloc_reg();
+                    emit_join_expr(b, term, cond_reg, &all_tables, ctx)?;
+                    b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, current_advance, P4::None, 0);
+                }
             }
             SingleJoinLookupTarget::Index(index) => {
+                b.emit_jump_to_label(Opcode::IsNull, probe_base, 0, current_advance, P4::None, 0);
                 let idx_cursor =
                     index_cursors[i].expect("index lookup step must have an index cursor");
-                let comparison_p4 = direct_lookup_index_comparison_p4(index);
-                // Probe the secondary index for `probe = X`, then
-                // SeekRowid on the data cursor using the resulting
-                // rowid.  The resolver guarantees non-unique indexes
-                // have been rejected, so the first matching key row
-                // is the only one.
-                //
-                // Both source registers were reserved before evaluating the
-                // probe, including any generated-column expression.
-                let min_rowid_reg = probe_base + 1;
-                b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+                let right_table = all_tables[i + 1].0;
+                let comparison_p4 = index
+                    .key_term_collation(0)
+                    .or_else(|| {
+                        index
+                            .columns
+                            .first()
+                            .and_then(|c| right_table.column_index(c))
+                            .and_then(|ci| right_table.columns[ci].collation.as_deref())
+                    })
+                    .filter(|coll| !coll.eq_ignore_ascii_case("BINARY"))
+                    .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+                let probe_fields = if step.prefix_probe { 1 } else { 2 };
                 let probe_record_reg = b.alloc_reg();
                 b.emit_op(
                     Opcode::MakeRecord,
                     probe_base,
-                    2,
+                    probe_fields,
                     probe_record_reg,
                     P4::None,
                     0,
@@ -16817,76 +17609,56 @@ fn codegen_multi_join_lookup_select(
                     Opcode::SeekGE,
                     idx_cursor,
                     probe_record_reg,
-                    miss_label,
+                    current_advance,
                     P4::None,
                     0,
                 );
+                let loop_top = b.current_addr();
                 let idx_key_reg = b.alloc_reg();
                 b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
                 b.emit_jump_to_label(
                     Opcode::Ne,
                     probe_base,
                     idx_key_reg,
-                    miss_label,
+                    current_advance,
                     comparison_p4,
                     0,
                 );
-                let rowid_reg = b.alloc_reg();
-                b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-                b.emit_jump_to_label(
-                    Opcode::SeekRowid,
-                    right_cursor,
-                    rowid_reg,
-                    miss_label,
-                    P4::None,
-                    0,
-                );
+                let step_advance = if step.is_unique_lookup {
+                    current_advance
+                } else {
+                    let lbl = b.emit_label();
+                    loop_stack.push(MultiJoinLoopFrame {
+                        advance_label: lbl,
+                        idx_cursor,
+                        loop_top,
+                    });
+                    current_advance = lbl;
+                    lbl
+                };
+                if seek_table_row[i] {
+                    let rowid_reg = b.alloc_reg();
+                    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(
+                        Opcode::SeekRowid,
+                        right_cursor,
+                        rowid_reg,
+                        step_advance,
+                        P4::None,
+                        0,
+                    );
+                }
+                emit_join_on_residual(b, &step.on_residual, step_advance, &all_tables, ctx)?;
+                for &term in table_where_terms {
+                    let cond_reg = b.alloc_reg();
+                    emit_join_expr(b, term, cond_reg, &all_tables, ctx)?;
+                    b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, step_advance, P4::None, 0);
+                }
             }
         }
     }
 
-    // All lookups landed on a real row.  Evaluate the optional WHERE
-    // clause against the full bound tuple.
-    if let Some(where_expr) = where_clause {
-        let cond_reg = b.alloc_regs(1);
-        emit_join_expr(b, where_expr, cond_reg, &all_tables, ctx)?;
-        b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, row_done_label, P4::None, 0);
-    }
-
-    emit_join_lookup_match(
-        b,
-        columns,
-        out_regs,
-        &all_tables,
-        ctx,
-        sorter,
-        &stmt.order_by,
-        aggregates,
-        accum_base,
-        limit,
-    )?;
-
-    // Jump past the trailing LEFT-JOIN null-row block (if any) to the
-    // outer Next.  When there is no LEFT JOIN this is a harmless extra
-    // unconditional jump; keeping it makes the control-flow layout
-    // symmetric with the branch below.
-    b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done_label, P4::None, 0);
-
-    // Trailing LEFT JOIN null-row block: the final step's lookup missed,
-    // so we emit `NullRow` on its cursor, re-evaluate the WHERE clause
-    // (which sees NULLs for the left-joined table's columns), and emit
-    // the row with those NULLs.  `resolve_multi_join_lookup_plan`
-    // guarantees the LEFT join is the terminal step, so no later steps
-    // need to be re-run here.
-    if let Some(null_label) = left_null_label {
-        b.resolve_label(null_label);
-        let last_right_cursor = join_tables.len() as i32;
-        b.emit_op(Opcode::NullRow, last_right_cursor, 0, 0, P4::None, 0);
-        if let Some(where_expr) = where_clause {
-            let cond_reg = b.alloc_regs(1);
-            emit_join_expr(b, where_expr, cond_reg, &all_tables, ctx)?;
-            b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, row_done_label, P4::None, 0);
-        }
+    if !terminal_is_left {
         emit_join_lookup_match(
             b,
             columns,
@@ -16901,7 +17673,21 @@ fn codegen_multi_join_lookup_select(
         )?;
     }
 
-    b.resolve_label(row_done_label);
+    // Unwind any non-unique index loops from innermost to outermost.
+    while let Some(frame) = loop_stack.pop() {
+        b.resolve_label(frame.advance_label);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        b.emit_op(
+            Opcode::Next,
+            frame.idx_cursor,
+            frame.loop_top as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
+
+    b.resolve_label(outer_advance_label);
     b.emit_jump_to_label(Opcode::Next, left_cursor, 0, next_left_label, P4::None, 0);
 
     b.resolve_label(done_label);
@@ -17124,20 +17910,18 @@ fn codegen_join_select(
         );
     }
 
-    // Multi-table fast path (issue #62): when every join in the chain
-    // can be expressed as a rowid / indexed-equality lookup against an
-    // already-bound table, avoid the Cartesian nested-loop scan below
-    // and emit a single outer loop with O(1) seeks into each dimension
-    // table.  On the 4-table FTS rebuild reported in the bug, this
-    // replaces a 600×-slower full-materialization plan.
+    // Multi-table lookup fast path (issue #62, bd-knibh): when every join in
+    // the chain can be expressed as a rowid or indexed-equality lookup (unique
+    // or non-unique) against an already-bound table, avoid the Cartesian
+    // nested-loop scan below.
     if join_tables.len() >= 2
-        && let Some(plan) = resolve_multi_join_lookup_plan(left_table, left_alias, &join_tables)
+        && let Some(plan) =
+            resolve_multi_join_lookup_plan(left_table, left_alias, &join_tables, where_clause)
     {
         return codegen_multi_join_lookup_select(
             b,
             stmt,
             columns,
-            where_clause,
             left_table,
             left_alias,
             &join_tables,
@@ -65309,9 +66093,6 @@ mod tests {
              LEFT JOIN conversations c ON c.id = m.conversation_id \
              LEFT JOIN agents a ON a.id = c.agent_id",
             "SELECT count(*) FROM messages m \
-             JOIN conversations c ON c.id = m.conversation_id AND c.agent_id > 0 \
-             JOIN agents a ON a.id = c.agent_id",
-            "SELECT count(*) FROM messages m \
              JOIN conversations c ON c.id = m.conversation_id \
              JOIN agents a ON a.id = c.agent_id + 1",
             "SELECT count(DISTINCT m.id) FROM messages m \
@@ -65332,18 +66113,60 @@ mod tests {
             );
         }
 
+        // Conjunctive ON residual (`AND c.agent_id > 0`) now compiles cleanly
+        // with an inline IfNot filter on the lookup path (bd-knibh).
+        let residual_stmt = select_sql(
+            "SELECT count(*) FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id AND c.agent_id > 0 \
+             JOIN agents a ON a.id = c.agent_id",
+        );
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &residual_stmt, &schema, &CodegenContext::default()).unwrap();
+        let residual_prog = b.finish().unwrap();
+        assert!(
+            residual_prog.ops().iter().any(|op| op.opcode == Opcode::IfNot),
+            "conjunctive ON residual must emit a predicate guard"
+        );
+        assert!(
+            residual_prog.ops().iter().any(|op| op.opcode == Opcode::AggStep),
+            "conjunctive ON residual aggregate must emit AggStep"
+        );
+
         let stmt = select_sql(
             "SELECT count(*) FROM messages m \
              JOIN conversations c ON c.id = m.conversation_id \
              JOIN agents a ON a.tenant_id = c.tenant_id",
         );
-        // A UNIQUE(a,b) index still has multiple matches for a alone.
+        // bd-knibh: A UNIQUE(a,b) composite prefix lookup now compiles using a
+        // 1-field prefix SeekGE + Next index loop so all matching rows are visited.
         let schema = test_schema_multi_join_composite_unique_prefix_lookup();
         let mut b = ProgramBuilder::new();
-        assert!(matches!(
-            codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()),
-            Err(CodegenError::Unsupported(_))
-        ));
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let prefix_prog = b.finish().unwrap();
+        assert_eq!(
+            prefix_prog
+                .ops()
+                .iter()
+                .filter(|op| op.opcode == Opcode::Rewind)
+                .count(),
+            1
+        );
+        assert!(
+            prefix_prog
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::MakeRecord && op.p2 == 1),
+            "composite prefix lookup must build a 1-field prefix probe record"
+        );
+        assert!(
+            prefix_prog
+                .ops()
+                .iter()
+                .filter(|op| op.opcode == Opcode::Next)
+                .count()
+                >= 2,
+            "composite prefix lookup must loop over duplicate prefix entries with Next"
+        );
 
         let mut schema = test_schema_multi_join_prefers_unique_single_column_lookup();
         schema[2].without_rowid = true;
@@ -65790,16 +66613,29 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        let rewind_count = prog
-            .ops()
-            .iter()
-            .filter(|op| op.opcode == Opcode::Rewind)
-            .count();
-
+        // bd-knibh: joining on the leftmost column of UNIQUE(tenant_id, slug)
+        // is NOT a single-row lookup; the multi-join path must use a 1-field
+        // prefix SeekGE and iterate every matching index entry with Next
+        // (never silently stopping after the first match).
+        let ops = prog.ops();
+        assert_eq!(
+            ops.iter().filter(|op| op.opcode == Opcode::Rewind).count(),
+            1,
+            "composite prefix multi-join should scan only the driver table"
+        );
         assert!(
-            rewind_count >= 2,
-            "joining on the leftmost column of UNIQUE(tenant_id, slug) is not a \
-             single-row lookup; the multi-join fast path must be rejected"
+            ops.iter()
+                .any(|op| op.opcode == Opcode::MakeRecord && op.p2 == 1),
+            "composite prefix probe must be a 1-field key record"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE)
+                && ops.iter().any(|op| op.opcode == Opcode::Ne),
+            "composite prefix lookup must SeekGE and guard the key equality with Ne"
+        );
+        assert!(
+            ops.iter().filter(|op| op.opcode == Opcode::Next).count() >= 2,
+            "composite prefix lookup must advance the index cursor with Next for all matching rows"
         );
     }
 

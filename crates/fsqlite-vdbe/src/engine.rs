@@ -6220,6 +6220,18 @@ impl CursorBackend {
         }
     }
 
+    /// Span and local payload bytes for an index cell stored whole on its page.
+    #[inline]
+    #[allow(clippy::type_complexity)]
+    fn current_local_index_row(&self) -> Result<Option<(std::ops::Range<usize>, &[u8])>> {
+        match self {
+            Self::Mem(c) => c.current_local_index_row(),
+            Self::Temp(c) => c.current_local_index_row(),
+            Self::Txn(c) => c.current_local_index_row(),
+            Self::TimeTravel(c) => c.current_local_index_row(),
+        }
+    }
+
     /// Bytes `span` of the page the cursor stands on.
     #[inline]
     fn current_page_span(&self, span: std::ops::Range<usize>) -> Option<&[u8]> {
@@ -6880,6 +6892,7 @@ type RowDecodeScratch = fsqlite_types::record::RecordDecodeScratch;
 struct PageRowView {
     stamp: Option<CursorPositionStamp>,
     rowid: i64,
+    is_index_row: bool,
     payload: std::ops::Range<usize>,
     /// Column table of the record header.
     layout: RecordColumnTable,
@@ -20034,6 +20047,11 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            // Extract the trailing integer rowid of a local index cell directly
+            // from the page bytes (reusing `page_row.layout` when `Column` just
+            // decoded the same entry). Kept out of line so non-index scan loops
+            // keep their compact instruction footprint.
+            Opcode::IdxRowid => self.execute_idx_rowid_hot(op, pc),
             // A virtual-table cursor's column read and step are synchronous
             // calls into the module (bd-w4pr1.13.21, lever S): leaving this
             // lane for them cost an INSERT ... SELECT from a table-valued
@@ -20085,6 +20103,75 @@ impl VdbeEngine {
             Opcode::Delete => self.execute_plain_delete_hot(op, pc),
             _ => Ok(false),
         }
+    }
+
+    /// Synchronous fast path for `Opcode::IdxRowid` on a local index cell
+    /// (leaf or interior). Reuses `cursor.page_row` when `Column` already
+    /// parsed the current entry's header, reading the trailing integer rowid
+    /// straight from the page bytes without allocating or leaving the sync loop.
+    #[inline(never)]
+    fn execute_idx_rowid_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<bool> {
+        if self.collect_vdbe_metrics {
+            return Ok(false);
+        }
+        let Some(cursor) = self.storage_cursors.get_mut(&op.p1) else {
+            return Ok(false);
+        };
+        let Some(stamp) = cursor.cursor.position_stamp() else {
+            return Ok(false);
+        };
+        let view = &mut cursor.page_row;
+        let fresh_record = if view.stamp == Some(stamp) {
+            if !view.is_index_row {
+                return Ok(false);
+            }
+            None
+        } else {
+            view.stamp = None;
+            let Some((payload, bytes)) = cursor.cursor.current_local_index_row()? else {
+                return Ok(false);
+            };
+            if !view.layout.parse(bytes) {
+                return Ok(false);
+            }
+            view.rowid = 0;
+            view.is_index_row = true;
+            view.payload = payload;
+            view.includes_rowid_alias = None;
+            view.stamp = Some(stamp);
+            Some(bytes)
+        };
+        let Some(last_idx) = view.layout.column_count().checked_sub(1) else {
+            return Ok(false);
+        };
+        let Some(col) = view.layout.column_offset(last_idx) else {
+            return Ok(false);
+        };
+        let Some(record) =
+            fresh_record.or_else(|| cursor.cursor.current_page_span(view.payload.clone()))
+        else {
+            return Ok(false);
+        };
+        let Some(value_bytes) = usize::try_from(col.body_offset)
+            .ok()
+            .zip(column_payload_end(col))
+            .and_then(|(start, end)| record.get(start..end))
+        else {
+            return Ok(false);
+        };
+        let Some(SqliteValue::Integer(rowid)) =
+            fsqlite_types::record::decode_scalar_value(col.serial_type, value_bytes)
+        else {
+            return Ok(false);
+        };
+        #[allow(clippy::cast_sign_loss)]
+        if op.p2 >= 0 && (op.p2 as usize) < self.registers.len() {
+            self.set_reg_int(op.p2, rowid);
+        } else {
+            self.set_reg_fast(op.p2, SqliteValue::Integer(rowid));
+        }
+        *pc += 1;
+        Ok(true)
     }
 
     /// The main loop's `Delete` arm for a plain DELETE (no `OPFLAG_ISUPDATE`)
@@ -25446,13 +25533,19 @@ fn try_read_column_in_place(
     let mut fresh_record: Option<&[u8]> = None;
     if view.stamp != Some(stamp) {
         view.stamp = None;
-        let Some((rowid, payload, bytes)) = cursor.cursor.current_local_table_row()? else {
-            return Ok(None);
-        };
+        let (rowid, is_index_row, payload, bytes) =
+            if let Some((rowid, payload, bytes)) = cursor.cursor.current_local_table_row()? {
+                (rowid, false, payload, bytes)
+            } else if let Some((payload, bytes)) = cursor.cursor.current_local_index_row()? {
+                (0, true, payload, bytes)
+            } else {
+                return Ok(None);
+            };
         if !view.layout.parse(bytes) {
             return Ok(None);
         }
         view.rowid = rowid;
+        view.is_index_row = is_index_row;
         view.payload = payload;
         view.includes_rowid_alias = None;
         view.stamp = Some(stamp);

@@ -305,13 +305,21 @@ fn join_aggregates_joined_by_where_match_sqlite() {
                     "`{sql}` must run as a rowid lookup loop: {ops:?}"
                 );
             }
-            // A comma join keeps its written order: `t` drives and `u.a`,
-            // which has no index, is looked up through an automatic index
-            // rather than `u` driving lookups into `t`.
-            let ops = opcodes(&f, "SELECT count(*), sum(u.r) FROM t, u WHERE u.a = t.id").await;
+            // An explicit CROSS JOIN keeps its written order: `t` drives and
+            // `u.a`, which has no index, is looked up through an automatic
+            // index rather than `u` driving lookups into `t`. A comma join
+            // parses as INNER JOIN (bd-hexz0) and reorders to a rowid lookup,
+            // matching stock SQLite.
+            let ops = opcodes(&f, "SELECT count(*), sum(u.r) FROM t CROSS JOIN u WHERE u.a = t.id").await;
             assert!(
                 ops.iter().any(|op| op == "AggStep") && ops.iter().any(|op| op == "OpenAutoindex"),
                 "a cross join must not be reordered into a rowid lookup: {ops:?}"
+            );
+            let comma_ops = opcodes(&f, "SELECT count(*), sum(u.r) FROM t, u WHERE u.a = t.id").await;
+            assert!(
+                comma_ops.iter().any(|op| op == "AggStep")
+                    && comma_ops.iter().any(|op| op == "SeekRowid"),
+                "a comma join reorders into a rowid lookup like stock SQLite: {comma_ops:?}"
             );
         });
     }
@@ -975,11 +983,24 @@ fn multi_join_aggregates_stream_and_match_sqlite() {
                     let sql = format!("SELECT {aggregates} FROM {chain}{predicate}");
                     assert_agree(&f, &r, &sql, &[], &[]).await;
                     let ops = opcodes(&f, &sql).await;
-                    assert_eq!(
-                        ops.iter().filter(|op| *op == "Rewind").count(),
-                        1,
-                        "{sql}: {ops:?}"
-                    );
+                    if predicate == " WHERE d.id > 1" {
+                        assert_eq!(
+                            ops.iter().filter(|op| *op == "Rewind").count(),
+                            0,
+                            "{sql} should seek driver via SeekGT instead of Rewind: {ops:?}"
+                        );
+                        assert_eq!(
+                            ops.iter().filter(|op| *op == "SeekGT").count(),
+                            1,
+                            "{sql} should seek driver via SeekGT: {ops:?}"
+                        );
+                    } else {
+                        assert_eq!(
+                            ops.iter().filter(|op| *op == "Rewind").count(),
+                            1,
+                            "{sql}: {ops:?}"
+                        );
+                    }
                     assert_eq!(
                         ops.iter().filter(|op| *op == "ResultRow").count(),
                         1,
@@ -2192,7 +2213,10 @@ fn join_lookups_seek_the_outer_table_by_unconsumed_inner_join_terms() {
             "SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND (t.a = 2 OR t.a = 4) ORDER BY t.id",
             false,
         ),
-        ("SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND t.a = '2' ORDER BY t.id", false),
+        // bd-qk7vd: text probe `'2'` against INTEGER index `t.a` coerces via
+        // Affinity before SeekGE; `t.a + 0 = 2` disables the index seek.
+        ("SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND t.a = '2' ORDER BY t.id", true),
+        ("SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND t.a + 0 = 2 ORDER BY t.id", false),
         ("SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND t.a = 9 ORDER BY t.id", true),
     ];
     for indexed in [false, true] {
@@ -2295,9 +2319,15 @@ fn inner_joins_drive_from_the_table_their_where_pins_by_row_estimates() {
             "SELECT t.id, u.r FROM u LEFT JOIN t ON u.id = t.a WHERE t.b = 'k2' ORDER BY t.id",
             Some([true, true]),
         ),
+        // CROSS JOIN pins join order (full outer scan of u); comma join parses
+        // as INNER JOIN (bd-hexz0) and reorders to drive from pinned t.b = 'k2'.
+        (
+            "SELECT count(*) FROM u CROSS JOIN t WHERE u.id = t.a AND t.b = 'k2'",
+            Some([true, true]),
+        ),
         (
             "SELECT count(*) FROM u, t WHERE u.id = t.a AND t.b = 'k2'",
-            Some([true, true]),
+            Some([false, false]),
         ),
         (
             "SELECT * FROM u JOIN t ON u.id = t.a WHERE t.b = 'k2' ORDER BY t.id, u.id",
@@ -2493,4 +2523,371 @@ fn same_leaf_rowid_lookups_match_sqlite_across_leaves_and_after_writes() {
             f.close().await.unwrap();
         });
     }
+}
+
+/// bd-knibh: aggregates (and plain selects) over 3+ table joins whose middle
+/// or trailing lookup uses a non-unique secondary index (single-column or
+/// leading composite prefix) must compile directly to VDBE lookup-loop
+/// bytecode (EXPLAIN works, zero fallback) and match bundled SQLite 3.54.1 on
+/// both `:memory:` and file-backed databases, ad hoc and prepared.
+#[test]
+fn bd_knibh_multi_join_non_unique_index_aggregates_match_sqlite() {
+    const SETUP_SQL: &str = "
+        CREATE TABLE a(id INTEGER PRIMARY KEY, code TEXT, grp INTEGER, w REAL);
+        CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER, c_id INTEGER, tag TEXT, flag INTEGER);
+        CREATE TABLE c(id INTEGER PRIMARY KEY, b_tag TEXT, val REAL, label TEXT);
+        CREATE TABLE d(id INTEGER PRIMARY KEY, c_id INTEGER, bonus REAL);
+        CREATE TABLE b_comp(id INTEGER PRIMARY KEY, a_id INTEGER, c_id INTEGER, extra INTEGER);
+        CREATE TABLE empty_a(id INTEGER PRIMARY KEY, grp INTEGER);
+        CREATE INDEX idx_b_a_id ON b(a_id);
+        CREATE INDEX idx_c_b_tag ON c(b_tag);
+        CREATE INDEX idx_d_c_id ON d(c_id);
+        CREATE INDEX idx_b_comp_ac ON b_comp(a_id, c_id);
+        INSERT INTO a VALUES
+            (1,'1',10,1.5),(2,'2',20,2.5),(3,'3',10,NULL),(4,'4',30,-4.0),
+            (5,'999',20,0.5),(6,'x',10,3.0);
+        INSERT INTO b VALUES
+            (10,1,100,'k1',1),(11,1,101,'k1',0),(12,1,999,'missing',1),
+            (13,2,101,'k2',1),(14,2,NULL,'k1',1),(15,2,102,'k2',0),
+            (16,4,100,'k3',1),(17,4,100,'k3',1),(18,NULL,100,'k1',1);
+        INSERT INTO c VALUES
+            (100,'k1',10.0,'alpha'),(101,'k1',20.0,'beta'),(102,'k2',NULL,'gamma'),
+            (103,'k2',-5.0,'delta'),(104,'k3',7.5,'epsilon');
+        INSERT INTO d VALUES
+            (1,100,1.0),(2,100,2.0),(3,101,3.5),(4,104,-1.0);
+        INSERT INTO b_comp VALUES
+            (1,1,100,5),(2,1,101,6),(3,2,102,7),(4,2,100,8),(5,4,999,9);
+    ";
+
+    // Shapes that MUST compile to multi-join lookup bytecode (EXPLAIN works,
+    // single outer Rewind, AggStep + AggFinal, zero SorterInsert).
+    let compiled_aggregate_queries: &[&str] = &[
+        // Core bd-knibh shape: 3-table join with non-unique secondary index on middle table + PK leaf.
+        "SELECT count(*), sum(c.val), total(c.val), avg(c.val), min(c.val), max(c.val) \
+         FROM a JOIN b ON b.a_id = a.id JOIN c ON c.id = b.c_id",
+        // Count-only: trailing index lookup can even avoid table SeekRowid when unreferenced.
+        "SELECT count(*) FROM a JOIN b ON b.a_id = a.id JOIN c ON c.b_tag = b.tag",
+        // Non-unique secondary index on BOTH middle AND leaf tables.
+        "SELECT count(*), sum(c.val), sum(a.w), min(c.label), max(c.label) \
+         FROM a JOIN b ON b.a_id = a.id JOIN c ON c.b_tag = b.tag",
+        // Composite leading-column non-unique index on middle table.
+        "SELECT count(*), sum(c.val), sum(b_comp.extra) \
+         FROM a JOIN b_comp ON b_comp.a_id = a.id JOIN c ON c.id = b_comp.c_id",
+        // Non-unique middle index + terminal LEFT JOIN (PK leaf).
+        "SELECT count(*), count(c.id), sum(c.val), sum(a.w) \
+         FROM a JOIN b ON b.a_id = a.id LEFT JOIN c ON c.id = b.c_id",
+        // Non-unique middle index + terminal LEFT JOIN (non-unique indexed leaf!).
+        "SELECT count(*), count(c.id), sum(c.val) \
+         FROM a JOIN b ON b.a_id = a.id LEFT JOIN c ON c.b_tag = b.tag",
+        // Terminal LEFT JOIN with ON residual + WHERE filtering NULL matches.
+        "SELECT count(*), count(c.id), sum(c.val) \
+         FROM a JOIN b ON b.a_id = a.id AND b.flag = 1 LEFT JOIN c ON c.id = b.c_id AND c.val > 10",
+        "SELECT count(*), sum(b.id) \
+         FROM a JOIN b ON b.a_id = a.id LEFT JOIN c ON c.id = b.c_id WHERE c.id IS NULL",
+        // Cross-affinity coercion (TEXT probe a.code into INTEGER index b.a_id).
+        "SELECT count(*), sum(c.val) \
+         FROM a JOIN b ON b.a_id = a.code JOIN c ON c.id = b.c_id",
+        // WHERE filters at table 0, table 1, and table 2.
+        "SELECT count(*), sum(c.val), sum(a.w * c.val) \
+         FROM a JOIN b ON b.a_id = a.id JOIN c ON c.id = b.c_id \
+         WHERE a.grp = 10 AND b.flag = 1 AND c.val >= 10",
+        // 4-table chain: non-unique middle + PK + non-unique terminal LEFT JOIN.
+        "SELECT count(*), count(d.id), sum(d.bonus), sum(c.val) \
+         FROM a JOIN b ON b.a_id = a.id JOIN c ON c.id = b.c_id LEFT JOIN d ON d.c_id = c.id",
+        // Comma-joined 3-table aggregate.
+        "SELECT count(*), sum(c.val) FROM a, b, c WHERE b.a_id = a.id AND c.id = b.c_id",
+        "SELECT count(*), sum(c.val) FROM a, b, c WHERE c.id = b.c_id AND b.a_id = a.id AND b.flag = 1",
+        // Empty driver table.
+        "SELECT count(*), count(c.id), sum(c.val) \
+         FROM empty_a JOIN b ON b.a_id = empty_a.id JOIN c ON c.id = b.c_id",
+        "SELECT count(*), count(c.id), sum(c.val) \
+         FROM empty_a JOIN b ON b.a_id = empty_a.id LEFT JOIN c ON c.id = b.c_id",
+        // Exact join3_secidx_30k shape with driver rowid upper bound (`WHERE a.id <= ...`).
+        "SELECT count(*), sum(c.val) \
+         FROM a JOIN b ON b.a_id = a.id JOIN c ON c.id = b.c_id WHERE a.id <= 3",
+        "SELECT count(*), sum(c.val) \
+         FROM a JOIN b ON b.a_id = a.id JOIN c ON c.id = b.c_id WHERE a.id <= 3 AND b.flag = 1",
+    ];
+
+    // Driver rowid lower-bounded range queries (use SeekGE instead of Rewind on driver).
+    let driver_range_aggregate_queries: &[&str] = &[
+        "SELECT count(*), sum(c.val) \
+         FROM a JOIN b ON b.a_id = a.id JOIN c ON c.id = b.c_id WHERE a.id BETWEEN 2 AND 4",
+        "SELECT count(*), sum(c.val) \
+         FROM a JOIN b ON b.a_id = a.id JOIN c ON c.id = b.c_id WHERE a.id = 2",
+        "SELECT count(*), sum(c.val) \
+         FROM a JOIN b ON b.a_id = a.id LEFT JOIN c ON c.id = b.c_id WHERE a.id > 1 AND a.id < 5",
+    ];
+
+    // Non-aggregate multi-join selects with non-unique indexes (with ORDER BY / LIMIT).
+    let non_aggregate_queries: &[&str] = &[
+        "SELECT a.id, b.id, c.id, c.val FROM a JOIN b ON b.a_id = a.id JOIN c ON c.id = b.c_id \
+         ORDER BY a.id, b.id, c.id",
+        "SELECT a.id, b.id, c.id FROM a JOIN b ON b.a_id = a.id LEFT JOIN c ON c.b_tag = b.tag \
+         ORDER BY a.id, b.id, c.id",
+        "SELECT a.id, b.id, c.id FROM a JOIN b ON b.a_id = a.id JOIN c ON c.id = b.c_id \
+         WHERE a.grp = 10 ORDER BY a.id, b.id LIMIT 2 OFFSET 1",
+    ];
+
+    // Negative controls that MUST remain accurate through fallback.
+    let fallback_control_queries: &[&str] = &[
+        "SELECT count(*), count(c.id), sum(c.val) \
+         FROM a LEFT JOIN b ON b.a_id = a.id JOIN c ON c.id = b.c_id",
+        "SELECT count(DISTINCT c.id), sum(c.val) \
+         FROM a JOIN b ON b.a_id = a.id JOIN c ON c.id = b.c_id",
+        "SELECT count(*) FROM a JOIN b ON b.a_id = a.id OR b.id = a.id JOIN c ON c.id = b.c_id",
+    ];
+
+    for file_backed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = if file_backed {
+                dir.path()
+                    .join("bd_knibh_multi_join.db")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let f = Connection::open(&path).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            f.execute_batch(SETUP_SQL).await.unwrap();
+            r.execute_batch(SETUP_SQL).unwrap();
+
+            for &sql in compiled_aggregate_queries {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+                // Prepared parity too.
+                let prep = f.prepare(sql).await.unwrap();
+                let prep_rows: Vec<Vec<String>> = prep
+                    .query()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().iter().map(tag_f).collect())
+                    .collect();
+                let direct_rows: Vec<Vec<String>> = f
+                    .query(sql)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().iter().map(tag_f).collect())
+                    .collect();
+                assert_eq!(prep_rows, direct_rows, "prepared vs direct on `{sql}`");
+
+                // EXPLAIN must succeed and show the lookup-loop bytecode program!
+                let ops = opcodes(&f, sql).await;
+                assert_eq!(
+                    ops.iter().filter(|op| *op == "Rewind").count(),
+                    1,
+                    "file={file_backed} `{sql}` expected 1 outer Rewind: {ops:?}"
+                );
+                assert!(
+                    ops.iter().any(|op| op == "SeekGE"),
+                    "file={file_backed} `{sql}` expected SeekGE: {ops:?}"
+                );
+                assert!(
+                    ops.iter().any(|op| op == "AggStep") && ops.iter().any(|op| op == "AggFinal"),
+                    "file={file_backed} `{sql}` expected AggStep+AggFinal: {ops:?}"
+                );
+                assert!(
+                    !ops.iter().any(|op| op == "SorterInsert"),
+                    "file={file_backed} `{sql}` unexpected SorterInsert: {ops:?}"
+                );
+            }
+
+            // Verify driver rowid-range seek queries replace outer Rewind with SeekGE + upper exit.
+            for &sql in driver_range_aggregate_queries {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+                let ops = opcodes(&f, sql).await;
+                assert_eq!(
+                    ops.iter().filter(|op| *op == "Rewind").count(),
+                    0,
+                    "file={file_backed} `{sql}` expected SeekGE instead of Rewind: {ops:?}"
+                );
+                assert!(
+                    ops.iter().filter(|op| *op == "SeekGE" || *op == "SeekGT").count() >= 2,
+                    "file={file_backed} `{sql}` expected driver + index seeks: {ops:?}"
+                );
+                assert!(
+                    ops.iter().any(|op| op == "Gt" || op == "Ge"),
+                    "file={file_backed} `{sql}` expected driver rowid upper-bound exit: {ops:?}"
+                );
+                assert!(
+                    ops.iter().any(|op| op == "AggStep") && ops.iter().any(|op| op == "AggFinal"),
+                    "file={file_backed} `{sql}` expected AggStep+AggFinal: {ops:?}"
+                );
+            }
+
+            // Anonymous `?` placeholders split across terminal LEFT JOIN ON residual and WHERE.
+            let anon_left_sql = "SELECT count(*), count(c.id), sum(c.val) \
+                                 FROM a JOIN b ON b.a_id = a.id \
+                                 LEFT JOIN c ON c.id = b.c_id AND c.val > ? \
+                                 WHERE a.id <= 4 AND a.grp >= ?";
+            for (v, g) in [(10.0_f64, 10_i64), (50.0, 10), (0.0, 20)] {
+                let fp = [SqliteValue::Float(v), SqliteValue::Integer(g)];
+                assert_agree(&f, &r, anon_left_sql, &fp, &[&v, &g]).await;
+            }
+
+            // Verify zero fallback decisions on `:memory:` for the core shape!
+            if !file_backed {
+                f.set_fallback_capture_enabled(true);
+                f.reset_fallback_decision_evidence();
+                f.query(compiled_aggregate_queries[0]).await.unwrap();
+                let fell_back = f
+                    .fallback_decision_snapshot()
+                    .decisions
+                    .iter()
+                    .any(|d| d.decision_reason == "group_by_join_fallback");
+                assert!(
+                    !fell_back,
+                    "core 3-table non-unique index join aggregate must not fall back on :memory:"
+                );
+                f.set_fallback_capture_enabled(false);
+            }
+
+            // Parameterized query across both direct and prepared.
+            let param_sql = "SELECT count(*), sum(c.val) \
+                             FROM a JOIN b ON b.a_id = a.id LEFT JOIN c ON c.id = b.c_id \
+                             WHERE a.grp >= ?1 AND (c.val IS NULL OR c.val >= ?2)";
+            let prep = f.prepare(param_sql).await.unwrap();
+            for (g, v) in [(10_i64, 0.0_f64), (20, 10.0), (99, 0.0)] {
+                let fp = [SqliteValue::Integer(g), SqliteValue::Float(v)];
+                assert_agree(&f, &r, param_sql, &fp, &[&g, &v]).await;
+                let pr: Vec<Vec<String>> = prep
+                    .query_with_params(&fp)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().iter().map(tag_f).collect())
+                    .collect();
+                let dr: Vec<Vec<String>> = f
+                    .query_with_params(param_sql, &fp)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().iter().map(tag_f).collect())
+                    .collect();
+                assert_eq!(pr, dr, "param ({g}, {v}) prepared vs direct");
+            }
+            drop(prep);
+
+            for &sql in non_aggregate_queries {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+            for &sql in fallback_control_queries {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+            f.close().await.unwrap();
+        });
+    }
+}
+
+/// bd-knibh live A/B benchmark harness: 30,000-row 3-table join with a
+/// non-unique secondary index on the middle table (`join3_secidx_30k`),
+/// compared directly against bundled SQLite 3.54.1 in the same invocation.
+#[test]
+#[ignore = "live release-perf A/B benchmark for bd-knibh (join3_secidx_30k)"]
+fn bd_knibh_join3_secidx_30k_live_vs_sqlite() {
+    use std::time::Instant;
+
+    const SQL_FULL: &str = "SELECT count(*), sum(c.val) \
+                            FROM a JOIN b ON b.a_id = a.id JOIN c ON c.id = b.c_id";
+    const SQL_BOUNDED: &str = "SELECT count(*), sum(pr.price) \
+                               FROM cust c JOIN ord o ON o.cid = c.id JOIN prod pr ON pr.id = o.pid \
+                               WHERE c.id <= 2000";
+    const SETUP_SQL: &[&str] = &[
+        "CREATE TABLE a(id INTEGER PRIMARY KEY, grp INTEGER)",
+        "CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER, c_id INTEGER)",
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, val INTEGER)",
+        "WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 10000) \
+         INSERT INTO a SELECT v, v % 100 FROM s",
+        "WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 30000) \
+         INSERT INTO b SELECT v, 1 + ((v - 1) % 10000), 1 + ((v * 7) % 10000) FROM s",
+        "WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 10000) \
+         INSERT INTO c SELECT v, (v * 13) % 1000 FROM s",
+        "CREATE INDEX idx_b_a_id ON b(a_id)",
+        // Exact bd-w4pr1.13.18 join3_secidx_30k shape: large driving table c with
+        // `WHERE c.id <= 2000` joining 30k matching rows through non-unique `o_cid`.
+        "CREATE TABLE cust(id INTEGER PRIMARY KEY, tier INTEGER)",
+        "CREATE TABLE ord(id INTEGER PRIMARY KEY, cid INTEGER, pid INTEGER)",
+        "CREATE TABLE prod(id INTEGER PRIMARY KEY, price INTEGER)",
+        "WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 20000) \
+         INSERT INTO cust SELECT v, v % 10 FROM s",
+        "WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 300000) \
+         INSERT INTO ord SELECT v, 1 + ((v - 1) % 20000), 1 + ((v * 7) % 10000) FROM s",
+        "WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 10000) \
+         INSERT INTO prod SELECT v, (v * 13) % 1000 FROM s",
+        "CREATE INDEX o_cid ON ord(cid)",
+    ];
+
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = if file_backed {
+                dir.path()
+                    .join("join3_secidx_30k.db")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let f = Connection::open(&path).await.unwrap();
+            let r = if file_backed {
+                rusqlite::Connection::open(dir.path().join("sqlite_join3.db")).unwrap()
+            } else {
+                rusqlite::Connection::open_in_memory().unwrap()
+            };
+            for &stmt in SETUP_SQL {
+                f.execute(stmt).await.unwrap();
+                r.execute_batch(stmt).unwrap();
+            }
+
+            for (label, sql) in [("full_30k", SQL_FULL), ("join3_secidx_30k_bounded", SQL_BOUNDED)] {
+                // Prove EXPLAIN compiles cleanly and emits lookup-loop bytecode.
+                let ops = opcodes(&f, sql).await;
+                assert_eq!(ops.iter().filter(|op| *op == "Rewind").count(), 1, "{label}: {ops:?}");
+                assert!(ops.iter().any(|op| op == "SeekGE"), "{label}: {ops:?}");
+                assert!(ops.iter().any(|op| op == "AggStep"), "{label}: {ops:?}");
+
+                // Parity check before timing.
+                assert_agree(&f, &r, sql, &[], &[]).await;
+
+                let f_stmt = f.prepare(sql).await.unwrap();
+                let mut r_stmt = r.prepare(sql).unwrap();
+
+                // Warmup.
+                for _ in 0..3 {
+                    let _ = f_stmt.query().await.unwrap();
+                    let _ = r_stmt
+                        .query_row([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                        .unwrap();
+                }
+
+                let iters = 15_usize;
+                let mut f_times = Vec::with_capacity(iters);
+                let mut r_times = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t0 = Instant::now();
+                    let rows = f_stmt.query().await.unwrap();
+                    f_times.push(t0.elapsed().as_nanos());
+                    assert_eq!(rows.len(), 1);
+
+                    let t1 = Instant::now();
+                    let _ = r_stmt
+                        .query_row([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                        .unwrap();
+                    r_times.push(t1.elapsed().as_nanos());
+                }
+                f_times.sort_unstable();
+                r_times.sort_unstable();
+                let f_med = f_times[iters / 2] as f64 / 1_000_000.0;
+                let r_med = r_times[iters / 2] as f64 / 1_000_000.0;
+                eprintln!(
+                    "{label} file_backed={file_backed}: fsqlite={f_med:.3}ms rusqlite={r_med:.3}ms ratio={:.2}x",
+                    f_med / r_med
+                );
+            }
+            f.close().await.unwrap();
+        }
+    });
 }

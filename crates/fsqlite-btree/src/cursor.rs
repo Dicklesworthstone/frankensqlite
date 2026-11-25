@@ -13610,6 +13610,82 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(Some((rowid, payload_offset..local_end)))
     }
 
+    /// Where index cell `idx` keeps its payload on `entry`'s page (leaf or
+    /// interior index). `None` when the page is not an index page or the
+    /// payload spills to overflow pages.
+    fn local_index_cell_span(
+        &self,
+        entry: &StackEntry,
+        idx: u16,
+    ) -> Result<Option<std::ops::Range<usize>>> {
+        let page_type = entry.header.page_type;
+        let child_prefix = match page_type {
+            BtreePageType::LeafIndex => 0_usize,
+            BtreePageType::InteriorIndex => 4_usize,
+            BtreePageType::LeafTable | BtreePageType::InteriorTable => return Ok(None),
+        };
+        if idx >= entry.header.cell_count {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cell index {} out of bounds ({})",
+                    idx, entry.header.cell_count
+                ),
+            });
+        }
+
+        let page = entry.usable_bytes();
+        let idx_usize = usize::from(idx);
+        let cell_offset = if idx_usize < entry.cell_pointers.len() {
+            usize::from(entry.cell_pointers[idx_usize])
+        } else {
+            usize::from(Self::read_stack_entry_cell_pointer_inline(entry, idx)?)
+        };
+        let payload_size_start =
+            cell_offset
+                .checked_add(child_prefix)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "index cell offset overflow".to_owned(),
+                })?;
+        let payload_size_slice =
+            page.get(payload_size_start..)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("cell offset {payload_size_start} extends past page"),
+                })?;
+        let (payload_size_raw, ps_len) =
+            read_varint(payload_size_slice).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "truncated varint in index cell (payload size)".to_owned(),
+            })?;
+        let payload_size =
+            u32::try_from(payload_size_raw).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "index cell payload size exceeds 32-bit range".to_owned(),
+            })?;
+        if payload_size > crate::cell::max_local_payload(self.usable_size, page_type) {
+            return Ok(None);
+        }
+
+        let payload_offset = payload_size_start.checked_add(ps_len).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: "index cell payload offset overflow".to_owned(),
+            }
+        })?;
+        let payload_len =
+            usize::try_from(payload_size).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "index cell payload size exceeds usize range".to_owned(),
+            })?;
+        let local_end = payload_offset.checked_add(payload_len).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: "index cell payload offset overflow".to_owned(),
+            }
+        })?;
+        let usable_size = usize::try_from(self.usable_size).unwrap_or(usize::MAX);
+        if local_end > page.len() || local_end > usable_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "index cell extends past usable page size (payload bytes)".to_owned(),
+            });
+        }
+        Ok(Some(payload_offset..local_end))
+    }
+
     fn local_leaf_table_rowid_and_payload<'a>(
         &'a self,
         entry: &'a StackEntry,
@@ -13722,6 +13798,24 @@ impl<P: PageWriter> BtCursor<P> {
             .and_then(|(rowid, payload)| {
                 let bytes = top.usable_bytes().get(payload.clone())?;
                 Some((rowid, payload, bytes))
+            }))
+    }
+
+    /// Span and local payload bytes for an index cell (leaf or interior) that
+    /// fits completely on its page without overflow; `None` otherwise.
+    #[allow(clippy::type_complexity)]
+    pub fn current_local_index_row(&self) -> Result<Option<(std::ops::Range<usize>, &[u8])>> {
+        if self.at_eof {
+            return Ok(None);
+        }
+        let Some(top) = self.stack.last() else {
+            return Ok(None);
+        };
+        Ok(self
+            .local_index_cell_span(top, top.cell_idx)?
+            .and_then(|payload| {
+                let bytes = top.usable_bytes().get(payload.clone())?;
+                Some((payload, bytes))
             }))
     }
 
