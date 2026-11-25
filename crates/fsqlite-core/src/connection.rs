@@ -77052,13 +77052,19 @@ impl Connection {
                 }
             }
             DropObjectType::Index => {
+                let requested_scope = match drop_stmt.name.schema.as_deref() {
+                    Some(schema) if schema.eq_ignore_ascii_case("main") => PragmaSchemaScope::Main,
+                    Some(schema) if schema.eq_ignore_ascii_case("temp") => PragmaSchemaScope::Temp,
+                    Some(_) => unreachable!("attached DROP targets are delegated before execution"),
+                    None => PragmaSchemaScope::Unqualified,
+                };
                 let temp_names = self.temp_table_names.borrow();
                 let mut schema = self.schema.borrow_mut();
                 let mut found = false;
                 let mut dropped_root_page = None;
                 let mut dropped_temp = false;
                 let mut dropped_temp_unique = None;
-                for table in schema.iter_mut() {
+                let mut try_remove_from_table = |table: &mut TableSchema, is_temp: bool| -> bool {
                     if let Some(pos) = table
                         .indexes
                         .iter()
@@ -77066,8 +77072,8 @@ impl Connection {
                     {
                         let removed = table.indexes.remove(pos);
                         dropped_root_page = Some(removed.root_page);
-                        dropped_temp = temp_names.contains(&table.name.to_ascii_lowercase());
-                        if dropped_temp && removed.is_unique {
+                        dropped_temp = is_temp;
+                        if is_temp && removed.is_unique {
                             let columns = removed
                                 .columns
                                 .iter()
@@ -77082,8 +77088,46 @@ impl Connection {
                                     Some((table.root_page, columns, removed.key_collations));
                             }
                         }
-                        found = true;
-                        break;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if matches!(
+                    requested_scope,
+                    PragmaSchemaScope::Temp | PragmaSchemaScope::Unqualified
+                ) {
+                    for table in schema.iter_mut() {
+                        if temp_names.contains(&table.name.to_ascii_lowercase())
+                            && try_remove_from_table(table, true)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if !found
+                    && matches!(
+                        requested_scope,
+                        PragmaSchemaScope::Main | PragmaSchemaScope::Unqualified
+                    )
+                {
+                    for table in schema.iter_mut() {
+                        if !temp_names.contains(&table.name.to_ascii_lowercase())
+                            && try_remove_from_table(table, false)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        let mut shadowed = self.shadowed_main_tables.borrow_mut();
+                        for table in shadowed.values_mut() {
+                            if try_remove_from_table(table, false) {
+                                found = true;
+                                break;
+                            }
+                        }
                     }
                 }
                 drop(schema);
@@ -77092,10 +77136,24 @@ impl Connection {
                     if drop_stmt.if_exists {
                         return Ok(Vec::new());
                     }
+                    let missing = match requested_scope {
+                        PragmaSchemaScope::Main if drop_stmt.name.schema.is_some() => {
+                            format!("main.{obj_name}")
+                        }
+                        PragmaSchemaScope::Temp if drop_stmt.name.schema.is_some() => {
+                            format!("temp.{obj_name}")
+                        }
+                        PragmaSchemaScope::Unqualified
+                        | PragmaSchemaScope::Main
+                        | PragmaSchemaScope::Temp => obj_name.clone(),
+                    };
                     return Err(FrankenError::FunctionError(format!(
-                        "no such index: {obj_name}"
+                        "no such index: {missing}"
                     )));
                 }
+                // bd-5xi8y: dropping a TEMP index mutates only connection-local
+                // TEMP state, never main sqlite_master or the main schema cookie.
+                dropped_connection_local = dropped_temp;
                 // bd-pirr5 (GH#371): remove the persistent sqlite_master row
                 // before freeing the index b-tree. free_btree_pages tears the
                 // b-tree down in bounded page batches across committed
@@ -77161,12 +77219,21 @@ impl Connection {
                     dropped_connection_local = dropped_view.temporary;
                     drop(views);
 
+                    let view_schema = if dropped_view.temporary {
+                        "temp"
+                    } else {
+                        "main"
+                    };
                     let mut triggers_to_drop = Vec::new();
                     {
                         let mut triggers = self.triggers.borrow_mut();
                         let mut i = 0;
                         while i < triggers.len() {
-                            if triggers[i].table_name.eq_ignore_ascii_case(obj_name) {
+                            if triggers[i].table_name.eq_ignore_ascii_case(obj_name)
+                                && triggers[i]
+                                    .bound_table_schema
+                                    .eq_ignore_ascii_case(view_schema)
+                            {
                                 let trigger = triggers.remove(i);
                                 if !trigger.temporary {
                                     triggers_to_drop.push(trigger.name.clone());
@@ -77214,19 +77281,35 @@ impl Connection {
             DropObjectType::Trigger => {
                 let schema_name = drop_stmt.name.schema.as_deref();
                 let mut triggers = self.triggers.borrow_mut();
-                let trigger_idx = triggers.iter().position(|trigger| {
-                    if !trigger.name.eq_ignore_ascii_case(obj_name) {
-                        return false;
+                let trigger_idx = match schema_name {
+                    Some(schema) if schema.eq_ignore_ascii_case("temp") => {
+                        triggers.iter().position(|trigger| {
+                            trigger.temporary && trigger.name.eq_ignore_ascii_case(obj_name)
+                        })
                     }
-                    match schema_name {
-                        Some(schema) if schema.eq_ignore_ascii_case("temp") => trigger.temporary,
-                        Some(schema) if schema.eq_ignore_ascii_case("main") => !trigger.temporary,
-                        Some(_) => false,
-                        None => true,
+                    Some(schema) if schema.eq_ignore_ascii_case("main") => {
+                        triggers.iter().position(|trigger| {
+                            !trigger.temporary && trigger.name.eq_ignore_ascii_case(obj_name)
+                        })
                     }
-                });
+                    Some(_) => None,
+                    None => triggers
+                        .iter()
+                        .position(|trigger| {
+                            trigger.temporary && trigger.name.eq_ignore_ascii_case(obj_name)
+                        })
+                        .or_else(|| {
+                            triggers.iter().position(|trigger| {
+                                !trigger.temporary && trigger.name.eq_ignore_ascii_case(obj_name)
+                            })
+                        }),
+                };
                 if let Some(idx) = trigger_idx {
                     let trigger = triggers.remove(idx);
+                    // bd-5xi8y: dropping a TEMP trigger mutates only connection-local
+                    // TEMP state, so do not touch main sqlite_master or the main
+                    // schema cookie (which runs on a read-only main txn).
+                    dropped_connection_local = trigger.temporary;
                     drop(triggers);
                     if !trigger.temporary
                         && let Err(err) = self
@@ -77240,8 +77323,17 @@ impl Connection {
                     if drop_stmt.if_exists {
                         return Ok(Vec::new());
                     }
+                    let missing = match schema_name {
+                        Some(schema) if schema.eq_ignore_ascii_case("main") => {
+                            format!("main.{obj_name}")
+                        }
+                        Some(schema) if schema.eq_ignore_ascii_case("temp") => {
+                            format!("temp.{obj_name}")
+                        }
+                        _ => obj_name.clone(),
+                    };
                     return Err(FrankenError::FunctionError(format!(
-                        "no such trigger: {obj_name}"
+                        "no such trigger: {missing}"
                     )));
                 }
             }
@@ -80643,17 +80735,18 @@ impl Connection {
                         table_name
                     ),
                 })?;
-            // An index cannot reuse the name of an existing table or view. C
-            // SQLite rejects this unconditionally — IF NOT EXISTS only suppresses
-            // a collision with another *index* of the same name. (GH #232)
-            let name_taken_by_table = schema
-                .iter()
-                .any(|t| t.name.eq_ignore_ascii_case(&index_name));
-            let name_taken_by_view = self
-                .views
-                .borrow()
-                .iter()
-                .any(|v| v.name.eq_ignore_ascii_case(&index_name));
+            // An index cannot reuse the name of an existing table or view in the
+            // same schema namespace (`main` vs `temp`). C SQLite rejects this
+            // unconditionally — IF NOT EXISTS only suppresses a collision with
+            // another *index* of the same name in that namespace. (GH #232, bd-5xi8y)
+            let temp_names = self.temp_table_names.borrow();
+            let name_taken_by_table = schema.iter().any(|t| {
+                temp_names.contains(&t.name.to_ascii_lowercase()) == target_is_temp
+                    && t.name.eq_ignore_ascii_case(&index_name)
+            });
+            let name_taken_by_view = self.views.borrow().iter().any(|v| {
+                v.temporary == target_is_temp && v.name.eq_ignore_ascii_case(&index_name)
+            });
             if name_taken_by_table || name_taken_by_view {
                 // Stock's text under SQLITE_ERROR, not "internal error:"
                 // under SQLITE_INTERNAL (bd-nnnd8).
@@ -80662,10 +80755,11 @@ impl Connection {
                 )));
             }
             let index_name_exists = schema.iter().any(|candidate| {
-                candidate
-                    .indexes
-                    .iter()
-                    .any(|idx| idx.name.eq_ignore_ascii_case(&index_name))
+                temp_names.contains(&candidate.name.to_ascii_lowercase()) == target_is_temp
+                    && candidate
+                        .indexes
+                        .iter()
+                        .any(|idx| idx.name.eq_ignore_ascii_case(&index_name))
             });
             if index_name_exists {
                 if stmt.if_not_exists {
@@ -81364,10 +81458,10 @@ impl Connection {
         }
 
         let triggers = self.triggers.borrow();
-        if triggers
-            .iter()
-            .any(|trigger| trigger.name.eq_ignore_ascii_case(trigger_name))
-        {
+        if triggers.iter().any(|trigger| {
+            trigger.temporary == is_temp_trigger
+                && trigger.name.eq_ignore_ascii_case(trigger_name)
+        }) {
             if stmt.if_not_exists {
                 return Ok(None);
             }
