@@ -49,6 +49,33 @@ const SEQUENCE: &[(&str, &str)] = &[
     ("UPDATE nosuch SET x = 1", "0|10|4"),
     ("INSERT INTO w VALUES (8, 8)", "1|11|5"),
     ("INSERT INTO nosuch VALUES (1)", "1|11|5"),
+    // bd-ulgsj: RETURNING alias resolution failures, generated-column INSERT/UPDATE
+    // prepare failures, 1-column table mismatch, and INSERT ... SELECT prepare errors
+    // must keep changes(), total_changes(), and last_insert_rowid() untouched.
+    (
+        "CREATE TABLE g(a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL, d TEXT)",
+        "1|11|5",
+    ),
+    ("INSERT INTO g(a, d) VALUES (10, 'ok')", "1|12|1"),
+    ("INSERT INTO g(a, b) VALUES (1, 2)", "1|12|1"),
+    ("INSERT INTO g(a, b) SELECT x, y FROM w", "1|12|1"),
+    ("INSERT INTO g SELECT x FROM w", "1|12|1"),
+    ("UPDATE g SET b = 99", "1|12|1"),
+    (
+        "UPDATE w AS a SET x = 0 WHERE rowid < 5 RETURNING a.x",
+        "1|12|1",
+    ),
+    (
+        "DELETE FROM w AS a WHERE rowid < 5 RETURNING a.x",
+        "1|12|1",
+    ),
+    ("CREATE TABLE s1(a INT)", "1|12|1"),
+    ("INSERT INTO s1 VALUES (1), (2)", "2|14|2"),
+    ("INSERT INTO s1 VALUES (1, 2)", "2|14|2"),
+    ("INSERT INTO s1 SELECT x, y FROM w", "2|14|2"),
+    ("INSERT INTO w(x, nosuch) SELECT a, a FROM s1", "2|14|2"),
+    ("DELETE FROM sqlite_schema", "2|14|2"),
+    ("UPDATE sqlite_schema SET name = 'z'", "2|14|2"),
 ];
 
 fn stock_counters(conn: &rusqlite::Connection) -> String {

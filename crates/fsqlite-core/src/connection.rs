@@ -181498,6 +181498,7 @@ fn error_is_prepare_time(error: &FrankenError) -> bool {
         "sub-select returns ",
         "row value misused",
         "cannot modify ",
+        "cannot INSERT into generated column",
         "cannot UPDATE generated column",
         "qualified table names are not allowed on INSERT, UPDATE, and DELETE",
         "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
@@ -181520,10 +181521,13 @@ fn error_is_prepare_time(error: &FrankenError) -> bool {
             PREPARE_TIME_MESSAGES
                 .iter()
                 .any(|prefix| message.starts_with(prefix))
-                // "table t has 2 columns but 3 values were supplied" and
-                // "table t has no column named x".
+                // "table t has 2 columns but 3 values were supplied",
+                // "table t has no column named x", and
+                // "table sqlite_schema may not be modified".
                 || (message.starts_with("table ")
-                    && (message.contains(" columns but ") || message.contains(" has no column named ")))
+                    && (message.contains(" columns but ")
+                        || message.contains(" has no column named ")
+                        || message.ends_with(" may not be modified")))
                 // "3 values for 2 columns".
                 || message
                     .split_once(" values for ")

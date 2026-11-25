@@ -313,13 +313,7 @@ async fn compare(
                         "  {path}\n     RETURNING:\n     frank= {fr:?}\n     stock= {rr:?}"
                     ));
                 }
-                let failed = rr.is_err();
                 for check in CHECKS {
-                    // bd-ulgsj: a statement that fails to prepare resets
-                    // changes() to 0 where stock keeps the previous count.
-                    if failed && *check == "SELECT changes()" {
-                        continue;
-                    }
                     let (fr, rr) = (fq(&f, check, &[], false).await, rq(&r, check, &[]));
                     if fr != rr {
                         diffs.push(format!(

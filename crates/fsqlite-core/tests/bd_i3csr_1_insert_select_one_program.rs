@@ -33,9 +33,7 @@
 //! column keeps its sign (stock stores it as the integer 0, bd-kqb76); after a
 //! statement that inserted explicit rowids above the table's largest fails,
 //! the next automatic rowid of a file-backed table (or in an explicit
-//! transaction) skips past them (bd-u65rh); and a statement that fails to
-//! prepare resets `changes()` (bd-ulgsj), so the error scenario compares the
-//! other two counters.
+//! transaction) skips past them (bd-u65rh).
 //!
 //! bd-jlbrk: the dedicated conflict-order oracles below cover a rowid REPLACE
 //! competing with secondary UNIQUE constraints, including conflicts on the
@@ -520,8 +518,8 @@ const SCENARIOS: &[Scenario] = &[
     },
 ];
 
-/// Statements that fail to prepare. A failed prepare resets `changes()`
-/// (bd-ulgsj), so these compare `total_changes()` and `last_insert_rowid()`.
+/// Statements that fail to prepare. Stock leaves `changes()`, `total_changes()`,
+/// and `last_insert_rowid()` untouched (bd-ulgsj).
 const PREPARE_ERRORS: Scenario = Scenario {
     name: "column-count, name and generated-column errors",
     steps: &[
@@ -576,7 +574,6 @@ const SOURCE_ERROR: Scenario = Scenario {
 };
 
 const COUNTERS: &str = "SELECT changes(), total_changes(), last_insert_rowid()";
-const COUNTERS_AFTER_PREPARE_ERRORS: &str = "SELECT total_changes(), last_insert_rowid()";
 
 async fn open_pair(
     file_backed: bool,
@@ -611,10 +608,7 @@ async fn compare_scenarios(file_backed: bool) -> (Vec<String>, usize) {
     let runs = SCENARIOS
         .iter()
         .map(|scenario| (scenario, COUNTERS))
-        .chain([
-            (&SOURCE_ERROR, COUNTERS),
-            (&PREPARE_ERRORS, COUNTERS_AFTER_PREPARE_ERRORS),
-        ]);
+        .chain([(&SOURCE_ERROR, COUNTERS), (&PREPARE_ERRORS, COUNTERS)]);
     for (scenario, counters) in runs {
         let dir = tempfile::tempdir().unwrap();
         let (f, r) = open_pair(file_backed, &dir).await;
