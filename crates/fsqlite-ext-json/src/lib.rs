@@ -1329,41 +1329,638 @@ pub fn json_array_length(input: &str, path: Option<&str>) -> Result<Option<usize
     json_array_length_value(&root, path)
 }
 
-/// Return 0 for valid JSON or JSON5, otherwise a 1-based parse-error position.
+/// Maximum JSON nesting depth matching SQLite's `JSON_MAX_DEPTH` (`sqlite3.c`).
+const STOCK_JSON_MAX_DEPTH: usize = 1000;
+
+/// Return 0 for valid JSON or JSON5, otherwise a 1-based UTF-8 character
+/// position matching stock SQLite's `jsonErrorFunc` / `jsonConvertTextToBlob`
+/// / `jsonTranslateTextToBlob` (`sqlite3.c`).
 #[must_use]
 pub fn json_error_position(input: &str) -> usize {
-    match serde_json::from_str::<Value>(input) {
-        Ok(_) => 0,
-        Err(error) => {
-            // JSON5 and out-of-range JSON numbers also have valid syntax.
-            // Keep strict parsing first so ordinary JSON is only parsed once.
-            if parse_json_value_lenient(input).is_ok() {
-                return 0;
-            }
-
-            let line = error.line();
-            let column = error.column();
-            if line == 0 || column == 0 {
-                return 1;
-            }
-
-            let mut current_line = 1usize;
-            let mut current_col = 1usize;
-            let mut char_pos = 1usize;
-            for (_idx, ch) in input.char_indices() {
-                if current_line == line && current_col == column {
-                    return char_pos;
-                }
-                if ch == '\n' {
-                    current_line += 1;
-                    current_col = 1;
-                } else {
-                    current_col += 1;
-                }
-                char_pos += 1;
-            }
-            char_pos
+    let bytes = input.as_bytes();
+    let mut scanner = StockJsonErrorScanner {
+        bytes,
+        i_err: 0,
+        depth: 0,
+        last_was_text: false,
+    };
+    let end = scanner.scan_value(0);
+    if end > 0 {
+        let mut tail = usize::try_from(end).unwrap_or(bytes.len());
+        while stock_json_is_space(stock_byte_at(bytes, tail)) {
+            tail += 1;
         }
+        if stock_byte_at(bytes, tail) != 0 {
+            tail += stock_json5_whitespace(bytes, tail);
+            if stock_byte_at(bytes, tail) != 0 {
+                // Match SQLite's `jsonConvertTextToBlob`: trailing garbage
+                // returns an error without modifying `pParse->iErr`.
+                return stock_byte_offset_to_char_pos(bytes, scanner.i_err);
+            }
+        }
+        return 0;
+    }
+    stock_byte_offset_to_char_pos(bytes, scanner.i_err)
+}
+
+#[inline]
+fn stock_byte_at(bytes: &[u8], idx: usize) -> u8 {
+    bytes.get(idx).copied().unwrap_or(0)
+}
+
+#[inline]
+const fn stock_json_is_space(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | b'\r' | b' ')
+}
+
+#[inline]
+const fn stock_json_is_ok(b: u8) -> bool {
+    b >= 0x20 && b != b'"' && b != b'\'' && b != b'\\'
+}
+
+#[inline]
+const fn stock_json_id1(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'$' || b == b'_' || b >= 0x80
+}
+
+#[inline]
+const fn stock_json_id2(b: u8) -> bool {
+    stock_json_id1(b) || b.is_ascii_digit()
+}
+
+#[inline]
+fn stock_is_2hex(bytes: &[u8], idx: usize) -> bool {
+    stock_byte_at(bytes, idx).is_ascii_hexdigit()
+        && stock_byte_at(bytes, idx + 1).is_ascii_hexdigit()
+}
+
+#[inline]
+fn stock_is_4hex(bytes: &[u8], idx: usize) -> bool {
+    stock_is_2hex(bytes, idx) && stock_is_2hex(bytes, idx + 2)
+}
+
+#[inline]
+fn stock_is_4hex_u(bytes: &[u8], idx: usize) -> bool {
+    stock_byte_at(bytes, idx) == b'u' && stock_is_4hex(bytes, idx + 1)
+}
+
+#[inline]
+fn stock_starts_with(bytes: &[u8], idx: usize, needle: &[u8]) -> bool {
+    bytes
+        .get(idx..idx + needle.len())
+        .is_some_and(|slice| slice == needle)
+}
+
+#[inline]
+fn stock_starts_with_ci(bytes: &[u8], idx: usize, needle: &[u8]) -> bool {
+    bytes
+        .get(idx..idx + needle.len())
+        .is_some_and(|slice| slice.eq_ignore_ascii_case(needle))
+}
+
+fn stock_byte_offset_to_char_pos(bytes: &[u8], i_err: usize) -> usize {
+    let mut pos = 0usize;
+    let limit = i_err.min(bytes.len());
+    for &b in &bytes[..limit] {
+        if b == 0 {
+            break;
+        }
+        if (b & 0xc0) != 0x80 {
+            pos += 1;
+        }
+    }
+    pos + 1
+}
+
+/// Port of SQLite's `json5Whitespace()` (`sqlite3.c`).
+fn stock_json5_whitespace(bytes: &[u8], start: usize) -> usize {
+    let mut n = 0usize;
+    loop {
+        let pos = start + n;
+        match stock_byte_at(bytes, pos) {
+            0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x20 => {
+                n += 1;
+            }
+            b'/' => {
+                let next = stock_byte_at(bytes, pos + 1);
+                if next == b'*' && stock_byte_at(bytes, pos + 2) != 0 {
+                    let mut j = n + 3;
+                    loop {
+                        let cur = stock_byte_at(bytes, start + j);
+                        if cur == b'/' && stock_byte_at(bytes, start + j - 1) == b'*' {
+                            n = j + 1;
+                            break;
+                        }
+                        if cur == 0 {
+                            return n;
+                        }
+                        j += 1;
+                    }
+                } else if next == b'/' {
+                    let mut j = n + 2;
+                    loop {
+                        let c = stock_byte_at(bytes, start + j);
+                        if c == 0 {
+                            break;
+                        }
+                        if c == b'\n' || c == b'\r' {
+                            break;
+                        }
+                        if c == 0xe2
+                            && stock_byte_at(bytes, start + j + 1) == 0x80
+                            && matches!(stock_byte_at(bytes, start + j + 2), 0xa8 | 0xa9)
+                        {
+                            j += 2;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    n = j;
+                    if stock_byte_at(bytes, start + n) != 0 {
+                        n += 1;
+                    }
+                } else {
+                    return n;
+                }
+            }
+            0xc2 if stock_byte_at(bytes, pos + 1) == 0xa0 => {
+                n += 2;
+            }
+            0xe1 if stock_byte_at(bytes, pos + 1) == 0x9a
+                && stock_byte_at(bytes, pos + 2) == 0x80 =>
+            {
+                n += 3;
+            }
+            0xe2 => {
+                let b1 = stock_byte_at(bytes, pos + 1);
+                let b2 = stock_byte_at(bytes, pos + 2);
+                if (b1 == 0x80 && ((0x80..=0x8a).contains(&b2) || matches!(b2, 0xa8 | 0xa9 | 0xaf)))
+                    || (b1 == 0x81 && b2 == 0x9f)
+                {
+                    n += 3;
+                } else {
+                    return n;
+                }
+            }
+            0xe3 if stock_byte_at(bytes, pos + 1) == 0x80
+                && stock_byte_at(bytes, pos + 2) == 0x80 =>
+            {
+                n += 3;
+            }
+            0xef if stock_byte_at(bytes, pos + 1) == 0xbb
+                && stock_byte_at(bytes, pos + 2) == 0xbf =>
+            {
+                n += 3;
+            }
+            _ => return n,
+        }
+    }
+}
+
+/// Zero-allocation scanner mirroring SQLite's `jsonTranslateTextToBlob`
+/// (`sqlite3.c`) solely for `json_error_position(X)` offset parity.
+struct StockJsonErrorScanner<'a> {
+    bytes: &'a [u8],
+    i_err: usize,
+    depth: usize,
+    last_was_text: bool,
+}
+
+impl StockJsonErrorScanner<'_> {
+    #[inline]
+    fn byte(&self, idx: usize) -> u8 {
+        stock_byte_at(self.bytes, idx)
+    }
+
+    fn scan_value(&mut self, mut i: usize) -> isize {
+        loop {
+            match self.byte(i) {
+                b'{' => return self.scan_object(i),
+                b'[' => return self.scan_array(i),
+                b'\'' | b'"' => return self.scan_string(i),
+                b't' => {
+                    if stock_starts_with(self.bytes, i, b"true")
+                        && !self.byte(i + 4).is_ascii_alphanumeric()
+                    {
+                        self.last_was_text = false;
+                        return isize::try_from(i + 4).unwrap_or(isize::MAX);
+                    }
+                    self.i_err = i;
+                    return -1;
+                }
+                b'f' => {
+                    if stock_starts_with(self.bytes, i, b"false")
+                        && !self.byte(i + 5).is_ascii_alphanumeric()
+                    {
+                        self.last_was_text = false;
+                        return isize::try_from(i + 5).unwrap_or(isize::MAX);
+                    }
+                    self.i_err = i;
+                    return -1;
+                }
+                b'+' | b'.' | b'-' | b'0'..=b'9' => return self.scan_number(i),
+                b'}' => {
+                    self.i_err = i;
+                    return -2;
+                }
+                b']' => {
+                    self.i_err = i;
+                    return -3;
+                }
+                b',' => {
+                    self.i_err = i;
+                    return -4;
+                }
+                b':' => {
+                    self.i_err = i;
+                    return -5;
+                }
+                0 => return 0,
+                0x09 | 0x0a | 0x0d | 0x20 => {
+                    i += 1;
+                    while stock_json_is_space(self.byte(i)) {
+                        i += 1;
+                    }
+                }
+                0x0b | 0x0c | b'/' | 0xc2 | 0xe1 | 0xe2 | 0xe3 | 0xef => {
+                    let ws = stock_json5_whitespace(self.bytes, i);
+                    if ws > 0 {
+                        i += ws;
+                    } else {
+                        self.i_err = i;
+                        return -1;
+                    }
+                }
+                b'n' => {
+                    if stock_starts_with(self.bytes, i, b"null")
+                        && !self.byte(i + 4).is_ascii_alphanumeric()
+                    {
+                        self.last_was_text = false;
+                        return isize::try_from(i + 4).unwrap_or(isize::MAX);
+                    }
+                    return self.scan_nan_inf(i);
+                }
+                _ => return self.scan_nan_inf(i),
+            }
+        }
+    }
+
+    fn scan_object(&mut self, i: usize) -> isize {
+        self.depth += 1;
+        if self.depth > STOCK_JSON_MAX_DEPTH {
+            self.i_err = i;
+            self.depth -= 1;
+            return -1;
+        }
+        let mut j = i + 1;
+        loop {
+            let mut x = self.scan_value(j);
+            if x <= 0 {
+                if x == -2 {
+                    j = self.i_err;
+                    break;
+                }
+                j += stock_json5_whitespace(self.bytes, j);
+                let b = self.byte(j);
+                if stock_json_id1(b) || (b == b'\\' && stock_is_4hex_u(self.bytes, j + 1)) {
+                    let mut k = j + 1;
+                    loop {
+                        let bk = self.byte(k);
+                        if (stock_json_id2(bk) && stock_json5_whitespace(self.bytes, k) == 0)
+                            || (bk == b'\\' && stock_is_4hex_u(self.bytes, k + 1))
+                        {
+                            k += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    self.last_was_text = true;
+                    x = isize::try_from(k).unwrap_or(isize::MAX);
+                } else {
+                    if x != -1 {
+                        self.i_err = j;
+                    }
+                    self.depth -= 1;
+                    return -1;
+                }
+            }
+            if !self.last_was_text {
+                self.i_err = j;
+                self.depth -= 1;
+                return -1;
+            }
+            j = usize::try_from(x).unwrap_or(self.bytes.len());
+            if self.byte(j) == b':' {
+                j += 1;
+            } else {
+                let mut found_colon = false;
+                if stock_json_is_space(self.byte(j)) {
+                    j += 1;
+                    while stock_json_is_space(self.byte(j)) {
+                        j += 1;
+                    }
+                    if self.byte(j) == b':' {
+                        j += 1;
+                        found_colon = true;
+                    }
+                }
+                if !found_colon {
+                    let sep = self.scan_value(j);
+                    if sep != -5 {
+                        if sep != -1 {
+                            self.i_err = j;
+                        }
+                        self.depth -= 1;
+                        return -1;
+                    }
+                    j = self.i_err + 1;
+                }
+            }
+            let val = self.scan_value(j);
+            if val <= 0 {
+                if val != -1 {
+                    self.i_err = j;
+                }
+                self.depth -= 1;
+                return -1;
+            }
+            j = usize::try_from(val).unwrap_or(self.bytes.len());
+            if self.byte(j) == b',' {
+                j += 1;
+                continue;
+            }
+            if self.byte(j) == b'}' {
+                break;
+            }
+            if stock_json_is_space(self.byte(j)) {
+                j += 1;
+                while stock_json_is_space(self.byte(j)) {
+                    j += 1;
+                }
+                if self.byte(j) == b',' {
+                    j += 1;
+                    continue;
+                }
+                if self.byte(j) == b'}' {
+                    break;
+                }
+            }
+            let next = self.scan_value(j);
+            if next == -4 {
+                j = self.i_err + 1;
+                continue;
+            }
+            if next == -2 {
+                j = self.i_err;
+                break;
+            }
+            self.i_err = j;
+            self.depth -= 1;
+            return -1;
+        }
+        self.depth -= 1;
+        self.last_was_text = false;
+        isize::try_from(j + 1).unwrap_or(isize::MAX)
+    }
+
+    fn scan_array(&mut self, i: usize) -> isize {
+        self.depth += 1;
+        if self.depth > STOCK_JSON_MAX_DEPTH {
+            self.i_err = i;
+            self.depth -= 1;
+            return -1;
+        }
+        let mut j = i + 1;
+        loop {
+            let x = self.scan_value(j);
+            if x <= 0 {
+                if x == -3 {
+                    j = self.i_err;
+                    break;
+                }
+                if x != -1 {
+                    self.i_err = j;
+                }
+                self.depth -= 1;
+                return -1;
+            }
+            j = usize::try_from(x).unwrap_or(self.bytes.len());
+            if self.byte(j) == b',' {
+                j += 1;
+                continue;
+            }
+            if self.byte(j) == b']' {
+                break;
+            }
+            if stock_json_is_space(self.byte(j)) {
+                j += 1;
+                while stock_json_is_space(self.byte(j)) {
+                    j += 1;
+                }
+                if self.byte(j) == b',' {
+                    j += 1;
+                    continue;
+                }
+                if self.byte(j) == b']' {
+                    break;
+                }
+            }
+            let next = self.scan_value(j);
+            if next == -4 {
+                j = self.i_err + 1;
+                continue;
+            }
+            if next == -3 {
+                j = self.i_err;
+                break;
+            }
+            self.i_err = j;
+            self.depth -= 1;
+            return -1;
+        }
+        self.depth -= 1;
+        self.last_was_text = false;
+        isize::try_from(j + 1).unwrap_or(isize::MAX)
+    }
+
+    fn scan_string(&mut self, i: usize) -> isize {
+        let delim = self.byte(i);
+        let mut j = i + 1;
+        loop {
+            while stock_json_is_ok(self.byte(j)) {
+                j += 1;
+            }
+            let c = self.byte(j);
+            if c == delim {
+                break;
+            }
+            if c == b'\\' {
+                j += 1;
+                let esc = self.byte(j);
+                let is_std_escape =
+                    matches!(esc, b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't')
+                        || (esc == b'u' && stock_is_4hex(self.bytes, j + 1));
+                let is_json5_escape = matches!(esc, b'\'' | b'v' | b'\n')
+                    || (esc == b'0' && !self.byte(j + 1).is_ascii_digit())
+                    || (esc == 0xe2
+                        && self.byte(j + 1) == 0x80
+                        && matches!(self.byte(j + 2), 0xa8 | 0xa9))
+                    || (esc == b'x' && stock_is_2hex(self.bytes, j + 1));
+                if is_std_escape || is_json5_escape {
+                    // Valid escape sequence.
+                } else if esc == b'\r' {
+                    if self.byte(j + 1) == b'\n' {
+                        j += 1;
+                    }
+                } else {
+                    self.i_err = j;
+                    return -1;
+                }
+            } else if c == 0 {
+                self.i_err = j;
+                return -1;
+            }
+            j += 1;
+        }
+        self.last_was_text = true;
+        isize::try_from(j + 1).unwrap_or(isize::MAX)
+    }
+
+    fn scan_number(&mut self, i: usize) -> isize {
+        let c = self.byte(i);
+        let mut is_float = false;
+        if c == b'.' {
+            if self.byte(i + 1).is_ascii_digit() {
+                is_float = true;
+            } else {
+                self.i_err = i;
+                return -1;
+            }
+        } else if c <= b'0' {
+            if c == b'0' {
+                if matches!(self.byte(i + 1), b'x' | b'X') && self.byte(i + 2).is_ascii_hexdigit() {
+                    let mut j = i + 3;
+                    while self.byte(j).is_ascii_hexdigit() {
+                        j += 1;
+                    }
+                    self.last_was_text = false;
+                    return isize::try_from(j).unwrap_or(isize::MAX);
+                }
+                if self.byte(i + 1).is_ascii_digit() {
+                    self.i_err = i + 1;
+                    return -1;
+                }
+            } else {
+                // '+' or '-'
+                if !self.byte(i + 1).is_ascii_digit() {
+                    if matches!(self.byte(i + 1), b'I' | b'i')
+                        && stock_starts_with_ci(self.bytes, i + 1, b"inf")
+                    {
+                        let len = if stock_starts_with_ci(self.bytes, i + 4, b"inity") {
+                            9
+                        } else {
+                            4
+                        };
+                        self.last_was_text = false;
+                        return isize::try_from(i + len).unwrap_or(isize::MAX);
+                    }
+                    if self.byte(i + 1) != b'.' {
+                        self.i_err = i;
+                        return -1;
+                    }
+                } else if self.byte(i + 1) == b'0' {
+                    if self.byte(i + 2).is_ascii_digit() {
+                        self.i_err = i + 1;
+                        return -1;
+                    }
+                    if matches!(self.byte(i + 2), b'x' | b'X')
+                        && self.byte(i + 3).is_ascii_hexdigit()
+                    {
+                        let mut j = i + 4;
+                        while self.byte(j).is_ascii_hexdigit() {
+                            j += 1;
+                        }
+                        self.last_was_text = false;
+                        return isize::try_from(j).unwrap_or(isize::MAX);
+                    }
+                }
+            }
+        }
+
+        let mut seen_e = false;
+        let mut j = i + 1;
+        loop {
+            let cur = self.byte(j);
+            if cur.is_ascii_digit() {
+                j += 1;
+                continue;
+            }
+            if cur == b'.' {
+                if is_float {
+                    self.i_err = j;
+                    return -1;
+                }
+                is_float = true;
+                j += 1;
+                continue;
+            }
+            if matches!(cur, b'e' | b'E') {
+                if self.byte(j - 1) < b'0'
+                    && !(self.byte(j - 1) == b'.'
+                        && j >= i + 2
+                        && self.byte(j - 2).is_ascii_digit())
+                {
+                    self.i_err = j;
+                    return -1;
+                }
+                if seen_e {
+                    self.i_err = j;
+                    return -1;
+                }
+                is_float = true;
+                seen_e = true;
+                let mut exp_c = self.byte(j + 1);
+                if matches!(exp_c, b'+' | b'-') {
+                    j += 1;
+                    exp_c = self.byte(j + 1);
+                }
+                if !exp_c.is_ascii_digit() {
+                    self.i_err = j;
+                    return -1;
+                }
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        if self.byte(j - 1) < b'0'
+            && !(self.byte(j - 1) == b'.' && j >= i + 2 && self.byte(j - 2).is_ascii_digit())
+        {
+            self.i_err = j;
+            return -1;
+        }
+        self.last_was_text = false;
+        isize::try_from(j).unwrap_or(isize::MAX)
+    }
+
+    fn scan_nan_inf(&mut self, i: usize) -> isize {
+        const NAN_INF_NAMES: &[&[u8]] = &[b"inf", b"infinity", b"NaN", b"QNaN", b"SNaN"];
+        let c = self.byte(i);
+        for &name in NAN_INF_NAMES {
+            if !c.eq_ignore_ascii_case(&name[0]) {
+                continue;
+            }
+            if !stock_starts_with_ci(self.bytes, i, name) {
+                continue;
+            }
+            if self.byte(i + name.len()).is_ascii_alphanumeric() {
+                continue;
+            }
+            self.last_was_text = false;
+            return isize::try_from(i + name.len()).unwrap_or(isize::MAX);
+        }
+        self.i_err = i;
+        -1
     }
 }
 
