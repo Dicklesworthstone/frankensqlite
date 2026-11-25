@@ -405,10 +405,7 @@ fn grouped_index_order_streams_and_matches_sqlite() {
         let either = "SELECT x, count(*) FROM t WHERE a = 5 GROUP BY x";
         let sorted: &[&str] = &[
             "SELECT x, count(*) FROM t GROUP BY x",
-            // (CAST: `a % 7` puts 7.5's 0.0 in the integer 0 group, whose
-            // output value the in-memory mirror takes from another row than
-            // stock, bd-t92q0.)
-            "SELECT CAST(a AS INTEGER) % 7, count(*) FROM t GROUP BY CAST(a AS INTEGER) % 7",
+            "SELECT a % 7, count(*) FROM t GROUP BY a % 7",
             "SELECT a, sum(id * 2) FROM t GROUP BY a",
             // An ORDER BY on x first needs the sorter.
             "SELECT x, a, count(*) FROM t GROUP BY x, a ORDER BY x, a LIMIT 5",
@@ -785,13 +782,14 @@ fn count_star_over_an_exact_index_range_counts_leaves_and_matches_sqlite() {
     });
 }
 
-/// bd-zgbhb: a lone COUNT(*) whose WHERE is exactly an equality prefix of an
-/// index, with every value a safe seek bound, counts the pinned entries from
-/// the index's pages: values whose runs span leaves, an absent value, a
-/// two-column prefix, text, typeless and REAL keys, and parameters, against
-/// stock on a file database in strict mode. A value that could need a
-/// conversion (a text literal on an INTEGER column) and an equality beside a
-/// residual keep their programs.
+/// bd-zgbhb / bd-text-probe-numeric-index-qk7vd: a lone COUNT(*) whose WHERE
+/// is exactly an equality prefix of an index, with every value exact after
+/// index-key affinity coercion, counts the pinned entries from the index's
+/// pages: values whose runs span leaves, an absent value, a two-column prefix,
+/// text, typeless, REAL and cross-type numeric-text keys, and parameters,
+/// against stock on a file database in strict mode. A suppressed key (`+a`),
+/// a mismatched-affinity CAST on a TEXT key (`s = CAST(3 AS INTEGER)`), and an
+/// equality beside a residual keep their programs.
 #[test]
 fn count_star_over_an_exact_equality_prefix_counts_leaves_and_matches_sqlite() {
     asupersync::test_utils::run_test(|| async {
@@ -839,6 +837,7 @@ fn count_star_over_an_exact_equality_prefix_counts_leaves_and_matches_sqlite() {
 
         let counted: &[(&str, &[i64])] = &[
             ("SELECT count(*) FROM t WHERE a = 3", &[]),
+            ("SELECT count(*) FROM t WHERE a = '3'", &[]),
             ("SELECT count(*) FROM t WHERE 3 = a", &[]),
             ("SELECT count(*) FROM t WHERE a = 999", &[]),
             ("SELECT count(*) FROM t WHERE x = 1 AND a = 4", &[]),
@@ -862,7 +861,8 @@ fn count_star_over_an_exact_equality_prefix_counts_leaves_and_matches_sqlite() {
             );
         }
         for sql in [
-            "SELECT count(*) FROM t WHERE a = '3'",
+            "SELECT count(*) FROM t WHERE +a = 3",
+            "SELECT count(*) FROM t WHERE s = CAST(3 AS INTEGER)",
             "SELECT count(*) FROM t WHERE a = 3 AND s = 'k1'",
         ] {
             assert_eq!(
@@ -966,5 +966,104 @@ fn count_star_over_an_integer_in_list_counts_each_member_and_matches_sqlite() {
             );
         }
         f.close().await.unwrap();
+    });
+}
+
+/// bd-t92q0: in `:memory:` (both unloaded mirror and hydrated mirror, with and
+/// without `HAVING`, ad hoc and prepared) and on file, `GROUP BY a % 7` with
+/// mixed INTEGER / REAL / TEXT rows must print the exact key storage class
+/// (INTEGER `0` vs REAL `0.0`) that stock SQLite prints.
+#[test]
+fn bd_t92q0_memory_group_by_expression_key_spelling_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("t92q0.db");
+        for path in [":memory:", file.to_str().unwrap()] {
+            let (f, r) = seeded(path, &[]).await;
+            let queries = [
+                "SELECT a % 7, count(*) FROM t GROUP BY a % 7",
+                "SELECT a % 7, count(*) FROM t GROUP BY a % 7 HAVING count(*) > 0",
+                "SELECT a % 7, count(*) FROM t WHERE id > 0 GROUP BY a % 7",
+            ];
+            // First pass: immediately after seeding (unloaded mirror on :memory:).
+            for sql in queries {
+                let want = sqlite_rows(&r, sql, &[]);
+                assert_eq!(
+                    frank_rows(&f, sql, &[]).await,
+                    want,
+                    "unloaded mirror diverged: `{sql}` at {path}"
+                );
+                let stmt = f.prepare(sql).await.unwrap();
+                let prepared: Vec<Vec<String>> = stmt
+                    .query()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().iter().map(render).collect())
+                    .collect();
+                assert_eq!(prepared, want, "prepared diverged: `{sql}` at {path}");
+            }
+            // Second pass: force the in-memory mirror to hydrate via a CTE/temp
+            // boundary so the in-memory streaming/fallback GROUP BY paths are
+            // also exercised directly.
+            let _ = f
+                .query("WITH c AS (SELECT id FROM t LIMIT 1) SELECT * FROM c")
+                .await
+                .unwrap();
+            for sql in queries {
+                let want = sqlite_rows(&r, sql, &[]);
+                assert_eq!(
+                    frank_rows(&f, sql, &[]).await,
+                    want,
+                    "hydrated mirror diverged: `{sql}` at {path}"
+                );
+            }
+            f.close().await.unwrap();
+        }
+
+        // Small mixed-class tables where rowid order puts REAL 7.5 before
+        // INTEGER 0 / -7 / 14 (table scan order, matching stock under the same
+        // table scan plan; both unloaded and hydrated :memory: mirrors).
+        for (name, rows) in [
+            ("7.5_then_0", &[(1_i64, "7.5"), (2, "0")][..]),
+            ("0_then_7.5", &[(1, "0"), (2, "7.5")][..]),
+            ("7.5_then_14", &[(1, "7.5"), (2, "14")][..]),
+            ("7.5_then_neg7", &[(1, "7.5"), (2, "-7")][..]),
+            (
+                "7.5_first_in_small",
+                &[(0, "7.5"), (1, "-7"), (2, "0"), (3, "7")][..],
+            ),
+        ] {
+            let f = Connection::open(":memory:").await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let mut setup =
+                vec!["CREATE TABLE m (id INTEGER PRIMARY KEY, a INTEGER, x INTEGER)".to_owned()];
+            for &(id, val) in rows {
+                setup.push(format!("INSERT INTO m VALUES ({id}, {val}, 0)"));
+            }
+            for sql in &setup {
+                f.execute(sql).await.unwrap();
+                r.execute_batch(sql).unwrap();
+            }
+            for pass in ["unloaded", "hydrated"] {
+                if pass == "hydrated" {
+                    let _ = f
+                        .query("WITH c AS (SELECT id FROM m LIMIT 1) SELECT * FROM c")
+                        .await
+                        .unwrap();
+                }
+                for sql in [
+                    "SELECT a % 7, count(*) FROM m GROUP BY a % 7",
+                    "SELECT a % 7, count(*) FROM m GROUP BY a % 7 HAVING count(*) > 0",
+                ] {
+                    assert_eq!(
+                        frank_rows(&f, sql, &[]).await,
+                        sqlite_rows(&r, sql, &[]),
+                        "case={name} pass={pass} `{sql}`"
+                    );
+                }
+            }
+            f.close().await.unwrap();
+        }
     });
 }
