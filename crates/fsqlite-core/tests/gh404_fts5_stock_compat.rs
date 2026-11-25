@@ -50,6 +50,129 @@ fn stock_count(stock: &rusqlite::Connection, sql: &str) -> i64 {
         .unwrap_or_else(|e| panic!("stock query failed: {sql}: {e}"))
 }
 
+#[test]
+fn fts5_create_shadow_layout_uses_final_options() {
+    asupersync::test_utils::run_test(|| async {
+        let cases = [
+            ("columnsize=0, columnsize=1", 2, 1),
+            ("columnsize=1, columnsize=0, detail=none, prefix='2 3'", 0, 1),
+            ("content='', contentless_delete=0, contentless_delete=1", 3, 0),
+            ("content='', contentless_delete=1, contentless_delete=0", 2, 0),
+            (
+                "content='', contentless_unindexed=0, contentless_unindexed=1",
+                2,
+                1,
+            ),
+            (
+                "content='', contentless_unindexed=1, contentless_unindexed=0",
+                2,
+                0,
+            ),
+        ];
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (i, (options, docsize_cols, content_tables)) in cases.into_iter().enumerate() {
+            let path = dir.path().join(format!("layout-{i}.db"));
+            let path = path.to_str().expect("UTF-8 path");
+            let create = format!(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(body, label UNINDEXED, {options})"
+            );
+            let stock = rusqlite::Connection::open_in_memory().expect("open stock");
+            let conn = Connection::open(path).await.expect("open franken");
+            for _ in 0..2 {
+                stock.execute_batch(&create).expect("stock create");
+                conn.execute(&create).await.expect("franken create");
+            }
+
+            for (sql, expected) in [
+                ("SELECT count(*) FROM sqlite_schema WHERE name='docs' AND rootpage=0", 1),
+                ("SELECT count(*) FROM pragma_table_info('docs_docsize')", docsize_cols),
+                ("SELECT count(*) FROM sqlite_schema WHERE name='docs_content'", content_tables),
+                ("SELECT count(*) FROM docs_config WHERE k='version' AND v=4", 1),
+                ("SELECT count(*) FROM docs_data WHERE id IN (1, 10)", 2),
+            ] {
+                assert_eq!(stock_count(&stock, sql), expected, "stock {options}: {sql}");
+                assert_eq!(franken_count(&conn, sql).await, expected, "{options}: {sql}");
+            }
+
+            let insert = "INSERT INTO docs(rowid, body, label) VALUES (7, 'anchor', 'unindexed')";
+            conn.execute(insert).await.expect("franken insert");
+            drop(conn);
+            let sql = "SELECT rowid FROM docs WHERE docs MATCH 'anchor'";
+            let reopened = Connection::open(path).await.expect("franken reopen");
+            assert_eq!(franken_count(&reopened, sql).await, 7, "{options}");
+            drop(reopened);
+            let reopened = rusqlite::Connection::open(path).expect("stock reopen");
+            assert_eq!(stock_count(&reopened, sql), 7, "{options}");
+        }
+    });
+}
+
+#[test]
+fn fts5_shadow_collision_uses_final_columnsize() {
+    asupersync::test_utils::run_test(|| async {
+        let stock = rusqlite::Connection::open_in_memory().expect("open stock");
+        let conn = Connection::open(":memory:").await.expect("open franken");
+        for sql in [
+            "CREATE TABLE docs_docsize(note TEXT)",
+            "INSERT INTO docs_docsize VALUES ('user data')",
+        ] {
+            stock.execute_batch(sql).expect("stock user table");
+            conn.execute(sql).await.expect("franken user table");
+        }
+
+        let collision = "CREATE VIRTUAL TABLE docs USING fts5(body, columnsize=0, columnsize=1)";
+        assert!(stock.execute_batch(collision).is_err());
+        assert!(conn.execute(collision).await.is_err());
+
+        for sql in [
+            "CREATE VIRTUAL TABLE docs USING fts5(body, columnsize=1, columnsize=0)",
+            "ALTER TABLE docs RENAME TO renamed",
+        ] {
+            stock.execute_batch(sql).expect("stock virtual table");
+            conn.execute(sql).await.expect("franken virtual table");
+        }
+        for (sql, expected) in [
+            ("SELECT count(*) FROM docs_docsize WHERE note='user data'", 1),
+            ("SELECT count(*) FROM sqlite_schema WHERE name='renamed_docsize'", 0),
+            ("SELECT count(*) FROM sqlite_schema WHERE name='renamed' AND rootpage=0", 1),
+        ] {
+            assert_eq!(stock_count(&stock, sql), expected, "stock: {sql}");
+            assert_eq!(franken_count(&conn, sql).await, expected, "{sql}");
+        }
+    });
+}
+
+#[test]
+fn fts5_legacy_missing_docsize_shadow_preserves_user_table() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("legacy-layout.db");
+        {
+            let stock = rusqlite::Connection::open(&path).expect("open fixture");
+            // Recreate the old catalog layout: the declaration enables
+            // docsize but the first option prevented allocation of its shadow.
+            stock.execute_batch(
+                "CREATE VIRTUAL TABLE docs USING fts5(body, columnsize=0);
+                 CREATE TABLE docs_docsize(note TEXT);
+                 INSERT INTO docs_docsize VALUES ('user data');
+                 PRAGMA writable_schema=ON;
+                 UPDATE sqlite_schema
+                    SET sql='CREATE VIRTUAL TABLE docs USING fts5(body, columnsize=0, columnsize=1)'
+                  WHERE name='docs';",
+            )
+            .expect("write legacy catalog");
+        }
+        let conn = Connection::open(path.to_str().expect("UTF-8 path"))
+            .await
+            .expect("open legacy layout");
+        assert!(conn.execute("INSERT INTO docs VALUES ('anchor')").await.is_err());
+        assert!(conn.execute("ALTER TABLE docs RENAME TO renamed").await.is_err());
+        conn.execute("DROP TABLE docs").await.expect("drop virtual table");
+        let sql = "SELECT count(*) FROM docs_docsize WHERE note='user data'";
+        assert_eq!(franken_count(&conn, sql).await, 1);
+    });
+}
+
 /// A porter-stable unique token: digit suffixes are never stemmed.
 fn tok(n: usize) -> String {
     format!("tok{n:06}")

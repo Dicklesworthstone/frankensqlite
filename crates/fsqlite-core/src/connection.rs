@@ -26501,7 +26501,13 @@ impl Connection {
             let name = format!("{table_name}{suffix}");
             schema
                 .iter()
-                .any(|table| table.name.eq_ignore_ascii_case(&name) && table.root_page > 0)
+                .any(|table| {
+                    table.name.eq_ignore_ascii_case(&name)
+                        && table.root_page > 0
+                        && (suffix != "_docsize"
+                            || !fts5_earlier_columnsize_disables_docsize(args)
+                            || fts5_docsize_columns_match(table))
+                })
         };
         let content = virtual_table_option_value(args, "content");
         let projection_is_lazy_capable = match content.as_deref() {
@@ -26512,7 +26518,7 @@ impl Connection {
             // indexes that cannot fit in memory.
             Some("") => {
                 allow_contentless
-                    && virtual_table_option_value(args, "columnsize").as_deref() != Some("0")
+                    && fts5_shadow_option_enabled(args, "columnsize", true)
                     && has_shadow("_docsize")
             }
             Some(_) => false,
@@ -65127,15 +65133,19 @@ impl Connection {
         // These b-trees belong to this pager. A TEMP table can have the same
         // SQL name but its root belongs to the connection's memory database.
         let key = name.to_ascii_lowercase();
+        let layout = |table: &TableSchema| {
+            (!key.ends_with("_docsize") || fts5_docsize_columns_match(table))
+                .then_some((table.root_page, table.without_rowid))
+        };
         if let Some(table) = self.shadowed_main_tables.borrow().get(&key) {
-            return Some((table.root_page, table.without_rowid));
+            return layout(table);
         }
         if self.temp_table_names.borrow().contains(&key) {
             return None;
         }
         self.schema.borrow().iter()
             .find(|table| table.name.eq_ignore_ascii_case(name))
-            .map(|table| (table.root_page, table.without_rowid))
+            .and_then(layout)
     }
 
     #[cfg(feature = "ext-fts5")]
@@ -78089,6 +78099,16 @@ impl Connection {
         // Reject a rename whose new shadow names would collide with an
         // existing table.
         self.preflight_fts5_shadow_table_names(new_name, &args)?;
+        if fts5_earlier_columnsize_disables_docsize(&args) {
+            let docsize_name = format!("{old_name}_docsize");
+            if !self.schema.borrow().iter().any(|table| {
+                table.name.eq_ignore_ascii_case(&docsize_name) && fts5_docsize_columns_match(table)
+            }) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("FTS5 table `{old_name}` is missing its docsize shadow"),
+                });
+            }
+        }
         let stored = fts5_sparse_columns(&args);
         if !stored.is_empty() {
             self.fts5_sparse_content_root(old_name, &stored)?;
@@ -119110,7 +119130,7 @@ impl Connection {
         let mut shadow: [Vec<(i64, Vec<SqliteValue>)>; 2] = [Vec::new(), Vec::new()];
         for (slot, suffix) in shadow.iter_mut().zip(["_data", "_docsize"]) {
             if suffix == "_docsize"
-                && virtual_table_option_value(args, "columnsize").as_deref() == Some("0")
+                && !fts5_shadow_option_enabled(args, "columnsize", true)
             {
                 continue;
             }
@@ -119119,6 +119139,12 @@ impl Connection {
                 .iter()
                 .find(|candidate| candidate.name.eq_ignore_ascii_case(&name))
             {
+                if suffix == "_docsize"
+                    && fts5_earlier_columnsize_disables_docsize(args)
+                    && !fts5_docsize_columns_match(table)
+                {
+                    continue;
+                }
                 *slot = self
                     .read_storage_table_rows_for_reload(
                         cx,
@@ -173325,6 +173351,14 @@ fn virtual_table_shadow_drop_names(table_name: &str, sql: &str, ddl: &HashMap<St
                 names.retain(|name| !name.eq_ignore_ascii_case(&content));
             }
         }
+        if fts5_earlier_columnsize_disables_docsize(&stmt.args) {
+            let docsize = format!("{table_name}_docsize");
+            if !ddl.get(&docsize.to_ascii_lowercase())
+                .is_some_and(|sql| ddl_matches_fts5_docsize_shadow(sql))
+            {
+                names.retain(|name| !name.eq_ignore_ascii_case(&docsize));
+            }
+        }
     }
     names
 }
@@ -173365,7 +173399,7 @@ fn fts5_stores_full_content(fts5: &Fts5Table) -> bool {
 fn fts5_sparse_columns(args: &[String]) -> Vec<usize> {
     use fsqlite_parser::TokenKind;
     if virtual_table_option_value(args, "content").as_deref() != Some("")
-        || virtual_table_option_value(args, "contentless_unindexed").as_deref() != Some("1")
+        || !fts5_shadow_option_enabled(args, "contentless_unindexed", false)
     {
         return Vec::new();
     }
@@ -173393,10 +173427,7 @@ fn fts5_shadow_drop_names(table_name: &str, args: &[String]) -> Vec<String> {
     if virtual_table_option_value(args, "content").is_none() || !fts5_sparse_columns(args).is_empty() {
         names.push(format!("{table_name}_content"));
     }
-    if !matches!(
-        virtual_table_option_value(args, "columnsize").as_deref(),
-        Some("0")
-    ) {
+    if fts5_shadow_option_enabled(args, "columnsize", true) {
         names.push(format!("{table_name}_docsize"));
     }
     names
@@ -173464,15 +173495,9 @@ fn fts5_shadow_table_defs(
         });
     }
 
-    if !matches!(
-        virtual_table_option_value(args, "columnsize").as_deref(),
-        Some("0")
-    ) {
+    if fts5_shadow_option_enabled(args, "columnsize", true) {
         let docsize_name = format!("{table_name}_docsize");
-        let contentless_delete = matches!(
-            virtual_table_option_value(args, "contentless_delete").as_deref(),
-            Some("1")
-        );
+        let contentless_delete = fts5_shadow_option_enabled(args, "contentless_delete", false);
         let columns = if contentless_delete {
             "id INTEGER PRIMARY KEY, sz BLOB, origin INTEGER"
         } else {
@@ -173586,7 +173611,82 @@ impl Fts5ContentSource {
 }
 
 fn virtual_table_option_value(args: &[String], option: &str) -> Option<String> {
-    args.iter().find_map(|arg| {
+    virtual_table_option_values(args, option).next()
+}
+
+fn fts5_shadow_option_enabled(args: &[String], option: &str, default: bool) -> bool {
+    // FTS5 applies each of its boolean options in declaration order. Create,
+    // ownership, and reload must use the same final setting as the live table.
+    virtual_table_option_values(args, option)
+        .next_back()
+        .map_or(default, |value| value.trim() == "1")
+}
+
+fn fts5_earlier_columnsize_disables_docsize(args: &[String]) -> bool {
+    // Older FrankenSQLite builds allocated shadows from the first setting.
+    // They could leave the docsize name available for an unrelated table.
+    virtual_table_option_value(args, "columnsize").as_deref() == Some("0")
+        && fts5_shadow_option_enabled(args, "columnsize", true)
+}
+
+#[cfg(feature = "ext-fts5")]
+fn fts5_docsize_columns_match(table: &TableSchema) -> bool {
+    if table.without_rowid || table.strict {
+        return false;
+    }
+    let [id, size, rest @ ..] = table.columns.as_slice() else {
+        return false;
+    };
+    let origin_matches = match rest {
+        [] => true,
+        [origin] => origin.name.eq_ignore_ascii_case("origin")
+            && origin.type_name.as_deref().is_some_and(|ty| ty.eq_ignore_ascii_case("INTEGER")),
+        _ => false,
+    };
+    id.name.eq_ignore_ascii_case("id")
+        && id.is_ipk
+        && size.name.eq_ignore_ascii_case("sz")
+        && size.type_name.as_deref().is_some_and(|ty| ty.eq_ignore_ascii_case("BLOB"))
+        && origin_matches
+}
+
+fn ddl_matches_fts5_docsize_shadow(sql: &str) -> bool {
+    let Ok(Statement::CreateTable(stmt)) = parse_single_statement(sql) else {
+        return false;
+    };
+    let CreateTableBody::Columns { columns, constraints } = &stmt.body else {
+        return false;
+    };
+    let [id, size, rest @ ..] = columns.as_slice() else {
+        return false;
+    };
+    let is_column = |col: &fsqlite_ast::ColumnDef, name: &str, decl_type: &str| {
+        col.name.eq_ignore_ascii_case(name)
+            && col.type_name.as_ref().is_some_and(|ty| ty.name.eq_ignore_ascii_case(decl_type))
+    };
+    let origin_matches = match rest {
+        [] => true,
+        [origin] => is_column(origin, "origin", "INTEGER") && origin.constraints.is_empty(),
+        _ => false,
+    };
+    !stmt.without_rowid
+        && !stmt.strict
+        && constraints.is_empty()
+        && is_column(id, "id", "INTEGER")
+        && matches!(id.constraints.as_slice(), [constraint]
+            if matches!(constraint.kind, ColumnConstraintKind::PrimaryKey {
+                direction: None, conflict: None, autoincrement: false,
+            }))
+        && is_column(size, "sz", "BLOB")
+        && size.constraints.is_empty()
+        && origin_matches
+}
+
+fn virtual_table_option_values<'a>(
+    args: &'a [String],
+    option: &'a str,
+) -> impl DoubleEndedIterator<Item = String> + 'a {
+    args.iter().filter_map(move |arg| {
         let (key, value) = arg.split_once('=')?;
         if normalize_virtual_table_option_token(key) == option {
             Some(normalize_virtual_table_option_token(value))
