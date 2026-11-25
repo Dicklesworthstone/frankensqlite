@@ -1534,6 +1534,15 @@ struct GroupCommitQueue {
     /// generation is stale — the frames that proved its pages were holes went
     /// with that generation — and must never be handed to the ledger.
     disowned_pages_generation: Arc<Mutex<Option<WalGenerationIdentity>>>,
+    /// bd-ioq6x: the file's hole-marker sidecar (`<db>.fsqlite-holes`, see
+    /// [`hole_marker_path`]). Set by a file-backed (non-memory) pager open;
+    /// unset, no commit ever writes a marker.
+    hole_marker_path: OnceLock<PathBuf>,
+    /// bd-ioq6x: whether this queue (this process's lifetime of the file)
+    /// already published the marker. Once per process per file: the flag
+    /// dies with the queue, so a later attachment that outlives a peer's
+    /// reclaim publishes again.
+    hole_marker_published: Mutex<bool>,
     /// Test-local proof that a resolved wake dropped during post-wake
     /// finalization is classified instead of being silently discarded.
     #[cfg(test)]
@@ -2021,6 +2030,8 @@ impl GroupCommitQueue {
             pending_logical_cleanups: Mutex::new(VecDeque::new()),
             disowned_pages: Arc::new(Mutex::new(HashSet::new())),
             disowned_pages_generation: Arc::new(Mutex::new(None)),
+            hole_marker_path: OnceLock::new(),
+            hole_marker_published: Mutex::new(false),
             #[cfg(test)]
             unaccounted_epoch_wake_drops: AtomicUsize::new(0),
         }
@@ -6528,6 +6539,106 @@ static GROUP_COMMIT_IDENTITY_QUEUES: OnceLock<Mutex<IdentityWeakRegistry<GroupCo
 /// last connection's drop discards the ledger and the parked holes orphan
 /// ("page N is never used") once a later grow brings them in range.
 static PENDING_DISOWNED_BY_PATH: OnceLock<Mutex<HashMap<PathBuf, HashSet<u32>>>> = OnceLock::new();
+
+/// bd-ioq6x: suffix of the hole-marker sidecar, `<db>.fsqlite-holes`.
+///
+/// The marker says "a commit of this file may have left EOF holes durable":
+/// pages below the page count that no b-tree references and that are not on
+/// the freelist, because the transaction that held them (a sibling's EOF
+/// lease or allocation, the abandonment pool, the disowned ledger) had not
+/// returned them yet. A clean close folds its own pool; a crash leaves the
+/// holes and this marker. The next open that is the file's FIRST attacher
+/// (stock's first-attach EXCLUSIVE try on the `-shm` dead-man switch) runs
+/// the integrity_check-exact reachability reclaim and removes the marker
+/// only after that commit is durable. It sits next to the migration-state
+/// marker (`<db>.fsqlite-migration-state`); stock never reads it, and a
+/// database copied without it simply keeps the pre-marker behavior.
+pub const HOLE_MARKER_SUFFIX: &str = ".fsqlite-holes";
+
+/// bd-ioq6x: the hole-marker sidecar of `db_path` (see [`HOLE_MARKER_SUFFIX`]).
+#[must_use]
+pub fn hole_marker_path(db_path: &Path) -> PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push(HOLE_MARKER_SUFFIX);
+    PathBuf::from(path)
+}
+
+/// bd-ioq6x: whether a WAL commit that grows the page count from
+/// `current_db_size` to `new_db_size` leaves a page of the grown range that it
+/// neither writes nor publishes free. Such a page is held by a sibling (or
+/// parked), and if that holder never returns it the commit has made it a
+/// durable hole. The reserved lock-byte page is never allocated and never a
+/// hole. A single writer grows contiguously, so its commits never qualify.
+fn commit_growth_leaves_unwritten_pages(
+    current_db_size: u32,
+    new_db_size: u32,
+    page_size: usize,
+    write_pages_sorted: &[PageNumber],
+    freed_pages: &[u32],
+) -> bool {
+    if new_db_size <= current_db_size {
+        return false;
+    }
+    let mut growth = new_db_size - current_db_size;
+    let lock_byte_page = u32::try_from(0x4000_0000_usize / page_size.max(1) + 1).unwrap_or(u32::MAX);
+    if lock_byte_page > current_db_size && lock_byte_page <= new_db_size {
+        growth -= 1;
+    }
+    let first_grown = write_pages_sorted.partition_point(|page| page.get() <= current_db_size);
+    let written = write_pages_sorted[first_grown..]
+        .iter()
+        .filter(|page| page.get() <= new_db_size && page.get() != lock_byte_page)
+        .count();
+    let freed = freed_pages
+        .iter()
+        .filter(|&&page| {
+            page > current_db_size
+                && page <= new_db_size
+                && page != lock_byte_page
+                && write_pages_sorted
+                    .binary_search_by_key(&page, |written| written.get())
+                    .is_err()
+        })
+        .count();
+    u32::try_from(written + freed).is_ok_and(|accounted| accounted < growth)
+}
+
+/// bd-ioq6x: publish the file's hole marker, once per queue (process
+/// lifetime of the file), BEFORE the commit that can make a hole durable
+/// reaches its WAL append and sync: the marker and its directory entry are
+/// fsynced first, so a power loss never keeps that commit without the
+/// marker. Best-effort: a failure is logged and retried by the next such
+/// commit, and it leaves the pre-marker behavior, never a failed commit.
+fn publish_hole_marker_once(queue: &GroupCommitQueue) {
+    let Some(path) = queue.hole_marker_path.get() else {
+        return;
+    };
+    let mut published = queue
+        .hole_marker_published
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *published {
+        return;
+    }
+    let written_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let body = format!(
+        "{{\"format\":1,\"pid\":{},\"written_at\":{written_at}}}\n",
+        std::process::id()
+    );
+    match fsqlite_vfs::host_fs::write_private_atomic(path, body.as_bytes())
+        .and_then(|()| fsqlite_vfs::host_fs::sync_parent_directory(path))
+    {
+        Ok(()) => *published = true,
+        Err(error) => tracing::warn!(
+            target: "fsqlite.pager.hole_marker",
+            marker = %path.display(),
+            %error,
+            "could not publish the hole marker; holes from this commit stay until VACUUM"
+        ),
+    }
+}
 static NEXT_GROUP_COMMIT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_GROUP_COMMIT_FINALIZATION_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -22585,6 +22696,13 @@ where
         // :memory:/private-VFS opens use a fresh, connection-local ledger that
         // is always empty here. Fully best-effort — it never fails the open and
         // never drops a ledger entry (see `sweep_disowned_ledger_on_open`).
+        if !pager.vfs.is_memory() {
+            // bd-ioq6x: file-backed commits may publish the hole marker.
+            let _ = pager
+                .group_commit_queue
+                .hole_marker_path
+                .set(hole_marker_path(&pager.db_path));
+        }
         if !defer_locked_header && !pager.vfs.is_memory() {
             let _ = pager.sweep_disowned_ledger_on_open(cx).await;
         }
@@ -27791,7 +27909,7 @@ where
         // re-acquire the pager mutex before entering the group-commit queue.
 
         let t_batch_build_start = detailed_metrics.then(Instant::now);
-        let (batch, _our_new_db_size) = match build_group_commit_batch_with_shrink(
+        let (batch, our_new_db_size) = match build_group_commit_batch_with_shrink(
             current_db_size,
             explicit_db_size_shrink,
             write_set,
@@ -27804,6 +27922,25 @@ where
             } // Nothing to commit
         };
         let batch_build_us = elapsed_profile_us(t_batch_build_start);
+        // bd-ioq6x: a commit that grows past a page it neither writes nor
+        // frees can make that page a durable hole; publish the hole marker
+        // (once per process per file) before this commit reaches the WAL.
+        if explicit_db_size_shrink.is_none()
+            && queue.hole_marker_path.get().is_some()
+            && let Some(page_size) = write_pages_sorted
+                .first()
+                .and_then(|page| write_set.get(page))
+                .map(|staged| staged.as_page_bytes().len())
+            && commit_growth_leaves_unwritten_pages(
+                current_db_size,
+                our_new_db_size,
+                page_size,
+                write_pages_sorted,
+                &freelist_publication_freed_pages,
+            )
+        {
+            publish_hole_marker_once(queue);
+        }
 
         if !conflict_pages.is_empty() && conflict_snapshot.is_none() {
             // bd-dk9ra / def2ed8c5 reconciliation: the fail-closed refusal
@@ -35397,6 +35534,138 @@ where
         shared_db_file_read(&db_file, cx)
             .await?
             .main_file_attached_elsewhere(cx)
+    }
+
+    /// bd-ioq6x: the close-time fold of this connection's OWN abandonment
+    /// pool. A transaction that rolled back after a sibling grew past its EOF
+    /// pages parks them here; with no later commit on this connection they
+    /// would be disowned at drop and die with the process, leaving durable
+    /// holes. The fold hands the parked pages to one minimal writer commit,
+    /// whose WAL Phase A runs the ordinary commit-time abandonment fold on
+    /// them: the same eligibility, WAL-generation and no-committed-frame
+    /// guards every commit applies (read at the physical appended tail under
+    /// the WAL backend write lock, native or not). A provable hole lands on
+    /// the durable freelist, a framed page is dropped, an above-extent page
+    /// goes back to the pool. So a cleanly closed file is clean at rest. It
+    /// walks nothing: no O(db) work at close. Best-effort: a refused begin
+    /// or commit returns the pages to the pool for the drop path. Returns how
+    /// many parked pages the commit was offered.
+    pub async fn fold_abandoned_pool_on_close(&self, cx: &Cx) -> Result<usize> {
+        {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if inner.access_mode.is_readonly()
+                || inner.journal_mode != JournalMode::Wal
+                || inner.db_size < 2
+                || inner.abandoned_eof_reservations.is_empty()
+            {
+                return Ok(0);
+            }
+        }
+        let Ok(mut txn) = self.begin(cx, TransactionMode::Immediate).await else {
+            return Ok(0);
+        };
+        let parked = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            std::mem::take(&mut inner.abandoned_eof_reservations)
+        };
+        if parked.is_empty() {
+            let _ = txn.rollback(cx).await;
+            return Ok(0);
+        }
+        let offered = parked.len();
+        // The commit's Phase A appends these back into the pool and folds
+        // them; rollback (or a NotCommitted attempt) restores them to it.
+        txn.reclaimed_abandoned_reservations.extend(parked);
+        if txn.commit(cx).await.is_err() {
+            let _ = txn.rollback(cx).await;
+            return Ok(0);
+        }
+        Ok(offered)
+    }
+
+    /// bd-ioq6x: after the first attacher's reachability reclaim committed,
+    /// every in-range page parked in this connection's pool or in the file's
+    /// disowned ledger is either reachable or already on the freelist. Forget
+    /// those entries so no later fold publishes one a second time. Entries
+    /// above the extent stay: they are reissuable from EOF.
+    pub fn discard_in_range_parked_holes(&self) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        let ceiling = inner.db_size;
+        inner
+            .abandoned_eof_reservations
+            .retain(|page| page.get() > ceiling);
+        if let Some(ledger) = inner.disowned_page_ledger.as_ref() {
+            ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|page| *page > ceiling);
+        }
+        Ok(())
+    }
+
+    /// bd-ioq6x: the hole marker was removed after a reclaim; the next
+    /// hole-capable commit of this process publishes it again.
+    pub fn forget_hole_marker_publication(&self) {
+        *self
+            .group_commit_queue
+            .hole_marker_published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+    }
+
+    /// bd-ioq6x: ask the main-file handle to make its FIRST `-shm`
+    /// attachment stock's first-attach EXCLUSIVE try on the dead-man-switch
+    /// byte. Call before the WAL backend attaches; no effect afterwards.
+    pub async fn request_first_attach_exclusive(&self, cx: &Cx) -> Result<()> {
+        let db_file = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            Arc::clone(&inner.db_file)
+        };
+        let mut file = shared_db_file_write(&db_file, cx).await?;
+        file.request_first_attach_exclusive();
+        Ok(())
+    }
+
+    /// bd-ioq6x: whether this pager's attachment won the first-attach try
+    /// and still holds the dead-man switch EXCLUSIVE: no other connection,
+    /// in any process, is attached or can attach until
+    /// [`Self::end_first_attach_exclusive`].
+    pub async fn holds_first_attach_exclusive(&self, cx: &Cx) -> Result<bool> {
+        let db_file = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            Arc::clone(&inner.db_file)
+        };
+        let file = shared_db_file_read(&db_file, cx).await?;
+        Ok(file.holds_first_attach_exclusive())
+    }
+
+    /// bd-ioq6x: downgrade the first-attach EXCLUSIVE claim to the ordinary
+    /// SHARED attachment claim (or withdraw an unused request). Idempotent.
+    pub async fn end_first_attach_exclusive(&self, cx: &Cx) -> Result<()> {
+        let db_file = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            Arc::clone(&inner.db_file)
+        };
+        let mut file = shared_db_file_write(&db_file, cx).await?;
+        file.end_first_attach_exclusive(cx)
     }
 
     /// Run a WAL checkpoint to transfer frames from the WAL to the database.
@@ -65450,6 +65719,179 @@ mod tests {
                 "bead_id=bd-fuwx0 case=predicted_commit_pages_carry_the_new_trunk trunk={trunk:?} predicted={predicted:?}"
             );
             txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    /// bd-ioq6x R3, pager level: a holder that rolls back after a peer grew
+    /// past its EOF pages parks them in this pager's abandonment pool; the
+    /// close-time fold publishes every one of them on the durable freelist
+    /// (red without the fold: the pool dies with the pager).
+    #[test]
+    fn test_close_fold_publishes_rolled_back_holes_below_peer_growth_bd_ioq6x() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = wal_pager().await;
+            let cx = Cx::new();
+            let ps = PageSize::DEFAULT.as_usize();
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let p2 = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, p2, &vec![0x21; ps]).await.unwrap();
+            seed.commit(&cx).await.unwrap();
+
+            let mut holder = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let h1 = holder.allocate_page(&cx).await.unwrap();
+            holder.write_page(&cx, h1, &vec![0x31; ps]).await.unwrap();
+            let h2 = holder.allocate_page(&cx).await.unwrap();
+            holder.write_page(&cx, h2, &vec![0x32; ps]).await.unwrap();
+            let lease = holder.page_lease.clone();
+            assert!(!lease.is_empty(), "precondition: the holder holds an EOF lease");
+            let mut grow = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let g = grow.allocate_page(&cx).await.unwrap();
+            grow.write_page(&cx, g, &vec![0x5A; ps]).await.unwrap();
+            grow.commit(&cx).await.unwrap();
+            holder.rollback(&cx).await.unwrap();
+            drop(holder);
+            drop(grow);
+
+            let pool_before = pager.inner.lock().unwrap().abandoned_eof_reservations.len();
+            let folded = pager.fold_abandoned_pool_on_close(&cx).await.unwrap();
+
+            let inner = pager.inner.lock().unwrap();
+            let page1 = inner
+                .read_committed_page_copy(&cx, &pager.cache, &pager.wal_backend, PageNumber::ONE)
+                .await
+                .unwrap();
+            let header_bytes: [u8; DATABASE_HEADER_SIZE] =
+                page1[..DATABASE_HEADER_SIZE].try_into().unwrap();
+            let header = DatabaseHeader::from_bytes(&header_bytes).unwrap();
+            let durable_freelist = load_freelist_from_committed_state(
+                &cx,
+                &inner,
+                &pager.cache,
+                &pager.wal_backend,
+                header.page_count,
+                &header,
+            )
+            .await
+            .unwrap();
+            drop(inner);
+            let held: Vec<PageNumber> = [h1, h2].into_iter().chain(lease).collect();
+            let unaccounted: Vec<PageNumber> = held
+                .iter()
+                .copied()
+                .filter(|p| p.get() <= header.page_count && !durable_freelist.contains(p))
+                .collect();
+            assert!(
+                unaccounted.is_empty(),
+                "bead_id=bd-ioq6x case=close_fold_publishes_rolled_back_holes pool_before={pool_before} \
+                 folded={folded} page_count={} g={g:?} held={held:?} durable_freelist={durable_freelist:?} \
+                 unaccounted={unaccounted:?}",
+                header.page_count
+            );
+        });
+    }
+
+    /// bd-fwsyc (single-writer lane r14): a concurrent transaction grows the
+    /// file past the unused lease pages a peer's commit returned, and commits.
+    /// Phase A decides whether the commit rewrites the freelist metadata; an
+    /// early return without the size range published the grown page count with
+    /// an empty durable freelist, leaving the returned pages free only in
+    /// memory ("page N is never used" once that list is gone).
+    ///
+    /// The safety property: never commit with a page unaccounted. Either the
+    /// commit succeeds and every page up to the committed page count is
+    /// written or on the durable freelist, or it is refused with
+    /// `BusySnapshot` and the durable state stays the peer's, with every page
+    /// accounted for.
+    #[test]
+    fn test_growth_past_a_peer_returned_lease_publishes_the_holes_bd_fwsyc() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = wal_pager().await;
+            let cx = Cx::new();
+            let ps = PageSize::DEFAULT.as_usize();
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let p2 = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, p2, &vec![0x21; ps]).await.unwrap();
+            seed.commit(&cx).await.unwrap();
+
+            let mut peer = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let peer_first = peer.allocate_page(&cx).await.unwrap();
+            let peer_page = peer.allocate_page(&cx).await.unwrap();
+            for page in [peer_first, peer_page] {
+                peer.write_page(&cx, page, &vec![0x31; ps]).await.unwrap();
+            }
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let grown = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, grown, &vec![0x5A; ps]).await.unwrap();
+            peer.commit(&cx).await.unwrap();
+
+            let between: Vec<PageNumber> = {
+                let inner = txn.inner.lock().unwrap();
+                let committed_db_size = txn.committed_db_size_with_inner(&inner);
+                inner
+                    .freelist
+                    .iter()
+                    .copied()
+                    .filter(|p| p.get() > inner.db_size && p.get() <= committed_db_size)
+                    .collect()
+            };
+            assert!(
+                !between.is_empty()
+                    && txn.allocated_from_freelist.is_empty()
+                    && txn.freed_pages.is_empty(),
+                "bead_id=bd-fwsyc case=precondition_growth_past_returned_lease_with_nothing_pending between={between:?}"
+            );
+            let committed = match txn.commit(&cx).await {
+                Ok(()) => true,
+                Err(FrankenError::BusySnapshot { conflicting_pages }) => {
+                    eprintln!("bd-fwsyc grower refused: BusySnapshot {conflicting_pages}");
+                    false
+                }
+                Err(other) => panic!("bead_id=bd-fwsyc case=commit_or_busy_snapshot got={other:?}"),
+            };
+            eprintln!("bd-fwsyc grower committed={committed}");
+
+            let inner = pager.inner.lock().unwrap();
+            let page1 = inner
+                .read_committed_page_copy(&cx, &pager.cache, &pager.wal_backend, PageNumber::ONE)
+                .await
+                .unwrap();
+            let header_bytes: [u8; DATABASE_HEADER_SIZE] =
+                page1[..DATABASE_HEADER_SIZE].try_into().unwrap();
+            let header = DatabaseHeader::from_bytes(&header_bytes).unwrap();
+            let durable_freelist = load_freelist_from_committed_state(
+                &cx,
+                &inner,
+                &pager.cache,
+                &pager.wal_backend,
+                header.page_count,
+                &header,
+            )
+            .await
+            .unwrap();
+            drop(inner);
+            let expected_page_count = if committed {
+                grown.get()
+            } else {
+                peer_first.get().max(peer_page.get())
+            };
+            assert_eq!(
+                header.page_count, expected_page_count,
+                "bead_id=bd-fwsyc case=page_count_is_the_committed_size committed={committed}"
+            );
+            let written: Vec<PageNumber> = if committed {
+                vec![PageNumber::ONE, p2, peer_first, peer_page, grown]
+            } else {
+                vec![PageNumber::ONE, p2, peer_first, peer_page]
+            };
+            let unaccounted: Vec<PageNumber> = (1..=header.page_count)
+                .filter_map(PageNumber::new)
+                .filter(|p| !written.contains(p) && !durable_freelist.contains(p))
+                .collect();
+            assert!(
+                unaccounted.is_empty(),
+                "bead_id=bd-fwsyc case=holes_below_page_count_are_durably_free page_count={} durable_freelist={durable_freelist:?} between={between:?} unaccounted={unaccounted:?}",
+                header.page_count
+            );
         });
     }
 

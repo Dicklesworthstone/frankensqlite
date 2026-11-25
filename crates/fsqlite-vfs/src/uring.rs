@@ -1646,6 +1646,18 @@ impl VfsFile for IoUringFile {
         self.inner.shm_unmap(cx, delete)
     }
 
+    fn request_first_attach_exclusive(&mut self) {
+        self.inner.request_first_attach_exclusive();
+    }
+
+    fn holds_first_attach_exclusive(&self) -> bool {
+        self.inner.holds_first_attach_exclusive()
+    }
+
+    fn end_first_attach_exclusive(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.end_first_attach_exclusive(cx)
+    }
+
     fn wal_reader_slot_acquire(&mut self, cx: &Cx, mx_frame: u32) -> Result<Option<u32>> {
         self.inner.wal_reader_slot_acquire(cx, mx_frame)
     }

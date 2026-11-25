@@ -462,6 +462,8 @@ impl Vfs for MemoryVfs {
             shm_owner_id,
             shm_path,
             shm_info: None,
+            shm_dms_claim: false,
+            first_attach_dms: MemoryFirstAttachDms::Idle,
         };
 
         let mut out_flags = flags;
@@ -596,9 +598,53 @@ pub struct MemoryFile {
     shm_owner_id: u64,
     shm_path: PathBuf,
     shm_info: Option<Arc<Mutex<MemoryShmInfo>>>,
+    /// bd-ioq6x: this attachment's SHARED claim on the reserved DMS slot of
+    /// the in-process SHM table (the analogue of stock's dead-man switch).
+    shm_dms_claim: bool,
+    /// bd-ioq6x: the first-attach EXCLUSIVE try on that slot.
+    first_attach_dms: MemoryFirstAttachDms,
+}
+
+/// bd-ioq6x: a memory handle's part in the first-attach EXCLUSIVE try.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryFirstAttachDms {
+    Idle,
+    Requested,
+    Held,
 }
 
 impl MemoryFile {
+    /// bd-ioq6x: the in-process analogue of the unix `-shm` dead-man-switch
+    /// claim. Every attachment holds the reserved DMS slot SHARED; a
+    /// requested first attach takes it EXCLUSIVE when the slot is empty (no
+    /// other handle of this VFS is attached). While another handle holds it
+    /// EXCLUSIVE an attach is refused with `Busy`, as the unix DMS refuses;
+    /// the caller's busy handling retries after the downgrade.
+    fn retain_shm_dms_claim(&mut self, info: &Arc<Mutex<MemoryShmInfo>>) -> Result<()> {
+        if self.shm_dms_claim {
+            return Ok(());
+        }
+        let dms = usize::try_from(WAL_TOTAL_LOCKS).expect("DMS slot fits usize");
+        let mut guard = info.lock().map_err(|_| lock_err())?;
+        let slot = &mut guard.slots[dms];
+        if slot
+            .exclusive_owner
+            .is_some_and(|owner| owner != self.shm_owner_id)
+        {
+            return Err(FrankenError::Busy);
+        }
+        if self.first_attach_dms == MemoryFirstAttachDms::Requested {
+            self.first_attach_dms = MemoryFirstAttachDms::Idle;
+            if slot.exclusive_owner.is_none() && slot.shared_holders.is_empty() {
+                slot.exclusive_owner = Some(self.shm_owner_id);
+                self.first_attach_dms = MemoryFirstAttachDms::Held;
+            }
+        }
+        slot.shared_holders.insert(self.shm_owner_id, 1);
+        self.shm_dms_claim = true;
+        Ok(())
+    }
+
     fn ensure_writable(&self) -> Result<()> {
         if self.read_only {
             Err(FrankenError::ReadOnly)
@@ -666,7 +712,9 @@ impl MemoryFile {
 
     fn ensure_shm_info(&mut self) -> Result<Arc<Mutex<MemoryShmInfo>>> {
         if let Some(info) = &self.shm_info {
-            return Ok(Arc::clone(info));
+            let info = Arc::clone(info);
+            self.retain_shm_dms_claim(&info)?;
+            return Ok(info);
         }
 
         let info = {
@@ -686,6 +734,7 @@ impl MemoryFile {
         };
 
         self.shm_info = Some(Arc::clone(&info));
+        self.retain_shm_dms_claim(&info)?;
         Ok(info)
     }
 
@@ -740,6 +789,8 @@ impl MemoryFile {
         // the exact SHM generation so a caller that retains the handle can
         // retry.
         self.shm_info = None;
+        self.shm_dms_claim = false;
+        self.first_attach_dms = MemoryFirstAttachDms::Idle;
         Ok(())
     }
 
@@ -1512,6 +1563,30 @@ impl VfsFile for MemoryFile {
         }
         checkpoint_or_abort(cx)?;
         self.release_shm_owner_state(delete)
+    }
+
+    fn request_first_attach_exclusive(&mut self) {
+        if self.shm_info.is_none() && !self.shm_dms_claim {
+            self.first_attach_dms = MemoryFirstAttachDms::Requested;
+        }
+    }
+
+    fn holds_first_attach_exclusive(&self) -> bool {
+        self.first_attach_dms == MemoryFirstAttachDms::Held
+    }
+
+    fn end_first_attach_exclusive(&mut self, _cx: &Cx) -> Result<()> {
+        if self.first_attach_dms == MemoryFirstAttachDms::Held
+            && let Some(info) = self.shm_info.as_ref()
+        {
+            let dms = usize::try_from(WAL_TOTAL_LOCKS).expect("DMS slot fits usize");
+            let mut guard = info.lock().map_err(|_| lock_err())?;
+            if guard.slots[dms].exclusive_owner == Some(self.shm_owner_id) {
+                guard.slots[dms].exclusive_owner = None;
+            }
+        }
+        self.first_attach_dms = MemoryFirstAttachDms::Idle;
+        Ok(())
     }
 }
 
@@ -2693,6 +2768,50 @@ mod tests {
         };
         assert_eq!(b0, 0xAA);
         assert_eq!(b1, 0xBB);
+    }
+
+    /// bd-ioq6x R2b, in-process on the memory VFS: a handle that wins the
+    /// first-attach EXCLUSIVE try keeps every other attacher out (refused
+    /// with `Busy`, for the caller's busy handling to retry) until it
+    /// downgrades; the refused attacher gets in after the downgrade; and a
+    /// try made while another handle is attached does not win.
+    #[test]
+    fn first_attach_exclusive_holds_other_attachers_until_downgrade() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut first, _) = vfs.open(&cx, Some(Path::new("r2b.db")), flags).unwrap();
+        first.request_first_attach_exclusive();
+        first.shm_map(&cx, 0, 64, true).unwrap();
+        assert!(
+            first.holds_first_attach_exclusive(),
+            "the sole attacher's requested try must win"
+        );
+
+        let (mut impatient, _) = vfs.open(&cx, Some(Path::new("r2b.db")), flags).unwrap();
+        assert!(
+            matches!(impatient.shm_map(&cx, 0, 64, true), Err(FrankenError::Busy)),
+            "bd-ioq6x: no attach while the first attacher holds the claim"
+        );
+
+        // A retry while the claim is still held is refused again.
+        assert!(
+            matches!(impatient.shm_map(&cx, 0, 64, true), Err(FrankenError::Busy)),
+            "bd-ioq6x: no attach on retry before the downgrade"
+        );
+        first.end_first_attach_exclusive(&cx).unwrap();
+        assert!(!first.holds_first_attach_exclusive());
+        impatient
+            .shm_map(&cx, 0, 64, true)
+            .expect("bd-ioq6x: the refused attacher gets in after the downgrade");
+
+        let (mut late, _) = vfs.open(&cx, Some(Path::new("r2b.db")), flags).unwrap();
+        late.request_first_attach_exclusive();
+        late.shm_map(&cx, 0, 64, true).unwrap();
+        assert!(
+            !late.holds_first_attach_exclusive(),
+            "bd-ioq6x: a try made while others are attached must not win"
+        );
     }
 
     #[test]

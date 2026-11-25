@@ -1731,6 +1731,39 @@ pub trait VfsFile: Send + Sync {
     /// (Equivalent to sqlite3_io_methods.xShmUnmap)
     fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()>;
 
+    // --- bd-ioq6x: stock's first-attach EXCLUSIVE dead-man-switch try ---
+    //
+    // Stock's `unixLockSharedMemory` tries the `-shm` dead-man-switch (DMS)
+    // byte EXCLUSIVE when it attaches: success means no connection in any
+    // process is attached, and the holder initializes shared state before it
+    // downgrades to SHARED. Every other opener's SHARED claim is refused with
+    // Busy until that downgrade (stock: SQLITE_BUSY to its busy handler), and
+    // the opener's busy handling retries. These three
+    // methods give the engine the same window for its open-time reclaim of
+    // EOF holes. They change only the attach-time DMS claim: no transaction
+    // lock, and nothing that serializes writers.
+
+    /// Ask that this handle's FIRST `-shm` attachment try the DMS byte
+    /// EXCLUSIVE instead of taking it SHARED. No effect once attached. A
+    /// failed try falls back to the ordinary SHARED claim. Backends without a
+    /// DMS byte ignore the request.
+    fn request_first_attach_exclusive(&mut self) {}
+
+    /// Whether this handle won the requested first-attach try and still
+    /// holds the DMS byte EXCLUSIVE: no other connection, in this or any
+    /// other process, is attached or can attach until
+    /// [`Self::end_first_attach_exclusive`].
+    fn holds_first_attach_exclusive(&self) -> bool {
+        false
+    }
+
+    /// Downgrade a held first-attach EXCLUSIVE claim to the attachment's
+    /// ordinary SHARED claim (stock's downgrade after initialization), or
+    /// withdraw a request that never reached an attachment. Idempotent.
+    fn end_first_attach_exclusive(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
+
     // --- Cross-process WAL reader registration (GH#399) ---
     //
     // These mirror C SQLite's `aReadMark` / `WAL_READ_LOCK(i)` protocol so a

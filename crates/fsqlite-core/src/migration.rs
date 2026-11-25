@@ -47,6 +47,33 @@
 //!    presence means "fully migrated to this version". An interruption before
 //!    the marker write leaves the pass eligible for retry on the next open.
 //! Earlier successful repairs are not rolled back when a later step fails.
+//!
+//! ## Hole marker (bd-ioq6x)
+//!
+//! A second sidecar, `<db>.fsqlite-holes` ([`HOLE_MARKER_SUFFIX`]), lives next
+//! to the migration-state marker. Concurrent writers can leave EOF holes:
+//! pages below the page count that no b-tree references and that are not on
+//! the freelist, because the transaction holding them (a sibling's EOF lease
+//! or allocation, a rolled-back transaction's parked pool) had not returned
+//! them when a peer's commit grew past them. A clean close folds its own pool;
+//! a crash leaves the holes. So the pager publishes this marker, with the
+//! migration marker's temp + rename writer plus a directory fsync, once per
+//! process per file, BEFORE the first commit that grows past a page it neither
+//! writes nor frees reaches its WAL sync. Single-writer cycles never write it.
+//!
+//! An open that finds the marker asks for stock's first-attach EXCLUSIVE try
+//! on the `-shm` dead-man-switch byte. If it wins (no connection of any process
+//! is attached), it keeps that claim across the
+//! [`Connection::repair_orphaned_pages`] walk (integrity_check's own
+//! never-used definition) and its durable commit, removes the marker, and only
+//! then downgrades to the ordinary SHARED claim. Peers that open meanwhile wait
+//! within their busy timeout (stock: SQLITE_BUSY to its busy handler); none can
+//! attach mid-walk. An open that is not the first attacher leaves the marker
+//! for a later one. A database copied without the marker keeps the behavior it
+//! had before the marker existed: no walk, no error. Neither the migration
+//! marker, its gating, integrity_check, nor the on-disk format changes; stock
+//! never reads the sidecar. Only open-time locking changes: writer concurrency
+//! is untouched.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -197,6 +224,59 @@ pub fn pre_migration_backup_path(db_path: &str) -> PathBuf {
 pub fn read_migration_marker(db_path: &str) -> Option<MigrationMarker> {
     let bytes = host_fs::read(&migration_marker_path(db_path)).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+pub use fsqlite_pager::{HOLE_MARKER_SUFFIX, hole_marker_path};
+
+/// bd-ioq6x: whether `db_path` carries a hole marker (see "Hole marker"
+/// above). One `stat`; any error, including a missing sidecar, reads as
+/// absent, which degrades to the behavior before the marker existed.
+#[must_use]
+pub fn hole_marker_present(db_path: &str) -> bool {
+    host_fs::metadata(&hole_marker_path(Path::new(db_path))).is_ok()
+}
+
+/// bd-ioq6x: a stage of the open-time hole reclaim, for an installed
+/// observer ([`set_hole_reclaim_observer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoleReclaimStage {
+    /// This open won the first-attach EXCLUSIVE claim; the walk starts now.
+    Walking,
+    /// The reclaim commit is durable and the marker is gone; the downgrade
+    /// to SHARED follows.
+    Committed {
+        /// Pages the reclaim published free.
+        freed: usize,
+    },
+    /// The reclaim did not complete; the marker stays.
+    Failed,
+}
+
+/// Observer of [`HoleReclaimStage`]s.
+pub type HoleReclaimObserver = std::sync::Arc<dyn Fn(HoleReclaimStage) + Send + Sync>;
+
+static HOLE_RECLAIM_OBSERVER: std::sync::Mutex<Option<HoleReclaimObserver>> =
+    std::sync::Mutex::new(None);
+
+/// bd-ioq6x: install (`Some`) or clear (`None`) the process-wide observer of
+/// the open-time hole reclaim. Diagnostics and tests only: the observer runs
+/// on the opening thread WHILE the first-attach claim is held, so a slow
+/// observer stretches the window in which other openers wait.
+#[doc(hidden)]
+pub fn set_hole_reclaim_observer(observer: Option<HoleReclaimObserver>) {
+    *HOLE_RECLAIM_OBSERVER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = observer;
+}
+
+pub(crate) fn notify_hole_reclaim(stage: HoleReclaimStage) {
+    let observer = HOLE_RECLAIM_OBSERVER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(observer) = observer {
+        observer(stage);
+    }
 }
 
 /// Decide whether the value of [`SKIP_MIGRATION_ENV`] opts the process out.

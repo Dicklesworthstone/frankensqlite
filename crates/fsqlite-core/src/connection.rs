@@ -33,6 +33,8 @@
 
 mod conformal_retry;
 mod cte_cursor_budget;
+#[cfg(all(test, feature = "native", unix))]
+mod hole_reclaim_tests;
 mod insert_batch;
 mod literal_params;
 mod pragma_maintenance;
@@ -4533,6 +4535,88 @@ impl PagerBackend {
         }
     }
 
+    /// bd-ioq6x: see [`SimplePager::request_first_attach_exclusive`].
+    #[cfg(feature = "native")]
+    async fn request_first_attach_exclusive(&self, cx: &Cx) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.request_first_attach_exclusive(cx).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.request_first_attach_exclusive(cx).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.request_first_attach_exclusive(cx).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.request_first_attach_exclusive(cx).await,
+        }
+    }
+
+    /// bd-ioq6x: see [`SimplePager::holds_first_attach_exclusive`].
+    #[cfg(feature = "native")]
+    async fn holds_first_attach_exclusive(&self, cx: &Cx) -> Result<bool> {
+        match self {
+            Self::Memory(p) => p.holds_first_attach_exclusive(cx).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.holds_first_attach_exclusive(cx).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.holds_first_attach_exclusive(cx).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.holds_first_attach_exclusive(cx).await,
+        }
+    }
+
+    /// bd-ioq6x: see [`SimplePager::end_first_attach_exclusive`].
+    #[cfg(feature = "native")]
+    async fn end_first_attach_exclusive(&self, cx: &Cx) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.end_first_attach_exclusive(cx).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.end_first_attach_exclusive(cx).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.end_first_attach_exclusive(cx).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.end_first_attach_exclusive(cx).await,
+        }
+    }
+
+    /// bd-ioq6x: see [`SimplePager::fold_abandoned_pool_on_close`].
+    async fn fold_abandoned_pool_on_close(&self, cx: &Cx) -> Result<usize> {
+        match self {
+            Self::Memory(p) => p.fold_abandoned_pool_on_close(cx).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.fold_abandoned_pool_on_close(cx).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.fold_abandoned_pool_on_close(cx).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.fold_abandoned_pool_on_close(cx).await,
+        }
+    }
+
+    /// bd-ioq6x: see [`SimplePager::discard_in_range_parked_holes`] and
+    /// [`SimplePager::forget_hole_marker_publication`], after a reclaim.
+    #[cfg(feature = "native")]
+    fn settle_parked_holes_after_reclaim(&self) -> Result<()> {
+        match self {
+            Self::Memory(p) => {
+                p.forget_hole_marker_publication();
+                p.discard_in_range_parked_holes()
+            }
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => {
+                p.forget_hole_marker_publication();
+                p.discard_in_range_parked_holes()
+            }
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => {
+                p.forget_hole_marker_publication();
+                p.discard_in_range_parked_holes()
+            }
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => {
+                p.forget_hole_marker_publication();
+                p.discard_in_range_parked_holes()
+            }
+        }
+    }
+
     fn validate_namespace_binding(&self) -> Result<()> {
         match self {
             Self::Memory(p) => p.validate_namespace_binding(),
@@ -5819,7 +5903,7 @@ impl PagerBackend {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native"))]
     fn wal_commit_sync_policy(&self) -> WalCommitSyncPolicy {
         match self {
             Self::Memory(p) => p.wal_commit_sync_policy(),
@@ -19188,6 +19272,21 @@ impl Connection {
                 conn.pager.finish_namespace_bootstrap()?;
                 return Ok(());
             }
+            // bd-ioq6x: a hole marker asks this open, if it is the file's first
+            // attacher, to reclaim EOF holes a crashed writer left. Ask the
+            // main-file handle for stock's first-attach EXCLUSIVE try on the
+            // `-shm` dead-man switch BEFORE the WAL backend attaches it. One
+            // stat() when the marker is absent.
+            #[cfg(feature = "native")]
+            let hole_reclaim_requested = !pager_is_memory
+                && !storage_was_empty
+                && !conn.pager.is_readonly()
+                && crate::migration::hole_marker_present(&conn.path)
+                && conn
+                    .pager
+                    .request_first_attach_exclusive(&op_cx)
+                    .await
+                    .is_ok();
             conn.bootstrap_journal_mode_from_storage(storage_was_empty)
                 .await?;
             conn.bootstrap_pragma_state_from_storage();
@@ -19224,6 +19323,12 @@ impl Connection {
             #[cfg(feature = "native")]
             if !pager_is_memory {
                 crate::migration::run_first_open_migration(&conn, storage_was_empty).await;
+            }
+            // bd-ioq6x: after recovery and the migration pass, while the
+            // first-attach claim (if this open won it) is still held.
+            #[cfg(feature = "native")]
+            if hole_reclaim_requested {
+                conn.reclaim_eof_holes_as_first_attacher(&op_cx).await;
             }
             op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             Ok(())
@@ -31573,6 +31678,23 @@ impl Connection {
             LiveVtabCleanupAction::Disconnect,
             "connection close staged drop",
         );
+
+        // bd-ioq6x: fold this connection's own abandonment pool (EOF pages a
+        // rolled-back transaction returned after a sibling grew past them), so
+        // a cleanly closed file has no EOF holes at rest. One commit, only when
+        // the pool is non-empty; no walk at close. Best-effort: a refused fold
+        // leaves the pool to the drop path, exactly as before.
+        if !close_memory_db
+            && !self.pager.is_readonly()
+            && self.pager.journal_mode() == JournalMode::Wal
+            && let Err(error) = self.pager.fold_abandoned_pool_on_close(&cx).await
+        {
+            tracing::debug!(
+                target: "fsqlite.close",
+                %error,
+                "close-time abandonment-pool fold skipped"
+            );
+        }
 
         // Only in WAL mode: leaving it retired the WAL, and the producer with
         // it, so there is no tail to admit.
@@ -91843,6 +91965,77 @@ impl Connection {
         })
         .await?;
         Ok(count)
+    }
+
+    /// bd-ioq6x: the open-time reclaim of EOF holes a crashed writer left
+    /// behind, gated by the hole marker (`<db>.fsqlite-holes`, see
+    /// [`crate::migration::hole_marker_present`]).
+    ///
+    /// Runs only while this open holds stock's first-attach EXCLUSIVE claim
+    /// on the `-shm` dead-man-switch byte (taken when the WAL backend first
+    /// attached, after the open saw the marker). That claim is the lock held
+    /// across the walk: no connection of any process is attached, so no live
+    /// transaction holds an EOF reservation, and none can attach (an fsqlite
+    /// opener waits within its busy timeout, stock gets SQLITE_BUSY for its
+    /// busy handler) until the downgrade below, which follows the durable
+    /// reclaim commit and the marker's removal. The walk is
+    /// [`Self::repair_orphaned_pages`], integrity_check's own never-used
+    /// definition. It changes OPEN-time locking only: writer concurrency is
+    /// untouched. Never fails the open: an error keeps the marker for the next
+    /// first attacher.
+    #[cfg(feature = "native")]
+    async fn reclaim_eof_holes_as_first_attacher(&self, cx: &Cx) {
+        use crate::migration::{HoleReclaimStage, notify_hole_reclaim};
+        let held = self
+            .pager
+            .holds_first_attach_exclusive(cx)
+            .await
+            .unwrap_or(false);
+        if held && !self.pager.is_readonly() {
+            notify_hole_reclaim(HoleReclaimStage::Walking);
+            match self.reclaim_eof_holes_holding_first_attach().await {
+                Ok(freed) => notify_hole_reclaim(HoleReclaimStage::Committed { freed }),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "fsqlite.migration",
+                        db = %self.path,
+                        %error,
+                        "hole reclaim incomplete; the marker stays for the next first attacher"
+                    );
+                    notify_hole_reclaim(HoleReclaimStage::Failed);
+                }
+            }
+        }
+        if let Err(error) = self.pager.end_first_attach_exclusive(cx).await {
+            tracing::warn!(
+                target: "fsqlite.migration",
+                db = %self.path,
+                %error,
+                "first-attach dead-man-switch downgrade failed"
+            );
+        }
+    }
+
+    #[cfg(feature = "native")]
+    async fn reclaim_eof_holes_holding_first_attach(&self) -> Result<usize> {
+        let marker = fsqlite_pager::hole_marker_path(Path::new(&self.path));
+        // The marker may go only after the reclaim commit is durable, whatever
+        // the connection's synchronous setting.
+        let policy = self.pager.wal_commit_sync_policy();
+        self.pager
+            .set_wal_commit_sync_policy(WalCommitSyncPolicy::PerCommit)?;
+        let freed = self.repair_orphaned_pages().await;
+        let restored = self.pager.set_wal_commit_sync_policy(policy);
+        let freed = freed?;
+        restored?;
+        self.pager.settle_parked_holes_after_reclaim()?;
+        match fsqlite_vfs::host_fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(FrankenError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fsqlite_vfs::host_fs::sync_parent_directory(&marker)?;
+        Ok(freed)
     }
 
     /// bd-7o1vu (GH#370): names of orphaned `%_content` shadow tables left on

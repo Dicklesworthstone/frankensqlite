@@ -2211,6 +2211,7 @@ impl Vfs for UnixVfs {
             shm_path,
             shm_info: None,
             shm_dms_lifetime_claim: false,
+            first_attach_dms: FirstAttachDms::Idle,
             private_reader_shm: None,
             busy_timeout_ms: 0,
             mmap: UnixMmapController::new(),
@@ -2389,6 +2390,18 @@ impl UnixExternalMaintenanceAttempt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalLifetimeClaim {
     Unclaimed,
+    Held,
+}
+
+/// bd-ioq6x: this handle's part in stock's first-attach EXCLUSIVE DMS try
+/// (see [`VfsFile::request_first_attach_exclusive`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstAttachDms {
+    /// The attachment takes (or took) the ordinary SHARED claim.
+    Idle,
+    /// The next first attachment tries EXCLUSIVE before SHARED.
+    Requested,
+    /// The try won: the DMS byte is held EXCLUSIVE until the downgrade.
     Held,
 }
 
@@ -2696,6 +2709,11 @@ pub struct UnixFile {
     /// One DMS SHARED claim for this attachment, independent of compatibility
     /// helper nesting. Retained through failed unmap/close and deferred cleanup.
     shm_dms_lifetime_claim: bool,
+    /// bd-ioq6x: whether the first attachment tries the DMS byte EXCLUSIVE,
+    /// and whether that try is held. The held claim lives in the SHM table's
+    /// DMS slot (`exclusive_owner` plus this owner's SHARED count), so close
+    /// and deferred cleanup release it like any other DMS claim.
+    first_attach_dms: FirstAttachDms,
     /// bd-j2dtf item 2: the `O_RDONLY` `-shm` descriptor whose open file
     /// description holds `WAL_READ_LOCK(0)` SHARED for a private-index
     /// reader. Never registered in the shared SHM table; dropping it releases
@@ -3113,11 +3131,55 @@ impl UnixFile {
             create,
         )?;
         self.shm_info = Some(Arc::clone(&info));
+        // bd-ioq6x: stock's first attach tries the DMS byte EXCLUSIVE before
+        // it settles for SHARED. Only a requested try is made; it wins only
+        // when no owner in this process and no other process holds the byte.
+        if self.first_attach_dms == FirstAttachDms::Requested {
+            self.first_attach_dms = FirstAttachDms::Idle;
+            if self.try_first_attach_exclusive_dms(&info)? {
+                self.first_attach_dms = FirstAttachDms::Held;
+                return Ok(info);
+            }
+        }
         // Register the exact cleanup owner before this fallible raw claim.
         // No mapping may escape while a stock first opener can take DMS
         // EXCLUSIVE and truncate the backing file beneath our aliases.
         self.retain_shm_dms_lifetime(&info)?;
         Ok(info)
+    }
+
+    /// bd-ioq6x: stock's first-attach EXCLUSIVE try on the DMS byte, made
+    /// before this handle holds any DMS claim. In-process owners share one
+    /// POSIX lock domain, so the SHM table's DMS slot must be empty as well:
+    /// any other owner there is a live attachment of this process. The won
+    /// claim records this owner as the EXCLUSIVE owner AND as its ordinary
+    /// SHARED holder, so the downgrade (or close) leaves exactly the claim an
+    /// ordinary attachment holds.
+    fn try_first_attach_exclusive_dms(&mut self, info: &Arc<Mutex<ShmInfo>>) -> Result<bool> {
+        if self.shm_dms_lifetime_claim {
+            return Ok(false);
+        }
+        let slot_idx = usize::try_from(SQLITE_SHM_DMS_SLOT).expect("DMS slot fits usize");
+        let mut info = info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot_state = &info.slots[slot_idx];
+        if slot_state.exclusive_owner.is_some() || !slot_state.shared_holders.is_empty() {
+            return Ok(false);
+        }
+        if !posix_lock(&*info.file, libc::F_WRLCK, sqlite_shm_dms_lock_byte(), 1)? {
+            return Ok(false);
+        }
+        let slot_state = &mut info.slots[slot_idx];
+        slot_state.exclusive_owner = Some(self.shm_owner_id);
+        slot_state.shared_holders.insert(self.shm_owner_id, 1);
+        self.shm_dms_lifetime_claim = true;
+        lock_debug!(
+            slot = SQLITE_SHM_DMS_SLOT,
+            requested_mode = "first-attach-exclusive",
+            "acquired shm DMS exclusive as the first attacher"
+        );
+        Ok(true)
     }
 
     /// SQLite takes EXCLUSIVE on the main file to decide whether its WAL
@@ -4233,6 +4295,7 @@ impl UnixFile {
             shm_path: self.shm_path.clone(),
             shm_info: Some(Arc::clone(shm_info)),
             shm_dms_lifetime_claim: false,
+            first_attach_dms: FirstAttachDms::Idle,
             private_reader_shm: None,
             busy_timeout_ms: self.busy_timeout_ms,
             mmap: UnixMmapController::new(),
@@ -4243,7 +4306,20 @@ impl UnixFile {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             info.owner_refs.insert(owner.shm_owner_id, 1);
             info.mapping_owners.insert(owner.shm_owner_id);
-            owner.acquire_shm_dms_shared(&mut info)
+            let dms_slot = usize::try_from(SQLITE_SHM_DMS_SLOT).expect("DMS slot fits usize");
+            if info.slots[dms_slot].exclusive_owner == Some(self.shm_owner_id) {
+                // bd-ioq6x: this handle's own first-attach EXCLUSIVE claim
+                // already holds the process's lock on the DMS byte and keeps
+                // every other attacher out; a mapping it creates meanwhile
+                // registers its SHARED claim under that hold, which the
+                // downgrade then leaves in place.
+                info.slots[dms_slot]
+                    .shared_holders
+                    .insert(owner.shm_owner_id, 1);
+                Ok(())
+            } else {
+                owner.acquire_shm_dms_shared(&mut info)
+            }
         };
         acquire?;
         owner.shm_dms_lifetime_claim = true;
@@ -4285,6 +4361,7 @@ impl UnixFile {
             shm_path: std::mem::take(&mut self.shm_path),
             shm_info: self.shm_info.take(),
             shm_dms_lifetime_claim: self.shm_dms_lifetime_claim,
+            first_attach_dms: FirstAttachDms::Idle,
             private_reader_shm: self.private_reader_shm.take(),
             busy_timeout_ms: self.busy_timeout_ms,
             mmap: UnixMmapController::new(),
@@ -4332,6 +4409,7 @@ impl UnixFile {
             shm_path: self.shm_path.clone(),
             shm_info: None,
             shm_dms_lifetime_claim: false,
+            first_attach_dms: FirstAttachDms::Idle,
             private_reader_shm: None,
             busy_timeout_ms: 0,
             mmap: UnixMmapController::new(),
@@ -6058,6 +6136,51 @@ impl VfsFile for UnixFile {
         }
         self.release_shm_owner_state(delete)?;
         self.release_wal_lifetime_claim()
+    }
+
+    fn request_first_attach_exclusive(&mut self) {
+        if self.shm_info.is_none() && !self.shm_dms_lifetime_claim {
+            self.first_attach_dms = FirstAttachDms::Requested;
+        }
+    }
+
+    fn holds_first_attach_exclusive(&self) -> bool {
+        self.first_attach_dms == FirstAttachDms::Held
+    }
+
+    fn end_first_attach_exclusive(&mut self, _cx: &Cx) -> Result<()> {
+        match self.first_attach_dms {
+            FirstAttachDms::Idle => return Ok(()),
+            FirstAttachDms::Requested => {
+                self.first_attach_dms = FirstAttachDms::Idle;
+                return Ok(());
+            }
+            FirstAttachDms::Held => {}
+        }
+        let Some(info_arc) = self.shm_info.as_ref().map(Arc::clone) else {
+            // Close already released the claim with the attachment.
+            self.first_attach_dms = FirstAttachDms::Idle;
+            return Ok(());
+        };
+        let slot_idx = usize::try_from(SQLITE_SHM_DMS_SLOT).expect("DMS slot fits usize");
+        let mut info = info_arc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if info.slots[slot_idx].exclusive_owner == Some(self.shm_owner_id) {
+            // Raw first, state second: converting this process's own write
+            // lock to a read lock cannot conflict with another process.
+            if !posix_lock(&*info.file, libc::F_RDLCK, sqlite_shm_dms_lock_byte(), 1)? {
+                return Err(FrankenError::Busy);
+            }
+            info.slots[slot_idx].exclusive_owner = None;
+        }
+        self.first_attach_dms = FirstAttachDms::Idle;
+        lock_debug!(
+            slot = SQLITE_SHM_DMS_SLOT,
+            requested_mode = "first-attach-downgrade",
+            "downgraded shm DMS exclusive to shared"
+        );
+        Ok(())
     }
 
     // --- GH#399: cross-process WAL reader registration (C SQLite `aReadMark`) ---

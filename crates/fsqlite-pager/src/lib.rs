@@ -127,10 +127,10 @@ pub use page_cache::{
     PageCacheQueueKind, ShardedPageCache, resolve_page_buffer_max,
 };
 pub use pager::{
-    ConnectionPagerOpenMode, PAGER_METADATA_PUBLICATION_CONTRACTS, PagerCommitProfileSnapshot,
+    ConnectionPagerOpenMode, HOLE_MARKER_SUFFIX, PAGER_METADATA_PUBLICATION_CONTRACTS, PagerCommitProfileSnapshot,
     PagerMetadataPublicationClass, PagerMetadataPublicationContract, PagerPublishedSnapshot,
     ParallelWalPublicationIntent, RollbackCleanup, SimplePager, SimplePagerCheckpointWriter,
-    SimpleTransaction, WalCommitSyncPolicy, WalIndexReaderLease, WalIndexShmSource, pager_commit_profile_enabled,
+    SimpleTransaction, WalCommitSyncPolicy, WalIndexReaderLease, WalIndexShmSource, hole_marker_path, pager_commit_profile_enabled,
     pager_commit_profile_snapshot, remove_group_commit_queue, reset_pager_commit_profile,
     reset_staged_page_overwrite_steals_total, set_pager_commit_profile_enabled,
     staged_page_overwrite_steals_total,
