@@ -75,6 +75,43 @@ Current blocker snapshot from [tests/artifacts/perf/concurrent-showcase-20260424
 
 Those numbers are a blocker, not evidence of an MVCC throughput win yet.
 
+## OLTP Short-Transaction Shape (bd-acuhw)
+
+Group commit can only coalesce when commits from different connections arrive
+together, so it needs many short transactions per connection. One bulk
+transaction per writer never exercises it. `mt-mvcc-bench` measures this shape
+with two flags on top of `--one-row-per-transaction`:
+
+```bash
+rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_<name> \
+  cargo run --profile release-perf -p fsqlite-e2e --bin mt-mvcc-bench -- \
+  --one-row-per-transaction --rows-per-transaction=5 --stock-begin=immediate \
+  --synchronous=full --separate-tables \
+  --threads=1,2,4,8,16 --rows-per-thread=500 --iters=5
+```
+
+- `--rows-per-transaction=K` makes every transaction insert K consecutive
+  rows. It requires `--one-row-per-transaction`, and K must divide
+  `--rows-per-thread`. The report's `transaction_contract` receipt records K.
+- `--stock-begin=immediate` opens the stock arm's transactions with
+  `BEGIN IMMEDIATE`. FrankenSQLite keeps its default concurrent mode.
+- Without these flags the run keeps the v10 one-row contract: K = 1, and stock
+  opens with a deferred `BEGIN`.
+- Per arm, stderr carries an executed-work receipt for both engines:
+  `arm_cost engine=… threads=… rows_per_transaction=… committed_rows=…
+  transactions=… workload_ms=… process_cpu_ms=… cpu_cores=…
+  cpu_us_per_transaction=… os_threads_peak=…`. It is diagnostic only, and no
+  verdict reads it.
+- Per FrankenSQLite round, `group_commit_batches threads=… epochs=…
+  transactions_batched=… mean_batch=… histogram=…` prints the epoch batch-size
+  histogram from fsqlite-wal's `ConsolidationMetrics`. Coalescing shows up as
+  `mean_batch` > 1. At `--synchronous=normal` no per-commit sync is shared, so
+  expect batches of 1 there.
+
+For the measured result, the method (same-worker A/B with an A/A null, stock
+3.54.1 live) and the coverage limits, see the 2026-11-25 bd-6a8a5 L1 entry in
+`docs/progress/perf-negative-results.md` and commit `c71e4a99e`.
+
 ## Canonical Hot-Profile Workflow
 
 The standard way to answer “where is FrankenSQLite spending time?” is `realdb-e2e hot-profile`, not ad hoc speculation.
