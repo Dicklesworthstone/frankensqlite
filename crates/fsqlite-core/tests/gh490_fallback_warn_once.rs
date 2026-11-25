@@ -148,6 +148,15 @@ fn row_by_row_inserts_do_not_warn_and_other_fallbacks_warn_once() {
                 .await
                 .expect("trigger insert");
             }
+            // bd-5ofes (GH#496): a multi-statement 100-row plain FK insert
+            // enters execute_insert_dispatch and must take morsel_insert_dispatch
+            // (not insert_values_row_by_row_trigger_or_fk_fallback), at DEBUG.
+            conn.execute(&format!(
+                "SELECT 1; INSERT INTO events VALUES {}",
+                values_list(20_000, 100)
+            ))
+            .await
+            .expect("multi-statement fk morsel insert");
             // An unexpected fallback, repeated: reported once.
             for _ in 0..5 {
                 conn.query(
@@ -158,7 +167,7 @@ fn row_by_row_inserts_do_not_warn_and_other_fallbacks_warn_once() {
                 .expect("correlated exists");
             }
             for (sql, expected) in [
-                ("SELECT count(*) FROM events", 2000),
+                ("SELECT count(*) FROM events", 2100),
                 ("SELECT count(*) FROM logged", 1000),
                 ("SELECT count(*) FROM audit", 1000),
             ] {
@@ -179,8 +188,15 @@ fn row_by_row_inserts_do_not_warn_and_other_fallbacks_warn_once() {
         .clone();
     assert!(
         events.iter().any(|(_, _, reason)| reason == ROW_BY_ROW),
-        "the multi-row FK / trigger inserts must take the row-by-row replay this test is about: \
+        "the multi-row trigger / OR REPLACE RETURNING inserts must take the row-by-row replay: \
          {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, _, reason)| reason == "morsel_insert_dispatch"),
+        "bd-5ofes (GH#496): 100-row plain FK inserts into `events` must take \
+         morsel_insert_dispatch instead of row-by-row fallback: {events:?}"
     );
     let warnings: Vec<&Captured> = events.iter().filter(|(warn, _, _)| *warn).collect();
     assert!(

@@ -9437,6 +9437,35 @@ struct PreparedCountIndexedRowidProbeSpec {
     probe_rowid_upper_bound: PreparedProbeRowidBound,
 }
 
+/// bd-5ofes (GH#496): source of one child-FK column value in a precompiled
+/// prepared `INSERT ... VALUES` statement, eliminating per-execution SQL
+/// re-parsing and AST re-evaluation on FK-checked prepared inserts.
+#[derive(Debug, Clone)]
+enum PreparedFkValueSource {
+    /// 1-based bound parameter slot in `params`.
+    Param(usize),
+    /// Constant literal value from VALUES or a constant column DEFAULT.
+    Literal(SqliteValue),
+}
+
+#[derive(Debug, Clone)]
+struct PreparedInsertFkCheck {
+    /// Index into `TableSchema::foreign_keys`.
+    fk_index: usize,
+    /// Number of child columns in this FK (`1` for single-column FKs).
+    col_count: usize,
+    /// Child column affinities (`len == col_count`).
+    affinities: SmallVec<[TypeAffinity; 2]>,
+    /// Flat row-major value sources (`len == row_count * col_count`).
+    sources: Vec<PreparedFkValueSource>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedInsertFkPlan {
+    row_count: usize,
+    checks: Vec<PreparedInsertFkCheck>,
+}
+
 #[derive(Debug, Clone)]
 struct PreparedPrecompiledDml {
     kind: PreparedDmlKind,
@@ -9448,6 +9477,9 @@ struct PreparedPrecompiledDml {
     runtime_requirements: TableExecutionRuntimeRequirements,
     static_runtime_inputs: Option<TableExecutionRuntimeInputs>,
     direct_simple_insert: Option<PreparedDirectSimpleInsert>,
+    /// bd-5ofes (GH#496): precompiled child-FK validation plan for plain/ABORT
+    /// VALUES inserts into tables with outbound FKs.
+    prepared_insert_fk_plan: Option<PreparedInsertFkPlan>,
     /// Issue #110: `true` when this is an `INSERT OR REPLACE` or an upsert
     /// (`ON CONFLICT`), i.e. an INSERT that can delete or mutate an existing
     /// row (potentially a parent of a previously cached child FK). Only
@@ -15988,6 +16020,11 @@ pub struct Connection {
     /// User trigger programs temporarily restore enforcement while the
     /// enclosing action remains charged against the recursion budget.
     fk_action_checks_suppressed: Cell<bool>,
+    /// bd-5ofes (GH#496): suppresses redundant inner per-batch / per-row FK
+    /// checks while `InsertSelectReplayEmitter` runs batched `VALUES` chunks
+    /// for an admitted plain/`OR ABORT` outbound-FK table and validates the
+    /// deduplicated parent keys once at statement end.
+    suppress_inner_batched_insert_fk_check: Cell<bool>,
     /// Recursive-program depth inherited from a delegating parent connection
     /// (bd-wymdl.3). Attached-schema statements execute on a separately opened
     /// child `Connection`; seeding this baseline at every delegation makes
@@ -18202,6 +18239,7 @@ impl Connection {
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             fk_action_checks_suppressed: Cell::new(false),
+            suppress_inner_batched_insert_fk_check: Cell::new(false),
             inherited_recursive_program_depth: Cell::new(0),
             deferred_fk_checks: RefCell::new(Vec::new()),
             fk_force_immediate_check: Cell::new(false),
@@ -18878,6 +18916,7 @@ impl Connection {
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             fk_action_checks_suppressed: Cell::new(false),
+            suppress_inner_batched_insert_fk_check: Cell::new(false),
             inherited_recursive_program_depth: Cell::new(0),
             deferred_fk_checks: RefCell::new(Vec::new()),
             fk_force_immediate_check: Cell::new(false),
@@ -38720,7 +38759,10 @@ impl Connection {
             .direct_simple_insert
             .as_ref()
             .filter(|direct| !Self::direct_simple_insert_prefers_reusable_table_program(direct))?;
-        if self.fk_enforcement_enabled() && self.table_has_outbound_foreign_keys(table_name) {
+        if self.fk_enforcement_enabled()
+            && !self.suppress_inner_batched_insert_fk_check.get()
+            && self.table_has_outbound_foreign_keys(table_name)
+        {
             return None;
         }
 
@@ -39030,19 +39072,43 @@ impl Connection {
         // row it never inserted (#111).
         if affected > 0
             && !fk_enforced_by_inner
+            && !self.suppress_inner_batched_insert_fk_check.get()
             && self.fk_enforcement_enabled()
             && self.table_has_outbound_foreign_keys(table_name)
         {
-            // Only re-parse on the cold FK path (rare: inserts into tables
-            // with outbound FKs that didn't take the direct-simple lane).
-            let statement = parse_single_statement(stmt.sql.as_ref())?;
-            let Statement::Insert(insert) = statement else {
-                return Err(FrankenError::internal(
-                    "prepared INSERT FK enforcement expected canonical INSERT SQL",
-                ));
+            let validated_by_plan = if self.statement_fk_validation_depth.get() <= 1
+                && let Some(fk_plan) = stmt
+                    .precompiled_dml()
+                    .and_then(|dml| dml.prepared_insert_fk_plan.as_ref())
+            {
+                match self
+                    .validate_prepared_insert_fk_plan(table_name, fk_plan, params)
+                    .await
+                {
+                    Ok(handled) => handled,
+                    Err(error) => {
+                        if fk_plan.row_count > 1 {
+                            self.record_fk_validation_error_state(affected, last_insert_rowid, 0);
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                false
             };
-            self.enforce_fk_on_insert(&insert, table_name, params)
-                .await?;
+            if !validated_by_plan {
+                // Only re-parse on the cold FK path (rare: inserts into tables
+                // with outbound FKs that didn't take the direct-simple or
+                // precompiled-FK-plan lanes).
+                let statement = parse_single_statement(stmt.sql.as_ref())?;
+                let Statement::Insert(insert) = statement else {
+                    return Err(FrankenError::internal(
+                        "prepared INSERT FK enforcement expected canonical INSERT SQL",
+                    ));
+                };
+                self.enforce_fk_on_insert(&insert, table_name, params)
+                    .await?;
+            }
         }
         match post_write_action {
             PreparedInsertPostWriteAction::None => {}
@@ -39116,6 +39182,7 @@ impl Connection {
         // (outcome.0 == 0); SQLite does not run FK checks on a row it never
         // inserted, so gate FK enforcement on a row actually landing (#111).
         if outcome.0 > 0
+            && !self.suppress_inner_batched_insert_fk_check.get()
             && self.fk_enforcement_enabled()
             && self.table_has_outbound_foreign_keys(&insert.table.name)
         {
@@ -39693,8 +39760,9 @@ impl Connection {
             .await?;
         self.flush_pending_direct_delete_leaf_run(execution_cx)
             .await?;
-        let direct_insert_requires_fk_check =
-            self.fk_enforcement_enabled() && self.table_has_outbound_foreign_keys(table_name);
+        let direct_insert_requires_fk_check = self.fk_enforcement_enabled()
+            && !self.suppress_inner_batched_insert_fk_check.get()
+            && self.table_has_outbound_foreign_keys(table_name);
         let track_memdb_delta = self.should_track_prepared_direct_insert_memdb_delta();
         let defer_memdb_upsert =
             track_memdb_delta && self.in_transaction.get() && !self.pager.is_memory();
@@ -49236,6 +49304,11 @@ struct InsertSelectReplayEmitter<'conn> {
     compiled_insert: Option<insert_batch::CompiledInsertReplay>,
     returning_statement: Option<Statement>,
     batch: Option<InsertSelectReplayBatch<'conn>>,
+    /// bd-5ofes (GH#496): per-statement distinct-parent-key child-FK collector
+    /// used when batched replay runs on an admitted plain/`OR ABORT` outbound-FK
+    /// table. Inner batches suppress per-row FK checks and this collector
+    /// validates each distinct parent key once at statement end.
+    batched_fk: Option<BatchedInsertFkCollector>,
     statement_changes: usize,
     returning_rows: Vec<Row>,
     produced_rows: usize,
@@ -49243,6 +49316,260 @@ struct InsertSelectReplayEmitter<'conn> {
     preserve_constraint_failure_rows: bool,
     previous_changes: usize,
     previous_total_changes: usize,
+}
+
+enum BatchedFkColSource {
+    SourceIdx(usize),
+    Constant(SqliteValue),
+}
+
+struct BatchedFkSpec {
+    fk_index: usize,
+    sources: SmallVec<[(BatchedFkColSource, TypeAffinity); 2]>,
+    /// Fast single-value deduplication for 1-column FKs: avoids allocating a
+    /// HashSet when every row in the statement shares one constant parent key.
+    single_first: Option<SqliteValue>,
+    single_set: Option<HashSet<SqliteValueHashable>>,
+    /// Distinct composite keys for multi-column FKs.
+    multi_set: HashSet<Vec<SqliteValueHashable>>,
+}
+
+struct BatchedInsertFkCollector {
+    table_name: String,
+    specs: Vec<BatchedFkSpec>,
+    capture_deferred_rows: bool,
+    deferred_source_rows: Vec<Vec<SqliteValue>>,
+    layout: InsertTargetLayout,
+}
+
+impl BatchedFkSpec {
+    fn observe_single_into(
+        single_first: &mut Option<SqliteValue>,
+        single_set: &mut Option<HashSet<SqliteValueHashable>>,
+        value: Cow<'_, SqliteValue>,
+    ) {
+        if let Some(set) = single_set.as_mut() {
+            set.insert(SqliteValueHashable(value.into_owned()));
+            return;
+        }
+        if let Some(first) = single_first.as_ref() {
+            if value.as_ref() == first {
+                return;
+            }
+            let mut set = HashSet::new();
+            set.insert(SqliteValueHashable(first.clone()));
+            set.insert(SqliteValueHashable(value.into_owned()));
+            *single_set = Some(set);
+        } else {
+            *single_first = Some(value.into_owned());
+        }
+    }
+
+    fn extract_key_for_row(&self, source_row: &[SqliteValue]) -> Option<Vec<SqliteValue>> {
+        let mut key = Vec::with_capacity(self.sources.len());
+        for (source, affinity) in &self.sources {
+            let raw = match source {
+                BatchedFkColSource::SourceIdx(idx) => source_row.get(*idx)?,
+                BatchedFkColSource::Constant(val) => val,
+            };
+            if raw.is_null() {
+                return None;
+            }
+            key.push(coerce_child_fk_value_cow(raw, *affinity).into_owned());
+        }
+        Some(key)
+    }
+}
+
+impl BatchedInsertFkCollector {
+    fn observe_row(&mut self, source_row: &[SqliteValue]) {
+        if self.capture_deferred_rows {
+            self.deferred_source_rows.push(source_row.to_vec());
+        }
+        for spec in &mut self.specs {
+            if spec.sources.len() == 1 {
+                let (source, affinity) = &spec.sources[0];
+                let raw = match source {
+                    BatchedFkColSource::SourceIdx(idx) => {
+                        let Some(v) = source_row.get(*idx) else {
+                            continue;
+                        };
+                        v
+                    }
+                    BatchedFkColSource::Constant(val) => val,
+                };
+                if raw.is_null() {
+                    continue;
+                }
+                let coerced = coerce_child_fk_value_cow(raw, *affinity);
+                BatchedFkSpec::observe_single_into(
+                    &mut spec.single_first,
+                    &mut spec.single_set,
+                    coerced,
+                );
+            } else {
+                let mut key = Vec::with_capacity(spec.sources.len());
+                let mut has_null = false;
+                for (source, affinity) in &spec.sources {
+                    let raw = match source {
+                        BatchedFkColSource::SourceIdx(idx) => {
+                            let Some(v) = source_row.get(*idx) else {
+                                has_null = true;
+                                break;
+                            };
+                            v
+                        }
+                        BatchedFkColSource::Constant(val) => val,
+                    };
+                    if raw.is_null() {
+                        has_null = true;
+                        break;
+                    }
+                    key.push(SqliteValueHashable(
+                        coerce_child_fk_value_cow(raw, *affinity).into_owned(),
+                    ));
+                }
+                if !has_null {
+                    spec.multi_set.insert(key);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn validate(&self, conn: &Connection) -> Result<()> {
+        let fk_defs = {
+            let schema = conn.schema.borrow();
+            let Some(table) = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(&self.table_name))
+            else {
+                return Ok(());
+            };
+            if table.foreign_keys.is_empty() {
+                return Ok(());
+            }
+            table.foreign_keys.clone()
+        };
+        conn.ensure_fk_parent_validation_cache();
+
+        let mut autocommit_deferred_violation = false;
+        let mut deferred_missing: Vec<(usize, HashSet<Vec<SqliteValueHashable>>)> = Vec::new();
+
+        for spec in &self.specs {
+            let Some(fk) = fk_defs.get(spec.fk_index) else {
+                continue;
+            };
+            let is_deferred_in_txn = conn.fk_should_defer(fk);
+            let is_autocommit_deferred = fk.deferred || conn.defer_foreign_keys.get();
+            let mut missing_keys: Option<HashSet<Vec<SqliteValueHashable>>> = None;
+
+            if spec.sources.len() == 1 {
+                if let Some(set) = spec.single_set.as_ref() {
+                    for key in set {
+                        let key_ref = [&key.0];
+                        if conn
+                            .fk_parent_key_exists(&self.table_name, fk, &key_ref)
+                            .await?
+                            == FkParentKeyPresence::Missing
+                        {
+                            if is_deferred_in_txn {
+                                missing_keys
+                                    .get_or_insert_with(HashSet::new)
+                                    .insert(vec![key.clone()]);
+                            } else if is_autocommit_deferred {
+                                autocommit_deferred_violation = true;
+                            } else {
+                                conn.last_fk_violation_was_deferred.set(false);
+                                return Err(FrankenError::ForeignKeyViolation);
+                            }
+                        }
+                    }
+                } else if let Some(first) = spec.single_first.as_ref() {
+                    let key_ref = [first];
+                    if conn
+                        .fk_parent_key_exists(&self.table_name, fk, &key_ref)
+                        .await?
+                        == FkParentKeyPresence::Missing
+                    {
+                        if is_deferred_in_txn {
+                            missing_keys
+                                .get_or_insert_with(HashSet::new)
+                                .insert(vec![SqliteValueHashable(first.clone())]);
+                        } else if is_autocommit_deferred {
+                            autocommit_deferred_violation = true;
+                        } else {
+                            conn.last_fk_violation_was_deferred.set(false);
+                            return Err(FrankenError::ForeignKeyViolation);
+                        }
+                    }
+                }
+            } else {
+                for key in &spec.multi_set {
+                    let key_refs: SmallVec<[&SqliteValue; 4]> = key.iter().map(|v| &v.0).collect();
+                    if conn
+                        .fk_parent_key_exists(&self.table_name, fk, &key_refs)
+                        .await?
+                        == FkParentKeyPresence::Missing
+                    {
+                        if is_deferred_in_txn {
+                            missing_keys
+                                .get_or_insert_with(HashSet::new)
+                                .insert(key.clone());
+                        } else if is_autocommit_deferred {
+                            autocommit_deferred_violation = true;
+                        } else {
+                            conn.last_fk_violation_was_deferred.set(false);
+                            return Err(FrankenError::ForeignKeyViolation);
+                        }
+                    }
+                }
+            }
+
+            if let Some(keys) = missing_keys {
+                deferred_missing.push((spec.fk_index, keys));
+            }
+        }
+
+        if autocommit_deferred_violation {
+            conn.last_fk_violation_was_deferred.set(true);
+            return Err(FrankenError::ForeignKeyViolation);
+        }
+
+        if !deferred_missing.is_empty() {
+            let default_row = conn
+                .evaluate_default_row_from_sqls(&self.layout.default_sqls)
+                .await?;
+            for (row_idx, source_row) in self.deferred_source_rows.iter().enumerate() {
+                let violated = deferred_missing.iter().any(|(fk_index, missing_set)| {
+                    self.specs
+                        .iter()
+                        .find(|spec| spec.fk_index == *fk_index)
+                        .and_then(|spec| spec.extract_key_for_row(source_row))
+                        .is_some_and(|key| {
+                            let hashable: Vec<SqliteValueHashable> =
+                                key.into_iter().map(SqliteValueHashable).collect();
+                            missing_set.contains(&hashable)
+                        })
+                });
+                if violated {
+                    let (table_row, _explicit_rowid) = conn.map_insert_source_row_to_table_row(
+                        &default_row,
+                        &self.layout.targets,
+                        self.layout.rowid_alias_col_idx,
+                        self.layout.explicit_rowid_source,
+                        source_row,
+                        &format!("batched FK deferred row {}", row_idx + 1),
+                    )?;
+                    conn.deferred_fk_checks
+                        .borrow_mut()
+                        .push((self.table_name.clone(), table_row));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// bd-i3csr (GH#491): source rows replayed `rows` at a time through one
@@ -49310,6 +49637,10 @@ impl InsertSelectReplayEmitter<'_> {
             return Err(FrankenError::FunctionError(message));
         }
 
+        if let Some(batched_fk) = self.batched_fk.as_mut() {
+            batched_fk.observe_row(row_values);
+        }
+
         let Some(mut batch) = self.batch.take() else {
             return self.replay(None, row_values).await;
         };
@@ -49338,6 +49669,32 @@ impl InsertSelectReplayEmitter<'_> {
         Ok(())
     }
 
+    /// bd-5ofes (GH#496): validate all distinct child-FK parent keys collected
+    /// across the statement after every row has been written to the B-tree.
+    async fn validate_batched_fk(&self) -> Result<()> {
+        let Some(collector) = self.batched_fk.as_ref() else {
+            return Ok(());
+        };
+        let retained_changes = self.connection.last_changes.get();
+        let retained_total_changes = self.connection.total_changes.get();
+        let retained_last_insert_rowid = self.connection.current_last_insert_rowid();
+        let result = collector.validate(self.connection).await;
+        if let Err(error) = result {
+            self.connection.record_fk_validation_error_state(
+                self.statement_changes,
+                (self.statement_changes > 0).then_some(retained_last_insert_rowid),
+                0,
+            );
+            return Err(error);
+        }
+        self.connection.restore_change_tracking_state(
+            retained_changes,
+            retained_total_changes,
+            retained_last_insert_rowid,
+        );
+        Ok(())
+    }
+
     /// Inserts `row_values`: one row through the replay statement, or a whole
     /// batch of rows through `batch_prepared`.
     async fn replay(
@@ -49347,6 +49704,9 @@ impl InsertSelectReplayEmitter<'_> {
     ) -> Result<()> {
         self.connection
             .set_statement_change_count(self.previous_changes);
+        let _suppress_inner_fk = self.batched_fk.is_some().then(|| {
+            BoolCellRestoreGuard::new(&self.connection.suppress_inner_batched_insert_fk_check, true)
+        });
         let row_result = if let Some(prepared) = batch_prepared {
             self.connection
                 .execute_prepared_with_params_after_background_status(prepared, row_values, false)
@@ -49386,6 +49746,7 @@ impl InsertSelectReplayEmitter<'_> {
                 "INSERT ... SELECT replay missing prepared statement",
             ))
         };
+        drop(_suppress_inner_fk);
 
         match row_result {
             Ok(affected) => {
@@ -51680,6 +52041,14 @@ impl Connection {
                 } else {
                     0
                 };
+                let batched_fk = if prepared.is_some()
+                    && self.insert_has_outbound_fk(insert)
+                    && self.insert_supports_batched_fk_replay(insert)
+                {
+                    self.build_batched_insert_fk_collector(&insert.table.name, &layout)
+                } else {
+                    None
+                };
                 let batch = if batch_rows > 1 {
                     let batch_sql =
                         self.build_insert_select_replay_sql(insert, &layout, batch_rows);
@@ -51701,6 +52070,7 @@ impl Connection {
                     compiled_insert,
                     returning_statement,
                     batch,
+                    batched_fk,
                     statement_changes: 0,
                     returning_rows: Vec::new(),
                     produced_rows: 0,
@@ -51719,6 +52089,7 @@ impl Connection {
                     return Err(error);
                 }
                 emitter.flush_batch_rows().await?;
+                emitter.validate_batched_fk().await?;
                 Ok(emitter.into_outcome())
             })
             .await
@@ -51757,8 +52128,9 @@ impl Connection {
     /// in order with the same per-row conflict handling as per-row replay. It
     /// differs where a row's effects or failure scope are visible per
     /// statement, so these keep per-row replay: RETURNING, UPSERT, OR FAIL,
-    /// OR ROLLBACK, foreign keys, and INSERT triggers. So does any target that
-    /// is not a plain table of the main schema.
+    /// OR ROLLBACK, INSERT triggers, and non-batched FK shapes. Plain tables
+    /// (zero outbound/parent-victim FK work) and admitted plain/`OR ABORT`
+    /// outbound-FK tables batch even under `PRAGMA foreign_keys = ON` (bd-5ofes).
     fn insert_select_replay_batch_rows(
         &self,
         insert: &fsqlite_ast::InsertStatement,
@@ -51766,6 +52138,10 @@ impl Connection {
     ) -> usize {
         let table = &insert.table;
         let event = fsqlite_ast::TriggerEvent::Insert;
+        let insert_has_outbound_fk = self.insert_has_outbound_fk(insert);
+        let insert_may_delete_fk_parent = self.insert_may_delete_fk_parent_victim(insert);
+        let fk_blocks_batching = insert_may_delete_fk_parent
+            || (insert_has_outbound_fk && !self.insert_supports_batched_fk_replay(insert));
         if source_column_count == 0
             || !insert.returning.is_empty()
             || !insert.upsert.is_empty()
@@ -51773,7 +52149,7 @@ impl Connection {
                 insert.or_conflict,
                 Some(fsqlite_ast::ConflictAction::Fail | fsqlite_ast::ConflictAction::Rollback)
             )
-            || self.fk_enforcement_enabled()
+            || fk_blocks_batching
             || table
                 .schema
                 .as_deref()
@@ -53737,6 +54113,8 @@ impl Connection {
                                 static_runtime_inputs: self
                                     .prepared_static_table_runtime_inputs(runtime_requirements),
                                 direct_simple_insert,
+                                prepared_insert_fk_plan: self
+                                    .build_prepared_insert_fk_plan(insert),
                                 insert_may_invalidate_fk_parent_cache: insert.or_conflict
                                     == Some(fsqlite_ast::ConflictAction::Replace)
                                     || !insert.upsert.is_empty(),
@@ -54045,13 +54423,39 @@ impl Connection {
             return false;
         }
 
+        let values_rows: Option<&[Vec<Expr>]> = match &insert.source {
+            fsqlite_ast::InsertSource::Values(rows) => Some(rows.as_slice()),
+            fsqlite_ast::InsertSource::Select(select) if select.body.compounds.is_empty() => {
+                match &select.body.select {
+                    SelectCore::Values(rows) => Some(rows),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let is_multi_row = values_rows.is_some_and(|rows| rows.len() > 1);
+        let values_pure_for_fk =
+            !is_multi_row || values_rows.is_none_or(Self::values_exprs_are_pure_for_post_fk);
         let Some(idx) = self.schema_index_of(table_name) else {
             return false;
         };
         let schema = self.schema.borrow();
         schema.get(idx).is_some_and(|table| {
+            // Single-row OR IGNORE/FAIL/ROLLBACK is safe on the precompiled
+            // lane (affected == 0 skips FK). Multi-row INSERT into an FK child
+            // table only admits plain/ABORT with pure VALUES here because
+            // IGNORE/REPLACE/FAIL/ROLLBACK need row-by-row replay and volatile
+            // or subquery VALUES must be materialized once before VDBE + FK
+            // checking so side-effecting expressions are not evaluated twice.
             let fk_ok = table.foreign_keys.is_empty()
-                || insert.or_conflict != Some(fsqlite_ast::ConflictAction::Replace);
+                || (values_pure_for_fk
+                    && ((!is_multi_row
+                        && insert.or_conflict != Some(fsqlite_ast::ConflictAction::Replace))
+                        || (is_multi_row
+                            && matches!(
+                                insert.or_conflict,
+                                None | Some(fsqlite_ast::ConflictAction::Abort)
+                            ))));
             // A column or index that declares its own `ON CONFLICT <algo>`
             // requires the full codegen INSERT path, which honors per-constraint
             // conflict resolution; the direct-simple lane does not (bd-587fx,
@@ -81844,18 +82248,698 @@ impl Connection {
     ///
     /// This resolves inserted row values in table-column order (including
     /// DEFAULT handling) and validates each row against parent FK targets.
+    /// bd-5ofes (GH#496): for multi-row `INSERT ... VALUES` at top-level
+    /// statement depth, deduplicate distinct child-FK parent keys so repeated
+    /// parent keys (the common case) pay only one parent lookup per distinct
+    /// key, even in autocommit mode.
     async fn enforce_fk_on_insert(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         table_name: &str,
         params: Option<&[SqliteValue]>,
     ) -> Result<()> {
+        if self.statement_fk_validation_depth.get() <= 1
+            && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
+            && rows.len() > 1
+            && self.insert_supports_batched_fk_replay(insert)
+        {
+            let layout = self.resolve_insert_target_layout(insert)?;
+            if let Some(mut collector) = self.build_batched_insert_fk_collector(table_name, &layout)
+            {
+                let mut bind_state = BindParamState::default();
+                for row_exprs in rows {
+                    let mut canonical_exprs = row_exprs.clone();
+                    for expr in &mut canonical_exprs {
+                        canonicalize_expr_placeholders(expr, &mut bind_state)?;
+                    }
+                    let source_values = self
+                        .evaluate_insert_source_row(&canonical_exprs, params)
+                        .await?;
+                    collector.observe_row(&source_values);
+                }
+                let needs_cache_scope = self.fk_parent_validation_cache.borrow().is_none();
+                let _cache_scope = needs_cache_scope
+                    .then(|| self.enter_fk_parent_validation_cache_scope(table_name));
+                return collector.validate(self).await;
+            }
+        }
         for (row_values, _explicit_rowid) in
             self.collect_insert_trigger_rows(insert, params).await?
         {
             self.check_fk_parent_exists(table_name, &row_values).await?;
         }
         Ok(())
+    }
+
+    /// bd-5ofes (GH#496): whether `insert`'s target table has outbound foreign
+    /// keys that must be enforced under the current `PRAGMA foreign_keys` state.
+    fn insert_has_outbound_fk(&self, insert: &fsqlite_ast::InsertStatement) -> bool {
+        if !self.fk_enforcement_enabled() {
+            return false;
+        }
+        self.local_dml_target_table(&insert.table.name, insert.table.schema.as_deref())
+            .is_none_or(|table| !table.foreign_keys.is_empty())
+    }
+
+    /// bd-5ofes (GH#496): whether `insert` can implicitly delete a row of a
+    /// foreign-key parent table (`OR REPLACE` or schema-level `ON CONFLICT
+    /// REPLACE` on a table referenced by any child FK).
+    fn insert_may_delete_fk_parent_victim(&self, insert: &fsqlite_ast::InsertStatement) -> bool {
+        if !self.fk_cascade_propagation_enabled()
+            || !self.table_is_foreign_key_parent(&insert.table.name)
+        {
+            return false;
+        }
+        if matches!(insert.or_conflict, Some(fsqlite_ast::ConflictAction::Replace)) {
+            return true;
+        }
+        self.local_dml_target_table(&insert.table.name, insert.table.schema.as_deref())
+            .is_none_or(|table| {
+                table.columns.iter().any(|column| {
+                    column.conflict_action == Some(fsqlite_ast::ConflictAction::Replace)
+                }) || table.indexes.iter().any(|index| {
+                    index.conflict_action == Some(fsqlite_ast::ConflictAction::Replace)
+                })
+            })
+    }
+
+    /// bd-5ofes (GH#496): strict positive admission rule for batched/morsel
+    /// multi-row `INSERT` with statement-end distinct-parent-key child-FK
+    /// validation.
+    fn insert_supports_batched_fk_replay(&self, insert: &fsqlite_ast::InsertStatement) -> bool {
+        let table_ref = &insert.table;
+        let event = fsqlite_ast::TriggerEvent::Insert;
+        if !insert.returning.is_empty()
+            || !insert.upsert.is_empty()
+            || !matches!(
+                insert.or_conflict,
+                None | Some(fsqlite_ast::ConflictAction::Abort)
+            )
+            || self.insert_may_delete_fk_parent_victim(insert)
+            || table_ref
+                .schema
+                .as_deref()
+                .is_some_and(|schema| !schema.eq_ignore_ascii_case("main"))
+            || is_sqlite_schema_name(&table_ref.name)
+            || table_ref.name.eq_ignore_ascii_case("sqlite_sequence")
+            || self.has_live_vtab_instance(&table_ref.name)
+            || self.view_index_of(&table_ref.name).is_some()
+            || self.targets_shadowed_main(table_ref)
+            || self
+                .temp_table_names
+                .borrow()
+                .contains(&table_ref.name.to_ascii_lowercase())
+            || self.has_matching_triggers(
+                &table_ref.name,
+                fsqlite_ast::TriggerTiming::Before,
+                &event,
+            )
+            || self.has_matching_triggers(
+                &table_ref.name,
+                fsqlite_ast::TriggerTiming::After,
+                &event,
+            )
+        {
+            return false;
+        }
+        let Ok(layout) = self.resolve_insert_target_layout(insert) else {
+            return false;
+        };
+        let Some(idx) = self.schema_index_of(&table_ref.name) else {
+            return false;
+        };
+        let schema = self.schema.borrow();
+        let Some(table) = schema.get(idx) else {
+            return false;
+        };
+        if table.foreign_keys.is_empty() {
+            return false;
+        }
+        // Any column/index with a non-ABORT per-constraint conflict action
+        // (IGNORE/REPLACE/FAIL/ROLLBACK) can skip or partially commit rows.
+        if !table.columns.iter().all(|c| {
+            matches!(
+                c.conflict_action,
+                None | Some(fsqlite_ast::ConflictAction::Abort)
+            )
+        }) || !table.indexes.iter().all(|i| {
+            matches!(
+                i.conflict_action,
+                None | Some(fsqlite_ast::ConflictAction::Abort)
+            )
+        }) {
+            return false;
+        }
+        for fk in &table.foreign_keys {
+            for &col_idx in &fk.child_columns {
+                let Some(col) = table.columns.get(col_idx) else {
+                    return false;
+                };
+                if col.is_ipk || col.generated_expr.is_some() {
+                    return false;
+                }
+                let supplied = layout.targets.contains(&InsertTarget::Column(col_idx));
+                if !supplied
+                    && Self::eval_constant_default_sql(col.default_value.as_deref()).is_none()
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn build_batched_insert_fk_collector(
+        &self,
+        table_name: &str,
+        layout: &InsertTargetLayout,
+    ) -> Option<BatchedInsertFkCollector> {
+        let idx = self.schema_index_of(table_name)?;
+        let schema = self.schema.borrow();
+        let table = schema.get(idx)?;
+        if table.foreign_keys.is_empty() {
+            return None;
+        }
+        let mut specs = Vec::with_capacity(table.foreign_keys.len());
+        let mut capture_deferred_rows = false;
+        for (fk_index, fk) in table.foreign_keys.iter().enumerate() {
+            if self.fk_should_defer(fk) {
+                capture_deferred_rows = true;
+            }
+            let mut sources = SmallVec::with_capacity(fk.child_columns.len());
+            for &col_idx in &fk.child_columns {
+                let col = table.columns.get(col_idx)?;
+                if col.is_ipk || col.generated_expr.is_some() {
+                    return None;
+                }
+                let affinity = affinity_char_to_type(col.affinity);
+                if let Some(src_idx) = layout
+                    .targets
+                    .iter()
+                    .position(|target| *target == InsertTarget::Column(col_idx))
+                {
+                    sources.push((BatchedFkColSource::SourceIdx(src_idx), affinity));
+                } else {
+                    let constant = Self::eval_constant_default_sql(col.default_value.as_deref())?;
+                    sources.push((BatchedFkColSource::Constant(constant), affinity));
+                }
+            }
+            specs.push(BatchedFkSpec {
+                fk_index,
+                sources,
+                single_first: None,
+                single_set: None,
+                multi_set: HashSet::new(),
+            });
+        }
+        Some(BatchedInsertFkCollector {
+            table_name: table.name.clone(),
+            specs,
+            capture_deferred_rows,
+            deferred_source_rows: Vec::new(),
+            layout: layout.clone(),
+        })
+    }
+
+    /// Evaluate a pure constant literal expression (used to admit constant
+    /// VALUES and constant column DEFAULTs for batched/prepared FK checks).
+    fn eval_constant_literal_expr(expr: &Expr) -> Option<SqliteValue> {
+        match expr {
+            Expr::Literal(Literal::Null, _) => Some(SqliteValue::Null),
+            Expr::Literal(Literal::Integer(i), _) => Some(SqliteValue::Integer(*i)),
+            Expr::Literal(Literal::Float(f), _) => Some(SqliteValue::Float(*f)),
+            Expr::Literal(Literal::String(s), _) => Some(SqliteValue::Text(s.clone().into())),
+            Expr::Literal(Literal::Blob(b), _) => Some(SqliteValue::Blob(b.clone().into())),
+            Expr::Literal(Literal::True, _) => Some(SqliteValue::Integer(1)),
+            Expr::Literal(Literal::False, _) => Some(SqliteValue::Integer(0)),
+            Expr::UnaryOp {
+                op: fsqlite_ast::UnaryOp::Negate,
+                expr: inner,
+                ..
+            } => match inner.as_ref() {
+                Expr::Literal(Literal::Integer(i), _) => i.checked_neg().map(SqliteValue::Integer),
+                Expr::Literal(Literal::Float(f), _) => Some(SqliteValue::Float(-*f)),
+                _ => None,
+            },
+            Expr::UnaryOp {
+                op: fsqlite_ast::UnaryOp::Plus,
+                expr: inner,
+                ..
+            } => Self::eval_constant_literal_expr(inner),
+            _ => None,
+        }
+    }
+
+    fn eval_constant_default_sql(default_sql: Option<&str>) -> Option<SqliteValue> {
+        let Some(default_sql) = default_sql else {
+            return Some(SqliteValue::Null);
+        };
+        let trimmed = default_sql.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NULL") {
+            return Some(SqliteValue::Null);
+        }
+        let literal_sql = Self::strip_wrapping_default_parens(trimmed);
+        if literal_sql.eq_ignore_ascii_case("NULL") {
+            return Some(SqliteValue::Null);
+        }
+        if let Some(value) = Self::parse_wrapped_default_text(literal_sql, '\'')
+            .or_else(|| Self::parse_wrapped_default_text(literal_sql, '"'))
+        {
+            return Some(value);
+        }
+        if let Ok(i) = literal_sql.parse::<i64>() {
+            return Some(SqliteValue::Integer(i));
+        }
+        let sql = format!("SELECT {trimmed}");
+        let Ok(Statement::Select(select)) = parse_single_statement(&sql) else {
+            return None;
+        };
+        let SelectCore::Select {
+            columns,
+            from: None,
+            where_clause: None,
+            group_by,
+            having: None,
+            ..
+        } = &select.body.select
+        else {
+            return None;
+        };
+        if !group_by.is_empty() || columns.len() != 1 {
+            return None;
+        }
+        let ResultColumn::Expr { expr, .. } = &columns[0] else {
+            return None;
+        };
+        Self::eval_constant_literal_expr(expr)
+    }
+
+    /// Whether every VALUES expression is side-effect-free and deterministic
+    /// enough that evaluating it once in VDBE and once in post-insert FK
+    /// checking cannot observe divergent values (rejects function calls,
+    /// subqueries, and CURRENT_TIME/DATE/TIMESTAMP).
+    fn values_exprs_are_pure_for_post_fk(rows: &[Vec<Expr>]) -> bool {
+        let mut stack: Vec<&Expr> = Vec::new();
+        for row in rows {
+            for expr in row {
+                stack.push(expr);
+            }
+        }
+        while let Some(expr) = stack.pop() {
+            match expr {
+                Expr::Literal(
+                    Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp,
+                    _,
+                ) => return false,
+                Expr::Literal(..) | Expr::Placeholder(..) => {}
+                Expr::UnaryOp { expr: inner, .. }
+                | Expr::Cast { expr: inner, .. }
+                | Expr::Collate { expr: inner, .. }
+                | Expr::IsNull { expr: inner, .. } => stack.push(inner.as_ref()),
+                Expr::BinaryOp { left, right, .. } => {
+                    stack.push(left.as_ref());
+                    stack.push(right.as_ref());
+                }
+                Expr::Between {
+                    expr: target,
+                    low,
+                    high,
+                    ..
+                } => {
+                    stack.push(target.as_ref());
+                    stack.push(low.as_ref());
+                    stack.push(high.as_ref());
+                }
+                Expr::Case {
+                    operand,
+                    whens,
+                    else_expr,
+                    ..
+                } => {
+                    if let Some(op) = operand {
+                        stack.push(op.as_ref());
+                    }
+                    for (cond, val) in whens {
+                        stack.push(cond);
+                        stack.push(val);
+                    }
+                    if let Some(els) = else_expr {
+                        stack.push(els.as_ref());
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// bd-5ofes (GH#496): build a precompiled child-FK validation plan at
+    /// `prepare()` time for plain/`OR ABORT` `INSERT ... VALUES` statements
+    /// targeting a table with outbound FKs.
+    #[allow(clippy::too_many_lines)]
+    fn build_prepared_insert_fk_plan(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> Option<PreparedInsertFkPlan> {
+        if !matches!(
+            insert.or_conflict,
+            None | Some(fsqlite_ast::ConflictAction::Abort)
+        ) {
+            return None;
+        }
+        let rows: &[Vec<Expr>] = match &insert.source {
+            fsqlite_ast::InsertSource::Values(rows) => rows.as_slice(),
+            fsqlite_ast::InsertSource::Select(select) if select.body.compounds.is_empty() => {
+                match &select.body.select {
+                    SelectCore::Values(rows) => rows,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        if rows.is_empty() {
+            return None;
+        }
+        let idx = self.schema_index_of(&insert.table.name)?;
+        let layout = self.resolve_insert_target_layout(insert).ok()?;
+        let row_width = layout.targets.len();
+        if rows.iter().any(|row| row.len() != row_width) {
+            return None;
+        }
+
+        // Canonicalize all placeholders once across all rows in statement order.
+        let mut canonical_rows = Vec::with_capacity(rows.len());
+        let mut bind_state = BindParamState::default();
+        for row in rows {
+            let mut cloned = row.clone();
+            for expr in &mut cloned {
+                canonicalize_expr_placeholders(expr, &mut bind_state).ok()?;
+            }
+            canonical_rows.push(cloned);
+        }
+
+        let schema = self.schema.borrow();
+        let table = schema.get(idx)?;
+        if table.foreign_keys.is_empty() {
+            return None;
+        }
+
+        let mut checks = Vec::with_capacity(table.foreign_keys.len());
+        for (fk_index, fk) in table.foreign_keys.iter().enumerate() {
+            let col_count = fk.child_columns.len();
+            let mut affinities = SmallVec::with_capacity(col_count);
+            let mut col_positions: SmallVec<[Option<usize>; 2]> =
+                SmallVec::with_capacity(col_count);
+            let mut omitted_defaults: SmallVec<[Option<SqliteValue>; 2]> =
+                SmallVec::with_capacity(col_count);
+            for &col_idx in &fk.child_columns {
+                let col = table.columns.get(col_idx)?;
+                if col.is_ipk || col.generated_expr.is_some() {
+                    return None;
+                }
+                affinities.push(affinity_char_to_type(col.affinity));
+                if let Some(src_pos) = layout
+                    .targets
+                    .iter()
+                    .position(|target| *target == InsertTarget::Column(col_idx))
+                {
+                    col_positions.push(Some(src_pos));
+                    omitted_defaults.push(None);
+                } else {
+                    let default_val = Self::eval_constant_default_sql(col.default_value.as_deref())?;
+                    col_positions.push(None);
+                    omitted_defaults.push(Some(default_val));
+                }
+            }
+
+            let mut sources = Vec::with_capacity(canonical_rows.len() * col_count);
+            for row in &canonical_rows {
+                for c in 0..col_count {
+                    if let Some(src_pos) = col_positions[c] {
+                        let expr = &row[src_pos];
+                        let source = match expr {
+                            Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(slot), _) => {
+                                PreparedFkValueSource::Param(usize::try_from(*slot).ok()?)
+                            }
+                            other => {
+                                PreparedFkValueSource::Literal(Self::eval_constant_literal_expr(
+                                    other,
+                                )?)
+                            }
+                        };
+                        sources.push(source);
+                    } else {
+                        let default_val = omitted_defaults[c].clone()?;
+                        sources.push(PreparedFkValueSource::Literal(default_val));
+                    }
+                }
+            }
+            checks.push(PreparedInsertFkCheck {
+                fk_index,
+                col_count,
+                affinities,
+                sources,
+            });
+        }
+        Some(PreparedInsertFkPlan {
+            row_count: canonical_rows.len(),
+            checks,
+        })
+    }
+
+    /// bd-5ofes (GH#496): execute a precompiled child-FK validation plan for a
+    /// prepared `INSERT ... VALUES`, checking each distinct parent key once.
+    /// Returns `Ok(true)` if validation completed; returns `Ok(false)` ONLY
+    /// when a deferred FK missed in an active explicit transaction so the
+    /// caller can fall back to full row-image capture for `deferred_fk_checks`.
+    #[allow(clippy::too_many_lines)]
+    async fn validate_prepared_insert_fk_plan(
+        &self,
+        table_name: &str,
+        plan: &PreparedInsertFkPlan,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<bool> {
+        let fk_defs = {
+            let schema = self.schema.borrow();
+            let Some(table) = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(table_name))
+            else {
+                return Ok(true);
+            };
+            if table.foreign_keys.is_empty() {
+                return Ok(true);
+            }
+            table.foreign_keys.clone()
+        };
+
+        let needs_cache_scope =
+            plan.row_count > 1 && self.fk_parent_validation_cache.borrow().is_none();
+        let _cache_scope = needs_cache_scope
+            .then(|| self.enter_fk_parent_validation_cache_scope(table_name));
+        self.ensure_fk_parent_validation_cache();
+
+        let retained_changes = self.last_changes.get();
+        let retained_total_changes = self.total_changes.get();
+        let retained_last_insert_rowid = self.current_last_insert_rowid();
+        let mut autocommit_deferred_violation = false;
+        let mut needs_deferred_row_fallback = false;
+
+        let validation: Result<()> = async {
+            for check in &plan.checks {
+                let Some(fk) = fk_defs.get(check.fk_index) else {
+                    continue;
+                };
+                let is_deferred_in_txn = self.fk_should_defer(fk);
+                let is_autocommit_deferred = fk.deferred || self.defer_foreign_keys.get();
+
+                if check.col_count == 1 {
+                    let affinity = check.affinities[0];
+                    let mut single_first: Option<SqliteValue> = None;
+                    let mut single_set: Option<HashSet<SqliteValueHashable>> = None;
+                    for source in &check.sources {
+                        let raw = match source {
+                            PreparedFkValueSource::Param(slot) => slot
+                                .checked_sub(1)
+                                .and_then(|idx| params.and_then(|slice| slice.get(idx)))
+                                .unwrap_or(&SqliteValue::Null),
+                            PreparedFkValueSource::Literal(val) => val,
+                        };
+                        if raw.is_null() {
+                            continue;
+                        }
+                        let coerced = coerce_child_fk_value_cow(raw, affinity);
+                        if let Some(set) = single_set.as_mut() {
+                            if !set.insert(SqliteValueHashable(coerced.as_ref().clone())) {
+                                continue;
+                            }
+                        } else if let Some(first) = single_first.as_ref() {
+                            if coerced.as_ref() == first {
+                                continue;
+                            }
+                            let mut set = HashSet::new();
+                            set.insert(SqliteValueHashable(first.clone()));
+                            set.insert(SqliteValueHashable(coerced.as_ref().clone()));
+                            single_set = Some(set);
+                        } else {
+                            single_first = Some(coerced.as_ref().clone());
+                        }
+                        let key_ref = [coerced.as_ref()];
+                        if self.fk_parent_key_exists(table_name, fk, &key_ref).await?
+                            == FkParentKeyPresence::Missing
+                        {
+                            if is_deferred_in_txn {
+                                needs_deferred_row_fallback = true;
+                            } else if is_autocommit_deferred {
+                                autocommit_deferred_violation = true;
+                            } else {
+                                self.last_fk_violation_was_deferred.set(false);
+                                return Err(FrankenError::ForeignKeyViolation);
+                            }
+                        }
+                    }
+                } else {
+                    let mut seen: HashSet<Vec<SqliteValueHashable>> = HashSet::new();
+                    for row_sources in check.sources.chunks_exact(check.col_count) {
+                        let mut key: Vec<SqliteValueHashable> =
+                            Vec::with_capacity(check.col_count);
+                        let mut has_null = false;
+                        for (source, &affinity) in
+                            row_sources.iter().zip(check.affinities.iter())
+                        {
+                            let raw = match source {
+                                PreparedFkValueSource::Param(slot) => slot
+                                    .checked_sub(1)
+                                    .and_then(|idx| params.and_then(|slice| slice.get(idx)))
+                                    .unwrap_or(&SqliteValue::Null),
+                                PreparedFkValueSource::Literal(val) => val,
+                            };
+                            if raw.is_null() {
+                                has_null = true;
+                                break;
+                            }
+                            key.push(SqliteValueHashable(
+                                coerce_child_fk_value_cow(raw, affinity).into_owned(),
+                            ));
+                        }
+                        if has_null || !seen.insert(key.clone()) {
+                            continue;
+                        }
+                        let key_refs: SmallVec<[&SqliteValue; 4]> =
+                            key.iter().map(|v| &v.0).collect();
+                        if self.fk_parent_key_exists(table_name, fk, &key_refs).await?
+                            == FkParentKeyPresence::Missing
+                        {
+                            if is_deferred_in_txn {
+                                needs_deferred_row_fallback = true;
+                            } else if is_autocommit_deferred {
+                                autocommit_deferred_violation = true;
+                            } else {
+                                self.last_fk_violation_was_deferred.set(false);
+                                return Err(FrankenError::ForeignKeyViolation);
+                            }
+                        }
+                    }
+                }
+            }
+            if autocommit_deferred_violation {
+                self.last_fk_violation_was_deferred.set(true);
+                return Err(FrankenError::ForeignKeyViolation);
+            }
+            Ok(())
+        }
+        .await;
+
+        self.restore_change_tracking_state(
+            retained_changes,
+            retained_total_changes,
+            retained_last_insert_rowid,
+        );
+        validation?;
+        Ok(!needs_deferred_row_fallback)
+    }
+
+    /// Probe whether a single non-NULL child FK key tuple `fk_values` exists in
+    /// `fk.parent_table`, consulting the validation cache, the O(log N)
+    /// active-txn IPK B-tree probe, and finally the fallback SELECT query.
+    async fn fk_parent_key_exists(
+        &self,
+        child_table: &str,
+        fk: &FkDef,
+        fk_values: &[&SqliteValue],
+    ) -> Result<FkParentKeyPresence> {
+        let parent_cols = {
+            let parent_schema = self.schema.borrow();
+            let Some(parent) = parent_schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(&fk.parent_table))
+            else {
+                return Ok(FkParentKeyPresence::Missing);
+            };
+            if fk.parent_columns.is_empty() {
+                Self::fk_implicit_parent_key_columns(Some(parent))
+            } else {
+                fk.parent_columns.clone()
+            }
+        };
+        if parent_cols.is_empty() || parent_cols.len() != fk_values.len() {
+            return Err(FrankenError::ForeignKeyViolation);
+        }
+
+        let cache_key = self.build_fk_parent_validation_cache_key(
+            child_table,
+            &fk.parent_table,
+            &parent_cols,
+            fk_values,
+        );
+        if let Some(cache_key) = cache_key.as_ref()
+            && self.fk_parent_validation_cache_contains(cache_key)
+        {
+            return Ok(FkParentKeyPresence::Present);
+        }
+
+        FSQLITE_FK_PROBE_ENGAGED.fetch_add(1, AtomicOrdering::Relaxed);
+        if let Some(parent_present) = self
+            .fk_parent_rowid_fast_lookup(&fk.parent_table, &parent_cols, fk_values)
+            .await?
+        {
+            FSQLITE_FK_PROBE_ANSWERED.fetch_add(1, AtomicOrdering::Relaxed);
+            if parent_present {
+                if let Some(cache_key) = cache_key {
+                    self.fk_parent_validation_cache_insert(cache_key);
+                }
+                return Ok(FkParentKeyPresence::Present);
+            }
+            return Ok(FkParentKeyPresence::Missing);
+        }
+
+        let where_parts: Vec<String> = parent_cols
+            .iter()
+            .enumerate()
+            .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE {} LIMIT 1",
+            quote_identifier(&fk.parent_table),
+            where_parts.join(" AND ")
+        );
+        let params: Vec<SqliteValue> = fk_values.iter().map(|v| (*v).clone()).collect();
+        let fallbacks = FSQLITE_FK_SELECT_FALLBACK.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        tracing::debug!(
+            target: "fsqlite.fk_probe",
+            fallbacks,
+            engaged = FSQLITE_FK_PROBE_ENGAGED.load(AtomicOrdering::Relaxed),
+            answered = FSQLITE_FK_PROBE_ANSWERED.load(AtomicOrdering::Relaxed),
+            "fk validation fell back to the ad-hoc SELECT"
+        );
+        let rows = self.fk_validation_query(&sql, &params).await?;
+        if rows.is_empty() {
+            return Ok(FkParentKeyPresence::Missing);
+        }
+        if let Some(cache_key) = cache_key {
+            self.fk_parent_validation_cache_insert(cache_key);
+        }
+        Ok(FkParentKeyPresence::Present)
     }
 
     /// Verify that every FK value in a child row has a matching parent row.
@@ -82360,6 +83444,30 @@ impl Connection {
             }
             parent.root_page
         };
+
+        let parent_lc = parent_table.to_ascii_lowercase();
+        let is_plain_main_parent = !self.temp_table_names.borrow().contains(&parent_lc)
+            && !self.shadowed_main_tables.borrow().contains_key(&parent_lc)
+            && !self.has_live_vtab_instance(parent_table);
+        if is_plain_main_parent
+            && self.active_txn.borrow().is_some()
+            && let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0))
+        {
+            // bd-5ofes (GH#496): probe the live active transaction B-tree
+            // directly instead of forcing a full memdb reload + VDBE engine
+            // discard + ad-hoc SELECT. `flush_pending_direct_write_runs` ensures
+            // buffered direct-insert page runs are materialized into `active_txn`
+            // first, so this observes every committed and uncommitted in-txn
+            // parent insert, delete, and savepoint rollback in O(log N) time.
+            let cx = self.op_cx_after_background_status();
+            self.flush_pending_direct_write_runs(&cx).await?;
+            let mut active_txn = self.active_txn.borrow_mut();
+            if let Some(txn) = active_txn.as_mut() {
+                let mut cursor = Self::new_pager_btree_cursor(&cx, txn, root, true).await?;
+                let seek = cursor.table_move_to(&cx, rowid).await?;
+                return Ok(Some(seek.is_found()));
+            }
+        }
 
         // The #111 super-linear term is the per-insert full memdb staleness
         // refresh, not the validation SELECT (ABBA receipt on the bead:
@@ -157543,6 +158651,22 @@ mod exists_value_set_tests {
             !set.contains(&SqliteValue::Integer(1)),
             "a no-affinity memo probe must not coerce an INTEGER runtime value to TEXT"
         );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FkParentKeyPresence {
+    Present,
+    Missing,
+}
+
+fn coerce_child_fk_value_cow(raw: &SqliteValue, affinity: TypeAffinity) -> Cow<'_, SqliteValue> {
+    match (affinity, raw) {
+        (TypeAffinity::Blob, _)
+        | (TypeAffinity::Integer | TypeAffinity::Numeric, SqliteValue::Integer(_))
+        | (TypeAffinity::Text, SqliteValue::Text(_))
+        | (TypeAffinity::Real, SqliteValue::Float(_)) => Cow::Borrowed(raw),
+        _ => Cow::Owned(raw.clone().apply_affinity(affinity)),
     }
 }
 

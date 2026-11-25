@@ -848,3 +848,923 @@ fn fk_upsert_snapshot_preserves_mixed_parameter_identity() {
         }
     });
 }
+
+/// Live A/B benchmark for bd-5ofes (GH#496): multi-row `INSERT ... VALUES`
+/// under `PRAGMA foreign_keys = ON` vs `OFF` and vs live bundled `rusqlite`.
+#[test]
+#[ignore = "live release-perf A/B benchmark for bd-5ofes (GH#496)"]
+#[allow(clippy::too_many_lines)]
+fn bd_5ofes_multirow_insert_fk_ab_live() {
+    use std::time::Instant;
+
+    fn build_literal_events_sql(table: &str, run_id_mod: i64, start_seq: i64, rows: usize) -> String {
+        let mut sql = format!("INSERT INTO {table} VALUES ");
+        for i in 0..rows {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let seq = start_seq + i64::try_from(i).unwrap();
+            let run_id = (seq % run_id_mod) + 1;
+            let _ = std::fmt::Write::write_fmt(
+                &mut sql,
+                format_args!("({run_id}, {seq}, 'payload_{seq}')"),
+            );
+        }
+        sql
+    }
+
+    fn build_literal_text_fk_sql(start_seq: i64, rows: usize) -> String {
+        let mut sql = String::from("INSERT INTO child_u VALUES ");
+        for i in 0..rows {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let seq = start_seq + i64::try_from(i).unwrap();
+            let _ = std::fmt::Write::write_fmt(
+                &mut sql,
+                format_args!("({seq}, 'run-1', 'payload_{seq}')"),
+            );
+        }
+        sql
+    }
+
+    fn build_prepared_events_sql(table: &str, rows: usize) -> String {
+        let mut sql = format!("INSERT INTO {table} VALUES ");
+        for i in 0..rows {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let base = i * 3 + 1;
+            let _ = std::fmt::Write::write_fmt(
+                &mut sql,
+                format_args!("(?{base}, ?{}, ?{})", base + 1, base + 2),
+            );
+        }
+        sql
+    }
+
+    async fn setup_f(path: &str, fk_on: bool) -> Connection {
+        let conn = Connection::open(path).await.unwrap();
+        if path != ":memory:" {
+            let _ = conn.query("PRAGMA journal_mode=WAL;").await.unwrap();
+            conn.execute("PRAGMA synchronous=NORMAL;").await.unwrap();
+        }
+        conn.execute(if fk_on {
+            "PRAGMA foreign_keys = ON;"
+        } else {
+            "PRAGMA foreign_keys = OFF;"
+        })
+        .await
+        .unwrap();
+        for ddl in [
+            "CREATE TABLE runs (run_id INTEGER PRIMARY KEY);",
+            "INSERT INTO runs VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);",
+            "CREATE TABLE events (run_id INTEGER NOT NULL, seq INTEGER NOT NULL, v TEXT, \
+             PRIMARY KEY (run_id, seq), FOREIGN KEY (run_id) REFERENCES runs(run_id));",
+            "CREATE INDEX events_v ON events (v);",
+            "CREATE TABLE plain (run_id INTEGER NOT NULL, seq INTEGER NOT NULL, v TEXT, \
+             PRIMARY KEY (run_id, seq));",
+            "CREATE INDEX plain_v ON plain (v);",
+            "CREATE TABLE parent_u (k TEXT UNIQUE NOT NULL);",
+            "INSERT INTO parent_u VALUES ('run-1');",
+            "CREATE TABLE child_u (id INTEGER PRIMARY KEY, pk TEXT REFERENCES parent_u(k), v TEXT);",
+        ] {
+            conn.execute(ddl).await.unwrap();
+        }
+        conn
+    }
+
+    fn setup_r(path: &str, fk_on: bool) -> rusqlite::Connection {
+        let conn = if path == ":memory:" {
+            rusqlite::Connection::open_in_memory().unwrap()
+        } else {
+            rusqlite::Connection::open(path).unwrap()
+        };
+        if path != ":memory:" {
+            let _: String = conn
+                .query_row("PRAGMA journal_mode=WAL;", [], |r| r.get(0))
+                .unwrap();
+            conn.execute_batch("PRAGMA synchronous=NORMAL;").unwrap();
+        }
+        conn.execute_batch(if fk_on {
+            "PRAGMA foreign_keys = ON;"
+        } else {
+            "PRAGMA foreign_keys = OFF;"
+        })
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (run_id INTEGER PRIMARY KEY);
+             INSERT INTO runs VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+             CREATE TABLE events (run_id INTEGER NOT NULL, seq INTEGER NOT NULL, v TEXT,
+               PRIMARY KEY (run_id, seq), FOREIGN KEY (run_id) REFERENCES runs(run_id));
+             CREATE INDEX events_v ON events (v);
+             CREATE TABLE plain (run_id INTEGER NOT NULL, seq INTEGER NOT NULL, v TEXT,
+               PRIMARY KEY (run_id, seq));
+             CREATE INDEX plain_v ON plain (v);
+             CREATE TABLE parent_u (k TEXT UNIQUE NOT NULL);
+             INSERT INTO parent_u VALUES ('run-1');
+             CREATE TABLE child_u (id INTEGER PRIMARY KEY, pk TEXT REFERENCES parent_u(k), v TEXT);",
+        )
+        .unwrap();
+        conn
+    }
+
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        println!("SQLite version: {}", rusqlite::version());
+        println!(
+            "{:<38} {:>10} {:>10} {:>10} {:>9} {:>9}",
+            "case", "f_off_us/r", "f_on_us/r", "sql_on_us", "on/off", "f_on/sql"
+        );
+
+        #[derive(Clone, Copy)]
+        struct AbCase {
+            label: &'static str,
+            table: &'static str,
+            rows_per_stmt: usize,
+            batches: usize,
+            run_id_mod: i64,
+            explicit_txn: bool,
+            file_backed: bool,
+            prepared: bool,
+        }
+
+        let cases: &[AbCase] = &[
+            AbCase { label: "mem_plain_20r_txn_lit", table: "plain", rows_per_stmt: 20, batches: 40, run_id_mod: 1, explicit_txn: true, file_backed: false, prepared: false },
+            AbCase { label: "mem_plain_100r_txn_lit", table: "plain", rows_per_stmt: 100, batches: 30, run_id_mod: 1, explicit_txn: true, file_backed: false, prepared: false },
+            AbCase { label: "mem_plain_200r_txn_lit", table: "plain", rows_per_stmt: 200, batches: 20, run_id_mod: 1, explicit_txn: true, file_backed: false, prepared: false },
+            AbCase { label: "mem_fk_20r_1p_txn_lit", table: "events", rows_per_stmt: 20, batches: 40, run_id_mod: 1, explicit_txn: true, file_backed: false, prepared: false },
+            AbCase { label: "mem_fk_100r_1p_txn_lit", table: "events", rows_per_stmt: 100, batches: 30, run_id_mod: 1, explicit_txn: true, file_backed: false, prepared: false },
+            AbCase { label: "mem_fk_200r_1p_txn_lit", table: "events", rows_per_stmt: 200, batches: 20, run_id_mod: 1, explicit_txn: true, file_backed: false, prepared: false },
+            AbCase { label: "mem_fk_100r_10p_txn_lit", table: "events", rows_per_stmt: 100, batches: 30, run_id_mod: 10, explicit_txn: true, file_backed: false, prepared: false },
+            AbCase { label: "mem_fk_100r_1p_auto_lit", table: "events", rows_per_stmt: 100, batches: 20, run_id_mod: 1, explicit_txn: false, file_backed: false, prepared: false },
+            AbCase { label: "file_fk_100r_1p_txn_lit", table: "events", rows_per_stmt: 100, batches: 20, run_id_mod: 1, explicit_txn: true, file_backed: true, prepared: false },
+            AbCase { label: "file_fk_100r_1p_auto_lit", table: "events", rows_per_stmt: 100, batches: 15, run_id_mod: 1, explicit_txn: false, file_backed: true, prepared: false },
+            AbCase { label: "mem_fk_100r_1p_txn_prep", table: "events", rows_per_stmt: 100, batches: 30, run_id_mod: 1, explicit_txn: true, file_backed: false, prepared: true },
+            AbCase { label: "mem_fk_100r_1p_auto_prep", table: "events", rows_per_stmt: 100, batches: 20, run_id_mod: 1, explicit_txn: false, file_backed: false, prepared: true },
+            AbCase { label: "mem_textfk_100r_1p_txn_lit", table: "child_u", rows_per_stmt: 100, batches: 20, run_id_mod: 1, explicit_txn: true, file_backed: false, prepared: false },
+            AbCase { label: "mem_textfk_100r_1p_auto_lit", table: "child_u", rows_per_stmt: 100, batches: 15, run_id_mod: 1, explicit_txn: false, file_backed: false, prepared: false },
+        ];
+
+        for &AbCase {
+            label,
+            table,
+            rows_per_stmt,
+            batches,
+            run_id_mod,
+            explicit_txn,
+            file_backed,
+            prepared,
+        } in cases
+        {
+            let total_rows = rows_per_stmt * batches;
+            let sqls: Vec<String> = if prepared {
+                Vec::new()
+            } else {
+                (0..batches)
+                    .map(|b| {
+                        let start = i64::try_from(b * rows_per_stmt).unwrap();
+                        if table == "child_u" {
+                            build_literal_text_fk_sql(start, rows_per_stmt)
+                        } else {
+                            build_literal_events_sql(table, run_id_mod, start, rows_per_stmt)
+                        }
+                    })
+                    .collect()
+            };
+            let prep_sql = prepared.then(|| build_prepared_events_sql(table, rows_per_stmt));
+
+            let mut times_us_per_row = [0.0f64; 3]; // 0=f_off, 1=f_on, 2=sql_on
+            for (slot, fk_on) in [(0usize, false), (1usize, true)] {
+                let path = if file_backed {
+                    dir.path()
+                        .join(format!("{label}_f_{slot}.db"))
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    ":memory:".to_owned()
+                };
+                let conn = setup_f(&path, fk_on).await;
+                if explicit_txn {
+                    conn.execute("BEGIN;").await.unwrap();
+                }
+                let start = Instant::now();
+                if let Some(ref ps) = prep_sql {
+                    let stmt = conn.prepare(ps).await.unwrap();
+                    for b in 0..batches {
+                        let mut params = Vec::with_capacity(rows_per_stmt * 3);
+                        for i in 0..rows_per_stmt {
+                            let seq = i64::try_from(b * rows_per_stmt + i).unwrap();
+                            let run_id = (seq % run_id_mod) + 1;
+                            params.push(SqliteValue::Integer(run_id));
+                            params.push(SqliteValue::Integer(seq));
+                            params.push(SqliteValue::Text(format!("payload_{seq}").into()));
+                        }
+                        let n = stmt.execute_with_params(&params).await.unwrap();
+                        assert_eq!(n, rows_per_stmt);
+                    }
+                } else {
+                    for sql in &sqls {
+                        let n = conn.execute(sql).await.unwrap();
+                        assert_eq!(n, rows_per_stmt);
+                    }
+                }
+                if explicit_txn {
+                    conn.execute("COMMIT;").await.unwrap();
+                }
+                let elapsed = start.elapsed();
+                let count = conn
+                    .query(&format!("SELECT count(*) FROM {table};"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    count[0].values()[0],
+                    SqliteValue::Integer(i64::try_from(total_rows).unwrap())
+                );
+                conn.close().await.unwrap();
+                times_us_per_row[slot] = elapsed.as_secs_f64() * 1e6 / (total_rows as f64);
+            }
+
+            // Live bundled rusqlite with foreign_keys = ON
+            {
+                let path = if file_backed {
+                    dir.path()
+                        .join(format!("{label}_r.db"))
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    ":memory:".to_owned()
+                };
+                let r = setup_r(&path, true);
+                if explicit_txn {
+                    r.execute_batch("BEGIN;").unwrap();
+                }
+                let start = Instant::now();
+                if let Some(ref ps) = prep_sql {
+                    let mut stmt = r.prepare(ps).unwrap();
+                    for b in 0..batches {
+                        let mut params = Vec::with_capacity(rows_per_stmt * 3);
+                        for i in 0..rows_per_stmt {
+                            let seq = i64::try_from(b * rows_per_stmt + i).unwrap();
+                            let run_id = (seq % run_id_mod) + 1;
+                            params.push(rusqlite::types::Value::Integer(run_id));
+                            params.push(rusqlite::types::Value::Integer(seq));
+                            params.push(rusqlite::types::Value::Text(format!("payload_{seq}")));
+                        }
+                        let n = stmt.execute(rusqlite::params_from_iter(params)).unwrap();
+                        assert_eq!(n, rows_per_stmt);
+                    }
+                } else {
+                    for sql in &sqls {
+                        let n = r.execute(sql, []).unwrap();
+                        assert_eq!(n, rows_per_stmt);
+                    }
+                }
+                if explicit_txn {
+                    r.execute_batch("COMMIT;").unwrap();
+                }
+                let elapsed = start.elapsed();
+                let count: i64 = r
+                    .query_row(&format!("SELECT count(*) FROM {table};"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, i64::try_from(total_rows).unwrap());
+                times_us_per_row[2] = elapsed.as_secs_f64() * 1e6 / (total_rows as f64);
+            }
+
+            println!(
+                "{:<38} {:>10.2} {:>10.2} {:>10.2} {:>8.2}x {:>8.2}x",
+                label,
+                times_us_per_row[0],
+                times_us_per_row[1],
+                times_us_per_row[2],
+                times_us_per_row[1] / times_us_per_row[0],
+                times_us_per_row[1] / times_us_per_row[2],
+            );
+        }
+    });
+}
+
+/// bd-5ofes (GH#496): comprehensive differential oracle against live bundled
+/// `rusqlite` covering multi-row `INSERT VALUES` (below and above
+/// `MORSEL_INSERT_THRESHOLD = 64`), direct & prepared lanes, `:memory:` &
+/// file-backed, explicit txn & autocommit, composite/NULL/DEFAULT/affinity/
+/// WITHOUT ROWID/self-referential/deferred FKs, PK-beats-FK across morsels,
+/// and all negative controls (OR IGNORE/REPLACE/FAIL/ROLLBACK, schema
+/// ON CONFLICT IGNORE, IPK-FK, generated FK, volatile VALUES, triggers,
+/// and foreign_keys toggled ON after prepare()).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn bd_5ofes_multirow_fk_batched_and_morsel_oracle_matrix() {
+    fn build_child_values(rows: impl IntoIterator<Item = (i64, i64)>) -> String {
+        let vals = rows
+            .into_iter()
+            .map(|(id, pid)| format!("({id}, {pid})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("INSERT INTO child VALUES {vals};")
+    }
+
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            for explicit_txn in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let f_path = if file_backed {
+                    dir.path().join("bd_5ofes_f.db").to_string_lossy().into_owned()
+                } else {
+                    ":memory:".to_owned()
+                };
+                let r_path = if file_backed {
+                    dir.path().join("bd_5ofes_r.db").to_string_lossy().into_owned()
+                } else {
+                    ":memory:".to_owned()
+                };
+                let f = Connection::open(&f_path).await.unwrap();
+                let r = if file_backed {
+                    rusqlite::Connection::open(&r_path).unwrap()
+                } else {
+                    rusqlite::Connection::open_in_memory().unwrap()
+                };
+
+                let setup = "
+                    PRAGMA foreign_keys = ON;
+                    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                    INSERT INTO parent VALUES (1), (2), (3), (10);
+                    CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id));
+                    CREATE TABLE plain (id INTEGER PRIMARY KEY, v TEXT);
+                    CREATE TABLE comp_p (a INTEGER, b TEXT, PRIMARY KEY (a, b));
+                    INSERT INTO comp_p VALUES (1, 'x'), (2, 'y');
+                    CREATE TABLE comp_c (id INTEGER PRIMARY KEY, a INTEGER, b TEXT,
+                        FOREIGN KEY (a, b) REFERENCES comp_p(a, b));
+                    CREATE TABLE def_c (id INTEGER PRIMARY KEY,
+                        pid INTEGER DEFAULT 1 REFERENCES parent(id),
+                        bad_pid INTEGER DEFAULT 99 REFERENCES parent(id));
+                    CREATE TABLE self_ref (id INTEGER PRIMARY KEY,
+                        parent_id INTEGER REFERENCES self_ref(id));
+                    CREATE TABLE blob_p (k BLOB PRIMARY KEY);
+                    INSERT INTO blob_p VALUES ('42');
+                    CREATE TABLE text_aff_c (id INTEGER PRIMARY KEY,
+                        pk TEXT REFERENCES blob_p(k));
+                    CREATE TABLE wr_p (k TEXT PRIMARY KEY) WITHOUT ROWID;
+                    INSERT INTO wr_p VALUES ('alpha'), ('beta');
+                    CREATE TABLE wr_c (id INTEGER PRIMARY KEY,
+                        pk TEXT REFERENCES wr_p(k)) WITHOUT ROWID;
+                    CREATE TABLE ipk_fk (id INTEGER PRIMARY KEY REFERENCES parent(id), note TEXT);
+                    CREATE TABLE gen_fk (id INTEGER PRIMARY KEY, base INTEGER,
+                        pid INTEGER GENERATED ALWAYS AS (base + 1) STORED REFERENCES parent(id));
+                    CREATE TABLE ign_col_fk (id INTEGER PRIMARY KEY,
+                        tag TEXT UNIQUE ON CONFLICT IGNORE,
+                        pid INTEGER REFERENCES parent(id));
+                ";
+                f.execute(setup).await.unwrap();
+                r.execute_batch(setup).unwrap();
+
+                if explicit_txn {
+                    f.execute("BEGIN;").await.unwrap();
+                    r.execute_batch("BEGIN;").unwrap();
+                    f.execute("INSERT INTO child VALUES (500, 1);").await.unwrap();
+                    r.execute("INSERT INTO child VALUES (500, 1);", []).unwrap();
+                }
+
+                // 1. Plain non-FK table: 20 rows and 100 rows under foreign_keys=ON.
+                let plain_20 = format!(
+                    "INSERT INTO plain VALUES {};",
+                    (0..20)
+                        .map(|i| format!("({i}, 'p{i}')"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let plain_100 = format!(
+                    "INSERT INTO plain VALUES {};",
+                    (100..200)
+                        .map(|i| format!("({i}, 'p{i}')"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                // 2. Outbound FK: 20 rows (below morsel), 64 rows (threshold), 100 rows (morsel),
+                //    constant parent and mixed parents.
+                let child_20 = build_child_values((1..=20).map(|i| (i, 1)));
+                let child_64 = build_child_values(
+                    (101..=164).map(|i| (i, if i % 2 == 0 { 1 } else { 2 })),
+                );
+                // 3. Missing parent on row 99 of 100 -> FkViolation, all 100 rolled back.
+                let child_100_bad_last =
+                    build_child_values((1000..1100).map(|i| (i, if i == 1099 { 999 } else { 1 })));
+                // 4. PK-beats-FK across morsel boundaries: row 0 has bad FK (999),
+                //    row 80 collides with existing id=120 -> PkOrUnique, NOT FkViolation!
+                let child_100_pk_beats_fk = build_child_values((2000..2100).map(|i| {
+                    if i == 2000 {
+                        (i, 999)
+                    } else if i == 2080 {
+                        (120, 1)
+                    } else {
+                        (i, 1)
+                    }
+                }));
+                // 5. Composite FK (valid + NULL partial + bad pair) across 70 rows.
+                let comp_ok = format!(
+                    "INSERT INTO comp_c VALUES {};",
+                    (0..70)
+                        .map(|i| match i % 3 {
+                            0 => format!("({i}, 1, 'x')"),
+                            1 => format!("({i}, 2, 'y')"),
+                            _ => format!("({i}, 999, NULL)"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let comp_bad = format!(
+                    "INSERT INTO comp_c VALUES {};",
+                    (100..170)
+                        .map(|i| if i == 165 {
+                            format!("({i}, 1, 'y')")
+                        } else {
+                            format!("({i}, 1, 'x')")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                // 6. Omitted FK column with constant DEFAULT (valid vs bad).
+                let def_ok = format!(
+                    "INSERT INTO def_c (id, bad_pid) VALUES {};",
+                    (0..70)
+                        .map(|i| format!("({i}, 1)"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let def_bad = format!(
+                    "INSERT INTO def_c (id) VALUES {};",
+                    (100..170)
+                        .map(|i| format!("({i})"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                // 7. Self-referential FK across morsel boundaries (forward refs!).
+                let self_ok = format!(
+                    "INSERT INTO self_ref VALUES {};",
+                    (1..=100)
+                        .rev()
+                        .map(|i| if i == 1 {
+                            "(1, NULL)".to_owned()
+                        } else {
+                            format!("({i}, {})", i - 1)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let self_bad = format!(
+                    "INSERT INTO self_ref VALUES {};",
+                    (200..270)
+                        .map(|i| if i == 200 {
+                            "(200, 9999)".to_owned()
+                        } else {
+                            format!("({i}, {})", i - 1)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                // 8. Child affinity coercion: INTEGER 42 -> TEXT '42' matching BLOB parent '42',
+                //    plus child.pid INTEGER receiving TEXT '10' matching parent.id 10.
+                let aff_ok = format!(
+                    "INSERT INTO text_aff_c VALUES {};",
+                    (0..70)
+                        .map(|i| format!("({i}, 42)"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let aff_int_from_text = format!(
+                    "INSERT INTO child VALUES {};",
+                    (3000..3070)
+                        .map(|i| format!("({i}, '10')"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                // 9. WITHOUT ROWID child & parent across 70 rows (valid + bad).
+                let wr_ok = format!(
+                    "INSERT INTO wr_c VALUES {};",
+                    (0..70)
+                        .map(|i| format!("({i}, '{}')", if i % 2 == 0 { "alpha" } else { "beta" }))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                let wr_bad = format!(
+                    "INSERT INTO wr_c VALUES {};",
+                    (100..170)
+                        .map(|i| format!("({i}, '{}')", if i == 150 { "gamma" } else { "alpha" }))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                // 10. Negative controls: OR IGNORE, OR REPLACE, OR FAIL, IPK-FK, generated FK,
+                //     column-level UNIQUE ON CONFLICT IGNORE.
+                let or_ignore_skip_bad =
+                    "INSERT OR IGNORE INTO child VALUES (1, 999), (4000, 1), (2, 888), (4001, 2);";
+                let or_ignore_new_bad =
+                    "INSERT OR IGNORE INTO child VALUES (1, 999), (4010, 999);";
+                let or_replace_valid =
+                    "INSERT OR REPLACE INTO child VALUES (1, 2), (2, 1);";
+                let or_replace_bad =
+                    "INSERT OR REPLACE INTO child VALUES (1, 1), (4020, 999);";
+                let or_fail_pk_after_good =
+                    "INSERT OR FAIL INTO child VALUES (4030, 1), (1, 1), (4031, 1);";
+                let or_fail_fk_aborts_all =
+                    "INSERT OR FAIL INTO child VALUES (4040, 1), (4041, 999);";
+                let ipk_fk_auto = "INSERT INTO ipk_fk (note) VALUES ('a'), ('b'), ('c');";
+                let ipk_fk_auto_fail = "INSERT INTO ipk_fk (note) VALUES ('d');"; // rowid 4 missing!
+                let gen_fk_ok = "INSERT INTO gen_fk (id, base) VALUES (1, 0), (2, 1), (3, 2);";
+                let ign_col_seed = "INSERT INTO ign_col_fk VALUES (1, 'dup', 1);";
+                let ign_col_skip =
+                    "INSERT INTO ign_col_fk VALUES (2, 'dup', 999), (3, 'fresh', 2);";
+
+                let steps: &[(&str, &str)] = &[
+                    ("plain_20", &plain_20),
+                    ("plain_100", &plain_100),
+                    ("child_20", &child_20),
+                    ("child_64", &child_64),
+                    ("child_100_bad_last", &child_100_bad_last),
+                    ("child_100_pk_beats_fk", &child_100_pk_beats_fk),
+                    ("comp_ok", &comp_ok),
+                    ("comp_bad", &comp_bad),
+                    ("def_ok", &def_ok),
+                    ("def_bad", &def_bad),
+                    ("self_ok", &self_ok),
+                    ("self_bad", &self_bad),
+                    ("aff_ok", &aff_ok),
+                    ("aff_int_from_text", &aff_int_from_text),
+                    ("wr_ok", &wr_ok),
+                    ("wr_bad", &wr_bad),
+                    ("or_ignore_skip_bad", or_ignore_skip_bad),
+                    ("or_ignore_new_bad", or_ignore_new_bad),
+                    ("or_replace_valid", or_replace_valid),
+                    ("or_replace_bad", or_replace_bad),
+                    ("or_fail_pk_after_good", or_fail_pk_after_good),
+                    ("or_fail_fk_aborts_all", or_fail_fk_aborts_all),
+                    ("ipk_fk_auto", ipk_fk_auto),
+                    ("ipk_fk_auto_fail", ipk_fk_auto_fail),
+                    ("gen_fk_ok", gen_fk_ok),
+                    ("ign_col_seed", ign_col_seed),
+                    ("ign_col_skip", ign_col_skip),
+                ];
+
+                for &(step_name, sql) in steps {
+                    let fo = classify_franken(f.execute(sql).await);
+                    let ro = classify_rusqlite(r.execute(sql, []));
+                    assert_eq!(
+                        fo, ro,
+                        "[file={file_backed} txn={explicit_txn} step={step_name}] outcome diverged: f={fo:?} vs r={ro:?}"
+                    );
+                    assert_eq!(
+                        f.in_transaction(),
+                        !r.is_autocommit(),
+                        "[file={file_backed} txn={explicit_txn} step={step_name}] txn state diverged"
+                    );
+                }
+
+                // 11. Prepared multi-row OR IGNORE negative control (must skip dup PK without
+                //     raising false FK on ignored row!) + prepared multi-row plain INSERT (70 rows).
+                {
+                    let prep_ign = f
+                        .prepare("INSERT OR IGNORE INTO child VALUES (?1, ?2), (?3, ?4);")
+                        .await
+                        .unwrap();
+                    let fo = classify_franken(
+                        prep_ign
+                            .execute_with_params(&[
+                                SqliteValue::Integer(1),
+                                SqliteValue::Integer(999),
+                                SqliteValue::Integer(4100),
+                                SqliteValue::Integer(2),
+                            ])
+                            .await,
+                    );
+                    let ro = classify_rusqlite(r.execute(
+                        "INSERT OR IGNORE INTO child VALUES (?1, ?2), (?3, ?4);",
+                        rusqlite::params![1i64, 999i64, 4100i64, 2i64],
+                    ));
+                    assert_eq!(
+                        fo, ro,
+                        "[file={file_backed} txn={explicit_txn}] prepared multi-row OR IGNORE diverged"
+                    );
+
+                    let mut prep_70_sql = String::from("INSERT INTO child VALUES ");
+                    let mut f_params = Vec::with_capacity(140);
+                    let mut r_params = Vec::with_capacity(140);
+                    for i in 0..70i64 {
+                        if i > 0 {
+                            prep_70_sql.push_str(", ");
+                        }
+                        let base = i * 2 + 1;
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut prep_70_sql,
+                            format_args!("(?{base}, ?{})", base + 1),
+                        );
+                        f_params.push(SqliteValue::Integer(5000 + i));
+                        f_params.push(SqliteValue::Integer(1));
+                        r_params.push(rusqlite::types::Value::Integer(5000 + i));
+                        r_params.push(rusqlite::types::Value::Integer(1));
+                    }
+                    let prep_70 = f.prepare(&prep_70_sql).await.unwrap();
+                    assert_eq!(
+                        classify_franken(prep_70.execute_with_params(&f_params).await),
+                        classify_rusqlite(
+                            r.execute(&prep_70_sql, rusqlite::params_from_iter(r_params))
+                        ),
+                        "[file={file_backed} txn={explicit_txn}] prepared 70-row valid diverged"
+                    );
+                    // Now execute the SAME prepared statement with a bad FK on row 69.
+                    let mut f_params_bad = Vec::with_capacity(140);
+                    let mut r_params_bad = Vec::with_capacity(140);
+                    for i in 0..70i64 {
+                        let pid = if i == 69 { 999 } else { 1 };
+                        f_params_bad.push(SqliteValue::Integer(6000 + i));
+                        f_params_bad.push(SqliteValue::Integer(pid));
+                        r_params_bad.push(rusqlite::types::Value::Integer(6000 + i));
+                        r_params_bad.push(rusqlite::types::Value::Integer(pid));
+                    }
+                    assert_eq!(
+                        classify_franken(prep_70.execute_with_params(&f_params_bad).await),
+                        classify_rusqlite(
+                            r.execute(&prep_70_sql, rusqlite::params_from_iter(r_params_bad))
+                        ),
+                        "[file={file_backed} txn={explicit_txn}] prepared 70-row bad diverged"
+                    );
+                }
+
+                if explicit_txn {
+                    f.execute("COMMIT;").await.unwrap();
+                    r.execute_batch("COMMIT;").unwrap();
+                }
+
+                for (select, ncols) in [
+                    ("SELECT id, v FROM plain ORDER BY id;", 2),
+                    ("SELECT id, pid FROM child ORDER BY id;", 2),
+                    ("SELECT id, a, b FROM comp_c ORDER BY id;", 3),
+                    ("SELECT id, pid, bad_pid FROM def_c ORDER BY id;", 3),
+                    ("SELECT id, parent_id FROM self_ref ORDER BY id;", 2),
+                    ("SELECT id, pk FROM text_aff_c ORDER BY id;", 2),
+                    ("SELECT id, pk FROM wr_c ORDER BY id;", 2),
+                    ("SELECT id, note FROM ipk_fk ORDER BY id;", 2),
+                    ("SELECT id, base, pid FROM gen_fk ORDER BY id;", 3),
+                    ("SELECT id, tag, pid FROM ign_col_fk ORDER BY id;", 3),
+                ] {
+                    assert_eq!(
+                        franken_table_dump(&f, select).await,
+                        rusqlite_table_dump(&r, select, ncols),
+                        "[file={file_backed} txn={explicit_txn}] table dump `{select}` diverged"
+                    );
+                }
+                assert!(
+                    f.query("PRAGMA foreign_key_check;")
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "[file={file_backed} txn={explicit_txn}] foreign_key_check not empty"
+                );
+                f.close().await.unwrap();
+            }
+        }
+    });
+}
+
+/// bd-5ofes: deferred multi-row FK multiplicity, volatile VALUES single-eval,
+/// `PRAGMA foreign_keys = ON` toggled AFTER `prepare()`, and multi-statement
+/// `morsel_insert_dispatch` FK parity.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn bd_5ofes_deferred_multiplicity_volatile_and_toggle_after_prepare() {
+    asupersync::test_utils::run_test(|| async {
+        // 1. Deferred FK multiplicity across 80 rows in an explicit transaction:
+        //    inserting 80 rows referencing missing parent 99, then deleting only 1
+        //    of them, must STILL fail COMMIT until parent 99 exists.
+        let (f, r) = setup_pair(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, \
+             pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);",
+        )
+        .await;
+        f.execute("INSERT INTO parent VALUES (1); BEGIN;").await.unwrap();
+        r.execute_batch("INSERT INTO parent VALUES (1); BEGIN;").unwrap();
+        let deferred_80 = format!(
+            "INSERT INTO child VALUES {};",
+            (0..80)
+                .map(|i| format!("({i}, 99)"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(
+            classify_franken(f.execute(&deferred_80).await),
+            classify_rusqlite(r.execute(&deferred_80, []))
+        );
+        f.execute("DELETE FROM child WHERE id = 0;").await.unwrap();
+        r.execute("DELETE FROM child WHERE id = 0;", []).unwrap();
+        assert_eq!(
+            classify_franken(f.execute("COMMIT;").await),
+            classify_rusqlite(r.execute("COMMIT;", []))
+        );
+        assert!(f.in_transaction());
+        assert!(!r.is_autocommit());
+        f.execute("INSERT INTO parent VALUES (99); COMMIT;").await.unwrap();
+        r.execute_batch("INSERT INTO parent VALUES (99); COMMIT;").unwrap();
+        assert_eq!(
+            franken_table_dump(&f, "SELECT count(*) FROM child;").await,
+            rusqlite_table_dump(&r, "SELECT count(*) FROM child;", 1)
+        );
+        // Autocommit deferred 80-row INSERT with missing parent fails at statement end.
+        let deferred_80_auto = format!(
+            "INSERT INTO child VALUES {};",
+            (100..180)
+                .map(|i| format!("({i}, 888)"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(
+            classify_franken(f.execute(&deferred_80_auto).await),
+            classify_rusqlite(r.execute(&deferred_80_auto, []))
+        );
+        assert_eq!(
+            franken_table_dump(&f, "SELECT count(*) FROM child;").await,
+            rusqlite_table_dump(&r, "SELECT count(*) FROM child;", 1)
+        );
+        f.close().await.unwrap();
+
+        // 2. Volatile scalar function in 20-row (< 64) multi-row INSERT VALUES
+        //    under foreign_keys = ON must be invoked EXACTLY once per row.
+        let f = Connection::open(":memory:").await.unwrap();
+        f.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+        f.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY); INSERT INTO parent VALUES (1),(2);")
+            .await
+            .unwrap();
+        f.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id));")
+            .await
+            .unwrap();
+        struct CountingParent(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl fsqlite_func::ScalarFunction for CountingParent {
+            fn invoke(&self, _args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+                let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(SqliteValue::Integer(if n.is_multiple_of(2) { 1 } else { 2 }))
+            }
+            fn is_deterministic(&self) -> bool {
+                false
+            }
+            fn num_args(&self) -> i32 {
+                0
+            }
+            fn name(&self) -> &str {
+                "counting_parent"
+            }
+        }
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        f.register_nondeterministic_scalar_function(CountingParent(std::sync::Arc::clone(&calls)));
+        let vol_20 = format!(
+            "INSERT INTO child VALUES {};",
+            (0..20)
+                .map(|i| format!("({i}, counting_parent())"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        f.execute(&vol_20).await.unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            20,
+            "volatile VALUES function must execute exactly once per row"
+        );
+        f.close().await.unwrap();
+
+        // 3. Statement prepared while foreign_keys = OFF, then foreign_keys toggled ON:
+        //    precompiled FK plan must still reject missing parent.
+        let f = Connection::open(":memory:").await.unwrap();
+        f.execute("PRAGMA foreign_keys = OFF;").await.unwrap();
+        f.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY); INSERT INTO parent VALUES (1);")
+            .await
+            .unwrap();
+        f.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id));")
+            .await
+            .unwrap();
+        let stmt = f
+            .prepare("INSERT INTO child VALUES (?1, ?2), (?3, ?4);")
+            .await
+            .unwrap();
+        f.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+        let err = stmt
+            .execute_with_params(&[
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(99),
+            ])
+            .await;
+        assert!(matches!(err, Err(FrankenError::ForeignKeyViolation)));
+        assert_eq!(
+            franken_table_dump(&f, "SELECT count(*) FROM child;").await,
+            vec![vec![SqliteValue::Integer(0)]]
+        );
+        drop(stmt);
+        f.close().await.unwrap();
+
+        // 4. Multi-statement batches bypass ad-hoc prepared reuse and exercise
+        //    execute_insert_dispatch -> morsel_insert_dispatch ->
+        //    BatchedInsertFkCollector directly (valid 100-row, bad-last-row
+        //    100-row rollback, PK-beats-FK across morsels, self-ref 100-row,
+        //    and deferred 80-row multiplicity) against live rusqlite.
+        let (f, r) = setup_pair(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id));",
+        )
+        .await;
+        let extra_ddl = "
+            INSERT INTO parent VALUES (1), (2);
+            CREATE TABLE self_ref (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES self_ref(id));
+            CREATE TABLE def_c (id INTEGER PRIMARY KEY,
+                pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+            BEGIN;
+            INSERT INTO child VALUES (50, 1);";
+        f.execute(extra_ddl).await.unwrap();
+        r.execute_batch(extra_ddl).unwrap();
+
+        let morsel_ok = format!(
+            "SELECT 1; INSERT INTO child VALUES {};",
+            (100..200)
+                .map(|i| format!("({i}, {})", if i % 2 == 0 { 1 } else { 2 }))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let morsel_bad_last = format!(
+            "SELECT 1; INSERT INTO child VALUES {};",
+            (300..400)
+                .map(|i| format!("({i}, {})", if i == 399 { 999 } else { 1 }))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let morsel_pk_beats_fk = format!(
+            "SELECT 1; INSERT INTO child VALUES {};",
+            (500..600)
+                .map(|i| if i == 500 {
+                    "(500, 999)".to_owned()
+                } else if i == 580 {
+                    "(50, 1)".to_owned()
+                } else {
+                    format!("({i}, 1)")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let morsel_self_ok = format!(
+            "SELECT 1; INSERT INTO self_ref VALUES {};",
+            (1..=100)
+                .rev()
+                .map(|i| if i == 1 {
+                    "(1, NULL)".to_owned()
+                } else {
+                    format!("({i}, {})", i - 1)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let morsel_def_80 = format!(
+            "SELECT 1; INSERT INTO def_c VALUES {};",
+            (0..80)
+                .map(|i| format!("({i}, 99)"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        for (name, sql) in [
+            ("morsel_ok", &morsel_ok),
+            ("morsel_bad_last", &morsel_bad_last),
+            ("morsel_pk_beats_fk", &morsel_pk_beats_fk),
+            ("morsel_self_ok", &morsel_self_ok),
+            ("morsel_def_80", &morsel_def_80),
+        ] {
+            let fo = classify_franken(f.execute(sql).await);
+            let ro = match r.execute_batch(sql) {
+                Ok(()) => Outcome::Ok(0),
+                Err(e) => classify_rusqlite(Err(e)),
+            };
+            match (&fo, &ro) {
+                (Outcome::Ok(_), Outcome::Ok(_)) => {}
+                _ => assert_eq!(fo, ro, "[{name}] morsel outcome diverged: f={fo:?} vs r={ro:?}"),
+            }
+            assert!(f.in_transaction(), "[{name}] explicit txn must stay open");
+            assert!(!r.is_autocommit(), "[{name}] rusqlite txn must stay open");
+        }
+        // Delete 1 deferred row -> COMMIT must still fail until parent 99 exists.
+        f.execute("DELETE FROM def_c WHERE id = 0;").await.unwrap();
+        r.execute("DELETE FROM def_c WHERE id = 0;", []).unwrap();
+        assert_eq!(
+            classify_franken(f.execute("COMMIT;").await),
+            classify_rusqlite(r.execute("COMMIT;", []))
+        );
+        f.execute("INSERT INTO parent VALUES (99); COMMIT;").await.unwrap();
+        r.execute_batch("INSERT INTO parent VALUES (99); COMMIT;").unwrap();
+        for (select, ncols) in [
+            ("SELECT id, pid FROM child ORDER BY id;", 2),
+            ("SELECT id, parent_id FROM self_ref ORDER BY id;", 2),
+            ("SELECT count(*) FROM def_c;", 1),
+        ] {
+            assert_eq!(
+                franken_table_dump(&f, select).await,
+                rusqlite_table_dump(&r, select, ncols),
+                "[morsel_batch] `{select}` diverged"
+            );
+        }
+        f.close().await.unwrap();
+    });
+}

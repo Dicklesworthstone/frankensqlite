@@ -1259,6 +1259,12 @@ impl Connection {
         } else {
             None
         };
+        let insert_has_outbound_fk = self.insert_has_outbound_fk(insert);
+        let insert_may_delete_fk_parent = self.insert_may_delete_fk_parent_victim(insert);
+        let insert_supports_batched_fk =
+            insert_has_outbound_fk && self.insert_supports_batched_fk_replay(insert);
+        let insert_needs_row_by_row_fk =
+            (insert_has_outbound_fk && !insert_supports_batched_fk) || insert_may_delete_fk_parent;
         if !is_live_vtab
             && let fsqlite_ast::InsertSource::Select(select_stmt) = &insert.source
         {
@@ -1314,11 +1320,15 @@ impl Connection {
             // per-row INSERT ... VALUES operations. Those inner
             // statements already handle trigger firing and change
             // tracking, so route around the outer trigger path here.
+            // bd-5ofes: only tables with actual outbound or parent-victim FK
+            // work need FK row replay; plain tables keep the one-program lane
+            // even under PRAGMA foreign_keys = ON.
             let needs_row_by_row_replay = has_before_insert
                 || has_after_insert
                 || upsert_needs_conflict_plan
                 || returning_projection.is_some()
-                || self.fk_enforcement_enabled();
+                || insert_has_outbound_fk
+                || insert_may_delete_fk_parent;
             // bd-i3csr.1: a source the INSERT program can scan itself runs
             // as that one program (the VDBE path below), not materialized
             // and replayed.
@@ -1347,14 +1357,25 @@ impl Connection {
                 .await;
             }
         }
+        // bd-5ofes (GH#496): multi-row INSERT VALUES only needs row-by-row
+        // replay for triggers, UPSERT conflict routing, deferred RETURNING,
+        // non-batched FK shapes (OR IGNORE/REPLACE/FAIL/ROLLBACK, parent
+        // replace victims, generated/IPK/volatile-default FK columns), or
+        // small (<64) outbound-FK VALUES containing volatile/subquery
+        // expressions (which must be materialized once before VDBE + FK check).
+        // Plain tables and admitted outbound-FK tables keep single-program
+        // execution (<64 rows) and morsel/batched dispatch (>=64 rows).
         if !is_live_vtab
+            && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
+            && rows.len() > 1
             && (has_before_insert
                 || has_after_insert
                 || upsert_needs_conflict_plan
                 || returning_projection.is_some()
-                || self.fk_enforcement_enabled())
-            && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
-            && rows.len() > 1
+                || insert_needs_row_by_row_fk
+                || (insert_supports_batched_fk
+                    && rows.len() < MORSEL_INSERT_THRESHOLD
+                    && !Self::values_exprs_are_pure_for_post_fk(rows)))
         {
             self.log_mem_execution_fallback(
                 "insert_values",
@@ -1400,15 +1421,15 @@ impl Connection {
                 .await?;
             return Ok(outcome.returning_rows);
         }
-        // bd-xb07w: morsel-driven INSERT for large multi-row VALUES
-        // without triggers, FK, RETURNING, or UPSERT. The morsel
-        // scheduler splits the row stream into batches for future
-        // parallel execution; this wiring executes them sequentially.
+        // bd-xb07w + bd-5ofes (GH#496): morsel-driven INSERT for large
+        // multi-row VALUES without triggers, RETURNING, UPSERT, or
+        // row-by-row-only FK work. Admitted outbound-FK tables keep the morsel
+        // path and validate child-side FKs once per distinct parent key.
         if !is_live_vtab
             && insert.returning.is_empty()
             && !has_before_insert
             && !has_after_insert
-            && !self.fk_enforcement_enabled()
+            && !insert_needs_row_by_row_fk
             && insert.upsert.is_empty()
             && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
             && rows.len() >= MORSEL_INSERT_THRESHOLD
@@ -1804,7 +1825,10 @@ impl Connection {
                     row.values.truncate(start);
                 }
             }
-        } else if affected > 0 && self.fk_enforcement_enabled() {
+        } else if affected > 0
+            && !self.suppress_inner_batched_insert_fk_check.get()
+            && self.fk_enforcement_enabled()
+        {
             // Ordinary INSERT and UPSERT shapes without a precise receipt keep
             // their established enforcement. Never check a skipped row.
             Box::pin(self.enforce_fk_on_insert(insert, table_name, params)).await?;
