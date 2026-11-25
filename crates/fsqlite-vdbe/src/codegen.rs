@@ -21363,8 +21363,14 @@ enum CountIndexRange<'e> {
     Nulls,
     NotNulls,
     /// The values of the index's leading key columns, in index order, each
-    /// paired with the `Affinity` to emit before seeking (if any).
-    Prefix(Vec<(&'e Expr, Option<char>)>),
+    /// paired with the `Affinity` to emit before seeking (if any). When
+    /// `rowid_bounds` is `Some`, the prefix pins every key column of a rowid
+    /// table's index (`(prefix..., rowid)`), so the start seek and upper
+    /// `IdxCountBefore` bound apply those exact rowid bounds (bd-qrn03).
+    Prefix {
+        values: Vec<(&'e Expr, Option<char>)>,
+        rowid_bounds: Option<IndexEqRowidBounds>,
+    },
     /// bd-qyd3s: distinct integer values of the leading key column, each
     /// counted as its own run.
     Members(Vec<i64>),
@@ -21379,7 +21385,10 @@ enum CountIndexRange<'e> {
 /// also an equality prefix that is exactly the WHERE
 /// ([`aggregate_index_eq_seek_target`]) when every pinned value is exact after
 /// index-key affinity coercion ([`index_eq_term_probe_plan`]): the prefix is
-/// then the inclusive range from the coerced values to themselves.
+/// then the inclusive range from the coerced values to themselves. bd-qrn03:
+/// also a full-key equality prefix plus exact integer-literal rowid bounds
+/// (`index_prefix_rowid_bounds_cover_where`), counting the `(prefix, rowid)`
+/// slice straight from the index's leaves.
 /// bd-qyd3s: and a WHERE that is exactly `col IN (<integer literals>)` on an
 /// INTEGER-affinity column ([`index_integer_in_list_target`]): the members are
 /// de-duplicated, so their runs are disjoint and the counts add up.
@@ -21415,8 +21424,60 @@ fn count_star_index_range_target<'t, 'e>(
             planned.push((value, plan.affinity_to_emit));
         }
         if all_exact {
-            return Some((index, CountIndexRange::Prefix(planned)));
+            return Some((
+                index,
+                CountIndexRange::Prefix {
+                    values: planned,
+                    rowid_bounds: None,
+                },
+            ));
         }
+    }
+    if !table.without_rowid
+        && let Some((rowid_range, true)) =
+            extract_rowid_range_residual_target(where_clause, table, table_alias)
+        && let Some(bounds) = IndexEqRowidBounds::from_range(&rowid_range)
+        && let Some((index, values)) = aggregate_index_prefix_residual_target(
+            where_clause,
+            table,
+            table_alias,
+            schema,
+            PrefixIndexShape::FullKey,
+            PrefixProbe::Literal,
+        )
+        && index.where_clause.is_none()
+        && index_prefix_rowid_bounds_cover_where(
+            where_clause,
+            table,
+            table_alias,
+            index,
+            &values,
+            bounds,
+        )
+    {
+        let planned: Vec<(&'e Expr, Option<char>)> = values
+            .into_iter()
+            .enumerate()
+            .map(|(pos, value)| {
+                let plan = index_eq_term_probe_plan(
+                    table,
+                    table_alias,
+                    schema,
+                    index,
+                    pos,
+                    value,
+                    where_clause,
+                );
+                (value, plan.affinity_to_emit)
+            })
+            .collect();
+        return Some((
+            index,
+            CountIndexRange::Prefix {
+                values: planned,
+                rowid_bounds: Some(bounds),
+            },
+        ));
     }
     if let Some((index, range, false)) =
         aggregate_index_range_seek_target(where_clause, table, table_alias, schema)
@@ -21540,11 +21601,17 @@ fn codegen_select_count_star_index_range(
                 (Some((record, Opcode::SeekGE)), Some((record, true)))
             })
             .collect(),
-        // bd-zgbhb / bd-text-probe-numeric-index-qk7vd: from the first entry
-        // the coerced prefix pins up to the last.
-        CountIndexRange::Prefix(values) => {
+        // bd-zgbhb / bd-text-probe-numeric-index-qk7vd / bd-qrn03: from the
+        // first entry the coerced prefix (and optional lower rowid bound) pins
+        // up to the last (or optional upper rowid bound).
+        CountIndexRange::Prefix {
+            values,
+            rowid_bounds,
+        } => {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let base = b.alloc_regs(values.len() as i32);
+            let prefix_len = values.len() as i32;
+            let has_rowid_bound = rowid_bounds.is_some();
+            let base = b.alloc_regs(prefix_len + i32::from(has_rowid_bound));
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             for (pos, (value, affinity)) in values.iter().enumerate() {
                 let reg = base + pos as i32;
@@ -21554,10 +21621,63 @@ fn codegen_select_count_star_index_range(
                     b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(aff.to_string()), 0);
                 }
             }
-            let record = b.alloc_reg();
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            b.emit_op(Opcode::MakeRecord, base, values.len() as i32, record, P4::None, 0);
-            vec![(Some((record, Opcode::SeekGE)), Some((record, true)))]
+            if let Some(bounds) = rowid_bounds {
+                // Emit `upper` before `start` so the `MakeRecord` immediately
+                // preceding `SeekGE`/`SeekGT` is always the start seek probe.
+                let upper = if let Some(upper_rowid) = bounds.upper {
+                    b.emit_op(
+                        Opcode::Int64,
+                        0,
+                        base + prefix_len,
+                        0,
+                        P4::Int64(upper_rowid),
+                        0,
+                    );
+                    let upper_record = b.alloc_reg();
+                    b.emit_op(
+                        Opcode::MakeRecord,
+                        base,
+                        prefix_len + 1,
+                        upper_record,
+                        P4::None,
+                        0,
+                    );
+                    (upper_record, bounds.upper_inclusive)
+                } else {
+                    let upper_record = b.alloc_reg();
+                    b.emit_op(Opcode::MakeRecord, base, prefix_len, upper_record, P4::None, 0);
+                    (upper_record, true)
+                };
+                let start = if let Some(lower) = bounds.lower {
+                    b.emit_op(Opcode::Int64, 0, base + prefix_len, 0, P4::Int64(lower), 0);
+                    let start_record = b.alloc_reg();
+                    b.emit_op(
+                        Opcode::MakeRecord,
+                        base,
+                        prefix_len + 1,
+                        start_record,
+                        P4::None,
+                        0,
+                    );
+                    (
+                        start_record,
+                        if bounds.lower_inclusive {
+                            Opcode::SeekGE
+                        } else {
+                            Opcode::SeekGT
+                        },
+                    )
+                } else {
+                    let start_record = b.alloc_reg();
+                    b.emit_op(Opcode::MakeRecord, base, prefix_len, start_record, P4::None, 0);
+                    (start_record, Opcode::SeekGE)
+                };
+                vec![(Some(start), Some(upper))]
+            } else {
+                let record = b.alloc_reg();
+                b.emit_op(Opcode::MakeRecord, base, prefix_len, record, P4::None, 0);
+                vec![(Some((record, Opcode::SeekGE)), Some((record, true)))]
+            }
         }
     };
     b.emit_op(
