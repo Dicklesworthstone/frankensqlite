@@ -94,6 +94,57 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-25 - SMALL WIN (landed as 749c2e213; instructions only: rowid_lookups_200k -23.4M Ir, x4.82 -> x4.77 stock 3.54.1, the prediction band's low end missed by 0.6M and the gain kill line held; time a replicated TIE under judge v2b, where FS1 v1 was a cycles LOSE): the clean-buffer eviction walks an occupancy bitmap and prefetches the next victim's slot (bd-w4pr1.13.18, point lane rounds 13-14, lever FS1 v2)
+
+- Target: as for FS1 (the 2026-11-23 REJECTED entry below), `take_clean_buffer_from_flat_slots`' slot walk: about 233
+  Ir an eviction on rowid_lookups_200k.
+- Touched (patch `scratchpad/pl13/fs1v2r/fs1v2r.patch`, sha256 84288e9b13da4e9a): `crates/fsqlite-pager/src/page_cache.rs`.
+  This is `fs1v2.patch` (7ede2dead05a13fa) regenerated against page_cache.rs with CP1 and NW in, with identical +/-
+  lines. It is FS1's occupancy-bitmap walk plus one addition: after each successful take at slot i, a prefetch of
+  every cache line of the next occupied slot. `FlatPageSlots::next_occupied_after(i)` looks at the rest of i's word
+  and the next word only, wrapping, and otherwise returns None.
+  - Keepers: FS1's two, plus `test_bd_w4pr1_13_18_flat_next_occupied_after_looks_two_words_ahead`.
+  - Seven planted mutants each failed on the assertion it targets: m1-m4 are FS1's; m5 counts the victim's own slot;
+    m6 drops the wrap; m7 searches past two words.
+- Prediction (bead 2026-11-23 02:11Z, restated before the build at 2026-11-25 04:49Z on parent f72000664):
+  - rowid -24M to -32M Ir; scans -0.5M to -1.6M; write rows +-0.3%; all-hits +-0.05%.
+  - rowid cycles a TIE or WIN (0.97 to 1.00); every other row a TIE.
+  - Kill: rowid better by less than 20M; any row above +0.5% Ir; the all-hits control above +0.1%; any replicated
+    LOSE, rowid cycles included; an answer differing from stock; a red gate; a mutant passing.
+- Result. One rch job on hz3 built both arms on origin/main f72000664: cargo ELFs P 8d1c78c560655178, L
+  545b53f10ce7b9fa. Stock 3.54.1 ran live (8056229856cf74fe), on thinkstation1 with io_uring refused. Callgrind,
+  statement minus SELECT 1:
+  - rowid 2,213.03M -> 2,189.66M Ir (-23.37M, -1.06%, -125 an eviction); x4.82 -> x4.77 stock 459.21M.
+  - `trim_to_page_budget` 142.7M -> 117.5M; `insert_tiered_if_absent` +1.9M (the bit set on insert).
+  - All-hits control +0.0076%; x3.49 stock in both arms.
+  - Judge minima: the 1M-row read rows -0.9M to -1.0M each; the write rows +0.04% at most.
+  - Time, judge v2b, K=6: fs3j1 VOID (null max |z| 75.9); fs3j2 and fs3j3 valid.
+    - Every row is a replicated TIE except window_sum_over cpu: a v2b time WIN (0.9868 / 0.9891), pending
+      bd-j0jc0/bd-gvews. Its Ir moved -0.02%, so it is not this lever's doing.
+    - rowid cycles 0.9965 / 1.0026, cpu 0.9930 / 0.9998. FS1 v1 was 1.080, a LOSE.
+  - Answers equal stock in every run.
+- v1 against v2:
+  - The prefetch removes v1's cycles LOSE.
+  - It costs instructions: -23.4M here against v1's -32.0M (measured on parent e9dd4aa18). That is more than the
+    about 20 Ir an eviction modelled for the lookup and the prefetches.
+- Gate (rch):
+  - The lever on f72000664, on vmi1227854: clippy -D warnings fsqlite-pager clean; keepers and eviction tests 182
+    passed; pager lib 1,147 passed, 0 failed; m1-m7 each rc 101.
+  - Landed on 4ea859aab: page_cache.rs unchanged there, pager.rs changed (c414b06aa, 464ea941b). Re-gated on the
+    landed tree d9ab9296 (hz4): clippy -D warnings fsqlite-pager clean; pager lib 1,149 passed, 0 failed, the three
+    FS1 v2 keepers among them.
+  - rustfmt: ignored crate.
+  - ubs page_cache.rs: 0 critical; warnings 1,585 -> 1,659. The +74 are the keepers' asserts, unwraps and indexing,
+    plus the bitmap's bounded word and slot indexing.
+- Retry / next:
+  - Re-judge rowid cycles once bd-j0jc0/bd-gvews close. A replicated LOSE under the fixed judge reverts this lever. A
+    WIN there upgrades the entry.
+  - The rowid miss path's largest pieces left, per miss (callee table `scratchpad/pl13/fs3_kids_fs3L.txt`):
+    - `read_data_path` 755 Ir;
+    - `InFlightReadLeader::finish` 728 (two calls), mostly `trim_to_page_budget`;
+    - the page copy, memcpy 413 plus malloc 152;
+    - `insert_tiered_if_absent` 296.
+
 ## 2026-11-25 - REJECTED on two kill lines (trig_cte_20000 -58.8M Ir, x8.77 -> x8.52 stock 3.54.1, under its 60M gain line and half its -120M..-180M prediction; trig_values_20000 +2.25M, +0.106%, over its +0.1% regression line): a trigger firing that hides its caller's materialized CTE bindings keeps the table name index current in place instead of rebuilding every name index on entry and exit (bd-fpr5g, trig lane rounds 4-6, lever 6)
 
 - Target: `MaterializedBindingsVisibilityGuard` is entered once per trigger firing while the caller has materialized
