@@ -94,6 +94,85 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-25 - WIN (landed as c71e4a99e; past its gain kill line at 4 and 8 writers; FULL separate-table F/C 2.04 -> 3.39 at 4 writers and 3.90 -> 6.32 at 8, stock 3.54.1 live): at synchronous=FULL a group-commit epoch waits (bounded) for its file's peers, so N writers stop alternating a 1-member and an (N-1)-member sync (bd-6a8a5, group-commit lane round 1, lever L1, on bd-acuhw's workload)
+
+- Target: concurrent writers committing short transactions at synchronous=FULL (or EXTRA). Workload (bd-acuhw,
+  new in mt-mvcc-bench): `--one-row-per-transaction --rows-per-transaction=5 --stock-begin=immediate`, 100
+  transactions per writer, file-backed on / (ext4 on LVM, thinkstation1), stock = bundled 3.54.1 with
+  HAVE_FDATASYNC, live in every process with its C/C null.
+- Ledger preflight: 2026-07-23 bd-6hgad (retry predicate: FULL/EXTRA, many small overlapping transactions,
+  null-controlled A/B; met here); 2026-11-14 sole_transaction arrival-wait skip (kept: a transaction alone on its
+  file never waits); 2026-11-14 bd-i0tn6 S2+S3 (untouched); the bd-wee9a code comment (a 2 ms sparse wait did not
+  batch while writers were serialized on the pager mutex; promoted epochs never waited at all).
+- Diagnosis (baseline ELF ba393d44167cbdae): the queue coalesces at FULL, but N writers alternate an epoch of one
+  transaction with one of the other N-1 (8w: 541 epochs of 1 and 484 of 5-8; mean batch about N/2). A promoted
+  epoch began flushing the moment a waiter claimed its vacancy (`observe_epoch_outcome` -> `begin_flush`;
+  "promoted_follow_on" skipped any arrival wait), while the writer the previous sync released needed ~0.3-1 ms to
+  come back. Each flush costs one ~9.4-11.9 ms WAL sync at every batch size, so half the syncs carried one
+  transaction.
+- Change (crates/fsqlite-pager/src/pager.rs; crates/fsqlite-wal/src/group_commit.rs `is_full`): when the commit
+  syncs and the file has 2+ same-process transactions (the maintenance gate's count), the epoch waits until all of
+  them have submitted, the group is full by frames, or its budget ends: min(the queue's 1 ms group delay, half
+  the queue's EWMA of measured WAL syncs), halved after each wait that gained nobody (at most 6 times) and
+  restored by one that did. A waiter that takes over a promoted epoch claims the vacancy but leaves it FILLING
+  (`WaitForEpochOutcome::ClaimedPromotedFlusher`) under the same filling obligation a fresh flusher has.
+  NORMAL, a sole transaction, validation (each member validates in its own commit before it submits; flush-time
+  checks unchanged), certificates (v5, one per commit as before) and recovery are unchanged.
+- Prediction (bd-6a8a5, before the build): F txn/s +50..+95% at 2w, +40..+90% at 4w, +30..+85% at 8w, +25..+85%
+  at 16w; 1w and NORMAL 0; shared FULL -1..+30%; CPU per txn +0..+20%. Kill: under +20% at 4w or 8w; a replicated
+  LOSE above 1% at 1w FULL, any NORMAL cell or any FULL shared cell; CPU above +30%; any failed write.
+- Result. Arms A ba393d44167cbdae (origin/main 337f0bda8 + the bench change) and B 1392f944ac809c7c (A + L1),
+  both built in one rch job on vmi1153651; Q = a byte copy of A (distinct inode) as the A/A null. Per cell 5
+  repetitions of A/B/Q in rotated order, each a separate process with stock live; verdict rule posted before the
+  runs (WIN when the B/A median is above the Q/A band and 4 of 5 repetitions are); a row whose A/A median is
+  outside 0.95-1.05 is VOID (bd-w4pr1.27's rule); any arm run with 1-minute load >= 20 at its start or end was
+  voided before reading it (another session's local rustc pushed the host to load 135 during pass 1).
+  F txn/s B/A median, pass 1 / pass 2:
+  - FULL separate: 1w 0.960 VOID(null 0.935) / 1.016 TIE; 2w 1.713 WIN / 1.776 VOID(null 0.931);
+    4w 1.772 WIN / 1.714 WIN; 8w 1.659 WIN / 1.648 WIN; 16w 1.236 VOID(null 0.945) / 1.382 WIN.
+  - F/C (fsqlite/stock txn/s) A -> B: 2w 1.03 -> 1.83, 4w 2.04 -> 3.39, 8w 3.90 -> 6.32, 16w 4.99 -> 6.62.
+  - Mean batch A -> B: 2w 1.00 -> 1.87, 4w 1.94 -> 3.49, 8w 3.65 -> 5.83, 16w 6.6 -> 8.4-8.9.
+  - CPU per transaction A -> B: -10% to +13% at every FULL separate cell.
+  - NORMAL (1,000 txns per writer): separate 8w 0.971 TIE / 0.983 TIE, 2w 1.081 TIE; shared 8w VOID twice.
+  - FULL shared: 4w 1.025 VOID; 8w 1.145 TIE / 0.936 VOID; 16w 1.106 VOID / 0.848 VOID / 1.311 TIE (the last two
+    passes at 200 txns per writer). Shared-table commits serialize behind each other's sync (publication waits,
+    retries); B's arrival wait there settles at ~16 us per ~10 ms flush after the miss backoff.
+  - No replicated LOSE, no failed write, every committed-state oracle valid. GAIN kill cleared; predictions met at
+    2/4/8w and at 16w in its valid pass.
+- Keepers: pager lib test_commit_service_policy_durable_sync_join_waits_for_file_peers,
+  test_group_commit_queue_durable_join_budget_tracks_half_the_sync,
+  test_maintenance_lease_same_file_transactions_counts_the_gates_transactions,
+  test_durable_waiter_claims_a_promoted_epoch_without_beginning_its_flush; fsqlite-wal is_full vs an expired delay
+  and the batch-size histogram; fsqlite-e2e bd_6a8a5_group_commit_crash_mid_batch (FULL multi-member epochs, the
+  WAL cut at every frame boundary and mid-frame: every transaction all-or-nothing, per-writer prefixes,
+  FrankenSQLite reads what stock 3.54.1 reads, the uncut image holds every acknowledged commit).
+  Its writers rewrite seeded rows in place, so it covers batches whose members do not grow the file: growing
+  writers conflict on the page count (bd-emim5) and commit one at a time (an insert-only version flushed 120
+  single-transaction epochs on every worker), so a crash inside a growing batch is untested until bd-emim5 lets
+  growth batch. Stale members are guarded at the flush unit level only (MockWalBackend); a cross-process e2e
+  with a stale member in a multi-member epoch is not built.
+- Mutants (each built fresh; a step that did not recompile the patched crate is void): m3, every frame of an
+  epoch a commit marker in `flatten_group_commit_batches`, is red on the crash keeper (all 240 frames commit-marked: "cut after 1 of 240 frames
+  [FrankenSQLite]: writer 0 transaction 0 is partially present (2 of 3 rows)") and on two flatten
+  unit tests; the merge-path mutant m3s is masked end to end by the shadow-compare fallback (every lane-merged
+  epoch is compared against the flattened frames and a divergence falls back to them), so only its unit test
+  `test_parallel_wal_prepared_merge_clears_intermediate_commit_headers` kills it; m4 (stale check of the epoch
+  leader only) is red on both stale-member keepers, m4b on the flush-level one.
+- Gate: crash keeper green 3/3 twice (every one of 240 frame boundaries cut clean and torn; epochs of 1 / 2 / 3-4 /
+  5-8 members [21,8,9,10], [19,1,1,19], [20,1,2,18], [17,2,4,17], [19,1,1,19], [19,1,1,19]); clippy clean (wal, pager --all-targets, mt-mvcc-bench, the keeper target); L1
+  pager keepers 8/8; pager lib 1152/0 (13 ignored); wal group_commit 67/0; e2e group-commit durability 12/12,
+  split-claim 17/17, concurrency targets 49/0. Reds attributed: bd-uk9ob (wall-clock, red on main) and one
+  baton-bound run of `test_deferred_upgrade_busy_when_writer_active`, green 5/5 on the tree and on main on rerun.
+- Gate lessons: (1) the first crash keeper inserted 1500-byte rows, so every transaction grew the file, the
+  writers serialized on the page count and every run flushed 120 single-transaction epochs: its vacuity guard
+  fired on every worker, and it never reached a cut. (2) Its cuts were sampled at a stride of 6 frames while
+  every transaction is 2 frames, so no cut could split a transaction. (3) An rch job that follows a mutant job on
+  the same worker can reuse the mutant's build (synced sources keep older mtimes): touch the patched sources at
+  job start and require a compile of the patched crate in each step's log.
+- Retry condition / next: at 16w the epoch still often closes before every peer is back (B keeps ~200-270
+  singletons per 5 rounds): the 1 ms group-delay cap binds when think time grows. Shared tables do not coalesce at
+  all; that is the S3 publication-pending wait (bd-15hxt territory), not the queue.
+
 ## 2026-11-25 - SMALL WIN (landed as 749c2e213; instructions only: rowid_lookups_200k -23.4M Ir, x4.82 -> x4.77 stock 3.54.1, the prediction band's low end missed by 0.6M and the gain kill line held; time a replicated TIE under judge v2b, where FS1 v1 was a cycles LOSE): the clean-buffer eviction walks an occupancy bitmap and prefetches the next victim's slot (bd-w4pr1.13.18, point lane rounds 13-14, lever FS1 v2)
 
 - Target: as for FS1 (the 2026-11-23 REJECTED entry below), `take_clean_buffer_from_flat_slots`' slot walk: about 233
