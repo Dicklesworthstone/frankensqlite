@@ -87369,7 +87369,37 @@ impl Connection {
     }
 
     fn limit_probe_to_its_first_row(&self, probe: &mut SelectStatement) {
-        if probe.limit.is_some() {
+        if let Some(limit_clause) = probe.limit.as_mut() {
+            // bd-7zeum: mirror SQLite's `sqlite3CodeSubselect` (sqlite3.c:116871):
+            // when a scalar or EXISTS subquery already carries a LIMIT X other than
+            // the bare integer literal 0 or 1, rewrite LIMIT X to
+            // `X <> CAST(0 AS NUMERIC)` so the effective limit is 0 or 1 (handling
+            // floats/strings/negative limits without datatype mismatch, while
+            // preserving NULL -> datatype mismatch and preventing `unionWithLimitOne`
+            // from firing on `LIMIT 5`).
+            if !matches!(
+                limit_clause.limit,
+                Expr::Literal(Literal::Integer(0 | 1), _)
+            ) {
+                let original = std::mem::replace(
+                    &mut limit_clause.limit,
+                    Expr::Literal(Literal::Integer(1), Span::ZERO),
+                );
+                limit_clause.limit = Expr::BinaryOp {
+                    left: Box::new(original),
+                    op: BinaryOp::Ne,
+                    right: Box::new(Expr::Cast {
+                        expr: Box::new(Expr::Literal(Literal::Integer(0), Span::ZERO)),
+                        type_name: fsqlite_ast::TypeName {
+                            name: "NUMERIC".to_owned(),
+                            arg1: None,
+                            arg2: None,
+                        },
+                        span: Span::ZERO,
+                    }),
+                    span: Span::ZERO,
+                };
+            }
             return;
         }
         let unlimited_runs_in_vdbe = select_join_is_vdbe_eligible(probe);
@@ -111061,18 +111091,48 @@ impl Connection {
 
     /// Execute a compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT).
     ///
-    /// Executes each SELECT arm independently, then combines results according
-    /// to the set operation. ORDER BY and LIMIT are applied to the final result.
+    /// Mirrors SQLite 3.54.1 `multiSelect` / `computeLimitRegisters` /
+    /// `unionWithLimitOne` (bd-7zeum):
+    /// - Resolves LIMIT and OFFSET before running any arm; `LIMIT 0` runs no arm.
+    /// - Without `ORDER BY`, a trailing suffix of `UNION ALL` arms (and `UNION`
+    ///   arms when `LIMIT` is literal integer 1 with no `OFFSET`) streams arm by
+    ///   arm and stops as soon as `LIMIT + OFFSET` rows have been produced.
     async fn execute_compound_select(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let needs_collation_aware_dedup = select
-            .body
-            .compounds
-            .iter()
-            .any(|(op, _)| !matches!(op, CompoundOp::UnionAll));
+        fn expr_is_literal_integer(mut expr: &Expr) -> Option<i64> {
+            let mut negate = false;
+            loop {
+                match expr {
+                    Expr::Literal(Literal::Integer(value), _) => {
+                        return if negate {
+                            value.checked_neg()
+                        } else {
+                            Some(*value)
+                        };
+                    }
+                    Expr::UnaryOp {
+                        op: UnaryOp::Plus,
+                        expr: inner,
+                        ..
+                    } => {
+                        expr = inner;
+                    }
+                    Expr::UnaryOp {
+                        op: UnaryOp::Negate,
+                        expr: inner,
+                        ..
+                    } => {
+                        negate = !negate;
+                        expr = inner;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
         let resolved_order_indices = if select.order_by.is_empty() {
             Vec::new()
         } else {
@@ -111088,6 +111148,64 @@ impl Connection {
         } else {
             select
         };
+
+        // bd-7zeum: evaluate LIMIT / OFFSET before running any arm, matching
+        // SQLite's `computeLimitRegisters`. `LIMIT 0` returns immediately
+        // without evaluating any compound arm (even under UNION/INTERSECT/EXCEPT
+        // or ORDER BY).
+        let resolved_limit = self.resolve_expression_only_limit(select, params).await?;
+        if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+            return Ok(Vec::new());
+        }
+
+        // bd-7zeum: SQLite 3.54.1 `unionWithLimitOne` treats a UNION whose LIMIT
+        // is the literal integer 1 (through unary +/-), with no OFFSET and no
+        // ORDER BY, as UNION ALL.
+        let union_with_limit_one = select.order_by.is_empty()
+            && select.limit.as_ref().is_some_and(|clause| {
+                clause.offset.is_none() && expr_is_literal_integer(&clause.limit) == Some(1)
+            });
+
+        let streaming_needed: Option<usize> = if select.order_by.is_empty() {
+            resolved_limit.and_then(|limit| {
+                if limit.limit < 0 {
+                    None
+                } else {
+                    let lim = u64::try_from(limit.limit).ok()?;
+                    let off = u64::try_from(limit.offset.max(0)).ok()?;
+                    let total = lim.saturating_add(off);
+                    usize::try_from(total).ok()
+                }
+            })
+        } else {
+            None
+        };
+
+        let mut streaming_suffix_start = select.body.compounds.len();
+        if streaming_needed.is_some() {
+            while streaming_suffix_start > 0 {
+                let (op, _) = &select.body.compounds[streaming_suffix_start - 1];
+                let can_stream = matches!(op, CompoundOp::UnionAll)
+                    || (union_with_limit_one && matches!(op, CompoundOp::Union));
+                if can_stream {
+                    streaming_suffix_start -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let make_arm_limit = |count: usize| -> Option<fsqlite_ast::LimitClause> {
+            let count_i64 = i64::try_from(count).ok()?;
+            Some(fsqlite_ast::LimitClause {
+                limit: Expr::Literal(Literal::Integer(count_i64), Span::ZERO),
+                offset: None,
+            })
+        };
+
+        let needs_collation_aware_dedup = select.body.compounds[..streaming_suffix_start]
+            .iter()
+            .any(|(op, _)| !matches!(op, CompoundOp::UnionAll));
 
         let mut cores = Vec::with_capacity(select.body.compounds.len() + 1);
         cores.push(&select.body.select);
@@ -111121,6 +111239,11 @@ impl Connection {
         }
 
         // Execute the first SELECT arm.
+        let first_arm_limit = if streaming_suffix_start == 0 {
+            streaming_needed.and_then(make_arm_limit)
+        } else {
+            None
+        };
         let first_arm = SelectStatement {
             with: select.with.clone(),
             body: SelectBody {
@@ -111128,7 +111251,7 @@ impl Connection {
                 compounds: vec![],
             },
             order_by: vec![],
-            limit: None,
+            limit: first_arm_limit,
         };
         let mut result = self
             .execute_statement(&Statement::Select(first_arm), params)
@@ -111147,10 +111270,8 @@ impl Connection {
         // byte-identical, so the cheaper flat keep-last is observationally
         // identical and the hot path stays a single dedup+sort per arm.
         let union_collated_survivor = collations.iter().any(Option::is_some)
-            && !select.body.compounds.is_empty()
-            && select
-                .body
-                .compounds
+            && streaming_suffix_start > 0
+            && select.body.compounds[..streaming_suffix_start]
                 .iter()
                 .all(|(op, _)| matches!(op, CompoundOp::Union));
         if union_collated_survivor {
@@ -111158,7 +111279,16 @@ impl Connection {
         }
 
         // Process each compound arm.
-        for (op, core) in &select.body.compounds {
+        for (arm_index, (op, core)) in select.body.compounds.iter().enumerate() {
+            let is_streaming_arm = arm_index >= streaming_suffix_start;
+            let arm_limit = if is_streaming_arm && let Some(needed) = streaming_needed {
+                if result.len() >= needed {
+                    break;
+                }
+                make_arm_limit(needed - result.len())
+            } else {
+                None
+            };
             let arm_select = SelectStatement {
                 with: None,
                 body: SelectBody {
@@ -111166,11 +111296,16 @@ impl Connection {
                     compounds: vec![],
                 },
                 order_by: vec![],
-                limit: None,
+                limit: arm_limit,
             };
             let arm_rows = self
                 .execute_statement(&Statement::Select(arm_select), params)
                 .await?;
+
+            if is_streaming_arm {
+                result.extend(arm_rows);
+                continue;
+            }
 
             match op {
                 CompoundOp::UnionAll => {
@@ -111288,8 +111423,7 @@ impl Connection {
             )?;
         }
 
-        let limit = self.resolve_expression_only_limit(select, params).await?;
-        apply_resolved_expression_limit(&mut result, limit);
+        apply_resolved_expression_limit(&mut result, resolved_limit);
 
         Ok(result)
     }

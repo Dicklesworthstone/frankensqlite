@@ -48320,6 +48320,52 @@ fn emit_once_materialized_exists_subquery(
     b.emit_op(Opcode::Copy, cached_reg, reg, 0, P4::None, 0);
 }
 
+/// bd-7zeum: mirror SQLite's `sqlite3CodeSubselect` LIMIT gate for scalar and
+/// EXISTS subqueries compiled in the VDBE.
+///
+/// Any preexisting `LIMIT X` other than bare integer literal `0` or `1` is
+/// evaluated as `X <> CAST(0 AS NUMERIC)` and checked via `MustBeInt` +
+/// `IfNot -> done_label`. Thus `LIMIT 0`, `LIMIT '0'`, `LIMIT 0.0` skip the
+/// subquery; `LIMIT 2.5`, `LIMIT 'abc'`, `LIMIT -1` proceed to emit 1 row;
+/// and `LIMIT NULL` raises SQLite's `datatype mismatch`.
+fn emit_subquery_limit_gate(
+    b: &mut ProgramBuilder,
+    limit_clause: Option<&LimitClause>,
+    outer_ctx: &ScanCtx<'_>,
+    done_label: crate::Label,
+) {
+    let Some(clause) = limit_clause else {
+        return;
+    };
+    match &clause.limit {
+        Expr::Literal(Literal::Integer(0), _) => {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+        }
+        Expr::Literal(Literal::Integer(1), _) => {}
+        other => {
+            let nonzero_expr = Expr::BinaryOp {
+                left: Box::new(other.clone()),
+                op: BinaryOp::Ne,
+                right: Box::new(Expr::Cast {
+                    expr: Box::new(Expr::Literal(Literal::Integer(0), fsqlite_ast::Span::ZERO)),
+                    type_name: fsqlite_ast::TypeName {
+                        name: "NUMERIC".to_owned(),
+                        arg1: None,
+                        arg2: None,
+                    },
+                    span: fsqlite_ast::Span::ZERO,
+                }),
+                span: fsqlite_ast::Span::ZERO,
+            };
+            let r_lim = b.alloc_temp();
+            emit_expr(b, &nonzero_expr, r_lim, Some(outer_ctx));
+            b.emit_op(Opcode::MustBeInt, r_lim, 0, 0, P4::None, 0);
+            emit_limit_zero_guard(b, r_lim, done_label);
+            b.free_temp(r_lim);
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn emit_exists_subquery(
     b: &mut ProgramBuilder,
@@ -48366,16 +48412,25 @@ fn emit_exists_subquery(
             } if group_by.is_empty() && windows.is_empty() && has_aggregate_columns(columns)
         )
     {
+        let done_label = b.emit_label();
+        b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
+        emit_subquery_limit_gate(b, subquery.limit.as_ref(), outer_ctx, done_label);
         b.emit_op(Opcode::Integer, i32::from(!not), reg, 0, P4::None, 0);
+        b.resolve_label(done_label);
         return;
     }
 
     let from_clause = match from {
         Some(f) => f,
         None => {
-            // EXISTS on a no-FROM query like `EXISTS (SELECT 1)` — always true.
+            // EXISTS on a no-FROM query like `EXISTS (SELECT 1)` — always true
+            // unless gated out by LIMIT (bd-7zeum).
+            let done_label = b.emit_label();
+            b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
+            emit_subquery_limit_gate(b, subquery.limit.as_ref(), outer_ctx, done_label);
             let val = i32::from(!not);
             b.emit_op(Opcode::Integer, val, reg, 0, P4::None, 0);
+            b.resolve_label(done_label);
             return;
         }
     };
@@ -48405,6 +48460,9 @@ fn emit_exists_subquery(
     // Default result: 0 (not found) for EXISTS, 1 for NOT EXISTS.
     let default_val = i32::from(not);
     b.emit_op(Opcode::Integer, default_val, reg, 0, P4::None, 0);
+    // Evaluate LIMIT gate before opening/scanning the subquery cursor.
+    let early_exit_label = b.emit_label();
+    emit_subquery_limit_gate(b, subquery.limit.as_ref(), outer_ctx, early_exit_label);
 
     // A read cursor on the subquery table, opened by the paths below that read
     // a table row (bd-tx55u): an index probe without residual terms, and the
@@ -48461,6 +48519,7 @@ fn emit_exists_subquery(
             outer_ctx,
             schema,
         );
+        b.resolve_label(early_exit_label);
         return;
     }
 
@@ -48493,6 +48552,7 @@ fn emit_exists_subquery(
         b.emit_op(Opcode::Integer, found_val, reg, 0, P4::None, 0);
         b.resolve_label(done_label);
         b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
+        b.resolve_label(early_exit_label);
         return;
     }
 
@@ -48577,6 +48637,7 @@ fn emit_exists_subquery(
         if reads_table {
             b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
         }
+        b.resolve_label(early_exit_label);
         return;
     }
 
@@ -48615,6 +48676,7 @@ fn emit_exists_subquery(
 
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
+    b.resolve_label(early_exit_label);
 }
 
 /// Emit the first scalar result expression against an already-positioned
@@ -48676,11 +48738,13 @@ fn emit_scalar_subquery(
 
     // No-FROM scalar subquery: `(SELECT 1)`, `(SELECT 1 + 2)`.
     if from.is_none() {
+        let done_label = b.emit_label();
+        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        emit_subquery_limit_gate(b, subquery.limit.as_ref(), outer_ctx, done_label);
         if let Some(ResultColumn::Expr { expr, .. }) = columns.first() {
             emit_expr(b, expr, reg, Some(outer_ctx));
-            return;
         }
-        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        b.resolve_label(done_label);
         return;
     }
 
@@ -48709,6 +48773,9 @@ fn emit_scalar_subquery(
 
     // Default: NULL (subquery returns no rows).
     b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+    // bd-7zeum: evaluate subquery LIMIT gate (X <> CAST(0 AS NUMERIC)) before
+    // opening or scanning the subquery cursor.
+    emit_subquery_limit_gate(b, subquery.limit.as_ref(), outer_ctx, done_label);
 
     let open_done = b.emit_label();
     b.emit_jump_to_label(Opcode::Once, 0, 0, open_done, P4::None, 0);
@@ -48789,7 +48856,6 @@ fn emit_scalar_subquery(
                 outer_ctx,
                 where_clause.as_deref(),
                 reg,
-                done_label,
             );
         }
     }
@@ -48804,7 +48870,7 @@ fn emit_scalar_subquery(
 /// directions, skips `OFFSET` rows, and reads the result value of the next row
 /// into `reg`. `reg` is left as its pre-set NULL default when the subquery
 /// yields no row at the requested offset (empty match set, `OFFSET` past the
-/// end, or `LIMIT 0`). The caller resolves `done_label`.
+/// end, or `LIMIT 0`).
 #[allow(
     clippy::too_many_arguments,
     clippy::cast_possible_truncation,
@@ -48819,7 +48885,6 @@ fn emit_scalar_subquery_ordered(
     outer_ctx: &ScanCtx<'_>,
     where_clause: Option<&Expr>,
     reg: i32,
-    done_label: crate::Label,
 ) {
     let n_key = subquery.order_by.len();
     // Sort-direction string: '+' ascending (default) / '-' descending per term.
@@ -48832,18 +48897,8 @@ fn emit_scalar_subquery_ordered(
         })
         .collect();
 
-    // LIMIT 0 short-circuits to NULL before any work.
-    if let Some(limit) = subquery.limit.as_ref() {
-        let r_lim = b.alloc_temp();
-        emit_expr(b, &limit.limit, r_lim, Some(outer_ctx));
-        // IfPos jumps (and decrements) when > 0; fall through means <= 0 -> NULL.
-        let lim_ok = b.emit_label();
-        b.emit_jump_to_label(Opcode::IfPos, r_lim, 0, lim_ok, P4::None, 0);
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-        b.resolve_label(lim_ok);
-        b.free_temp(r_lim);
-    }
-
+    // LIMIT gating already ran in `emit_scalar_subquery` via
+    // `emit_subquery_limit_gate` (bd-7zeum).
     let sorter_cursor = b.alloc_aux_cursor_range(1);
     b.emit_op(
         Opcode::SorterOpen,
