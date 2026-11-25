@@ -30787,11 +30787,10 @@ where
                 return Err(FrankenError::BusyRecovery);
             }
             let committed_db_size = self.committed_db_size_with_inner(&inner);
-            let mut returned_allocations = self.prepare_unstaged_allocations();
-            let retained_allocations = returned_allocations.retained_by_transaction;
-            let pending_returned_pages = returned_allocations.all_pages();
-            let mut pending_free_pages = pending_returned_pages.clone();
-            pending_free_pages.extend(self.freed_pages.iter().copied());
+            // Keep unused allocations and leases transaction-owned across the
+            // fallible abandonment fold. Transfer them only once the pending WAL
+            // attempt can own them without an intervening await.
+            let mut pending_free_pages = self.pending_free_pages_for_commit();
 
             // bd-vnxjd: fold abandoned EOF reservations (rolled-back peers on
             // this pager parked them in the abandonment pool) into this
@@ -30925,6 +30924,10 @@ where
                     }
                 }
             }
+
+            let mut returned_allocations = self.prepare_unstaged_allocations();
+            let retained_allocations = returned_allocations.retained_by_transaction;
+            let pending_returned_pages = returned_allocations.all_pages();
 
             // Declared outside the block so it survives to Phase C where freed
             // pages are promoted into inner.freelist after successful WAL commit.
@@ -36620,9 +36623,14 @@ mod tests {
     ) -> (SimplePager<MemoryVfs>, SimpleTransaction<MemoryVfs>) {
         let (pager, _) = wal_pager().await;
         let mut txn = pager.begin(cx, TransactionMode::Concurrent).await.unwrap();
-        txn.write_page(cx, PageNumber::new(2).unwrap(), &sample_page(0x51))
+        let written = txn.allocate_page(cx).await.unwrap();
+        txn.write_page(cx, written, &sample_page(0x51))
             .await
             .unwrap();
+        let unused = txn.allocate_page(cx).await.unwrap();
+        assert!(!txn.write_set.contains_key(&unused));
+        assert!(!txn.page_lease.is_empty());
+        assert!(txn.savepoint_stack.is_empty());
         {
             let mut inner = pager.inner.lock().unwrap();
             inner.db_size = 64;
@@ -36651,6 +36659,10 @@ mod tests {
                 .map(|page| PageNumber::new(page).unwrap())
                 .collect();
             let (pager, mut txn) = commit_abandonment_probe_transaction(&cx, probe, &pages).await;
+            let allocated_before = txn.allocated_from_eof.clone();
+            let lease_before = txn.page_lease.clone();
+            let reserved_before = txn.live_reserved_pages();
+            assert!(!reserved_before.is_empty());
 
             let error = txn.commit(&cx).await.unwrap_err();
             assert!(
@@ -36662,8 +36674,17 @@ mod tests {
             assert!(page_reads.lock().unwrap().is_empty());
             assert!(txn.reclaimed_abandoned_reservations.is_empty());
             assert!(!txn.finished);
+            assert!(txn.pending_group_commit_attempt.is_none());
+            assert_eq!(txn.allocated_from_eof, allocated_before);
+            assert_eq!(txn.page_lease, lease_before);
+            assert_eq!(
+                txn.live_reserved_pages(),
+                reserved_before,
+                "a failed fold must leave unused allocations and leases transaction-owned"
+            );
             {
                 let inner = pager.inner.lock().unwrap();
+                assert!(reserved_before.iter().all(|page| !inner.freelist.contains(page)));
                 let mut retained = inner.abandoned_eof_reservations.clone();
                 retained.sort_unstable();
                 assert_eq!(
@@ -36673,6 +36694,13 @@ mod tests {
                 assert!(pages.iter().all(|page| !inner.freelist.contains(page)));
             }
             txn.rollback(&cx).await.unwrap();
+            let inner = pager.inner.lock().unwrap();
+            assert!(
+                reserved_before
+                    .iter()
+                    .all(|page| inner.abandoned_eof_reservations.contains(page)),
+                "rollback must retain every reservation after commit preparation fails"
+            );
         });
     }
 
@@ -36706,6 +36734,10 @@ mod tests {
                 .collect();
                 let (pager, mut txn) =
                     commit_abandonment_probe_transaction(&cx, probe, &pages).await;
+                let allocated_before = txn.allocated_from_eof.clone();
+                let lease_before = txn.page_lease.clone();
+                let reserved_before = txn.live_reserved_pages();
+                assert!(!reserved_before.is_empty());
 
                 let mut commit = Box::pin(txn.commit(&cx));
                 std::future::poll_fn(|poll_cx| match commit.as_mut().poll(poll_cx) {
@@ -36739,8 +36771,16 @@ mod tests {
                 );
                 assert!(!txn.finished);
                 assert!(txn.pending_group_commit_attempt.is_none());
+                assert_eq!(txn.allocated_from_eof, allocated_before);
+                assert_eq!(txn.page_lease, lease_before);
+                assert_eq!(
+                    txn.live_reserved_pages(),
+                    reserved_before,
+                    "a dropped fold future must leave private reservations owned, partial_progress={partial_progress}"
+                );
                 {
                     let inner = pager.inner.lock().unwrap();
+                    assert!(reserved_before.iter().all(|page| !inner.freelist.contains(page)));
                     let mut retained: Vec<u32> = inner
                         .abandoned_eof_reservations
                         .iter()
@@ -36754,6 +36794,13 @@ mod tests {
                     assert!(pages.iter().all(|page| !inner.freelist.contains(page)));
                 }
                 txn.rollback(&cx).await.unwrap();
+                let inner = pager.inner.lock().unwrap();
+                assert!(
+                    reserved_before
+                        .iter()
+                        .all(|page| inner.abandoned_eof_reservations.contains(page)),
+                    "rollback must retain every reservation after a dropped commit future"
+                );
             }
         });
     }
