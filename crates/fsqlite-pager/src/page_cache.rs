@@ -3756,6 +3756,11 @@ impl std::fmt::Debug for PageCacheShard {
 struct InFlightPageRead {
     completed: AtomicBool,
     notify: Notify,
+    /// Followers that joined this flight. Incremented only under
+    /// `ShardedPageCache::in_flight_reads`' lock, while the flight is still in
+    /// the map; the leader reads it under the same lock after removing the
+    /// flight, so the count it reads is final (bd-w4pr1.13.18, lever NW).
+    followers: AtomicUsize,
 }
 
 impl InFlightPageRead {
@@ -3763,6 +3768,7 @@ impl InFlightPageRead {
         Self {
             completed: AtomicBool::new(false),
             notify: Notify::new(),
+            followers: AtomicUsize::new(0),
         }
     }
 
@@ -3799,10 +3805,17 @@ impl InFlightReadLeader<'_> {
         {
             current.remove();
         }
+        // The flight is out of the map, so no follower can join it now.
+        let followers = self.flight.followers.load(Ordering::Relaxed);
         drop(in_flight);
 
         self.flight.completed.store(true, Ordering::Release);
-        self.flight.notify.notify_waiters();
+        // A miss nobody else waits for (nearly every miss of one connection)
+        // skips the waiter fanout: its generation bump, lock and waker list
+        // were about 120 instructions a miss.
+        if followers > 0 {
+            self.flight.notify.notify_waiters();
+        }
         self.finished = true;
         self.cache.trim_to_page_budget();
     }
@@ -4406,6 +4419,7 @@ impl ShardedPageCache {
     fn claim_in_flight_read(&self, page_no: PageNumber) -> InFlightReadRole<'_> {
         let mut in_flight = self.in_flight_reads.lock();
         if let Some(flight) = in_flight.get(&page_no) {
+            flight.followers.fetch_add(1, Ordering::Relaxed);
             return InFlightReadRole::Follower(Arc::clone(flight));
         }
 
@@ -6623,6 +6637,69 @@ mod tests {
             file.read_calls(),
             metrics.admits
         );
+    }
+
+    /// bd-w4pr1.13.18 (lever NW): a flight counts the followers that join it,
+    /// under the flight map's lock, and its leader wakes them (here by being
+    /// dropped mid-read) through each follower's own waker. A leader whose
+    /// flight nobody joined has a zero count, which is what lets it skip the
+    /// waiter fanout. A leader that skipped the wake whenever it held a
+    /// follower would leave the follower's waker unwoken here.
+    #[test]
+    fn test_bd_w4pr1_13_18_flight_counts_and_wakes_its_followers() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct CountingWaker(AtomicUsize);
+        impl Wake for CountingWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let followers_of = |cache: &ShardedPageCache, page_no: PageNumber| {
+            cache
+                .in_flight_reads
+                .lock()
+                .get(&page_no)
+                .map(|flight| flight.followers.load(Ordering::Relaxed))
+        };
+
+        let page_no = PageNumber::ONE;
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let file =
+            ControlledReadFile::first_pending_then_ready(vec![0x3C; PageSize::DEFAULT.as_usize()]);
+        let cx = Cx::new();
+        let leader_wakes = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let follower_wakes = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let leader_waker = Waker::from(Arc::clone(&leader_wakes));
+        let follower_waker = Waker::from(Arc::clone(&follower_wakes));
+        let mut leader = Box::pin(cache.read_page(&cx, &file, page_no, |data| data[0]));
+        let mut follower = Box::pin(cache.read_page(&cx, &file, page_no, |data| data[0]));
+
+        assert!(leader.as_mut().poll(&mut Context::from_waker(&leader_waker)).is_pending());
+        assert_eq!(followers_of(&cache, page_no), Some(0), "a lone leader has no follower");
+        assert!(follower.as_mut().poll(&mut Context::from_waker(&follower_waker)).is_pending());
+        assert_eq!(followers_of(&cache, page_no), Some(1), "the second miss joined the flight");
+        assert_eq!(file.read_calls(), 1);
+        assert_eq!(follower_wakes.0.load(Ordering::SeqCst), 0);
+
+        drop(leader);
+        assert!(
+            follower_wakes.0.load(Ordering::SeqCst) >= 1,
+            "the leader's finish must wake the follower that joined its flight"
+        );
+        assert_eq!(followers_of(&cache, page_no), None, "the finished flight left the map");
+
+        match follower.as_mut().poll(&mut Context::from_waker(&follower_waker)) {
+            Poll::Ready(Ok(value)) => assert_eq!(value, 0x3C),
+            other => panic!("the woken follower must lead a replacement read, got {other:?}"),
+        }
+        assert_eq!(file.read_calls(), 2);
+        assert!(cache.in_flight_reads.lock().is_empty());
+        assert_eq!(leader_wakes.0.load(Ordering::SeqCst), 0);
     }
 
     #[test]
