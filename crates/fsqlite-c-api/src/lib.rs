@@ -2749,6 +2749,68 @@ mod tests {
         }
     }
 
+    /// bd-7c6m7: preparing parenless eponymous pragma TVFs (`pragma_database_list`,
+    /// `pragma_collation_list`, `pragma_function_list`, `pragma_compile_options`,
+    /// `pragma_table_list`) via `sqlite3_prepare_v2` must succeed with stock-exact
+    /// columns and respect CTE / table shadowing.
+    #[test]
+    fn test_prepare_bare_pragma_table_functions_and_shadowing() {
+        unsafe {
+            let db = open_memory();
+            schema_exec_ok(db, "CREATE TABLE t(a INTEGER, b TEXT);");
+
+            assert_eq!(
+                schema_query_int(db, "SELECT count(*) FROM pragma_database_list"),
+                1
+            );
+            assert!(schema_query_int(db, "SELECT count(*) FROM pragma_collation_list") >= 3);
+            assert!(schema_query_int(db, "SELECT count(*) FROM pragma_function_list") > 10);
+            assert!(schema_query_int(db, "SELECT count(*) FROM pragma_compile_options") >= 1);
+
+            let stmt = prepare(db, "SELECT * FROM pragma_database_list");
+            assert_eq!(sqlite3_column_count(stmt), 3);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 0);
+            assert_eq!(
+                CStr::from_ptr(sqlite3_column_text(stmt, 1))
+                    .to_str()
+                    .unwrap(),
+                "main"
+            );
+            assert_eq!(
+                CStr::from_ptr(sqlite3_column_text(stmt, 2))
+                    .to_str()
+                    .unwrap(),
+                ""
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            // Hidden columns of pragma_table_list must be omitted by `SELECT *`.
+            let tl = prepare(db, "SELECT * FROM pragma_table_list");
+            assert_eq!(sqlite3_column_count(tl), 6);
+            assert_eq!(sqlite3_finalize(tl), SQLITE_OK);
+
+            // A CTE or real table with the same name shadows the bare pragma TVF.
+            assert_eq!(
+                schema_query_int(
+                    db,
+                    "WITH pragma_database_list(x) AS (SELECT 42) SELECT x FROM pragma_database_list"
+                ),
+                42
+            );
+            schema_exec_ok(
+                db,
+                "CREATE TABLE pragma_database_list(x); INSERT INTO pragma_database_list VALUES (99);",
+            );
+            assert_eq!(
+                schema_query_int(db, "SELECT x FROM pragma_database_list"),
+                99
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
     #[test]
     fn test_close_with_unfinalized_statement_returns_busy() {
         unsafe {

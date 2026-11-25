@@ -32687,10 +32687,22 @@ impl Connection {
             if is_prepared_schema_statement(parsed.as_ref()) {
                 return Box::pin(self.prepare_schema_statement(original_sql, parsed.as_ref())).await;
             }
+            // bd-7c6m7: mirror execute_statement_impl_after_background_status:
+            // rewrite parenless no-arg pragma TVFs (`SELECT ... FROM pragma_database_list`)
+            // into call form and expand hidden-column TVF stars BEFORE column
+            // binding and validation so prepared queries (including sqlite3_prepare_v2)
+            // resolve bare pragma TVFs identically to direct execution.
+            let pragma_rewritten =
+                self.rewrite_statement_bare_pragma_table_functions(parsed.as_ref());
+            let star_expanded =
+                expand_statement_hidden_table_function_stars(pragma_rewritten.as_ref());
+            let normalized: &Statement = star_expanded
+                .as_ref()
+                .unwrap_or_else(|| pragma_rewritten.as_ref());
             // bd-at0bx: bind `schema.table.column` references before
             // validation and compilation, as the direct execute path does.
-            let bound = self.bind_schema_qualified_columns(parsed.as_ref())?;
-            let parsed: &Statement = bound.as_ref().unwrap_or_else(|| parsed.as_ref());
+            let bound = self.bind_schema_qualified_columns(normalized)?;
+            let parsed: &Statement = bound.as_ref().unwrap_or(normalized);
             let snapshot_generation = self.function_registry_generation();
             let statement_snapshot = self.freeze_statement_values_snapshot(parsed);
 
