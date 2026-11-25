@@ -140,11 +140,14 @@ const QUERIES: &[&str] = &[
     "SELECT json_array_insert('[1]', 'x', 1)",
     "SELECT json_array_insert('[1]', 1, 1)",
     // The jsonb_ form, and the JSON result subtype of the json_ form.
-    // (A SQL text VALUE is left to json() here: stock stores it in JSONB as
-    // TEXTRAW, as for every jsonb_ edit function, and FrankenSQLite as TEXT.)
+    // bd-b0i0o: jsonb_array_insert stores SQL text values and created object
+    // labels as JSONB_TEXTRAW, matching stock byte-for-byte.
     "SELECT jsonb_array_insert('[1,2]', '$[1]', 9)",
     "SELECT hex(jsonb_array_insert('[1,[2]]', '$[1][0]', 9.5))",
+    "SELECT hex(jsonb_array_insert('[1,2]', '$[1]', 'x'))",
     "SELECT json(jsonb_array_insert('[1,2]', '$[1]', 'x'))",
+    "SELECT hex(jsonb_array_insert('{\"a\":[1]}', '$.a[0]', 9))",
+    "SELECT hex(jsonb_array_insert('{}', '$.a[0]', 'x'))",
     "SELECT json(jsonb_array_insert('{\"a\":[1]}', '$.a[0]', 9))",
     "SELECT json_array_insert(jsonb('[1,2]'), '$[1]', 9)",
     "SELECT json_array(json_array_insert('[1]', '$[0]', 0))",

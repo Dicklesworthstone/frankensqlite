@@ -2256,9 +2256,8 @@ pub fn json_set(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
 
 /// JSONB variant of `json_set`.
 pub fn jsonb_set(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
-    let root = parse_json_value_lenient(input)?;
-    let edited = edit_json_paths_value(&root, pairs, EditMode::Set)?;
-    encode_jsonb_root(&edited)
+    let blob = jsonb(input)?;
+    edit_jsonb_blob_pairs(blob, pairs, JsonbEditMode::Set)
 }
 
 /// Insert JSON values at path(s) only when path does not already exist.
@@ -2270,9 +2269,8 @@ pub fn json_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String>
 
 /// JSONB variant of `json_insert`.
 pub fn jsonb_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
-    let root = parse_json_value_lenient(input)?;
-    let edited = edit_json_paths_value(&root, pairs, EditMode::Insert)?;
-    encode_jsonb_root(&edited)
+    let blob = jsonb(input)?;
+    edit_jsonb_blob_pairs(blob, pairs, JsonbEditMode::Insert)
 }
 
 /// Insert values before array elements named by PATH.
@@ -2293,13 +2291,8 @@ pub fn json_array_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<S
 
 /// JSONB variant of `json_array_insert`.
 pub fn jsonb_array_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
-    let root = parse_json_value_lenient(input)?;
-    let mut edited = root;
-    for (path, value) in pairs {
-        let segments = parse_path(path)?;
-        apply_array_insert(&mut edited, &segments, sqlite_to_json(value)?, path)?;
-    }
-    encode_jsonb_root(&edited)
+    let blob = jsonb(input)?;
+    edit_jsonb_blob_pairs(blob, pairs, JsonbEditMode::ArrayInsert)
 }
 
 /// Replace JSON values at path(s) only when path already exists.
@@ -2311,9 +2304,8 @@ pub fn json_replace(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String
 
 /// JSONB variant of `json_replace`.
 pub fn jsonb_replace(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
-    let root = parse_json_value_lenient(input)?;
-    let edited = edit_json_paths_value(&root, pairs, EditMode::Replace)?;
-    encode_jsonb_root(&edited)
+    let blob = jsonb(input)?;
+    edit_jsonb_blob_pairs(blob, pairs, JsonbEditMode::Replace)
 }
 
 /// Remove JSON values at path(s). Array removals compact the array.
@@ -2327,11 +2319,11 @@ pub fn json_remove(input: &str, paths: &[&str]) -> Result<String> {
 
 /// JSONB variant of `json_remove`.
 pub fn jsonb_remove(input: &str, paths: &[&str]) -> Result<Vec<u8>> {
-    let root = parse_json_value_lenient(input)?;
-    let Some(edited) = json_remove_value(&root, paths)? else {
+    let blob = jsonb(input)?;
+    let Some(edited) = remove_jsonb_blob_paths(blob, paths)? else {
         return encode_jsonb_root(&Value::Null);
     };
-    encode_jsonb_root(&edited)
+    Ok(edited)
 }
 
 /// Apply RFC 7396 JSON Merge Patch.
@@ -3190,11 +3182,11 @@ fn decode_jsonb_text(node_type: u8, payload: &[u8]) -> Result<String> {
 }
 
 /// Resolve TEXTJ/TEXT5 escape sequences to the raw string. TEXT5 adds the
-/// JSON5 forms (`\'`, `\xNN`, escaped line continuations) on top of the
-/// RFC-8259 set.
+/// JSON5 forms (`\'`, `\v`, `\0`, `\xNN`, escaped line continuations) on top
+/// of the RFC-8259 set.
 fn decode_jsonb_escaped_text(text: &str, json5: bool) -> Result<String> {
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
+    let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch != '\\' {
             out.push(ch);
@@ -3224,10 +3216,26 @@ fn decode_jsonb_escaped_text(text: &str, json5: bool) -> Result<String> {
                 let unit = u32::from_str_radix(&code, 16).map_err(|error| {
                     FrankenError::function_error(format!("invalid JSONB \\u escape: {error}"))
                 })?;
+                if (0xD800..=0xDBFF).contains(&unit) {
+                    let mut look = chars.clone();
+                    if look.next() == Some('\\') && look.next() == Some('u') {
+                        let low_code: String = look.by_ref().take(4).collect();
+                        if low_code.len() == 4
+                            && let Ok(low) = u32::from_str_radix(&low_code, 16)
+                            && (0xDC00..=0xDFFF).contains(&low)
+                        {
+                            chars = look;
+                            let combined = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                            out.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
+                            continue;
+                        }
+                    }
+                }
                 // Lone surrogates are replaced, matching lossy JSON readers.
                 out.push(char::from_u32(unit).unwrap_or('\u{FFFD}'));
             }
             '\'' if json5 => out.push('\''),
+            'v' if json5 => out.push('\u{000B}'),
             '0' if json5 => out.push('\u{0000}'),
             'x' if json5 => {
                 let code: String = chars.by_ref().take(2).collect();
@@ -3236,7 +3244,13 @@ fn decode_jsonb_escaped_text(text: &str, json5: bool) -> Result<String> {
                 })?;
                 out.push(char::from(unit));
             }
-            '\n' if json5 => {}
+            '\n' | '\u{2028}' | '\u{2029}' if json5 => {}
+            '\r' if json5 => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            other if json5 => out.push(other),
             other => {
                 return Err(FrankenError::function_error(format!(
                     "invalid JSONB text escape: \\{other}"
@@ -3322,6 +3336,735 @@ fn decode_jsonb_payload_len(bytes: &[u8]) -> Result<usize> {
     usize::try_from(payload_len).map_err(|error| {
         FrankenError::function_error(format!("JSONB payload length overflow: {error}"))
     })
+}
+
+/// Stock SQLite's `JSON_MAX_DEPTH` for JSONB path traversal and edits.
+const JSONB_EDIT_MAX_DEPTH: usize = 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonbEditMode {
+    Delete,
+    Replace,
+    Insert,
+    Set,
+    ArrayInsert,
+}
+
+impl JsonbEditMode {
+    const fn creates_missing(self) -> bool {
+        matches!(self, Self::Insert | Self::Set | Self::ArrayInsert)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonbLookupOutcome {
+    Matched,
+    NotFound,
+}
+
+/// Decode a JSONB element header without checking `header_len + payload_len <= bytes.len()`.
+///
+/// Needed by `JsonbBlobEditor::after_edit_size_adjust`, where a child edit has
+/// already resized the blob while the parent's header still holds its previous
+/// payload size.
+fn decode_jsonb_header(bytes: &[u8]) -> Option<(u8, usize, usize)> {
+    let header = *bytes.first()?;
+    let node_type = header & 0x0f;
+    if node_type > JSONB_OBJECT_TYPE {
+        return None;
+    }
+    let size_nibble = usize::from(header >> 4);
+    let (extra, payload_len) = match size_nibble {
+        0..=11 => (0, size_nibble),
+        12 => (1, usize::from(*bytes.get(1)?)),
+        13 => {
+            let b: [u8; 2] = bytes.get(1..3)?.try_into().ok()?;
+            (2, usize::from(u16::from_be_bytes(b)))
+        }
+        14 => {
+            let b: [u8; 4] = bytes.get(1..5)?.try_into().ok()?;
+            (4, usize::try_from(u32::from_be_bytes(b)).ok()?)
+        }
+        _ => {
+            let b: [u8; 8] = bytes.get(1..9)?.try_into().ok()?;
+            (8, usize::try_from(u64::from_be_bytes(b)).ok()?)
+        }
+    };
+    Some((node_type, 1 + extra, payload_len))
+}
+
+/// Decode a JSONB element header at `offset` and verify that the entire node
+/// lies within `blob`.
+fn jsonb_node_bounds(blob: &[u8], offset: usize) -> Option<(u8, usize, usize)> {
+    let slice = blob.get(offset..)?;
+    let (node_type, hdr_len, payload_len) = decode_jsonb_header(slice)?;
+    let total = hdr_len.checked_add(payload_len)?;
+    if total > slice.len() {
+        return None;
+    }
+    Some((node_type, hdr_len, payload_len))
+}
+
+/// Exact safe-Rust equivalent of SQLite's `jsonBlobOverwrite`: when replacing
+/// an existing JSONB node with a shorter node (`1 <= expand_by <= 8`), expand
+/// the replacement's header size field so the overwrite keeps the blob's exact
+/// byte length unchanged.
+fn jsonb_overwrite(out: &mut [u8], ins: &[u8], expand_by: usize) -> bool {
+    let Some(&first) = ins.first() else {
+        return false;
+    };
+    if (first & 0x0f) <= JSONB_FALSE_TYPE {
+        return false;
+    }
+    let (sz_hdr, new_hdr) = match first >> 4 {
+        0..=11 => match expand_by {
+            1 | 2 | 4 | 8 => (1usize, expand_by + 1),
+            _ => return false,
+        },
+        12 => match expand_by {
+            1 | 3 | 7 => (2usize, expand_by + 2),
+            _ => return false,
+        },
+        13 => match expand_by {
+            2 | 6 => (3usize, expand_by + 3),
+            _ => return false,
+        },
+        14 => match expand_by {
+            4 => (5usize, 9usize),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let size_bits = match new_hdr {
+        2 => 0xc0_u8,
+        3 => 0xd0_u8,
+        5 => 0xe0_u8,
+        9 => 0xf0_u8,
+        _ => return false,
+    };
+    let Some(payload) = ins.get(sz_hdr..) else {
+        return false;
+    };
+    if out.len() != new_hdr + payload.len() {
+        return false;
+    }
+    out[0] = (first & 0x0f) | size_bits;
+    let mut sz_payload = u64::try_from(payload.len()).unwrap_or(0);
+    for idx in (1..new_hdr).rev() {
+        out[idx] = u8::try_from(sz_payload & 0xff).expect("masked byte fits in u8");
+        sz_payload >>= 8;
+    }
+    out[new_hdr..].copy_from_slice(payload);
+    true
+}
+
+/// Update the encoded payload size of the JSONB node at `offset`, returning
+/// the signed byte-length delta of the header itself (`sqlite3.c`:
+/// `jsonBlobChangePayloadSize`).
+fn jsonb_change_payload_size(blob: &mut Vec<u8>, offset: usize, new_payload_len: usize) -> isize {
+    let header = blob[offset];
+    let node_type = header & 0x0f;
+    let n_extra: usize = match header >> 4 {
+        0..=11 => 0,
+        12 => 1,
+        13 => 2,
+        14 => 4,
+        _ => 8,
+    };
+    let n_needed: usize = if new_payload_len <= 11 {
+        0
+    } else if new_payload_len <= 0xff {
+        1
+    } else if new_payload_len <= 0xffff {
+        2
+    } else if u32::try_from(new_payload_len).is_ok() {
+        4
+    } else {
+        8
+    };
+    let insert_at = offset + 1;
+    if n_needed > n_extra {
+        let grow = n_needed - n_extra;
+        blob.splice(insert_at..insert_at, std::iter::repeat_n(0_u8, grow));
+    } else if n_needed < n_extra {
+        let shrink = n_extra - n_needed;
+        blob.drain(insert_at..insert_at + shrink);
+    }
+    match n_needed {
+        0 => {
+            let nibble = u8::try_from(new_payload_len).expect("<= 11 fits in u8");
+            blob[offset] = node_type | (nibble << 4);
+        }
+        1 => {
+            blob[offset] = node_type | 0xc0;
+            blob[offset + 1] = u8::try_from(new_payload_len).expect("<= 0xff fits in u8");
+        }
+        2 => {
+            blob[offset] = node_type | 0xd0;
+            let bytes = u16::try_from(new_payload_len)
+                .expect("<= 0xffff fits in u16")
+                .to_be_bytes();
+            blob[offset + 1..offset + 3].copy_from_slice(&bytes);
+        }
+        4 => {
+            blob[offset] = node_type | 0xe0;
+            let bytes = u32::try_from(new_payload_len)
+                .expect("fits in u32")
+                .to_be_bytes();
+            blob[offset + 1..offset + 5].copy_from_slice(&bytes);
+        }
+        _ => {
+            blob[offset] = node_type | 0xf0;
+            let bytes = u64::try_from(new_payload_len)
+                .expect("fits in u64")
+                .to_be_bytes();
+            blob[offset + 1..offset + 9].copy_from_slice(&bytes);
+        }
+    }
+    isize::try_from(n_needed).expect("header extra bytes fit in isize")
+        - isize::try_from(n_extra).expect("header extra bytes fit in isize")
+}
+
+/// Count elements in the JSONB array at `i_root` (`sqlite3.c`: `jsonbArrayCount`).
+fn jsonb_array_count(blob: &[u8], i_root: usize) -> Option<u64> {
+    let (_, hdr_len, payload_len) = jsonb_node_bounds(blob, i_root)?;
+    let mut pos = i_root + hdr_len;
+    let end = pos + payload_len;
+    let mut count = 0_u64;
+    while pos < end {
+        let (_, child_hdr, child_payload) = jsonb_node_bounds(blob, pos)?;
+        pos = pos.checked_add(child_hdr)?.checked_add(child_payload)?;
+        count += 1;
+    }
+    if pos == end { Some(count) } else { None }
+}
+
+/// Compare a path key against an object label in a JSONB blob (`sqlite3.c`:
+/// `jsonLabelCompare`).
+fn jsonb_label_matches(
+    key_bytes: &[u8],
+    raw_key: bool,
+    label_type: u8,
+    label_payload: &[u8],
+) -> Result<bool> {
+    let raw_label = matches!(label_type, JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE);
+    if raw_key && raw_label {
+        return Ok(key_bytes == label_payload);
+    }
+    let left_str = std::str::from_utf8(key_bytes).map_err(|_| malformed_json())?;
+    let left = if raw_key {
+        Cow::Borrowed(left_str)
+    } else {
+        Cow::Owned(decode_jsonb_escaped_text(left_str, true)?)
+    };
+    let right = decode_jsonb_text(label_type, label_payload)?;
+    Ok(left.as_ref() == right.as_str())
+}
+
+/// Parse one `.key` or `."quoted"` path segment the way SQLite's
+/// `jsonLookupStep` does (`sqlite3.c:216959-216983`), returning
+/// `(key_bytes, raw_key, remaining_tail)`.
+fn jsonb_parse_path_object_key<'a>(
+    tail: &'a str,
+    full_path: &str,
+) -> Result<(&'a [u8], bool, &'a str)> {
+    let bytes = tail.as_bytes();
+    debug_assert_eq!(bytes.first(), Some(&b'.'));
+    if bytes.get(1) == Some(&b'"') {
+        let mut idx = 2usize;
+        while idx < bytes.len() && bytes[idx] != b'"' {
+            if bytes[idx] == b'\\' && idx + 1 < bytes.len() {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+        }
+        if idx >= bytes.len() {
+            return Err(bad_json_path(full_path));
+        }
+        let key_bytes = &bytes[2..idx];
+        let raw_key = !key_bytes.contains(&b'\\');
+        Ok((key_bytes, raw_key, &tail[idx + 1..]))
+    } else {
+        let mut idx = 1usize;
+        while idx < bytes.len() && bytes[idx] != b'.' && bytes[idx] != b'[' {
+            idx += 1;
+        }
+        if idx == 1 {
+            return Err(bad_json_path(full_path));
+        }
+        Ok((&bytes[1..idx], true, &tail[idx..]))
+    }
+}
+
+/// Parse one `[N]`, `[#]`, or `[#-N]` path segment the way SQLite's
+/// `jsonLookupStep` does (`sqlite3.c:217056-217090`). Returns `Ok(None)` when
+/// `#-N` reaches before index 0 (`JSON_LOOKUP_NOTFOUND`).
+fn jsonb_parse_path_array_index<'a>(
+    tail: &'a str,
+    array_count: u64,
+    full_path: &str,
+) -> Result<Option<(u64, &'a str)>> {
+    let bytes = tail.as_bytes();
+    debug_assert_eq!(bytes.first(), Some(&b'['));
+    let mut idx = 1usize;
+    let mut kk = 0_u64;
+    while let Some(&b) = bytes.get(idx) {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        if kk < 0xffff_ffff {
+            kk = kk * 10 + u64::from(b - b'0');
+        }
+        idx += 1;
+    }
+    if idx >= 2 && bytes.get(idx) == Some(&b']') {
+        return Ok(Some((kk, &tail[idx + 1..])));
+    }
+    if bytes.get(1) == Some(&b'#') {
+        kk = array_count;
+        idx = 2;
+        if bytes.get(2) == Some(&b'-') && bytes.get(3).is_some_and(u8::is_ascii_digit) {
+            let mut nn = 0_u64;
+            idx = 3;
+            while let Some(&b) = bytes.get(idx) {
+                if !b.is_ascii_digit() {
+                    break;
+                }
+                if nn < 0xffff_ffff {
+                    nn = nn * 10 + u64::from(b - b'0');
+                }
+                idx += 1;
+            }
+            if nn > kk {
+                return Ok(None);
+            }
+            kk -= nn;
+        }
+        if bytes.get(idx) != Some(&b']') {
+            return Err(bad_json_path(full_path));
+        }
+        return Ok(Some((kk, &tail[idx + 1..])));
+    }
+    Err(bad_json_path(full_path))
+}
+
+/// In-place JSONB blob editor mirroring SQLite 3.54.1's `jsonInsertIntoBlob` /
+/// `jsonLookupStep` / `jsonBlobEdit` (`bd-b0i0o`).
+struct JsonbBlobEditor {
+    blob: Vec<u8>,
+    delta: isize,
+    depth: usize,
+}
+
+impl JsonbBlobEditor {
+    const fn new(blob: Vec<u8>) -> Self {
+        Self {
+            blob,
+            delta: 0,
+            depth: 0,
+        }
+    }
+
+    fn blob_edit(&mut self, i_del: usize, n_del: usize, ins: &[u8]) {
+        let d = isize::try_from(ins.len()).expect("insert len fits in isize")
+            - isize::try_from(n_del).expect("delete len fits in isize");
+        if (-8..0).contains(&d)
+            && !ins.is_empty()
+            && let Ok(expand_by) = usize::try_from(-d)
+            && jsonb_overwrite(&mut self.blob[i_del..i_del + n_del], ins, expand_by)
+        {
+            return;
+        }
+        self.blob.splice(i_del..i_del + n_del, ins.iter().copied());
+        self.delta += d;
+    }
+
+    fn after_edit_size_adjust(&mut self, i_root: usize) -> Result<()> {
+        let (_, _, old_sz) =
+            decode_jsonb_header(&self.blob[i_root..]).ok_or_else(malformed_json)?;
+        let adjusted = isize::try_from(old_sz)
+            .ok()
+            .and_then(|sz| sz.checked_add(self.delta))
+            .and_then(|sz| usize::try_from(sz).ok())
+            .ok_or_else(malformed_json)?;
+        let hdr_delta = jsonb_change_payload_size(&mut self.blob, i_root, adjusted);
+        self.delta += hdr_delta;
+        Ok(())
+    }
+
+    fn create_edit_substructure(
+        &self,
+        mode: JsonbEditMode,
+        ins: &[u8],
+        tail: &str,
+        full_path: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        if tail.is_empty() {
+            return Ok(Some(ins.to_vec()));
+        }
+        let next_depth = self.depth + 1;
+        if next_depth >= JSONB_EDIT_MAX_DEPTH {
+            return Err(FrankenError::function_error("JSON path too deep"));
+        }
+        let empty = if tail.starts_with('.') {
+            JSONB_OBJECT_TYPE
+        } else {
+            JSONB_ARRAY_TYPE
+        };
+        let mut child = Self {
+            blob: vec![empty],
+            delta: 0,
+            depth: next_depth,
+        };
+        match child.lookup_step(0, tail, 0, mode, ins, full_path)? {
+            JsonbLookupOutcome::Matched => Ok(Some(child.blob)),
+            JsonbLookupOutcome::NotFound => Ok(None),
+        }
+    }
+
+    fn apply_path_edit(&mut self, path: &str, mode: JsonbEditMode, ins: &[u8]) -> Result<()> {
+        let Some(tail) = path.strip_prefix('$') else {
+            return Err(bad_json_path(path));
+        };
+        self.delta = 0;
+        self.depth = 0;
+        if tail.is_empty() {
+            if matches!(mode, JsonbEditMode::Set | JsonbEditMode::Replace) {
+                let old_len = self.blob.len();
+                self.blob_edit(0, old_len, ins);
+            }
+            return Ok(());
+        }
+        let _ = self.lookup_step(0, tail, 0, mode, ins, path)?;
+        Ok(())
+    }
+
+    fn lookup_step(
+        &mut self,
+        i_root: usize,
+        tail: &str,
+        i_label: usize,
+        mode: JsonbEditMode,
+        ins: &[u8],
+        full_path: &str,
+    ) -> Result<JsonbLookupOutcome> {
+        if tail.is_empty() {
+            let (_, hdr_len, payload_len) =
+                jsonb_node_bounds(&self.blob, i_root).ok_or_else(malformed_json)?;
+            let mut del_start = i_root;
+            let mut del_len = hdr_len + payload_len;
+            match mode {
+                JsonbEditMode::Delete => {
+                    if i_label > 0 {
+                        del_len += i_root - i_label;
+                        del_start = i_label;
+                    }
+                    self.blob_edit(del_start, del_len, &[]);
+                }
+                JsonbEditMode::Insert => {}
+                JsonbEditMode::ArrayInsert => {
+                    if !full_path.ends_with(']') {
+                        return Err(not_an_array_element(full_path));
+                    }
+                    self.blob_edit(i_root, 0, ins);
+                }
+                JsonbEditMode::Set | JsonbEditMode::Replace => {
+                    self.blob_edit(del_start, del_len, ins);
+                }
+            }
+            return Ok(JsonbLookupOutcome::Matched);
+        }
+
+        if tail.starts_with('.') {
+            self.lookup_step_object(i_root, tail, mode, ins, full_path)
+        } else if tail.starts_with('[') {
+            self.lookup_step_array(i_root, tail, mode, ins, full_path)
+        } else {
+            Err(bad_json_path(full_path))
+        }
+    }
+
+    fn lookup_step_object(
+        &mut self,
+        i_root: usize,
+        tail: &str,
+        mode: JsonbEditMode,
+        ins: &[u8],
+        full_path: &str,
+    ) -> Result<JsonbLookupOutcome> {
+        let (key_bytes, raw_key, rest) = jsonb_parse_path_object_key(tail, full_path)?;
+        let (root_type, root_hdr, root_payload) =
+            jsonb_node_bounds(&self.blob, i_root).ok_or_else(malformed_json)?;
+        if root_type != JSONB_OBJECT_TYPE {
+            return Ok(JsonbLookupOutcome::NotFound);
+        }
+        let mut pos = i_root + root_hdr;
+        let end = pos + root_payload;
+        while pos < end {
+            let (label_type, label_hdr, label_len) =
+                jsonb_node_bounds(&self.blob, pos).ok_or_else(malformed_json)?;
+            if !matches!(
+                label_type,
+                JSONB_TEXT_TYPE | JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE | JSONB_TEXTRAW_TYPE
+            ) {
+                return Err(malformed_json());
+            }
+            let label_start = pos + label_hdr;
+            let val_pos = label_start + label_len;
+            if val_pos >= end {
+                return Err(malformed_json());
+            }
+            if jsonb_label_matches(
+                key_bytes,
+                raw_key,
+                label_type,
+                &self.blob[label_start..val_pos],
+            )? {
+                let (_, val_hdr, val_len) =
+                    jsonb_node_bounds(&self.blob, val_pos).ok_or_else(malformed_json)?;
+                if val_pos + val_hdr + val_len > end {
+                    return Err(malformed_json());
+                }
+                if self.depth + 1 >= JSONB_EDIT_MAX_DEPTH {
+                    return Err(FrankenError::function_error("JSON path too deep"));
+                }
+                self.depth += 1;
+                let outcome = self.lookup_step(val_pos, rest, pos, mode, ins, full_path);
+                self.depth -= 1;
+                let outcome = outcome?;
+                if self.delta != 0 {
+                    self.after_edit_size_adjust(i_root)?;
+                }
+                return Ok(outcome);
+            }
+            let (_, val_hdr, val_len) =
+                jsonb_node_bounds(&self.blob, val_pos).ok_or_else(malformed_json)?;
+            pos = val_pos + val_hdr + val_len;
+        }
+        if pos > end {
+            return Err(malformed_json());
+        }
+        if mode.creates_missing() {
+            if mode == JsonbEditMode::ArrayInsert && !rest.ends_with(']') {
+                return Err(not_an_array_element(full_path));
+            }
+            let Some(sub_blob) = self.create_edit_substructure(mode, ins, rest, full_path)? else {
+                return Ok(JsonbLookupOutcome::NotFound);
+            };
+            let label_type = if raw_key {
+                JSONB_TEXTRAW_TYPE
+            } else {
+                JSONB_TEXT5_TYPE
+            };
+            let mut combined = Vec::with_capacity(key_bytes.len() + sub_blob.len() + 9);
+            append_jsonb_node(label_type, key_bytes, &mut combined)?;
+            combined.extend_from_slice(&sub_blob);
+            self.blob_edit(pos, 0, &combined);
+            if self.delta != 0 {
+                self.after_edit_size_adjust(i_root)?;
+            }
+            return Ok(JsonbLookupOutcome::Matched);
+        }
+        Ok(JsonbLookupOutcome::NotFound)
+    }
+
+    fn lookup_step_array(
+        &mut self,
+        i_root: usize,
+        tail: &str,
+        mode: JsonbEditMode,
+        ins: &[u8],
+        full_path: &str,
+    ) -> Result<JsonbLookupOutcome> {
+        let (root_type, root_hdr, root_payload) =
+            jsonb_node_bounds(&self.blob, i_root).ok_or_else(malformed_json)?;
+        if root_type != JSONB_ARRAY_TYPE {
+            return Ok(JsonbLookupOutcome::NotFound);
+        }
+        let array_count = jsonb_array_count(&self.blob, i_root).ok_or_else(malformed_json)?;
+        let Some((mut kk, rest)) = jsonb_parse_path_array_index(tail, array_count, full_path)?
+        else {
+            return Ok(JsonbLookupOutcome::NotFound);
+        };
+        let mut pos = i_root + root_hdr;
+        let end = pos + root_payload;
+        while pos < end {
+            if kk == 0 {
+                if self.depth + 1 >= JSONB_EDIT_MAX_DEPTH {
+                    return Err(FrankenError::function_error("JSON path too deep"));
+                }
+                self.depth += 1;
+                let outcome = self.lookup_step(pos, rest, 0, mode, ins, full_path);
+                self.depth -= 1;
+                let outcome = outcome?;
+                if self.delta != 0 {
+                    self.after_edit_size_adjust(i_root)?;
+                }
+                return Ok(outcome);
+            }
+            kk -= 1;
+            let (_, child_hdr, child_len) =
+                jsonb_node_bounds(&self.blob, pos).ok_or_else(malformed_json)?;
+            pos += child_hdr + child_len;
+        }
+        if pos > end {
+            return Err(malformed_json());
+        }
+        if kk > 0 {
+            return Ok(JsonbLookupOutcome::NotFound);
+        }
+        if mode.creates_missing() {
+            let Some(sub_blob) = self.create_edit_substructure(mode, ins, rest, full_path)? else {
+                return Ok(JsonbLookupOutcome::NotFound);
+            };
+            self.blob_edit(pos, 0, &sub_blob);
+            if self.delta != 0 {
+                self.after_edit_size_adjust(i_root)?;
+            }
+            return Ok(JsonbLookupOutcome::Matched);
+        }
+        Ok(JsonbLookupOutcome::NotFound)
+    }
+}
+
+/// Encode a single SQL argument into JSONB bytes for `jsonb_set` /
+/// `jsonb_insert` / `jsonb_replace` / `jsonb_array_insert`, matching SQLite
+/// 3.54.1's `jsonFunctionArgToBlob` (`sqlite3.c:217356-217427`).
+///
+/// Plain SQL `TEXT` (without `JSON_SUBTYPE`) is stored as `JSONB_TEXTRAW`
+/// (`0xA`). `JSON_SUBTYPE` text is parsed into standard JSONB (`TEXT`/`TEXTJ`),
+/// and valid JSONB `BLOB` values are embedded verbatim.
+fn jsonb_value_arg_to_blob(value: &SqliteValue, subtype: u32) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    match value {
+        SqliteValue::Null => {
+            append_jsonb_node(JSONB_NULL_TYPE, &[], &mut out)?;
+        }
+        SqliteValue::Blob(bytes) => {
+            if decode_jsonb_root(bytes).is_ok() {
+                return Ok(bytes.to_vec());
+            }
+            if subtype == JSON_SUBTYPE
+                && let Ok(text) = std::str::from_utf8(bytes)
+            {
+                return encode_jsonb_root(&parse_json_text(text)?);
+            }
+            return Err(FrankenError::function_error("JSON cannot hold BLOB values"));
+        }
+        SqliteValue::Text(text) => {
+            if subtype == JSON_SUBTYPE {
+                return encode_jsonb_root(&parse_json_value_lenient(text)?);
+            }
+            append_jsonb_node(JSONB_TEXTRAW_TYPE, text.as_bytes(), &mut out)?;
+        }
+        SqliteValue::Integer(i) => {
+            append_jsonb_node(JSONB_INT_TYPE, i.to_string().as_bytes(), &mut out)?;
+        }
+        SqliteValue::Float(f) => {
+            if f.is_nan() {
+                append_jsonb_node(JSONB_NULL_TYPE, &[], &mut out)?;
+            } else if f.is_infinite() {
+                let text = if *f > 0.0 {
+                    b"9e999".as_slice()
+                } else {
+                    b"-9e999".as_slice()
+                };
+                append_jsonb_node(JSONB_FLOAT_TYPE, text, &mut out)?;
+            } else {
+                let formatted = fsqlite_types::value::format_sqlite_float(*f);
+                append_jsonb_node(JSONB_FLOAT_TYPE, formatted.as_bytes(), &mut out)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Convert the target document argument (`argv[0]`) of a `jsonb_*` edit
+/// function into an editable JSONB byte buffer, preserving existing JSONB
+/// blobs verbatim so untouched `TEXTRAW` / `TEXT5` / header encodings survive
+/// chained edits.
+fn json_arg_to_jsonb_blob(name: &str, args: &[SqliteValue], index: usize) -> Result<Vec<u8>> {
+    match args.get(index) {
+        Some(SqliteValue::Blob(bytes)) => {
+            if decode_jsonb_root(bytes).is_ok() {
+                Ok(bytes.to_vec())
+            } else {
+                let text = std::str::from_utf8(bytes).map_err(|_| malformed_json())?;
+                jsonb(text)
+            }
+        }
+        Some(SqliteValue::Text(text)) => jsonb(text),
+        Some(SqliteValue::Integer(i)) => {
+            let mut out = Vec::new();
+            append_jsonb_node(JSONB_INT_TYPE, i.to_string().as_bytes(), &mut out)?;
+            Ok(out)
+        }
+        Some(SqliteValue::Float(f)) => encode_jsonb_root(&float_to_json(*f)?),
+        Some(other) => Err(FrankenError::function_error(format!(
+            "{name} argument {} must be TEXT or BLOB, got {}",
+            index + 1,
+            other.typeof_str()
+        ))),
+        None => Err(FrankenError::function_error(format!(
+            "{name} missing argument {}",
+            index + 1
+        ))),
+    }
+}
+
+fn edit_jsonb_blob_pairs(
+    blob: Vec<u8>,
+    pairs: &[(&str, SqliteValue)],
+    mode: JsonbEditMode,
+) -> Result<Vec<u8>> {
+    let mut editor = JsonbBlobEditor::new(blob);
+    for (path, value) in pairs {
+        let ins = jsonb_value_arg_to_blob(value, 0)?;
+        editor.apply_path_edit(path, mode, &ins)?;
+    }
+    Ok(editor.blob)
+}
+
+fn edit_jsonb_blob_with_subtypes(
+    name: &str,
+    blob: Vec<u8>,
+    args: &[SqliteValue],
+    arg_subtypes: &[u32],
+    start: usize,
+    mode: JsonbEditMode,
+) -> Result<Vec<u8>> {
+    let mut editor = JsonbBlobEditor::new(blob);
+    let mut idx = start;
+    while idx + 1 < args.len() {
+        if args[idx].is_null() {
+            idx += 2;
+            continue;
+        }
+        let path = path_arg(name, args, idx)?;
+        if !path.starts_with('$') {
+            return Err(bad_json_path(path));
+        }
+        let subtype = arg_subtypes.get(idx + 1).copied().unwrap_or(0);
+        let ins = jsonb_value_arg_to_blob(&args[idx + 1], subtype)?;
+        editor.apply_path_edit(path, mode, &ins)?;
+        idx += 2;
+    }
+    Ok(editor.blob)
+}
+
+fn remove_jsonb_blob_paths(blob: Vec<u8>, paths: &[&str]) -> Result<Option<Vec<u8>>> {
+    let mut editor = JsonbBlobEditor::new(blob);
+    for path in paths {
+        if !path.starts_with('$') {
+            return Err(bad_json_path(path));
+        }
+        if path.len() == 1 {
+            return Ok(None);
+        }
+        editor.apply_path_edit(path, JsonbEditMode::Delete, &[])?;
+    }
+    Ok(Some(editor.blob))
 }
 
 fn is_superficially_valid_jsonb(input: &[u8]) -> bool {
@@ -5133,22 +5876,7 @@ pub struct JsonbSetFunc;
 
 impl ScalarFunction for JsonbSetFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.is_empty() {
-            return Ok(SqliteValue::Null);
-        }
-        check_edit_arity(self.name(), args)?;
-        if matches!(args[0], SqliteValue::Null) {
-            return Ok(SqliteValue::Null);
-        }
-        let input = json_arg_value(self.name(), args, 0)?;
-        let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
-        let pairs = pairs_owned
-            .iter()
-            .map(|(path, value)| (path.as_str(), value.clone()))
-            .collect::<Vec<_>>();
-        let edited = edit_json_paths_value(&input, &pairs, EditMode::Set)?;
-        let blob = encode_jsonb_root(&edited)?;
-        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+        self.invoke_with_arg_subtypes(args, &[])
     }
 
     fn invoke_with_arg_subtypes(
@@ -5163,17 +5891,16 @@ impl ScalarFunction for JsonbSetFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
-        let input = json_arg_value(self.name(), args, 0)?;
-        let edited = edit_json_paths_value_with_subtypes(
+        let blob = json_arg_to_jsonb_blob(self.name(), args, 0)?;
+        let edited = edit_jsonb_blob_with_subtypes(
             self.name(),
-            &input,
+            blob,
             args,
             arg_subtypes,
             1,
-            EditMode::Set,
+            JsonbEditMode::Set,
         )?;
-        let blob = encode_jsonb_root(&edited)?;
-        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+        Ok(SqliteValue::Blob(Arc::from(edited.as_slice())))
     }
 
     fn num_args(&self) -> i32 {
@@ -5249,22 +5976,7 @@ pub struct JsonbInsertFunc;
 
 impl ScalarFunction for JsonbInsertFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.is_empty() {
-            return Ok(SqliteValue::Null);
-        }
-        check_edit_arity(self.name(), args)?;
-        if matches!(args[0], SqliteValue::Null) {
-            return Ok(SqliteValue::Null);
-        }
-        let input = json_arg_value(self.name(), args, 0)?;
-        let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
-        let pairs = pairs_owned
-            .iter()
-            .map(|(path, value)| (path.as_str(), value.clone()))
-            .collect::<Vec<_>>();
-        let edited = edit_json_paths_value(&input, &pairs, EditMode::Insert)?;
-        let blob = encode_jsonb_root(&edited)?;
-        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+        self.invoke_with_arg_subtypes(args, &[])
     }
 
     fn invoke_with_arg_subtypes(
@@ -5279,17 +5991,16 @@ impl ScalarFunction for JsonbInsertFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
-        let input = json_arg_value(self.name(), args, 0)?;
-        let edited = edit_json_paths_value_with_subtypes(
+        let blob = json_arg_to_jsonb_blob(self.name(), args, 0)?;
+        let edited = edit_jsonb_blob_with_subtypes(
             self.name(),
-            &input,
+            blob,
             args,
             arg_subtypes,
             1,
-            EditMode::Insert,
+            JsonbEditMode::Insert,
         )?;
-        let blob = encode_jsonb_root(&edited)?;
-        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+        Ok(SqliteValue::Blob(Arc::from(edited.as_slice())))
     }
 
     fn num_args(&self) -> i32 {
@@ -5356,17 +6067,7 @@ pub struct JsonbArrayInsertFunc;
 
 impl ScalarFunction for JsonbArrayInsertFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.is_empty() {
-            return Ok(SqliteValue::Null);
-        }
-        check_edit_arity(self.name(), args)?;
-        if matches!(args[0], SqliteValue::Null) {
-            return Ok(SqliteValue::Null);
-        }
-        let input = json_arg_value(self.name(), args, 0)?;
-        let edited = edit_json_array_insert_with_subtypes(self.name(), &input, args, &[], 1)?;
-        let blob = encode_jsonb_root(&edited)?;
-        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+        self.invoke_with_arg_subtypes(args, &[])
     }
 
     fn invoke_with_arg_subtypes(
@@ -5381,11 +6082,16 @@ impl ScalarFunction for JsonbArrayInsertFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
-        let input = json_arg_value(self.name(), args, 0)?;
-        let edited =
-            edit_json_array_insert_with_subtypes(self.name(), &input, args, arg_subtypes, 1)?;
-        let blob = encode_jsonb_root(&edited)?;
-        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+        let blob = json_arg_to_jsonb_blob(self.name(), args, 0)?;
+        let edited = edit_jsonb_blob_with_subtypes(
+            self.name(),
+            blob,
+            args,
+            arg_subtypes,
+            1,
+            JsonbEditMode::ArrayInsert,
+        )?;
+        Ok(SqliteValue::Blob(Arc::from(edited.as_slice())))
     }
 
     fn num_args(&self) -> i32 {
@@ -5461,22 +6167,7 @@ pub struct JsonbReplaceFunc;
 
 impl ScalarFunction for JsonbReplaceFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.is_empty() {
-            return Ok(SqliteValue::Null);
-        }
-        check_edit_arity(self.name(), args)?;
-        if matches!(args[0], SqliteValue::Null) {
-            return Ok(SqliteValue::Null);
-        }
-        let input = json_arg_value(self.name(), args, 0)?;
-        let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
-        let pairs = pairs_owned
-            .iter()
-            .map(|(path, value)| (path.as_str(), value.clone()))
-            .collect::<Vec<_>>();
-        let edited = edit_json_paths_value(&input, &pairs, EditMode::Replace)?;
-        let blob = encode_jsonb_root(&edited)?;
-        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+        self.invoke_with_arg_subtypes(args, &[])
     }
 
     fn invoke_with_arg_subtypes(
@@ -5491,17 +6182,16 @@ impl ScalarFunction for JsonbReplaceFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
-        let input = json_arg_value(self.name(), args, 0)?;
-        let edited = edit_json_paths_value_with_subtypes(
+        let blob = json_arg_to_jsonb_blob(self.name(), args, 0)?;
+        let edited = edit_jsonb_blob_with_subtypes(
             self.name(),
-            &input,
+            blob,
             args,
             arg_subtypes,
             1,
-            EditMode::Replace,
+            JsonbEditMode::Replace,
         )?;
-        let blob = encode_jsonb_root(&edited)?;
-        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+        Ok(SqliteValue::Blob(Arc::from(edited.as_slice())))
     }
 
     fn num_args(&self) -> i32 {
@@ -5564,20 +6254,25 @@ impl ScalarFunction for JsonbRemoveFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
-        let input = json_arg_value(self.name(), args, 0)?;
+        let blob = json_arg_to_jsonb_blob(self.name(), args, 0)?;
         if args.len() == 1 {
-            let blob = encode_jsonb_root(&input)?;
             return Ok(SqliteValue::Blob(Arc::from(blob.as_slice())));
         }
-        if args[1..].iter().any(|a| matches!(a, SqliteValue::Null)) {
-            return Ok(SqliteValue::Null);
+        let mut editor = JsonbBlobEditor::new(blob);
+        for arg in &args[1..] {
+            if arg.is_null() {
+                return Ok(SqliteValue::Null);
+            }
+            let path_text = arg.to_text();
+            if !path_text.starts_with('$') {
+                return Err(bad_json_path(&path_text));
+            }
+            if path_text.len() == 1 {
+                return Ok(SqliteValue::Null);
+            }
+            editor.apply_path_edit(&path_text, JsonbEditMode::Delete, &[])?;
         }
-        let paths = collect_path_args(self.name(), args, 1)?;
-        let Some(edited) = json_remove_value(&input, &paths)? else {
-            return Ok(SqliteValue::Null);
-        };
-        let blob = encode_jsonb_root(&edited)?;
-        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+        Ok(SqliteValue::Blob(Arc::from(editor.blob.as_slice())))
     }
 
     fn num_args(&self) -> i32 {

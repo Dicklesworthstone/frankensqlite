@@ -415,3 +415,243 @@ fn bd_72iv9_json_error_position_matches_stock_oracle() {
         );
     });
 }
+
+/// bd-b0i0o: `jsonb_set` / `jsonb_insert` / `jsonb_replace` / `jsonb_array_insert`
+/// must match stock SQLite 3.54.1 byte-for-byte (`hex(...)`), storing SQL TEXT
+/// values and created object labels as `JSONB_TEXTRAW` (0xA) — or `JSONB_TEXT5`
+/// (0x9) for quoted path labels containing escapes — while preserving existing
+/// JSON `TEXT`/`TEXTJ` labels, JSON-subtyped values, and `jsonb_array` /
+/// `jsonb_object` / `jsonb_group_*` `TEXT`/`TEXTJ` wire types.
+#[test]
+fn bd_b0i0o_jsonb_edit_textraw_matches_stock_oracle() {
+    let long_plain = "a".repeat(20);
+    let very_long_quoted = format!("{}\"{}", "b".repeat(140), "c".repeat(140));
+
+    // Bead canonical pins against stock SQLite 3.54.1 (non-vacuity check).
+    let stock_probe = rusqlite::Connection::open_in_memory().unwrap();
+    for (sql, expected_hex) in [
+        ("SELECT hex(jsonb_set('[1,2]','$[1]','x'))", "4B13311A78"),
+        (
+            "SELECT hex(jsonb_insert('[1,2]','$[#]','x'))",
+            "6B133113321A78",
+        ),
+        (
+            "SELECT hex(jsonb_replace('[1,2]','$[1]','x'))",
+            "4B13311A78",
+        ),
+        (
+            "SELECT hex(jsonb_set('{}','$.a','x\"y'))",
+            "6C1A613A782279",
+        ),
+    ] {
+        let got: String = stock_probe.query_row(sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(got, expected_hex, "stock pin failed for `{sql}`");
+    }
+
+    // Parameterized (doc, path, value) matrix covering all four jsonb_* edit functions.
+    let text_values: Vec<String> = vec![
+        String::new(),
+        "x".to_owned(),
+        "x\"y".to_owned(),
+        "a\\b".to_owned(),
+        "line1\nline2\t\r\u{0008}\u{000C}\u{0001}\u{001F}".to_owned(),
+        "café 🚀 中".to_owned(),
+        long_plain,
+        very_long_quoted,
+    ];
+
+    let edit_shapes: &[(&str, &str, &str)] = &[
+        // Array slots
+        ("jsonb_set", "[1,2]", "$[1]"),
+        ("jsonb_set", "[1,2]", "$[#]"),
+        ("jsonb_set", "[1,2]", "$[#-1]"),
+        ("jsonb_insert", "[1,2]", "$[#]"),
+        ("jsonb_insert", "[1,2]", "$[1]"),
+        ("jsonb_replace", "[1,2]", "$[1]"),
+        ("jsonb_replace", "[1,2]", "$[#]"),
+        ("jsonb_array_insert", "[1,2]", "$[0]"),
+        ("jsonb_array_insert", "[1,2]", "$[1]"),
+        ("jsonb_array_insert", "[1,2]", "$[#]"),
+        // Existing object members (label stays TEXT 0x7 / TEXTJ 0x8; value becomes TEXTRAW 0xA)
+        ("jsonb_set", "{\"a\":1}", "$.a"),
+        ("jsonb_replace", "{\"a\":1}", "$.a"),
+        ("jsonb_insert", "{\"a\":1}", "$.a"),
+        ("jsonb_set", "{\"a\\\"b\":1}", "$.\"a\\\"b\""),
+        ("jsonb_replace", "{\"a\\\"b\":1}", "$.\"a\\\"b\""),
+        // Created object members & nested scaffolding (created labels become TEXTRAW 0xA / TEXT5 0x9)
+        ("jsonb_set", "{}", "$.a"),
+        ("jsonb_insert", "{}", "$.a"),
+        ("jsonb_set", "{\"k\":\"v\\\"w\"}", "$.new_key"),
+        ("jsonb_set", "{}", "$.a.b.c"),
+        ("jsonb_insert", "{}", "$.a.b.c"),
+        ("jsonb_set", "{}", "$.\"a.b\""),
+        ("jsonb_set", "{}", "$.\"\""),
+        ("jsonb_set", "{}", "$.\"a\\\"b\""),
+        ("jsonb_set", "{}", "$.\"a\\\\b\""),
+        ("jsonb_set", "{}", "$.\"a\\nb\""),
+        ("jsonb_set", "{}", "$.\"café 🚀\""),
+        ("jsonb_set", "{}", "$.a\\b"),
+        ("jsonb_set", "{}", "$.café"),
+        ("jsonb_array_insert", "{}", "$.a[0]"),
+        ("jsonb_array_insert", "{}", "$.a.b[0]"),
+        ("jsonb_array_insert", "{}", "$.\"a.b\"[0]"),
+        ("jsonb_array_insert", "{}", "$.\"a\\\"b\"[0]"),
+        // Root replacement
+        ("jsonb_set", "[1]", "$"),
+        ("jsonb_replace", "[1]", "$"),
+        ("jsonb_insert", "[1]", "$"),
+    ];
+
+    // SQL-level expressions covering subtypes, chaining, blob values, equality, and controls.
+    let sql_queries: &[&str] = &[
+        // Exact equality with stock wire bytes
+        "SELECT jsonb_set('{}','$.a','x\"y') = x'6C1A613A782279'",
+        "SELECT jsonb_set('[1,2]','$[1]','x') = x'4B13311A78'",
+        // Multiple path/value pairs in one call
+        "SELECT hex(jsonb_set('{}','$.a','x','$.b','y\"z','$.a','w'))",
+        "SELECT hex(jsonb_insert('{}','$.a','x','$.a','ignored','$.b','y'))",
+        "SELECT hex(jsonb_replace('{\"a\":1,\"b\":2}','$.a','x','$.c','ignored','$.b','y\"z'))",
+        "SELECT hex(jsonb_array_insert('[1]','$[0]','x','$[#]','y\"z'))",
+        // Chained JSONB edits preserve prior TEXTRAW nodes and labels
+        "SELECT hex(jsonb_set(jsonb_set('{}','$.a','x\"y'),'$.b','z'))",
+        "SELECT hex(jsonb_insert(jsonb_set('{}','$.a','x'),'$.b','y'))",
+        "SELECT hex(jsonb_replace(jsonb_set('{}','$.a','x'),'$.a','y\"z'))",
+        "SELECT hex(jsonb_remove(jsonb_set('{\"keep\":1}','$.a','x\"y'),'$.keep'))",
+        "SELECT hex(jsonb_array_insert(jsonb_set('{\"a\":[1]}','$.b','x'),'$.a[0]','y'))",
+        // Embedding a JSONB blob value preserves its internal TEXTRAW nodes
+        "SELECT hex(jsonb_set('[1]','$[0]',jsonb_set('{}','$.a','x\"y')))",
+        "SELECT hex(jsonb_insert('[1]','$[#]',jsonb_set('[0]','$[0]','x')))",
+        "SELECT hex(jsonb_replace('[1]','$[0]',jsonb_set('{}','$.a','x')))",
+        "SELECT hex(jsonb_array_insert('[1]','$[0]',jsonb_set('{}','$.a','x')))",
+        // JSON-subtyped values MUST keep TEXT/TEXTJ, not TEXTRAW
+        "SELECT hex(jsonb_set('{\"a\":1}','$.a',json('\"x\"')))",
+        "SELECT hex(jsonb_set('{\"a\":1}','$.a',json('\"x\\\"y\"')))",
+        "SELECT hex(jsonb_set('{}','$.a',json('{\"k\":\"v\"}')))",
+        "SELECT hex(jsonb_insert('[1]','$[#]',json('\"x\"')))",
+        "SELECT hex(jsonb_replace('[1]','$[0]',json('\"x\"')))",
+        "SELECT hex(jsonb_array_insert('[1]','$[0]',json('\"x\"')))",
+        // Constructors and aggregates MUST keep TEXT/TEXTJ (negative controls)
+        "SELECT hex(jsonb_array('x'))",
+        "SELECT hex(jsonb_array('x\"y'))",
+        "SELECT hex(jsonb_array(jsonb_set('{}','$.a','x\"y')))",
+        "SELECT hex(jsonb_object('k','x'))",
+        "SELECT hex(jsonb_object('k','x\"y'))",
+        "SELECT hex(jsonb_object('k',jsonb_set('{}','$.a','x\"y')))",
+        "SELECT hex(jsonb_group_array('x'))",
+        "SELECT hex(jsonb_group_array('x\"y'))",
+        "SELECT hex(jsonb_group_object('k','x'))",
+        "SELECT hex(jsonb_group_object('k','x\"y'))",
+        // Round-trip through json() and json_extract()
+        "SELECT json(jsonb_set('{}','$.a','x\"y')), json_extract(jsonb_set('{}','$.a','x\"y'),'$.a')",
+        "SELECT json(jsonb_set('{}','$.\"a\\\"b\"','x\\y')), json_extract(jsonb_set('{}','$.\"a\\\"b\"','x\\y'),'$.\"a\\\"b\"')",
+        "SELECT json(jsonb_array_insert('{}','$.a[0]','x\"y'))",
+        // Text variants remain valid canonical JSON
+        "SELECT json_set('{}','$.a','x\"y')",
+        "SELECT json_insert('{}','$.a','x\"y')",
+        "SELECT json_replace('{\"a\":1}','$.a','x\"y')",
+        "SELECT json_array_insert('[1]','$[0]','x\"y')",
+    ];
+
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = if file_backed {
+                (
+                    Connection::open(dir.path().join("f.db").to_str().unwrap())
+                        .await
+                        .unwrap(),
+                    rusqlite::Connection::open(dir.path().join("r.db")).unwrap(),
+                )
+            } else {
+                (
+                    Connection::open(":memory:").await.unwrap(),
+                    rusqlite::Connection::open_in_memory().unwrap(),
+                )
+            };
+            let db = if file_backed { "file" } else { "memory" };
+
+            for &(func, doc, path) in edit_shapes {
+                let sql = format!("SELECT hex({func}(?1, ?2, ?3)), json({func}(?1, ?2, ?3))");
+                let f_prep = f.prepare(&sql).await.unwrap();
+                let mut r_prep = r.prepare(&sql).unwrap();
+
+                for val in &text_values {
+                    let stock_pair: (String, String) = r_prep
+                        .query_row(rusqlite::params![doc, path, val], |row| {
+                            Ok((row.get(0)?, row.get(1)?))
+                        })
+                        .unwrap();
+                    let params = [
+                        SqliteValue::Text(doc.into()),
+                        SqliteValue::Text(path.into()),
+                        SqliteValue::Text(val.as_str().into()),
+                    ];
+                    for prepared in [false, true] {
+                        let rows = if prepared {
+                            f_prep.query_with_params(&params).await.unwrap()
+                        } else {
+                            f.query_with_params(&sql, &params).await.unwrap()
+                        };
+                        let frank_pair = (
+                            rows[0].values()[0].to_text(),
+                            rows[0].values()[1].to_text(),
+                        );
+                        if frank_pair != stock_pair {
+                            diffs.push(format!(
+                                "  [{db}, prepared={prepared}] {func}({doc:?}, {path:?}, {val:?})\n     frank= {frank_pair:?}\n     stock= {stock_pair:?}"
+                            ));
+                        }
+                    }
+                }
+                drop(f_prep);
+            }
+
+            for &sql in sql_queries {
+                let mut r_stmt = r.prepare(sql).unwrap();
+                let col_count = r_stmt.column_count();
+                let rv: String = r_stmt
+                    .query_map([], |row| {
+                        let cols = (0..col_count)
+                            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                            .collect::<Vec<_>>()
+                            .join("|");
+                        Ok(cols)
+                    })
+                    .unwrap()
+                    .map(|row| row.unwrap())
+                    .collect::<Vec<_>>()
+                    .join(";");
+                drop(r_stmt);
+
+                let f_prep = f.prepare(sql).await.unwrap();
+                for prepared in [false, true] {
+                    let rows = if prepared {
+                        f_prep.query().await.unwrap()
+                    } else {
+                        f.query(sql).await.unwrap()
+                    };
+                    let fv = rows
+                        .into_iter()
+                        .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>().join("|"))
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    if fv != rv {
+                        diffs.push(format!(
+                            "  [{db}, prepared={prepared}] `{sql}`\n     frank= {fv}\n     stock= {rv}"
+                        ));
+                    }
+                }
+                drop(f_prep);
+            }
+
+            f.close().await.unwrap();
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} bd-b0i0o jsonb TEXTRAW divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.iter().take(40).cloned().collect::<Vec<_>>().join("\n")
+        );
+    });
+}
