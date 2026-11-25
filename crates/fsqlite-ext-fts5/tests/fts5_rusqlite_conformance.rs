@@ -2661,6 +2661,55 @@ fn unicode61_category_selection_and_folding_match_stock() {
 }
 
 #[test]
+fn unicode61_option_selection_matches_bundled_sqlite() {
+    let docs: Vec<_> = (1_i64..)
+        .zip(["abc123", "abc", "123", "CAFÉ"])
+        .map(|(rowid, body)| Doc {
+            rowid,
+            title: "",
+            body,
+        })
+        .collect();
+    let cases: &[(&str, &str, &[i64])] = &[
+        ("unicode61 categories 'N?' categories 'N*'", "123", &[1, 3]),
+        ("unicode61 categories 'N*suffix'", "123", &[1, 3]),
+        ("unicode61 categories 'L*\nN*'", "abc", &[1, 2]),
+        ("unicode61 categories 'L*' categories 'N*'", "123", &[1, 3]),
+        ("unicode61 remove_diacritics 1", "cafe", &[4]),
+    ];
+    for &(spec, query, expected) in cases {
+        let option = format!(r#"tokenize="{spec}""#);
+        let harness = Fts5ConformanceHarness::with_docs(&[&option], &docs);
+        let stock = harness.sqlite_match_rowids(query);
+        assert_eq!(stock, expected, "bundled SQLite: {spec}");
+        assert_eq!(harness.franken_match_rowids(query), stock, "{spec}");
+    }
+
+    for spec in [
+        "unicode61 categories 'N?'",
+        "unicode61 remove_diacritics '01'",
+        "unicode61 remove_diacritics '+1'",
+    ] {
+        let option = format!(r#"tokenize="{spec}""#);
+        let sql = format!("CREATE VIRTUAL TABLE docs USING fts5(body, {option})");
+        let stock = Connection::open_in_memory().unwrap();
+        let stock_error = stock.execute_batch(&sql).unwrap_err().to_string();
+        assert!(
+            stock_error.contains("error in tokenizer constructor"),
+            "{spec}: {stock_error}"
+        );
+        let error = Fts5Table::connect(&Cx::new(), &["fts5", "main", "docs", "body", &option])
+            .err()
+            .unwrap_or_else(|| panic!("{spec}: accepted an invalid tokenizer option"))
+            .to_string();
+        assert!(
+            error.contains("unsupported tokenizer specification"),
+            "{spec}: {error}"
+        );
+    }
+}
+
+#[test]
 fn default_unicode61_separator_queries_match_rusqlite_reference() {
     let harness = Fts5ConformanceHarness::with_docs(&[], UNICODE61_DEFAULT_SEPARATOR_DOCS);
 

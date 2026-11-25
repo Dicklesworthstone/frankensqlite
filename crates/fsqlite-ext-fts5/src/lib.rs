@@ -4725,15 +4725,17 @@ const DEFAULT_UNICODE61_CATEGORIES: u32 = (1 << 31) | (1 << 4) | (0b11111 << 6) 
 
 fn unicode61_categories(spec: &str) -> Option<u32> {
     let mut mask = 0;
-    for pattern in spec.split_ascii_whitespace() {
-        if pattern.len() != 2 || !pattern.is_ascii() {
-            return None;
-        }
+    // SQLite dispatches on the first two bytes of each space- or
+    // tab-delimited category and skips the remainder.
+    for pattern in spec
+        .split([' ', '\t'])
+        .filter(|pattern| !pattern.is_empty())
+    {
+        let prefix = pattern.as_bytes().get(..2)?;
         let mut selected = 0;
         for (index, name) in unicode61_data::CATEGORY_NAMES.iter().enumerate() {
-            if pattern == *name
-                || (pattern.ends_with('*') && pattern.as_bytes()[0] == name.as_bytes()[0])
-            {
+            let name = name.as_bytes();
+            if prefix == name || (prefix[1] == b'*' && prefix[0] == name[0]) {
                 selected |= 1 << (index + 1);
             }
         }
@@ -5339,13 +5341,13 @@ fn take_tokenizer_option<'a>(parts: &'a [String], index: &mut usize) -> Option<(
 
 fn unicode61_tokenizer_from_args(args: &[String]) -> Option<Box<dyn Fts5Tokenizer>> {
     let mut tokenizer = Unicode61Tokenizer::new();
-    let mut categories = DEFAULT_UNICODE61_CATEGORIES;
+    let mut category_spec = None;
     let mut index = 0;
 
     while index < args.len() {
         let (key, value) = take_tokenizer_option(args, &mut index)?;
         match key.to_ascii_lowercase().as_str() {
-            "categories" => categories = unicode61_categories(value)?,
+            "categories" => category_spec = Some(value),
             "tokenchars" | "token_chars" | "separators" => {
                 let (set, opposite) = if key.eq_ignore_ascii_case("separators") {
                     (&mut tokenizer.separators, &mut tokenizer.token_chars)
@@ -5358,16 +5360,22 @@ fn unicode61_tokenizer_from_args(args: &[String]) -> Option<Box<dyn Fts5Tokenize
                 set.push_str(value);
             }
             "remove_diacritics" => {
-                let remove_diacritics = value.parse::<u8>().ok()?;
-                if remove_diacritics > 2 {
-                    return None;
-                }
-                tokenizer.remove_diacritics = remove_diacritics;
+                tokenizer.remove_diacritics = match value {
+                    "0" => 0,
+                    "1" => 1,
+                    "2" => 2,
+                    _ => return None,
+                };
             }
             _ => return None,
         }
     }
 
+    // SQLite selects the last categories option before validating its value.
+    let categories = match category_spec {
+        Some(spec) => unicode61_categories(spec)?,
+        None => DEFAULT_UNICODE61_CATEGORIES,
+    };
     Some(Box::new(CategorizedUnicode61Tokenizer {
         tokenizer,
         categories,
