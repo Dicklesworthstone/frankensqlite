@@ -7,10 +7,17 @@
 //! read-after-write, uniqueness, and the still-refreshing INSERT...SELECT path)
 //! and that the memdb reload count does not scale with statement count.
 
+use std::sync::{Mutex, PoisonError};
+
 use fsqlite_core::connection::{
     Connection, hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 use fsqlite_types::value::SqliteValue;
+
+/// bd-8aqha: `hot_path_profile_snapshot().memdb_refresh_count` is process-global.
+/// Serialize the tests in this binary so sibling tests' reads cannot land in
+/// the reload-counting window under default parallel libtest execution.
+static PROFILE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn int(values: &[SqliteValue]) -> i64 {
     match values[0] {
@@ -21,6 +28,7 @@ fn int(values: &[SqliteValue]) -> i64 {
 
 #[test]
 fn read_free_insert_values_streak_defers_memdb_reload_and_stays_correct() {
+    let _guard = PROFILE_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     asupersync::test_utils::run_test(|| async {
         set_hot_path_profile_enabled(true);
         let dir = tempfile::tempdir().expect("temp dir");
@@ -68,11 +76,13 @@ fn read_free_insert_values_streak_defers_memdb_reload_and_stays_correct() {
         assert_eq!(int(count[0].values()), N * 2);
         let ic = conn.query("PRAGMA integrity_check;").await.expect("ic");
         assert!(matches!(ic[0].values()[0], SqliteValue::Text(ref s) if s.as_ref() == "ok"));
+        conn.close().await.expect("close");
     });
 }
 
 #[test]
 fn read_free_insert_streak_still_enforces_uniqueness() {
+    let _guard = PROFILE_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = dir.path().join("uniq.db").to_string_lossy().into_owned();
@@ -94,11 +104,13 @@ fn read_free_insert_streak_still_enforces_uniqueness() {
             "duplicate primary key must be rejected mid-streak"
         );
         conn.execute("ROLLBACK;").await.expect("rollback");
+        conn.close().await.expect("close");
     });
 }
 
 #[test]
 fn insert_select_source_is_not_deferred_and_stays_correct() {
+    let _guard = PROFILE_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = dir.path().join("insel.db").to_string_lossy().into_owned();
@@ -128,5 +140,6 @@ fn insert_select_source_is_not_deferred_and_stays_correct() {
             "INSERT...SELECT must see and copy all src rows"
         );
         conn.execute("COMMIT;").await.expect("commit");
+        conn.close().await.expect("close");
     });
 }
