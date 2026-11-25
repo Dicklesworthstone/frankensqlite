@@ -66,7 +66,7 @@ signature fails closed rather than silently downgrading authenticity.
 | Data races | Possible (careful C) | Prevented inside the Rust engine by ownership and type-system checks |
 | File format | SQLite 3.x | SQLite 3.x layout; UTF-8 and UTF-16le/be text encodings are admitted for reads and writes, with parity verification deepest on the UTF-8 surface |
 | Self-healing storage | No | Opt-in (`PRAGMA raptorq_repair_symbols = N`, default 0): native file-backed connections with a blocking pool generate WAL repair symbols asynchronously, and a writable open of an opted-in database repairs damaged WAL frames from them; the main database file is not covered |
-| Page-level encryption | No (commercial SEE extension) | Not currently available: the XChaCha20-Poly1305 DEK/KEK implementation exists in `fsqlite-pager`, but no `PRAGMA key`/`rekey` dispatch is wired into `Connection` |
+| Page-level encryption | No (commercial SEE extension) | Built-in compatibility page-level encryption (XChaCha20-Poly1305 DEK/KEK, Argon2id, `<db>-key` sidecar, `PRAGMA key`/`hexkey`/`rekey`/`hexrekey` with O(1) KEK re-wrap); `fsqlite-c-api` has no `sqlite3_key`/`sqlite3_rekey` yet and Native ECS encrypt-then-code remains design-only |
 | SQL dialect | Full | Large and growing subset; parser coverage exceeds full execution parity today |
 | Extensions | FTS3/4/5, R-tree, JSON1, etc. | FTS5, JSON1, R-tree/geopoly, ICU, and misc (`generate_series`) wired in live engine; session is a library facade; FTS3/4 are helper-level only |
 | Cross-process MVCC | No | Partial (shared-memory coordination, bounded by the measured harness scale) |
@@ -1966,33 +1966,34 @@ On systems where shared memory is unavailable or restricted, FrankenSQLite falls
 
 ## Page-Level Encryption
 
-> **Status: NOT WIRED. Do not rely on FrankenSQLite for encryption
-> at rest.** The envelope-encryption implementation
-> (`PageEncryptor`, DEK/KEK, Argon2id) exists in `fsqlite-pager`, but it is not
-> reachable from the public API: `Connection` implements no `PRAGMA key` or
-> `PRAGMA rekey`, and unrecognised PRAGMAs are **silently ignored** for SQLite
-> compatibility. `PRAGMA key = 'passphrase'` therefore parses, returns success
-> with no rows and no error, and the database is written **unencrypted**. The
-> `fsqlite-c-api` shim likewise exposes no `sqlite3_key`/`sqlite3_rekey`.
-> Wiring the key-management PRAGMAs into the connection pipeline is outstanding
-> work. The table below describes the intended design.
+> **Status: Wired for compatibility-mode databases (since v0.5.1, `89ae732c9`).**
+> `Connection` dispatches `PRAGMA key`, `PRAGMA hexkey`, `PRAGMA rekey`,
+> `PRAGMA hexrekey`, and `PRAGMA fsqlite.cipher_argon2_{m,t,p}_cost`, with
+> transparent page encryption across the main database file, WAL frames,
+> rollback journals, and checkpoints (verified by `bd_1vwiy_page_encryption_e2e`).
+> Opening an encrypted database without supplying the key fails closed with
+> `NotADatabase` on prepare/query/execute/export. **Caveats:** encrypted
+> databases are not readable by stock C SQLite, `fsqlite-c-api` does not yet
+> expose `sqlite3_key`/`sqlite3_rekey`, and Native-mode ECS encrypt-then-code
+> remains design-only.
 
-The design goal is page-level encryption as a built-in feature, replacing the need for SQLite's commercial Encryption Extension (SEE).
+FrankenSQLite provides page-level encryption as a built-in feature, replacing the need for SQLite's commercial Encryption Extension (SEE).
 
-| Property | Design value (not yet reachable from the public API) |
-|----------|-------|
+| Property | Compatibility-mode implementation |
+|----------|-----------------------------------|
 | Cipher | XChaCha20-Poly1305 (AEAD) |
-| Data key (DEK) | Random 256-bit key generated at database creation |
-| Key-encryption key (KEK) | Argon2id(passphrase, per-database random salt) |
-| Rekey | O(1): re-wrap DEK (planned `PRAGMA rekey = 'new_passphrase'`) |
-| Nonce | 24 bytes, random per page write |
+| Data key (DEK) | Random 256-bit key generated at database encryption |
+| Key-encryption key (KEK) | Argon2id(passphrase, per-database 16-byte random salt); tunable via `PRAGMA fsqlite.cipher_argon2_{m,t,p}_cost` |
+| Key envelope sidecar | 160-byte `<db>-key` file (`FSQLITE_KEY_V1`, AEAD-wrapped DEK with header AAD + 16-byte BLAKE3 digest) |
+| Rekey | O(1) KEK re-wrap via `PRAGMA rekey`/`hexrekey` (also converts plaintext <-> encrypted by rewriting pages between 0 and 40 reserved bytes) |
+| Nonce | 24 bytes, fresh random per page write |
 | Authentication tag | 16 bytes (Poly1305), stored in the page's reserved space |
 | Reserved bytes | `reserved_bytes >= 40` (24B nonce + 16B tag) |
-| Key management API | Planned `PRAGMA key = 'passphrase'` / `PRAGMA rekey = 'new_passphrase'`; **not currently dispatched** |
+| Key management API | `PRAGMA key`/`hexkey` and `PRAGMA rekey`/`hexrekey` on `Connection` (not yet exposed in `fsqlite-c-api`) |
 
-The intended scheme is envelope encryption: pages are encrypted with the DEK; the DEK is wrapped with the KEK derived from the passphrase. Random nonces eliminate global counters and remain safe under VM snapshot reverts, crashes, forks, and distributed writers.
+Envelope encryption encrypts pages with the DEK and wraps the DEK with the KEK derived from the passphrase. Random per-write nonces eliminate global counters and remain safe under VM snapshot reverts, crashes, forks, and concurrent MVCC writers.
 
-The Native-mode design applies encryption before RaptorQ encoding (encrypt-then-code). An attacker who corrupts encrypted ECS symbols cannot forge valid ciphertext; after the design is fully wired, RaptorQ repairs the corruption and decryption follows.
+The Native-mode design applies encryption before RaptorQ encoding (encrypt-then-code); that ECS pipeline remains design-only today.
 
 ---
 
@@ -3013,7 +3014,7 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 | Isolation level | Serializable (by serializing) | SSI (true serializable concurrency) | Snapshot | Snapshot | Snapshot |
 | Memory safety | Manual | Compile-time guaranteed | Manual (C) | Manual (C++) | Compile-time guaranteed |
 | File format | SQLite 3.x | SQLite 3.x with UTF-8 and UTF-16le/be encodings (Compat), or ECS (Native target) | SQLite 3.x (compatible) | Own format | SQLite 3.x (compatible) |
-| Page encryption | Commercial (SEE) | XChaCha20-Poly1305 implemented in `fsqlite-pager` but not wired to the public API | No | No | No |
+| Page encryption | Commercial (SEE) | Built-in in Compat mode (XChaCha20-Poly1305 DEK/KEK via `PRAGMA key`/`rekey`; no C-API `sqlite3_key` yet) | No | No | No |
 | Self-healing storage | No | Opt-in WAL repair symbols on supported native runtimes, with repair of damaged WAL frames at open | No | No | No |
 | Cross-process MVCC | No | Shared-memory coordination | No | Yes | No |
 | Embeddable | Yes | Yes | Yes | Yes | Yes |
@@ -3021,7 +3022,7 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 | WASM target | Via Emscripten | Experimental (`fsqlite-wasm` cdylib + npm package, in-memory SQL with explicit OPFS or IndexedDB checkpoints) | Yes | Yes | Yes |
 | Async I/O | No | Yes (asupersync + Cx) | Yes | No | Yes (io_uring) |
 
-FrankenSQLite's target combines SQLite file format compatibility, concurrent writers via MVCC with SSI, page-level encryption, self-healing storage, and Rust memory safety. The current compatibility runtime covers SQLite databases in UTF-8 and UTF-16le/be encodings; parts of the durability design remain active work: page encryption is not yet reachable from the public API, and RaptorQ self-healing reaches it only as opt-in repair of WAL frames at open. Limbo (another Rust SQLite) focuses on async I/O with io_uring but retains the single-writer model. libsql is a C fork that inherits the original codebase's complexity. DuckDB targets analytics workloads with a columnar storage format incompatible with SQLite.
+FrankenSQLite's target combines SQLite file format compatibility, concurrent writers via MVCC with SSI, page-level encryption, self-healing storage, and Rust memory safety. The current compatibility runtime covers SQLite databases in UTF-8 and UTF-16le/be encodings and wires compatibility page-level encryption (`PRAGMA key`/`rekey`, without C-API `sqlite3_key` yet); parts of the durability design remain active work: RaptorQ self-healing reaches the public API only as opt-in repair of WAL frames at open, and Native ECS mode remains partial implementation work. Limbo (another Rust SQLite) focuses on async I/O with io_uring but retains the single-writer model. libsql is a C fork that inherits the original codebase's complexity. DuckDB targets analytics workloads with a columnar storage format incompatible with SQLite.
 
 ---
 
@@ -3108,7 +3109,7 @@ still serves as an authoritative reference.
 
 **Multiplexor VFS.** C SQLite's multiplexor shards large databases across multiple files to work around filesystem limitations (e.g., FAT32 4GB limit). Modern filesystems do not have these limitations.
 
-**SEE (SQLite Encryption Extension).** The commercial C SQLite encryption extension is not ported. FrankenSQLite's own page-level encryption design uses XChaCha20-Poly1305 with DEK/KEK envelope encryption, Argon2id key derivation, and O(1) instant rekey (only the wrapped key is rewritten, not bulk page data). That implementation lives in `fsqlite-pager` and is not reachable from the public API — see the Page-Level Encryption section above.
+**SEE (SQLite Encryption Extension).** The commercial C SQLite encryption extension is not ported. FrankenSQLite's own page-level encryption uses XChaCha20-Poly1305 with DEK/KEK envelope encryption, Argon2id key derivation, a 160-byte `<db>-key` sidecar, and O(1) instant rekey (only the wrapped key is rewritten, not bulk page data). It is wired into `Connection` via `PRAGMA key`/`hexkey`/`rekey`/`hexrekey` in compatibility mode (though `fsqlite-c-api` does not yet expose `sqlite3_key`/`sqlite3_rekey`) — see the Page-Level Encryption section above.
 
 ---
 
@@ -3226,15 +3227,14 @@ still serves as an authoritative reference.
   allocated leave a gap instead (stock SQLite would reuse those values).
   Rowids stay unique either way, which is all SQLite promises; code that
   expects consecutive rowids after a failure should not.
-- **Page encryption is not wired, and `PRAGMA key`/`PRAGMA rekey` are
-  silently ignored.** Both statements parse and return success with no rows and
-  no error, but no key is installed and the database is written unencrypted.
-  Do not use FrankenSQLite where encryption at rest is required, and do not
-  treat a successful `PRAGMA key` as confirmation that a database is
-  encrypted. When
-  the design is wired, encryption will add per-page overhead: the 24-byte nonce
-  and 16-byte tag (40 bytes total) consume reserved space in each page, and
-  encrypted databases will not be readable without the key, even by C SQLite.
+- **Encrypted databases are FrankenSQLite-specific, and C-API key hooks are not
+  yet exposed.** Compatibility-mode page encryption (`PRAGMA key`/`hexkey` and
+  `PRAGMA rekey`/`hexrekey`, XChaCha20-Poly1305 + Argon2id DEK/KEK with a
+  160-byte `<db>-key` sidecar) consumes 40 reserved bytes per page (24-byte
+  nonce + 16-byte tag), and encrypted databases are not readable without the
+  key or by stock C SQLite. The optional `fsqlite-c-api` shim does not yet
+  expose `sqlite3_key`/`sqlite3_rekey`, and Native-mode ECS encrypt-then-code
+  remains design-only.
 - **Native mode databases are not directly readable by C SQLite.** The ECS commit stream format is FrankenSQLite-specific. Compatibility export (`compat/foo.db`) materializes a standard SQLite file on demand.
 - **Some schema text and diagnostics differ from stock SQLite.** The schemas
   are equivalent, but tools that compare text will see these differences:
@@ -3342,7 +3342,7 @@ A: A database opted in with `PRAGMA raptorq_repair_symbols = N` (off by default)
 A: Today, the stable user-facing runtime is the compatibility/pager-backed path over standard SQLite files (UTF-8 or UTF-16le/be encodings). Native mode refers to the ECS/content-addressed durability design and partial implementation work present in the repo. It is not yet a mature public `PRAGMA fsqlite.mode` toggle on `Connection`.
 
 **Q: How does encryption work?**
-A: It does not work yet. `PRAGMA key` and `PRAGMA rekey` are not implemented by `Connection`; because unrecognised PRAGMAs are silently ignored, they return success while leaving the database unencrypted. The design — which lives in `fsqlite-pager` but is not wired to the public API — derives a KEK via Argon2id and unwraps a per-database random DEK; pages are encrypted with XChaCha20-Poly1305 using a fresh random 24-byte nonce per page write, with the nonce and 16-byte tag stored in each page's reserved bytes, and `PRAGMA rekey` re-wraps the DEK in O(1). In Native mode, encryption is designed to happen before RaptorQ encoding (encrypt-then-code).
+A: Compatibility-mode page encryption is wired into `Connection` via `PRAGMA key`/`hexkey` and `PRAGMA rekey`/`hexrekey` (with Argon2id cost parameters configurable via `PRAGMA fsqlite.cipher_argon2_{m,t,p}_cost`). It derives a KEK via Argon2id and wraps/unwraps a per-database random 256-bit DEK stored in a 160-byte `<db>-key` sidecar; every page (main DB, WAL, rollback journal, checkpoint) is encrypted with XChaCha20-Poly1305 using a fresh random 24-byte nonce and 16-byte Poly1305 tag in the page's 40 reserved bytes, and `PRAGMA rekey` re-wraps the DEK in O(1) (or converts between plaintext and encrypted layouts). Opening an encrypted database without unlocking fails closed with `NotADatabase`. Caveats: encrypted files are not readable by stock C SQLite, `fsqlite-c-api` does not yet expose `sqlite3_key`/`sqlite3_rekey`, and Native-mode ECS encrypt-then-code remains design-only.
 
 **Q: Does FrankenSQLite support Windows?**
 A: Yes. The `WindowsVfs` implements the same `Vfs` trait as `UnixVfs`, using `LockFileEx`/`UnlockFileEx` for file locking, and it mirrors stock SQLite's WAL lock bytes onto the real `-shm` sidecar. Its shared-memory *contents*, however, are not a cross-process file mapping: `shm_map` extends the real `-shm` file but returns a process-local heap-backed region, so FrankenSQLite and stock SQLite WAL connections must not run concurrently against the same database on Windows ([#395](https://github.com/Dicklesworthstone/frankensqlite/issues/395) tracks the data-plane boundary; [#139](https://github.com/Dicklesworthstone/frankensqlite/issues/139) the native lock-byte receipt). Platform-specific code is isolated behind `#[cfg(target_os)]` gates. OS/2, VxWorks, and Windows CE are excluded.
@@ -3365,7 +3365,7 @@ A: Yes. The `fsqlite` crate is the public API. The CLI (`fsqlite-cli`) is a sepa
 | High memory usage with many readers | Long-lived snapshots pin old versions | Close transactions promptly; set connection timeouts |
 | SSI abort (write skew detected) | Two concurrent transactions created rw-antidependency cycle | Retry the aborted transaction; or `PRAGMA fsqlite.serializable = OFF` if write skew is acceptable |
 | Cannot open Native mode database in C SQLite | ECS format is FrankenSQLite-specific | Use `compat/foo.db` export, or switch to Compatibility mode |
-| `PRAGMA key` succeeded but the database is readable without a key | Page encryption is not wired; unrecognised PRAGMAs are silently ignored | Expected behavior today — do not rely on FrankenSQLite for encryption at rest; see Page-Level Encryption above |
+| Opening an encrypted database returns `NotADatabase` | Database is locked (wrong/missing passphrase or missing `<db>-key` sidecar) | Execute `PRAGMA key = '...'` (or `PRAGMA hexkey = '...'`) right after opening and ensure the `<db>-key` sidecar travels with the `.db` file; see Page-Level Encryption above |
 
 ---
 
