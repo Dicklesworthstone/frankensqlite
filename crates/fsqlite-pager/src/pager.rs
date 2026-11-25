@@ -10531,6 +10531,16 @@ impl<F: VfsFile> PagerInner<F> {
         self.read_page_copy_outside_wal(cx, cache, page_no).await
     }
 
+    /// GH#543: whether this pager reads a main file of `file_size` bytes as
+    /// the empty database a zero-length file stands for, serving page 1 from
+    /// memory ([`zero_length_main_file_page_one`]) as stock reads it. Only a
+    /// read-only or immutable pager does: it never writes, so the image it
+    /// serves can never reach the file. A writable pager keeps refusing a
+    /// zero-length main file it did not create.
+    fn serves_zero_length_main_file(&self, file_size: u64) -> bool {
+        file_size == 0 && self.access_mode.is_readonly()
+    }
+
     /// [`Self::read_page_copy`] for a page the WAL is already known not to
     /// hold for this reader: cache → disk.
     async fn read_page_copy_outside_wal(
@@ -10544,6 +10554,12 @@ impl<F: VfsFile> PagerInner<F> {
         // were allocated and then rolled back before commit.
         if page_no.get() > self.db_size {
             return Ok(vec![0_u8; self.page_size.as_usize()]);
+        }
+
+        if page_no == PageNumber::ONE
+            && self.serves_zero_length_main_file(self.committed_db_file_size_bytes)
+        {
+            return zero_length_main_file_page_one(self.page_size);
         }
 
         if self.page_cipher.is_enabled() {
@@ -10632,6 +10648,9 @@ impl<F: VfsFile> PagerInner<F> {
         let offset = u64::from(page_no.get().saturating_sub(1)) * page_size as u64;
         let db_file = shared_db_file_read(&self.db_file, cx).await?;
         let file_size = db_file.file_size(cx)?;
+        if page_no == PageNumber::ONE && self.serves_zero_length_main_file(file_size) {
+            return zero_length_main_file_page_one(self.page_size);
+        }
         if offset >= file_size {
             if dk9ra_trace_enabled() && page_no.get() > 1 {
                 eprintln!(
@@ -10665,6 +10684,9 @@ impl<F: VfsFile> PagerInner<F> {
         cx: &Cx,
         file_size: u64,
     ) -> Result<[u8; DATABASE_HEADER_SIZE]> {
+        if self.serves_zero_length_main_file(file_size) {
+            return zero_length_main_file_header(self.page_size);
+        }
         if file_size == 0 {
             return Ok([0_u8; DATABASE_HEADER_SIZE]);
         }
@@ -16021,6 +16043,38 @@ fn generate_db_file_id() -> [u8; 16] {
     id[..8].copy_from_slice(&n.to_le_bytes());
     id[8..].copy_from_slice(&n.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
     id
+}
+
+/// GH#543: the header of the empty database a zero-length main file stands
+/// for.
+///
+/// Stock SQLite reads a zero-length main database file as an empty database
+/// and writes page 1 only with its first write transaction. A read-only or
+/// immutable pager never writes, so it serves that page from memory instead
+/// (see [`PagerInner::serves_zero_length_main_file`]). The header is the one
+/// a fresh database carries: one page, change counter 0, and the unstamped
+/// file identity stock leaves.
+fn zero_length_main_file_header(page_size: PageSize) -> Result<[u8; DATABASE_HEADER_SIZE]> {
+    DatabaseHeader {
+        page_size,
+        page_count: 1,
+        ..DatabaseHeader::default()
+    }
+    .to_bytes()
+    .map_err(|error| {
+        FrankenError::internal(format!(
+            "failed to encode the empty-database header of a zero-length main file: {error}"
+        ))
+    })
+}
+
+/// GH#543: page 1 of the empty database a zero-length main file stands for:
+/// [`zero_length_main_file_header`] over an empty `sqlite_master` leaf.
+fn zero_length_main_file_page_one(page_size: PageSize) -> Result<Vec<u8>> {
+    let mut page1 = vec![0_u8; page_size.as_usize()];
+    page1[..DATABASE_HEADER_SIZE].copy_from_slice(&zero_length_main_file_header(page_size)?);
+    BTreePageHeader::write_empty_leaf_table(&mut page1, DATABASE_HEADER_SIZE, page_size.usable(0));
+    Ok(page1)
 }
 
 fn bootstrap_header_from_stale_main_file(
@@ -22173,9 +22227,23 @@ where
                         }
                         let file_size = db_file.file_size(cx)?;
                         if file_size == 0 {
-                            return Err(FrankenError::CannotOpen {
-                                path: db_path.clone(),
-                            });
+                            // GH#543: stock reads a zero-length main file as
+                            // an empty database (a creator killed before its
+                            // first page-1 write leaves one), and so does this
+                            // pager, which writes nothing. A journal, WAL or
+                            // index beside it is refused instead: stock
+                            // deletes one beside a zero-page database, and a
+                            // reader may neither delete nor replay it. An
+                            // immutable file is the whole database: stock
+                            // never looks for a sidecar.
+                            if !*immutable {
+                                Self::ensure_reserved_recovery_artifacts_absent(
+                                    cx,
+                                    &**vfs,
+                                    db_path.as_path(),
+                                )?;
+                            }
+                            return Ok((0, zero_length_main_file_header(PageSize::DEFAULT)?));
                         }
                         if file_size < DATABASE_HEADER_SIZE as u64 {
                             return Err(FrankenError::DatabaseCorrupt {
@@ -22202,6 +22270,7 @@ where
             let (header, page_size) = match DatabaseHeader::from_bytes(&header_bytes) {
                 Ok(header)
                     if !immutable
+                        && file_size != 0
                         && stale_main_header_can_be_recovered_from_live_wal(
                             cx,
                             &*vfs,
@@ -22248,6 +22317,10 @@ where
         // corruption — floor to whole pages (see the read-write open above).
         let db_pages = if defer_locked_header {
             0
+        } else if file_size == 0 {
+            // GH#543: the empty database a zero-length main file stands for is
+            // page 1 alone, served from memory.
+            1
         } else {
             file_size
                 .checked_div(page_size_u64)

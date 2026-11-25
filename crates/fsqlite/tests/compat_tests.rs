@@ -822,6 +822,344 @@ fn open_with_flags_read_write_without_create_preserves_empty_db() {
     });
 }
 
+// GH#543: stock SQLite reads a zero-length main database file as an empty
+// database. A process killed while it creates a database, before its first
+// page-1 write, leaves exactly such a file. Read-only and immutable opens
+// read it as empty and write nothing. A recovery sidecar beside it still
+// refuses the open: stock deletes a journal or WAL beside a zero-page
+// database, and a reader neither deletes nor replays one.
+
+/// Tables in `sqlite_master`, `PRAGMA integrity_check`, `user_version` and
+/// `schema_version`.
+#[cfg(all(feature = "native", any(unix, windows)))]
+type Gh543Probe = (i64, String, i64, i64);
+
+/// [`Gh543Probe`] through stock SQLite, which must also refuse a write.
+#[cfg(all(feature = "native", any(unix, windows)))]
+fn gh543_stock_probe(name: &str, flags: rusqlite::OpenFlags) -> Gh543Probe {
+    let stock = RusqliteConnection::open_with_flags(name, flags)
+        .expect("stock opens a zero-length database");
+    let probe = (
+        stock
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap(),
+        stock
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap(),
+        stock
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        stock
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap(),
+    );
+    assert!(
+        stock
+            .execute_batch("CREATE TABLE gh543_write_probe(x)")
+            .is_err(),
+        "stock refuses a write through this open"
+    );
+    probe
+}
+
+/// [`Gh543Probe`] through FrankenSQLite, which must also refuse a write.
+#[cfg(all(feature = "native", any(unix, windows)))]
+async fn gh543_frank_probe(conn: &Connection) -> Gh543Probe {
+    async fn integer(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql).await.unwrap().get_typed(0).expect(sql)
+    }
+    let verdict: String = conn
+        .query_row("PRAGMA integrity_check")
+        .await
+        .unwrap()
+        .get_typed(0)
+        .unwrap();
+    let probe = (
+        integer(conn, "SELECT count(*) FROM sqlite_master").await,
+        verdict,
+        integer(conn, "PRAGMA user_version").await,
+        integer(conn, "PRAGMA schema_version").await,
+    );
+    let write = conn
+        .execute("CREATE TABLE gh543_write_probe(x)")
+        .await
+        .expect_err("a read-only open refuses a write");
+    assert!(
+        matches!(write, FrankenError::ReadOnly),
+        "unexpected write refusal: {write:?}"
+    );
+    probe
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn gh543_read_only_open_of_zero_length_db_reads_empty_and_writes_nothing() {
+    asupersync::test_utils::run_test(|| async {
+        let stock_dir = tempfile::TempDir::new().unwrap();
+        let stock_path = stock_dir.path().join("zero.db");
+        std::fs::write(&stock_path, []).unwrap();
+        let stock = gh543_stock_probe(
+            stock_path.to_str().unwrap(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        );
+        assert_eq!(stock, (0, "ok".to_owned(), 0, 0));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("zero.db");
+        std::fs::write(&path, []).unwrap();
+        let before = snapshot_directory_files(dir.path());
+
+        let conn = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .await
+            .expect("a read-only open reads a zero-length database as empty, as stock does");
+        assert_eq!(gh543_frank_probe(&conn).await, stock);
+        conn.close().await.unwrap();
+
+        // Strictly read-only admission publishes no namespace record for a
+        // file that has none (GH#535), so the directory is exactly as it was.
+        assert_eq!(
+            snapshot_directory_files(dir.path()),
+            before,
+            "a read-only open of a zero-length database must create, write or touch nothing"
+        );
+    });
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn gh543_immutable_open_of_zero_length_db_reads_empty_and_ignores_sidecars() {
+    asupersync::test_utils::run_test(|| async {
+        // `immutable=1` reads the main file alone: stock looks for no journal,
+        // so a leftover one changes nothing.
+        let journal = vec![0xA5_u8; 4096];
+        let stock_dir = tempfile::TempDir::new().unwrap();
+        let stock_path = stock_dir.path().join("zero.db");
+        std::fs::write(&stock_path, []).unwrap();
+        std::fs::write(suffixed_path(&stock_path, "-journal"), &journal).unwrap();
+        let stock = gh543_stock_probe(
+            &format!("file:{}?mode=ro&immutable=1", stock_path.to_str().unwrap()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        );
+        assert_eq!(stock, (0, "ok".to_owned(), 0, 0));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("zero.db");
+        std::fs::write(&path, []).unwrap();
+        std::fs::write(suffixed_path(&path, "-journal"), &journal).unwrap();
+        let before = snapshot_directory_files(dir.path());
+
+        let conn = open_with_flags(
+            &format!("file:{}?mode=ro&immutable=1", path.to_str().unwrap()),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .await
+        .expect("an immutable open reads a zero-length database as empty, as stock does");
+        assert_eq!(gh543_frank_probe(&conn).await, stock);
+        conn.close().await.unwrap();
+
+        assert_eq!(
+            snapshot_directory_files(dir.path()),
+            before,
+            "an immutable open must create, write or touch nothing"
+        );
+    });
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn gh543_read_only_open_of_zero_length_db_refuses_recovery_sidecars() {
+    asupersync::test_utils::run_test(|| async {
+        for suffix in ["-journal", "-wal", "-wal-fec", "-shm"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("zero.db");
+            std::fs::write(&path, []).unwrap();
+
+            // Control: without the sidecar the same file opens.
+            let control =
+                open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY).await;
+            assert!(
+                control.is_ok(),
+                "{suffix}: control open of the bare zero-length file: {:?}",
+                control.as_ref().err()
+            );
+            control.unwrap().close().await.unwrap();
+
+            std::fs::write(suffixed_path(&path, suffix), vec![0xA5_u8; 4096]).unwrap();
+            let before = snapshot_directory_files(dir.path());
+            let refused =
+                open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY).await;
+            assert!(
+                refused.is_err(),
+                "{suffix}: a read-only open must refuse a zero-length database beside a recovery sidecar"
+            );
+            drop(refused);
+            assert_eq!(
+                snapshot_directory_files(dir.path()),
+                before,
+                "{suffix}: the refused open must neither delete nor replay the sidecar"
+            );
+        }
+    });
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn gh543_identity_bound_read_only_open_of_zero_length_db_honours_namespace_records() {
+    asupersync::test_utils::run_test(|| async {
+        // A database FrankenSQLite has opened read-write carries namespace
+        // records naming its file. Truncating it in place leaves the shape a
+        // creator killed before its first page-1 write leaves: a zero-length
+        // main file beside records that name it, and no journal or WAL.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("leftover.db");
+        let path_str = path.to_str().unwrap();
+        {
+            let seed = RusqliteConnection::open(&path).unwrap();
+            seed.execute_batch("CREATE TABLE seeded(x INTEGER)")
+                .unwrap();
+        }
+        let writer = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .await
+            .expect("publish this file's namespace records");
+        writer.query("SELECT x FROM seeded").await.unwrap();
+        writer.close().await.unwrap();
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            assert!(
+                suffixed_path(&path, suffix).exists(),
+                "precondition: a {suffix} record beside the database"
+            );
+        }
+        for suffix in ["-journal", "-wal", "-wal-fec", "-shm"] {
+            assert!(
+                !suffixed_path(&path, suffix).exists(),
+                "precondition: no {suffix} beside the database"
+            );
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let before = snapshot_directory_files(dir.path());
+
+        let leased = std::fs::File::open(&path).unwrap();
+        let identity = fsqlite::FileIdentity::from_file(&leased)
+            .unwrap()
+            .expect("a native file has an identity");
+        let conn = Connection::open_schema_only_with_expected_identity(path_str, identity)
+            .await
+            .expect("an identity-bound read-only open reads the zero-length database as empty");
+        assert_eq!(gh543_frank_probe(&conn).await, (0, "ok".to_owned(), 0, 0));
+        conn.close().await.unwrap();
+
+        let conn = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .await
+            .expect("a read-only open joins the records and reads the database as empty");
+        assert_eq!(gh543_frank_probe(&conn).await, (0, "ok".to_owned(), 0, 0));
+        conn.close().await.unwrap();
+
+        let other_path = dir.path().join("other");
+        std::fs::write(&other_path, b"other").unwrap();
+        let other = std::fs::File::open(&other_path).unwrap();
+        let other_identity = fsqlite::FileIdentity::from_file(&other)
+            .unwrap()
+            .expect("a native file has an identity");
+        let mismatch =
+            Connection::open_schema_only_with_expected_identity(path_str, other_identity).await;
+        assert!(
+            matches!(mismatch, Err(FrankenError::CannotOpen { .. })),
+            "an identity mismatch still refuses: {:?}",
+            mismatch.as_ref().err()
+        );
+        drop(mismatch);
+
+        let mut after = snapshot_directory_files(dir.path());
+        after.remove(std::ffi::OsStr::new("other"));
+        assert_eq!(
+            after, before,
+            "the opens must leave the database and its namespace records untouched"
+        );
+    });
+}
+
+#[cfg(all(feature = "native", unix))]
+#[test]
+fn gh543_read_write_open_of_unwritable_zero_length_db_reads_empty_read_only() {
+    asupersync::test_utils::run_test(|| async {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Stock's SQLITE_OPEN_READWRITE opens a file it cannot write read-only;
+        // a zero-length one then reads as an empty database.
+        let make_unwritable_zero_length = |path: &std::path::Path| {
+            std::fs::write(path, []).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("zero.db");
+        make_unwritable_zero_length(&path);
+        if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            eprintln!("SKIPPED: this process can write a 0444 file, so it cannot build one");
+            return;
+        }
+        let stock_dir = tempfile::TempDir::new().unwrap();
+        let stock_path = stock_dir.path().join("zero.db");
+        make_unwritable_zero_length(&stock_path);
+        let stock = gh543_stock_probe(
+            stock_path.to_str().unwrap(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        );
+        assert_eq!(stock, (0, "ok".to_owned(), 0, 0));
+        let before = snapshot_directory_files(dir.path());
+
+        let conn = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .await
+            .expect("READ_WRITE on an unwritable zero-length database opens it read-only, as stock does");
+        assert_eq!(gh543_frank_probe(&conn).await, stock);
+        conn.close().await.unwrap();
+
+        assert_eq!(
+            snapshot_directory_files(dir.path()),
+            before,
+            "the read-only fallback must create, write or touch nothing"
+        );
+    });
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn gh543_read_only_connection_on_zero_length_db_sees_a_later_writer() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("zero.db");
+        std::fs::write(&path, []).unwrap();
+
+        let reader = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .await
+            .expect("a read-only open reads a zero-length database as empty");
+        assert_eq!(gh543_frank_probe(&reader).await, (0, "ok".to_owned(), 0, 0));
+
+        {
+            let writer = RusqliteConnection::open(&path).unwrap();
+            writer
+                .execute_batch(
+                    "CREATE TABLE later(x INTEGER);
+                     INSERT INTO later VALUES (7);",
+                )
+                .unwrap();
+        }
+
+        let row = reader
+            .query_row("SELECT x FROM later")
+            .await
+            .expect("the reader sees the table a later writer created, as a stock reader does");
+        assert_eq!(row.get(0), Some(&SqliteValue::Integer(7)));
+        let verdict = reader.query_row("PRAGMA integrity_check").await.unwrap();
+        assert_eq!(verdict.get(0), Some(&SqliteValue::Text("ok".into())));
+        reader.close().await.unwrap();
+    });
+}
+
 #[test]
 fn open_with_flags_read_write_without_create_preserves_malformed_db() {
     asupersync::test_utils::run_test(|| async {
