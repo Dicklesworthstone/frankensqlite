@@ -1127,7 +1127,7 @@ impl Connection {
         // (`INSERT INTO ft(ft, ...)`). Any other INSERT is neither, so it does
         // not allocate their futures (bd-w4pr1.13.35).
         if fts5_insert_uses_command_column(insert) {
-            if Box::pin(self.execute_fts5_maintenance_insert(insert)).await? {
+            if Box::pin(self.execute_fts5_maintenance_insert(insert, params)).await? {
                 return Ok(Vec::new());
             }
             #[cfg(feature = "ext-fts5")]

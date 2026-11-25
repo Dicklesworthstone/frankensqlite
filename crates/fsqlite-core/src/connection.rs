@@ -63613,6 +63613,7 @@ impl Connection {
     async fn execute_fts5_maintenance_insert(
         &self,
         insert: &fsqlite_ast::InsertStatement,
+        params: Option<&[SqliteValue]>,
     ) -> Result<bool> {
         let Some(command) = fts5_maintenance_insert_command(insert) else {
             return Ok(false);
@@ -63654,7 +63655,9 @@ impl Connection {
             }
             self.persist_rootpage_zero_fts5_contentless_delete_all(insert.table.name.as_str())
                 .await?;
-            self.reset_statement_change_count();
+            // Stock executes special FTS5 command inserts via OP_VUpdate, which
+            // increments nChange by 1 on SQLITE_OK (bd-w4pr1.36).
+            self.record_statement_changes(1);
             return Ok(true);
         }
 
@@ -63665,7 +63668,7 @@ impl Connection {
         if command == Fts5MaintenanceCommand::IntegrityCheck {
             self.fts5_shadow_integrity_check(insert.table.name.as_str())
                 .await?;
-            self.reset_statement_change_count();
+            self.record_statement_changes(1);
             return Ok(true);
         }
 
@@ -63674,23 +63677,30 @@ impl Connection {
         // accept it as a no-op, exactly as stock does on a table with no pending
         // writes.
         if command == Fts5MaintenanceCommand::Flush {
-            self.reset_statement_change_count();
+            self.record_statement_changes(1);
             return Ok(true);
         }
 
-        // `'optimize'` (bd-aks56), decided before the promote-on-lazy fallback:
-        // an index that is already one tombstone-free, seekable segment is a
-        // no-op, exactly as in stock; a contentless table is merged from its
-        // persisted segments without ever hydrating the corpus (it has no
-        // `_content` to re-index, so the full re-encode below would write an
-        // EMPTY index). Only a content-backed table falls through to promote +
-        // full re-encode.
-        if command == Fts5MaintenanceCommand::Optimize {
-            if self
-                .fts5_persisted_index_is_optimized(insert.table.name.as_str())
-                .await?
+        // `'merge'` merges persisted segments when the optional `rank` parameter
+        // is non-zero (`nMerge == 0` is a stock no-op). Like `'optimize'`, handle
+        // already-optimized and lazy contentless tables without hydrating the
+        // corpus (bd-w4pr1.36).
+        if command == Fts5MaintenanceCommand::Merge {
+            let n_merge = match &insert.source {
+                fsqlite_ast::InsertSource::Values(rows) if rows[0].len() == 2 => {
+                    let values = self.evaluate_insert_source_row(&rows[0], params).await?;
+                    values
+                        .get(1)
+                        .map_or(0, fsqlite_types::value::SqliteValue::to_integer)
+                }
+                _ => 0,
+            };
+            if n_merge == 0
+                || self
+                    .fts5_persisted_index_is_optimized(insert.table.name.as_str())
+                    .await?
             {
-                self.reset_statement_change_count();
+                self.record_statement_changes(1);
                 return Ok(true);
             }
             let is_lazy_contentless = {
@@ -63706,7 +63716,40 @@ impl Connection {
             if is_lazy_contentless {
                 self.optimize_rootpage_zero_fts5_segments(insert.table.name.as_str())
                     .await?;
-                self.reset_statement_change_count();
+                self.record_statement_changes(1);
+                return Ok(true);
+            }
+        }
+
+        // `'optimize'` (bd-aks56), decided before the promote-on-lazy fallback:
+        // an index that is already one tombstone-free, seekable segment is a
+        // no-op, exactly as in stock; a contentless table is merged from its
+        // persisted segments without ever hydrating the corpus (it has no
+        // `_content` to re-index, so the full re-encode below would write an
+        // EMPTY index). Only a content-backed table falls through to promote +
+        // full re-encode.
+        if command == Fts5MaintenanceCommand::Optimize {
+            if self
+                .fts5_persisted_index_is_optimized(insert.table.name.as_str())
+                .await?
+            {
+                self.record_statement_changes(1);
+                return Ok(true);
+            }
+            let is_lazy_contentless = {
+                let instances = self.vtab_instances.borrow();
+                instances
+                    .get(&insert.table.name.to_ascii_uppercase())
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .is_some_and(|fts5| {
+                        fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Contentless
+                    })
+                    && self.schema_table_exists(&format!("{}_data", insert.table.name))
+            };
+            if is_lazy_contentless {
+                self.optimize_rootpage_zero_fts5_segments(insert.table.name.as_str())
+                    .await?;
+                self.record_statement_changes(1);
                 return Ok(true);
             }
         }
@@ -63727,12 +63770,12 @@ impl Connection {
         }
 
         match command {
-            Fts5MaintenanceCommand::Optimize => {
+            Fts5MaintenanceCommand::Optimize | Fts5MaintenanceCommand::Merge => {
                 // Content-backed only (contentless returned above): the
                 // promotion re-indexed `_content` into memory, and the full
                 // re-encode writes it back as one stock-shaped segment with
                 // fresh `%_idx` seek rows — stock's post-optimize shape
-                // (bd-aks56).
+                // (bd-aks56, bd-w4pr1.36).
                 self.persist_rootpage_zero_fts5_shadow_rows(&insert.table.name)
                     .await?;
             }
@@ -63785,7 +63828,7 @@ impl Connection {
             }
         }
 
-        self.reset_statement_change_count();
+        self.record_statement_changes(1);
         Ok(true)
     }
 
@@ -63793,6 +63836,7 @@ impl Connection {
     async fn execute_fts5_maintenance_insert(
         &self,
         _insert: &fsqlite_ast::InsertStatement,
+        _params: Option<&[SqliteValue]>,
     ) -> Result<bool> {
         Ok(false)
     }
@@ -130334,6 +130378,7 @@ fn resolve_virtual_table_column_infos(
 enum Fts5MaintenanceCommand {
     Optimize,
     Rebuild,
+    Merge,
     DeleteAll,
     IntegrityCheck,
     Flush,
@@ -130346,28 +130391,42 @@ fn fts5_insert_uses_command_column(insert: &fsqlite_ast::InsertStatement) -> boo
         .is_some_and(|column| column.eq_ignore_ascii_case(&insert.table.name))
 }
 
-/// Detect INSERT INTO t(t) VALUES('<command>') maintenance commands.
+/// Detect `INSERT INTO t(t[, rank]) VALUES('<command>'[, <arg>])` maintenance
+/// commands.
 fn fts5_maintenance_insert_command(
     insert: &fsqlite_ast::InsertStatement,
 ) -> Option<Fts5MaintenanceCommand> {
-    if insert.columns.len() != 1 || !fts5_insert_uses_command_column(insert) {
+    if !fts5_insert_uses_command_column(insert) {
         return None;
     }
+    let has_rank_arg = match insert.columns.len() {
+        1 => false,
+        2 if insert.columns[1].eq_ignore_ascii_case("rank") => true,
+        _ => return None,
+    };
+    let expected_values = if has_rank_arg { 2 } else { 1 };
     match &insert.source {
-        fsqlite_ast::InsertSource::Values(rows) if rows.len() == 1 && rows[0].len() == 1 => {
+        fsqlite_ast::InsertSource::Values(rows)
+            if rows.len() == 1 && rows[0].len() == expected_values =>
+        {
             match &rows[0][0] {
                 Expr::Literal(Literal::String(command), _)
-                    if command.eq_ignore_ascii_case("optimize") =>
+                    if !has_rank_arg && command.eq_ignore_ascii_case("optimize") =>
                 {
                     Some(Fts5MaintenanceCommand::Optimize)
                 }
                 Expr::Literal(Literal::String(command), _)
-                    if command.eq_ignore_ascii_case("rebuild") =>
+                    if !has_rank_arg && command.eq_ignore_ascii_case("rebuild") =>
                 {
                     Some(Fts5MaintenanceCommand::Rebuild)
                 }
                 Expr::Literal(Literal::String(command), _)
-                    if command.eq_ignore_ascii_case("delete-all") =>
+                    if command.eq_ignore_ascii_case("merge") =>
+                {
+                    Some(Fts5MaintenanceCommand::Merge)
+                }
+                Expr::Literal(Literal::String(command), _)
+                    if !has_rank_arg && command.eq_ignore_ascii_case("delete-all") =>
                 {
                     Some(Fts5MaintenanceCommand::DeleteAll)
                 }
@@ -130377,7 +130436,7 @@ fn fts5_maintenance_insert_command(
                     Some(Fts5MaintenanceCommand::IntegrityCheck)
                 }
                 Expr::Literal(Literal::String(command), _)
-                    if command.eq_ignore_ascii_case("flush") =>
+                    if !has_rank_arg && command.eq_ignore_ascii_case("flush") =>
                 {
                     Some(Fts5MaintenanceCommand::Flush)
                 }
