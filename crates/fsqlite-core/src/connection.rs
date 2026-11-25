@@ -73596,19 +73596,15 @@ impl Connection {
         hints
     }
 
-    /// bd-9uf3l / bd-prkvt: row estimates for a join's drive-side choice, or
-    /// `None` for a statement without a join or without any estimate.
+    /// bd-9uf3l / bd-prkvt / bd-mdnfh: row estimates for a join's drive-side
+    /// choice or a single-table IN + ORDER BY density check, or `None` when the
+    /// statement needs none or no estimate is available.
     ///
-    /// `sqlite_stat1`'s rows when ANALYZE wrote them. For a two-table join
-    /// whose written outer table `sqlite_stat1` has no row count for (most
-    /// applications never run ANALYZE), the b-tree is sampled instead
-    /// (`btree_join_sample`): the outer table's rows from one path down its
-    /// b-tree, and for each index of the joined table without statistics,
-    /// whether its leading value repeats across whole pages. The codegen
-    /// weighs the outer rows against the rows the joined table's pinned
-    /// equality matches, so a large unfiltered table written first is not
-    /// read in full, while a small one, or a pin on a repeated value
-    /// (`flag = 1`), keeps the written order.
+    /// `sqlite_stat1`'s rows when ANALYZE wrote them. When `sqlite_stat1` has
+    /// no row count for the table (most applications never run ANALYZE), the
+    /// b-tree is sampled instead (`btree_join_sample`): the table's rows from
+    /// one path down its b-tree, and for each referenced index without
+    /// statistics, whether its leading value repeats across whole pages.
     async fn join_row_estimates(
         &self,
         select: &SelectStatement,
@@ -73635,6 +73631,22 @@ impl Connection {
                 _ => None,
             }
         }
+        fn expr_has_in_or_or(expr: &Expr) -> bool {
+            match expr {
+                Expr::In { not: false, .. }
+                | Expr::BinaryOp {
+                    op: fsqlite_ast::BinaryOp::Or,
+                    ..
+                } => true,
+                Expr::BinaryOp {
+                    op: fsqlite_ast::BinaryOp::And,
+                    left,
+                    right,
+                    ..
+                } => expr_has_in_or_or(left) || expr_has_in_or_or(right),
+                _ => false,
+            }
+        }
         let SelectCore::Select {
             from: Some(from),
             where_clause,
@@ -73644,7 +73656,64 @@ impl Connection {
             return None;
         };
         if from.joins.is_empty() {
-            return None;
+            // bd-mdnfh: single-table density estimates are only needed for
+            // ORDER BY statements carrying an IN / OR predicate on an indexed
+            // table, keeping ordinary single-table compiles untouched.
+            if select.order_by.is_empty() {
+                return None;
+            }
+            let where_expr = where_clause.as_deref()?;
+            if !expr_has_in_or_or(where_expr) {
+                return None;
+            }
+            let table = main_table(&from.source, schema)?;
+            if table.indexes.is_empty() {
+                return None;
+            }
+            let stat1 = if self.sqlite_stat1_root_page().is_some() {
+                Some(self.sqlite_stat1_hints().await)
+            } else {
+                None
+            };
+            let key = table.name.to_ascii_lowercase();
+            if stat1
+                .as_ref()
+                .is_some_and(|estimates| estimates.table_rows.contains_key(&key))
+            {
+                return stat1;
+            }
+            if self.pager.is_memory() {
+                let row_count = self
+                    .db
+                    .try_borrow()
+                    .ok()
+                    .and_then(|db| db.tables.get(&table.root_page).map(|t| t.row_count() as u64));
+                if let Some(rows) = row_count {
+                    let mut estimates = stat1.as_deref().cloned().unwrap_or_default();
+                    estimates.table_rows.insert(key, rows);
+                    return Some(Arc::new(estimates));
+                }
+                return stat1.filter(|estimates| !estimates.table_rows.is_empty());
+            }
+            let mut referenced = HashSet::new();
+            for_each_column_ref_in_expr(where_expr, &mut |column| {
+                referenced.insert(column.column.to_ascii_lowercase());
+            });
+            if let Some(sample) = self
+                .btree_join_sample(table, table, &referenced, stat1.as_deref())
+                .await
+            {
+                let mut estimates = stat1.as_deref().cloned().unwrap_or_default();
+                estimates.table_rows.insert(key, sample.outer_rows);
+                for (index, rows_per_key) in sample.index_rows_per_key {
+                    estimates
+                        .index_rows_per_key
+                        .entry(index)
+                        .or_insert_with(|| vec![rows_per_key]);
+                }
+                return Some(Arc::new(estimates));
+            }
+            return stat1.filter(|estimates| !estimates.table_rows.is_empty());
         }
         let stat1 = if self.sqlite_stat1_root_page().is_some() {
             Some(self.sqlite_stat1_hints().await)

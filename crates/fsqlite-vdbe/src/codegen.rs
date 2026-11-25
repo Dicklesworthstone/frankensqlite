@@ -5447,7 +5447,7 @@ pub fn codegen_select(
             ),
             Some(fsqlite_ast::IndexHint::NotIndexed) => None,
         };
-        if let Some(index_plan) = ctx
+        let order_by_index_plan = ctx
             .index_ordered_scan_reliable
             .then(|| {
                 resolve_order_by_index_plan(
@@ -5461,8 +5461,111 @@ pub fn codegen_select(
                     schema,
                 )
             })
-            .flatten()
-            .filter(|plan| plan.equality_prefix_len > 0 || ordered_eq_seek.is_none())
+            .flatten();
+        let rowid_walk_dir = rowid_order.filter(|_| {
+            ordered_eq_seek.is_none()
+                && rowid_range_allowed
+                && where_clause.as_deref().is_none_or(where_is_plain_scan_safe)
+        });
+        // bd-odxzh / bd-mdnfh: a constant IN list (or same-column OR chain) on an indexed column
+        // with ORDER BY probes the index instead of scanning the whole table or ORDER BY index.
+        // When the probed index already yields rows in ORDER BY order (part 2: e.g. `ORDER BY a, b`
+        // or `ORDER BY a DESC, b DESC`), stream directly without a sorter and stop early at LIMIT.
+        // Otherwise feed the sorter from the probe (covering when outputs, ORDER BY, and residual
+        // WHERE read only index keys/rowid). When LIMIT is present alongside an early-stopping
+        // rowid/index walk, weigh probe cost against expected walk rows using `stat1_row_estimates`
+        // so sparse LIMITs probe while dense LIMITs keep the early-stopping walk.
+        let ordered_in_probe = if time_travel.is_none()
+            && !table.without_rowid
+            && !matches!(from_index_hint, Some(fsqlite_ast::IndexHint::NotIndexed))
+            && ordered_select_placeholders_are_canonical(
+                columns,
+                where_clause.as_deref(),
+                &stmt.order_by,
+                stmt.limit.as_ref(),
+            ) {
+            resolve_ordered_in_probe_plan(
+                where_clause.as_deref(),
+                &stmt.order_by,
+                columns,
+                distinct,
+                table,
+                table_alias,
+                schema,
+                from_index_hint,
+            )
+            .filter(|plan| {
+                let pinned_width = plan.target.pinned_width();
+                let beaten_by_eq_seek = match ordered_eq_seek.as_ref() {
+                    Some(OuterEqualitySeek::Rowid { .. }) => true,
+                    Some(OuterEqualitySeek::Index { .. }) => pinned_width <= 1,
+                    None => false,
+                };
+                let beaten_by_order_prefix = order_by_index_plan
+                    .as_ref()
+                    .is_some_and(|index_plan| index_plan.equality_prefix_len >= pinned_width);
+                !beaten_by_eq_seek && !beaten_by_order_prefix
+            })
+        } else {
+            None
+        };
+        if let Some(in_plan) = ordered_in_probe.as_ref() {
+            if let Some(descending) = in_plan.stream_descending {
+                return codegen_select_index_in_ordered_scan(
+                    b,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    columns,
+                    where_clause.as_deref(),
+                    stmt.limit.as_ref(),
+                    out_regs,
+                    out_col_count,
+                    done_label,
+                    end_label,
+                    &in_plan.target,
+                    in_plan.covering_output.as_deref(),
+                    descending,
+                );
+            }
+            let early_walk_plan = order_by_index_plan
+                .as_ref()
+                .filter(|plan| plan.equality_prefix_len > 0 || ordered_eq_seek.is_none());
+            let has_early_walk = early_walk_plan.is_some() || rowid_walk_dir.is_some();
+            let walk_is_non_covering_index =
+                early_walk_plan.is_some_and(|plan| plan.covering_output.is_none());
+            if !has_early_walk
+                || should_prefer_in_probe_over_ordered_walk(
+                    in_plan,
+                    table,
+                    stmt.limit.as_ref(),
+                    walk_is_non_covering_index,
+                    ctx.stat1_row_estimates.as_deref(),
+                )
+            {
+                return codegen_select_ordered_scan(
+                    b,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    columns,
+                    where_clause.as_deref(),
+                    &stmt.order_by,
+                    stmt.limit.as_ref(),
+                    distinct,
+                    out_regs,
+                    out_col_count,
+                    done_label,
+                    end_label,
+                    OrderedScanInput::IndexInProbe(&in_plan.target),
+                    ctx,
+                );
+            }
+        }
+        if let Some(index_plan) =
+            order_by_index_plan.filter(|plan| plan.equality_prefix_len > 0 || ordered_eq_seek.is_none())
         {
             tracing::info!(
                 table = %table.name,
@@ -5503,11 +5606,7 @@ pub fn codegen_select(
         // Both directions use the SAME scan emitter: `codegen_select_full_scan` walks ascending
         // (`Rewind`+`Next`) or descending (`Last`+`Prev`) and applies the WHERE + LIMIT/OFFSET the same
         // way the sorter path would, so it is byte-identical output with the sort elided.
-        if let Some(dir) = rowid_order.filter(|_| {
-            ordered_eq_seek.is_none()
-                && rowid_range_allowed
-                && where_clause.as_deref().is_none_or(where_is_plain_scan_safe)
-        }) {
+        if let Some(dir) = rowid_walk_dir {
             return codegen_select_full_scan(
                 b,
                 cursor,
@@ -5542,7 +5641,9 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
-            ordered_eq_seek.as_ref(),
+            ordered_eq_seek
+                .as_ref()
+                .map_or(OrderedScanInput::FullTable, OrderedScanInput::EqualitySeek),
             ctx,
         )
     } else if distinct == Distinctness::Distinct {
@@ -11795,15 +11896,185 @@ fn limit_clause_can_enable_top_n(limit_clause: Option<&LimitClause>) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// ORDER BY codegen (two-pass sorter)
+// ORDER BY codegen (two-pass sorter and probe-order streaming)
 // ---------------------------------------------------------------------------
+
+/// How pass 1 of [`codegen_select_ordered_scan`] feeds rows into the sorter.
+enum OrderedScanInput<'a, 't> {
+    FullTable,
+    EqualitySeek(&'a OuterEqualitySeek<'t>),
+    IndexInProbe(&'a IndexConstInList<'t, 'a>),
+}
+
+/// Index cursor and covering sources for a pass-1 row of [`codegen_select_ordered_scan`].
+#[derive(Clone, Copy)]
+struct CoveringOrderedRow<'a> {
+    idx_cursor: i32,
+    rowid_reg: i32,
+    outputs: &'a [CoveringOutputSource],
+    sort_keys: &'a [Option<CoveringOutputSource>],
+}
+
+/// Whether `term` is already enforced with exact SQLite semantics by `target`'s
+/// index probe (the primary IN predicate, or an exact non-REAL trailing range).
+fn in_probe_term_enforced_by_seek(
+    term: &Expr,
+    target: &IndexConstInList<'_, '_>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    if std::ptr::eq(term, target.predicate) {
+        return true;
+    }
+    if target.range.is_some()
+        && let Some(range_col) = target.index.columns.get(target.pinned_width())
+        && table
+            .column_index(range_col)
+            .and_then(|idx| table.columns.get(idx))
+            .is_some_and(|col| !col.affinity.eq_ignore_ascii_case(&'E'))
+        && conjunct_is_range_bound_on_column(term, range_col, table, table_alias)
+    {
+        return true;
+    }
+    false
+}
+
+/// Read one covering column or rowid into `target_reg` from an already-positioned
+/// index cursor.
+fn emit_single_covering_read(
+    b: &mut ProgramBuilder,
+    index_cursor: i32,
+    rowid_reg: i32,
+    source: &CoveringOutputSource,
+    target_reg: i32,
+) {
+    match source {
+        CoveringOutputSource::IndexColumn(index_col) => {
+            b.emit_op(
+                Opcode::Column,
+                index_cursor,
+                *index_col,
+                target_reg,
+                P4::None,
+                0,
+            );
+        }
+        CoveringOutputSource::Rowid => {
+            b.emit_op(Opcode::Copy, rowid_reg, target_reg, 0, P4::None, 0);
+        }
+    }
+}
+
+/// bd-mdnfh: stream an indexed constant IN/OR probe whose index order already
+/// satisfies `ORDER BY` (forward or reverse) without opening a sort temp B-tree.
+/// Covering queries never open the table or emit `SeekRowid`; `LIMIT`/`OFFSET`
+/// stop the probe loop as soon as enough rows are emitted.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn codegen_select_index_in_ordered_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    limit_clause: Option<&LimitClause>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    target: &IndexConstInList<'_, '_>,
+    covering_output: Option<&[CoveringOutputSource]>,
+    descending: bool,
+) -> Result<(), CodegenError> {
+    let idx_schema = target.index;
+    let idx_cursor = cursor + 1;
+    let probe_cursor = cursor + 2;
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
+
+    let mut terms = Vec::new();
+    if let Some(where_expr) = where_clause {
+        collect_conjunctive_terms(where_expr, &mut terms);
+    }
+
+    if covering_output.is_none() {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+
+    let where_placeholder_base = b.current_anon_placeholder();
+    emit_index_const_list_rows_directed(
+        b,
+        idx_cursor,
+        probe_cursor,
+        target,
+        where_placeholder_base,
+        descending,
+        |b, skip_row, probes_done| {
+            let rowid_reg = b.alloc_reg();
+            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+            if covering_output.is_none() {
+                b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
+            }
+            for &term in &terms {
+                if !in_probe_term_enforced_by_seek(term, target, table, table_alias) {
+                    if covering_output.is_some() {
+                        emit_index_entry_where_filter(
+                            b, term, idx_cursor, rowid_reg, cursor, table, table_alias, schema,
+                            idx_schema, skip_row,
+                        );
+                    } else {
+                        emit_where_filter(b, term, cursor, table, table_alias, schema, skip_row);
+                    }
+                }
+            }
+            if let Some(off_r) = offset_reg {
+                b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_row, P4::None, 0);
+            }
+            if let Some(sources) = covering_output {
+                emit_covering_output_reads(b, idx_cursor, rowid_reg, sources, out_regs);
+            } else {
+                emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+            }
+            b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+            if let Some(lim_r) = limit_reg {
+                b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, probes_done, P4::None, 0);
+            }
+            Ok::<(), CodegenError>(())
+        },
+    )?;
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    if covering_output.is_none() {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
 
 /// Generate VDBE bytecode for a full-scan SELECT with ORDER BY.
 ///
 /// Uses a two-pass sorter approach:
 /// 1. Scan table rows (with WHERE), pack sort-key + data columns into sorter.
-///    With `eq_seek`, only the rows its seek reaches are read (GH#498); the
-///    full WHERE still filters each of them.
+///    With `EqualitySeek` (GH#498) or `IndexInProbe` (bd-odxzh / bd-mdnfh),
+///    only the rows the seek reaches are read; a covering IN probe reads the
+///    index cursor alone and never opens the table.
 /// 2. After sorting, iterate sorted rows and emit `ResultRow`.
 ///
 /// LIMIT/OFFSET are applied in pass 2 (on sorted output).
@@ -11828,7 +12099,7 @@ fn codegen_select_ordered_scan(
     out_col_count: i32,
     done_label: crate::Label,
     end_label: crate::Label,
-    eq_seek: Option<&OuterEqualitySeek<'_>>,
+    input: OrderedScanInput<'_, '_>,
     _ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
     // Connection-level compilation canonicalizes anonymous and named bind
@@ -11838,27 +12109,7 @@ fn codegen_select_ordered_scan(
     // Sequential emission-order numbering would therefore reverse slots or
     // break named-parameter reuse. Decline the reordered path unless every
     // placeholder already carries its canonical numeric slot.
-    let projection_has_non_numbered_placeholder = columns.iter().any(|column| {
-        matches!(
-            column,
-            ResultColumn::Expr { expr, .. } if expr_contains_non_numbered_placeholder(expr)
-        )
-    });
-    let order_has_non_numbered_placeholder = order_by
-        .iter()
-        .any(|term| expr_contains_non_numbered_placeholder(&term.expr));
-    let limit_has_non_numbered_placeholder = limit_clause.is_some_and(|clause| {
-        expr_contains_non_numbered_placeholder(&clause.limit)
-            || clause
-                .offset
-                .as_ref()
-                .is_some_and(expr_contains_non_numbered_placeholder)
-    });
-    if projection_has_non_numbered_placeholder
-        || where_clause.is_some_and(expr_contains_non_numbered_placeholder)
-        || order_has_non_numbered_placeholder
-        || limit_has_non_numbered_placeholder
-    {
+    if !ordered_select_placeholders_are_canonical(columns, where_clause, order_by, limit_clause) {
         return Err(CodegenError::Unsupported(
             "ordered SELECT codegen requires canonical numbered bind parameters".to_owned(),
         ));
@@ -11995,42 +12246,39 @@ fn codegen_select_ordered_scan(
         None
     };
 
-    // Open table for reading.
-    b.emit_op(
-        Opcode::OpenRead,
-        cursor,
-        table.root_page,
-        0,
-        P4::Table(table.name.clone()),
-        0,
-    );
-
-    // === Pass 1: Scan rows into sorter ===
-    let scan_done = b.emit_label();
-    let (seek_loop, scan_body) = if let Some(seek) = eq_seek {
-        let seek_row = b.emit_label();
-        let outer_loop = emit_outer_loop_start(b, Some(seek), cursor, scan_done, None);
-        b.resolve_label(seek_row);
-        (Some((outer_loop, seek_row)), 0)
-    } else {
-        let scan_start = b.current_addr();
-        b.emit_jump_to_label(Opcode::Rewind, cursor, 0, scan_done, P4::None, 0);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let scan_body = (scan_start + 1) as i32;
-        (None, scan_body)
+    // bd-mdnfh: when pass 1 is driven by an index IN probe and every column
+    // read by outputs, ORDER BY, and non-probed WHERE conjuncts is held by
+    // the index (and pass 2 does not reproject from the table cursor), read
+    // directly from the index entry without opening the table.
+    let covering_in_probe = match input {
+        OrderedScanInput::IndexInProbe(target)
+            if !table.without_rowid
+                && !keep_source_cursor_open
+                && in_probe_where_is_covering(where_clause, target, table, table_alias) =>
+        {
+            resolve_in_probe_covering_output_sources(columns, table, table_alias, target.index)
+                .and_then(|outputs| {
+                    resolve_in_probe_covering_sort_keys(
+                        &sort_keys,
+                        &order_output_slots,
+                        table,
+                        target.index,
+                    )
+                    .map(|sort_key_sources| (outputs, sort_key_sources))
+                })
+        }
+        _ => None,
     };
 
-    // WHERE filter.
-    let skip_label = b.emit_label();
-    if let Some(where_expr) = where_clause {
-        emit_where_filter(
-            b,
-            where_expr,
+    // Open table for reading unless a covering IN probe answers pass 1 alone.
+    if covering_in_probe.is_none() {
+        b.emit_op(
+            Opcode::OpenRead,
             cursor,
-            table,
-            table_alias,
-            schema,
-            skip_label,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
         );
     }
 
@@ -12052,8 +12300,32 @@ fn codegen_select_ordered_scan(
         register_base: None,
         secondaries: &[],
     };
-    {
+
+    let emit_pass1_row = |b: &mut ProgramBuilder,
+                          skip_label: crate::Label,
+                          covering_row: Option<CoveringOrderedRow<'_>>|
+     -> Result<(), CodegenError> {
         let mut output_emitted = vec![false; num_data_cols];
+        let emit_outputs = |b: &mut ProgramBuilder,
+                            should_emit: &mut dyn FnMut(usize) -> bool|
+         -> Result<(), CodegenError> {
+            if let Some(cov) = covering_row {
+                for (slot, source) in cov.outputs.iter().enumerate() {
+                    if should_emit(slot) {
+                        emit_single_covering_read(
+                            b,
+                            cov.idx_cursor,
+                            cov.rowid_reg,
+                            source,
+                            output_base + slot as i32,
+                        );
+                    }
+                }
+                Ok(())
+            } else {
+                emit_column_reads_selected(b, &scan, columns, output_base, should_emit)
+            }
+        };
 
         // In the ordinary (non-merged) SQLite DISTINCT+ORDER BY shape, result
         // expressions are evaluated and deduplicated before independent ORDER
@@ -12061,7 +12333,7 @@ fn codegen_select_ordered_scan(
         // a duplicate output cannot invoke a volatile or failing sort-only
         // expression. Exact ORDER aliases/ordinals below reuse these registers.
         if let Some(distinct_cursor) = distinct_cursor {
-            emit_column_reads_selected(b, &scan, columns, output_base, |_| true)?;
+            emit_outputs(b, &mut |_| true)?;
             output_emitted.fill(true);
 
             let distinct_record = b.alloc_temp();
@@ -12095,9 +12367,7 @@ fn codegen_select_ordered_scan(
         for (index, (reg, key)) in (sorter_base..).zip(sort_keys.iter()).enumerate() {
             if let Some(output_slot) = order_output_slots[index] {
                 if !output_emitted[output_slot] {
-                    emit_column_reads_selected(b, &scan, columns, output_base, |slot| {
-                        slot == output_slot
-                    })?;
+                    emit_outputs(b, &mut |slot| slot == output_slot)?;
                     output_emitted[output_slot] = true;
                 }
                 b.emit_op(
@@ -12108,6 +12378,11 @@ fn codegen_select_ordered_scan(
                     P4::None,
                     0,
                 );
+            } else if let Some(cov) = covering_row {
+                let source = cov.sort_keys[index]
+                    .as_ref()
+                    .expect("covering sort key resolved when order_output_slots is None");
+                emit_single_covering_read(b, cov.idx_cursor, cov.rowid_reg, source, reg);
             } else {
                 emit_resolved_column(b, key, cursor, reg, &scan);
             }
@@ -12130,48 +12405,149 @@ fn codegen_select_ordered_scan(
         // an exact ORDER BY key. This occurs after admission, so rejected rows
         // cannot invoke volatile or failing payload expressions. DISTINCT
         // output was already evaluated above, before its membership probe.
-        emit_column_reads_selected(b, &scan, columns, output_base, |slot| !output_emitted[slot])?;
+        emit_outputs(b, &mut |slot| !output_emitted[slot])?;
 
         if distinct_projection_mode == OrderedDistinctProjectionMode::ReprojectRepresentative {
             emit_ordered_distinct_source_state(b, cursor, table, stored_data_base);
         }
-    }
 
-    // MakeRecord from all sorter columns, then SorterInsert.
-    let record_reg = b.alloc_reg();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    b.emit_op(
-        Opcode::MakeRecord,
-        sorter_base,
-        total_sorter_cols as i32,
-        record_reg,
-        P4::None,
-        0,
-    );
-    b.emit_op(
-        Opcode::SorterInsert,
-        sorter_cursor,
-        record_reg,
-        0,
-        P4::None,
-        0,
-    );
+        // MakeRecord from all sorter columns, then SorterInsert.
+        let record_reg = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            sorter_base,
+            total_sorter_cols as i32,
+            record_reg,
+            P4::None,
+            0,
+        );
+        b.emit_op(
+            Opcode::SorterInsert,
+            sorter_cursor,
+            record_reg,
+            0,
+            P4::None,
+            0,
+        );
+        Ok(())
+    };
 
-    // Skip label (for WHERE-filtered rows).
-    b.resolve_label(skip_label);
+    // === Pass 1: Scan or probe rows into sorter ===
+    let scan_done = b.emit_label();
+    match input {
+        OrderedScanInput::IndexInProbe(target) => {
+            let idx_schema = target.index;
+            let idx_cursor = distinct_cursor.unwrap_or(sorter_cursor) + 1;
+            let probe_cursor = idx_cursor + 1;
+            b.emit_op(
+                Opcode::OpenRead,
+                idx_cursor,
+                idx_schema.root_page,
+                0,
+                P4::Index(idx_schema.name.clone()),
+                0,
+            );
+            let mut terms = Vec::new();
+            if let Some(where_expr) = where_clause {
+                collect_conjunctive_terms(where_expr, &mut terms);
+            }
+            let where_placeholder_base = b.current_anon_placeholder();
+            emit_index_const_list_rows(
+                b,
+                idx_cursor,
+                probe_cursor,
+                target,
+                where_placeholder_base,
+                |b, skip_row| {
+                    let rowid_reg = b.alloc_reg();
+                    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+                    if covering_in_probe.is_none() {
+                        b.emit_jump_to_label(
+                            Opcode::SeekRowid,
+                            cursor,
+                            rowid_reg,
+                            skip_row,
+                            P4::None,
+                            0,
+                        );
+                    }
+                    for &term in &terms {
+                        if !in_probe_term_enforced_by_seek(term, target, table, table_alias) {
+                            if covering_in_probe.is_some() {
+                                emit_index_entry_where_filter(
+                                    b, term, idx_cursor, rowid_reg, cursor, table, table_alias,
+                                    schema, idx_schema, skip_row,
+                                );
+                            } else {
+                                emit_where_filter(
+                                    b, term, cursor, table, table_alias, schema, skip_row,
+                                );
+                            }
+                        }
+                    }
+                    let covering_row = covering_in_probe.as_ref().map(|(outputs, sort_srcs)| {
+                        CoveringOrderedRow {
+                            idx_cursor,
+                            rowid_reg,
+                            outputs: outputs.as_slice(),
+                            sort_keys: sort_srcs.as_slice(),
+                        }
+                    });
+                    emit_pass1_row(b, skip_row, covering_row)
+                },
+            )?;
+            b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+        }
+        OrderedScanInput::FullTable | OrderedScanInput::EqualitySeek(_) => {
+            let eq_seek = match input {
+                OrderedScanInput::EqualitySeek(seek) => Some(seek),
+                _ => None,
+            };
+            let (seek_loop, scan_body) = if let Some(seek) = eq_seek {
+                let seek_row = b.emit_label();
+                let outer_loop = emit_outer_loop_start(b, Some(seek), cursor, scan_done, None);
+                b.resolve_label(seek_row);
+                (Some((outer_loop, seek_row)), 0)
+            } else {
+                let scan_start = b.current_addr();
+                b.emit_jump_to_label(Opcode::Rewind, cursor, 0, scan_done, P4::None, 0);
+                let scan_body = (scan_start + 1) as i32;
+                (None, scan_body)
+            };
 
-    // Next row in scan (or in the seek's run).
-    if let Some((outer_loop, seek_row)) = &seek_loop {
-        emit_outer_loop_advance(b, outer_loop, cursor, *seek_row, scan_done);
-    } else {
-        b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
+            // WHERE filter.
+            let skip_label = b.emit_label();
+            if let Some(where_expr) = where_clause {
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    skip_label,
+                );
+            }
+
+            emit_pass1_row(b, skip_label, None)?;
+
+            // Skip label (for WHERE-filtered rows).
+            b.resolve_label(skip_label);
+
+            // Next row in scan (or in the seek's run).
+            if let Some((outer_loop, seek_row)) = &seek_loop {
+                emit_outer_loop_advance(b, outer_loop, cursor, *seek_row, scan_done);
+            } else {
+                b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
+            }
+        }
     }
 
     // End of pass 1. A merged ordered-DISTINCT query on a rowid table keeps
     // this read cursor open so pass 2 can seek and re-evaluate the selected
     // expressions for each retained representative.
     b.resolve_label(scan_done);
-    if !keep_source_cursor_open {
+    if !keep_source_cursor_open && covering_in_probe.is_none() {
         b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     }
 
@@ -20905,10 +21281,685 @@ struct IndexConstInList<'t, 'a> {
 }
 
 impl IndexConstInList<'_, '_> {
+    /// The key terms pinned by equalities or IN lists (excluding any trailing range).
+    const fn pinned_width(&self) -> usize {
+        self.prefix.len() + 1 + self.suffix.len()
+    }
+
     /// The key terms the probe constrains, its range term included.
     fn width(&self) -> usize {
-        self.prefix.len() + 1 + self.suffix.len() + usize::from(self.range.is_some())
+        self.pinned_width() + usize::from(self.range.is_some())
     }
+
+    /// Total probe combinations enumerated by the probe set.
+    fn probe_combinations(&self) -> u64 {
+        let mut total = u64::try_from(self.values.len().max(1)).unwrap_or(u64::MAX);
+        for pin in self.prefix.iter().chain(&self.suffix) {
+            if let KeyPin::In(members, _) = pin {
+                total = total.saturating_mul(u64::try_from(members.len().max(1)).unwrap_or(u64::MAX));
+            }
+        }
+        total
+    }
+
+    /// Whether key position `pos` (in `0..self.pinned_width()`) is pinned by a
+    /// constant equality (`KeyPin::Eq`) rather than an IN list.
+    fn is_eq_pin(&self, pos: usize) -> bool {
+        match pos.cmp(&self.prefix.len()) {
+            std::cmp::Ordering::Less => matches!(self.prefix[pos], KeyPin::Eq(..)),
+            std::cmp::Ordering::Equal => false,
+            std::cmp::Ordering::Greater => self
+                .suffix
+                .get(pos - self.prefix.len() - 1)
+                .is_some_and(|pin| matches!(pin, KeyPin::Eq(..))),
+        }
+    }
+}
+
+/// bd-odxzh / bd-mdnfh: resolved plan for an indexed constant IN/OR probe under
+/// an `ORDER BY`.
+struct OrderedInProbePlan<'t, 'a> {
+    target: IndexConstInList<'t, 'a>,
+    /// `Some(descending)` when the probe stream already emits rows in `ORDER BY`
+    /// order (forward or reverse) and needs no sort temp B-tree.
+    stream_descending: Option<bool>,
+    /// Covering output sources when outputs + non-probed WHERE conjuncts read
+    /// only index keys and the rowid (no REAL/virtual columns).
+    covering_output: Option<Vec<CoveringOutputSource>>,
+    /// True when the probe-and-sort path can run completely covering (outputs,
+    /// ORDER BY sort keys, and non-probed WHERE conjuncts all covered, and no
+    /// pass-2 representative reprojection).
+    covering_for_sorter: bool,
+}
+
+fn ordered_select_placeholders_are_canonical(
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    order_by: &[OrderingTerm],
+    limit_clause: Option<&LimitClause>,
+) -> bool {
+    let projection_non_numbered = columns.iter().any(|column| {
+        matches!(
+            column,
+            ResultColumn::Expr { expr, .. } if expr_contains_non_numbered_placeholder(expr)
+        )
+    });
+    let order_non_numbered = order_by
+        .iter()
+        .any(|term| expr_contains_non_numbered_placeholder(&term.expr));
+    let limit_non_numbered = limit_clause.is_some_and(|clause| {
+        expr_contains_non_numbered_placeholder(&clause.limit)
+            || clause
+                .offset
+                .as_ref()
+                .is_some_and(expr_contains_non_numbered_placeholder)
+    });
+    !(projection_non_numbered
+        || where_clause.is_some_and(expr_contains_non_numbered_placeholder)
+        || order_non_numbered
+        || limit_non_numbered)
+}
+
+/// Strict covering-output check for IN probes: fails closed on REAL-affinity
+/// (`'E'`) and virtual generated columns, matching `expr_reads_only_index_columns`.
+fn resolve_in_probe_covering_output_sources(
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    index: &IndexSchema,
+) -> Option<Vec<CoveringOutputSource>> {
+    let mut output = Vec::with_capacity(columns.len());
+    for col in columns {
+        match col {
+            ResultColumn::Expr { expr, .. } => match resolve_column_ref(expr, table, table_alias)? {
+                SortKeySource::Column(col_idx) => {
+                    let column = table.columns.get(col_idx)?;
+                    if column.affinity.eq_ignore_ascii_case(&'E')
+                        || virtual_generated_column_expr(column, table).is_some()
+                    {
+                        return None;
+                    }
+                    let index_pos = index_column_position(index, &column.name)?;
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    output.push(CoveringOutputSource::IndexColumn(index_pos as i32));
+                }
+                SortKeySource::Rowid => output.push(CoveringOutputSource::Rowid),
+                SortKeySource::Expression(_) => return None,
+            },
+            ResultColumn::Star | ResultColumn::TableStar(_) => return None,
+        }
+    }
+    Some(output)
+}
+
+/// Covering check for every `ORDER BY` sort key not already aliased to a covered
+/// output slot.
+fn resolve_in_probe_covering_sort_keys(
+    sort_keys: &[SortKeySource],
+    order_output_slots: &[Option<usize>],
+    table: &TableSchema,
+    index: &IndexSchema,
+) -> Option<Vec<Option<CoveringOutputSource>>> {
+    let mut resolved = Vec::with_capacity(sort_keys.len());
+    for (idx, sk) in sort_keys.iter().enumerate() {
+        if order_output_slots[idx].is_some() {
+            resolved.push(None);
+            continue;
+        }
+        match sk {
+            SortKeySource::Rowid => resolved.push(Some(CoveringOutputSource::Rowid)),
+            SortKeySource::Column(col_idx) => {
+                let column = table.columns.get(*col_idx)?;
+                if column.is_ipk {
+                    resolved.push(Some(CoveringOutputSource::Rowid));
+                } else if !column.affinity.eq_ignore_ascii_case(&'E')
+                    && virtual_generated_column_expr(column, table).is_none()
+                {
+                    let index_pos = index_column_position(index, &column.name)?;
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    resolved.push(Some(CoveringOutputSource::IndexColumn(index_pos as i32)));
+                } else {
+                    return None;
+                }
+            }
+            SortKeySource::Expression(_) => return None,
+        }
+    }
+    Some(resolved)
+}
+
+fn in_probe_where_is_covering(
+    where_clause: Option<&Expr>,
+    target: &IndexConstInList<'_, '_>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    let mut terms = Vec::new();
+    if let Some(where_expr) = where_clause {
+        collect_conjunctive_terms(where_expr, &mut terms);
+    }
+    terms.iter().all(|term| {
+        std::ptr::eq(*term, target.predicate)
+            || expr_reads_only_index_columns(term, table, table_alias, target.index, false)
+    })
+}
+
+/// bd-mdnfh: whether `emit_index_const_list_rows_directed` on `target` already
+/// emits rows in `order_by` order without a sorter. Returns `Some(descending)`
+/// where `false` is forward index order (`SeekGE`/`Next`) and `true` is reverse
+/// index order (`SeekLE`/`Prev`, declined when `target.range` is present).
+#[allow(clippy::too_many_lines)]
+fn in_probe_satisfies_order_by(
+    target: &IndexConstInList<'_, '_>,
+    order_by: &[OrderingTerm],
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<bool> {
+    if order_by.is_empty() || table.without_rowid {
+        return None;
+    }
+    let index = target.index;
+    let pinned_count = target.pinned_width();
+    // Every equality-pinned key term must share its column's declared collation
+    // with the index key so equality guarantees constancy under index order.
+    for pos in 0..pinned_count {
+        if target.is_eq_pin(pos) {
+            let column_idx = table.column_index(&index.columns[pos])?;
+            if !collation_names_equivalent(
+                table.columns[column_idx].collation.as_deref(),
+                index.key_term_collation(pos),
+            ) {
+                return None;
+            }
+        }
+    }
+
+    let mut order_columns = Vec::with_capacity(order_by.len());
+    for term in order_by {
+        if term.nulls.is_some() {
+            return None;
+        }
+        let term_direction = term.direction.unwrap_or(SortDirection::Asc);
+        let explicit_collation = extract_collation(&term.expr);
+        let resolved_expr = resolve_order_by_output_expr(&term.expr, columns).unwrap_or(&term.expr);
+        let Expr::Column(col_ref, _) = resolved_expr else {
+            return None;
+        };
+        if let Some(qualifier) = &col_ref.table
+            && !matches_table_or_alias(qualifier, table, table_alias)
+        {
+            return None;
+        }
+        let effective_collation =
+            explicit_collation.or_else(|| column_collation(resolved_expr, table, table_alias));
+        let is_rowid = matches!(
+            resolve_column_ref(resolved_expr, table, table_alias),
+            Some(SortKeySource::Rowid)
+        );
+        order_columns.push((
+            &*col_ref.column,
+            term_direction,
+            effective_collation,
+            is_rowid,
+        ));
+    }
+
+    let key_terms = index.key_term_count();
+    let mut key_pos = 0_usize;
+    let mut reverse: Option<bool> = None;
+    for (order_col, term_direction, order_collation, is_rowid) in order_columns {
+        // An equality-pinned key term is constant across the whole probe stream:
+        // naming it in ORDER BY with matching collation is satisfied in any direction.
+        if key_pos < pinned_count
+            && target.is_eq_pin(key_pos)
+            && !is_rowid
+            && index.columns[key_pos].eq_ignore_ascii_case(order_col)
+            && collation_names_equivalent(order_collation, index.key_term_collation(key_pos))
+        {
+            key_pos += 1;
+            continue;
+        }
+        // Skip equality-pinned constant key terms omitted from ORDER BY.
+        while key_pos < pinned_count && target.is_eq_pin(key_pos) {
+            key_pos += 1;
+        }
+        let forward_direction = if is_rowid && key_pos == key_terms {
+            SortDirection::Asc
+        } else {
+            if key_pos >= key_terms
+                || !index.columns[key_pos].eq_ignore_ascii_case(order_col)
+                || !collation_names_equivalent(order_collation, index.key_term_collation(key_pos))
+            {
+                return None;
+            }
+            if index.key_term_descending(key_pos) {
+                SortDirection::Desc
+            } else {
+                SortDirection::Asc
+            }
+        };
+        let want_reverse = term_direction != forward_direction;
+        if reverse.is_some_and(|existing| existing != want_reverse) {
+            return None;
+        }
+        reverse = Some(want_reverse);
+        key_pos += 1;
+    }
+
+    let descending = reverse.unwrap_or(false);
+    if descending && target.range.is_some() {
+        return None;
+    }
+    Some(descending)
+}
+
+/// bd-odxzh / bd-mdnfh: find the best indexed constant IN/OR probe for an
+/// `ORDER BY` query across all usable indexes (honoring `INDEXED BY`).
+///
+/// Ranks candidates by `(pinned_width, has_range, satisfies_order_by, covering,
+/// !has_residual, Reverse(index.key_term_count()))` so:
+/// - composite/range probes (`a IN .. AND b = 5`, `a IN .. AND b BETWEEN ..`)
+///   beat single-column probes;
+/// - an index whose order eliminates the sorter (`t_ab` for `ORDER BY a, b`)
+///   beats a narrower index (`t_a`) that requires sorting;
+/// - a covering index beats a non-covering index;
+/// - among equal plans, the narrowest index (`t_a` for `SELECT id ... ORDER BY id`)
+///   wins.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn resolve_ordered_in_probe_plan<'t, 'a>(
+    where_clause: Option<&'a Expr>,
+    order_by: &[OrderingTerm],
+    columns: &[ResultColumn],
+    distinct: Distinctness,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    from_index_hint: Option<&fsqlite_ast::IndexHint>,
+) -> Option<OrderedInProbePlan<'t, 'a>> {
+    let where_expr = where_clause?;
+    if table.without_rowid || expr_contains_non_numbered_placeholder(where_expr) {
+        return None;
+    }
+    let required_index = match from_index_hint {
+        None => None,
+        Some(fsqlite_ast::IndexHint::IndexedBy(name)) => Some(name.as_str()),
+        Some(fsqlite_ast::IndexHint::NotIndexed) => return None,
+    };
+
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    if conjuncts.is_empty() {
+        return None;
+    }
+
+    let is_binary =
+        |collation: Option<&str>| collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
+    let key_affinity = |column: &str| {
+        table
+            .column_index(column)
+            .and_then(|position| table.columns.get(position))
+            .map_or('A', |info| index_key_affinity(info.affinity))
+    };
+
+    let sort_keys: Vec<SortKeySource> = order_by
+        .iter()
+        .map(|term| resolve_sort_key(&term.expr, table, table_alias, columns))
+        .collect();
+    let order_output_slots: Vec<Option<usize>> = order_by
+        .iter()
+        .map(|term| resolve_order_by_output_slot(&term.expr, columns, table, table_alias))
+        .collect();
+    let sort_collations: Vec<String> = sort_keys
+        .iter()
+        .zip(order_by.iter())
+        .enumerate()
+        .map(|(index, (sk, term))| {
+            if let Some(collation) = extract_collation(&term.expr) {
+                return collation.to_owned();
+            }
+            if let Some(output_slot) = order_output_slots[index]
+                && let Some(collation) =
+                    result_output_slot_collation(output_slot, columns, table, table_alias)
+            {
+                return collation;
+            }
+            match sk {
+                SortKeySource::Column(idx) => table
+                    .columns
+                    .get(*idx)
+                    .and_then(|c| c.collation.as_deref())
+                    .unwrap_or_default()
+                    .to_owned(),
+                SortKeySource::Expression(expr) => extract_collation(expr)
+                    .or_else(|| column_collation(expr, table, table_alias))
+                    .unwrap_or_default()
+                    .to_owned(),
+                SortKeySource::Rowid => String::new(),
+            }
+        })
+        .collect();
+    let sorter_keeps_source_open = ordered_distinct_projection_mode(
+        distinct,
+        order_by,
+        &order_output_slots,
+        &sort_collations,
+        columns,
+        table,
+        table_alias,
+    ) == OrderedDistinctProjectionMode::ReprojectRepresentative;
+
+    let mut best: Option<OrderedInProbePlan<'t, 'a>> = None;
+    for (in_term_pos, &term) in conjuncts.iter().enumerate() {
+        let Some((col_name, values, affinity)) = const_in_list_members(term, table, table_alias)
+        else {
+            continue;
+        };
+        for index in &table.indexes {
+            if let Some(hinted) = required_index
+                && !index.name.eq_ignore_ascii_case(hinted)
+            {
+                continue;
+            }
+            if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
+                continue;
+            }
+            let key_terms = index.key_term_count().min(index.columns.len());
+            let Some(in_pos) = index.columns[..key_terms]
+                .iter()
+                .position(|column| column.eq_ignore_ascii_case(&col_name))
+            else {
+                continue;
+            };
+            if !is_binary(index.key_term_collation(in_pos)) {
+                continue;
+            }
+
+            let pinned = |key_pos: usize| {
+                let column = &index.columns[key_pos];
+                conjuncts
+                    .iter()
+                    .enumerate()
+                    .find_map(|(term_pos, candidate)| {
+                        let value = extract_index_column_equality_expr(
+                            candidate,
+                            table,
+                            table_alias,
+                            column,
+                        )?;
+                        index_equality_term_uses_key_collation(
+                            candidate, table, table_alias, index, key_pos,
+                        )
+                        .then(|| (term_pos, KeyPin::Eq(value, key_affinity(column))))
+                    })
+                    .or_else(|| {
+                        if !is_binary(index.key_term_collation(key_pos)) {
+                            return None;
+                        }
+                        conjuncts
+                            .iter()
+                            .enumerate()
+                            .find_map(|(term_pos, candidate)| {
+                                let (name, members, member_affinity) =
+                                    const_in_list_members(candidate, table, table_alias)?;
+                                (term_pos != in_term_pos && name.eq_ignore_ascii_case(column))
+                                    .then_some((term_pos, KeyPin::In(members, member_affinity)))
+                            })
+                    })
+            };
+
+            let mut probes = values.len();
+            let mut admit = |pin: &KeyPin<'_>| match pin {
+                KeyPin::Eq(..) => true,
+                KeyPin::In(members, _) => match probes.checked_mul(members.len()) {
+                    Some(total) if total <= MAX_COMPOSITE_IN_PROBES => {
+                        probes = total;
+                        true
+                    }
+                    _ => false,
+                },
+            };
+
+            let mut consumed = vec![in_term_pos];
+            let mut prefix = Vec::with_capacity(in_pos);
+            for key_pos in 0..in_pos {
+                match pinned(key_pos) {
+                    Some((term_pos, pin)) if admit(&pin) => {
+                        consumed.push(term_pos);
+                        prefix.push(pin);
+                    }
+                    _ => break,
+                }
+            }
+            if prefix.len() < in_pos {
+                continue;
+            }
+            let mut suffix = Vec::new();
+            for key_pos in in_pos + 1..key_terms {
+                match pinned(key_pos) {
+                    Some((term_pos, pin)) if admit(&pin) => {
+                        consumed.push(term_pos);
+                        suffix.push(pin);
+                    }
+                    _ => break,
+                }
+            }
+            let range_pos = in_pos + 1 + suffix.len();
+            let range = if range_pos < key_terms
+                && !index.key_term_descending(range_pos)
+                && is_binary(index.key_term_collation(range_pos))
+            {
+                let column = &index.columns[range_pos];
+                extract_named_column_range(where_expr, table, table_alias, column)
+                    .filter(|bounds| {
+                        index_range_fast_path_is_safe(table, table_alias, schema, column, bounds)
+                    })
+                    .map(|bounds| {
+                        consumed.extend(conjuncts.iter().enumerate().filter_map(
+                            |(term_pos, candidate)| {
+                                conjunct_is_range_bound_on_column(
+                                    candidate,
+                                    column,
+                                    table,
+                                    table_alias,
+                                )
+                                .then_some(term_pos)
+                            },
+                        ));
+                        ProbeRange {
+                            bounds,
+                            affinity: Some(key_affinity(column))
+                                .filter(|aff| matches!(aff, 'C' | 'D' | 'E' | 'B')),
+                        }
+                    })
+            } else {
+                None
+            };
+            consumed.sort_unstable();
+            consumed.dedup();
+            let has_residual = consumed.len() < conjuncts.len();
+
+            let target = IndexConstInList {
+                index,
+                values: values.clone(),
+                predicate: term,
+                affinity,
+                has_residual,
+                anon_offset: 0,
+                prefix,
+                suffix,
+                range,
+            };
+            let stream_descending = (distinct == Distinctness::All)
+                .then(|| in_probe_satisfies_order_by(&target, order_by, columns, table, table_alias))
+                .flatten();
+            let where_covering = in_probe_where_is_covering(where_clause, &target, table, table_alias);
+            let covering_output = where_covering
+                .then(|| resolve_in_probe_covering_output_sources(columns, table, table_alias, index))
+                .flatten();
+            let covering_for_sorter = covering_output.is_some()
+                && !sorter_keeps_source_open
+                && resolve_in_probe_covering_sort_keys(&sort_keys, &order_output_slots, table, index)
+                    .is_some();
+            let is_covering = if stream_descending.is_some() {
+                covering_output.is_some()
+            } else {
+                covering_for_sorter
+            };
+
+            let rank = |plan: &OrderedInProbePlan<'_, '_>, cov: bool| {
+                (
+                    plan.target.pinned_width(),
+                    plan.target.range.is_some(),
+                    plan.stream_descending.is_some(),
+                    cov,
+                    !plan.target.has_residual,
+                    std::cmp::Reverse(plan.target.index.key_term_count()),
+                )
+            };
+            let candidate = OrderedInProbePlan {
+                target,
+                stream_descending,
+                covering_output,
+                covering_for_sorter,
+            };
+            let best_cov = best.as_ref().is_some_and(|prev| {
+                if prev.stream_descending.is_some() {
+                    prev.covering_output.is_some()
+                } else {
+                    prev.covering_for_sorter
+                }
+            });
+            if best
+                .as_ref()
+                .is_none_or(|previous| rank(&candidate, is_covering) > rank(previous, best_cov))
+            {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+fn literal_signed_i64(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(Literal::Integer(n), _) => Some(*n),
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Negate,
+            expr: inner,
+            ..
+        } => match inner.as_ref() {
+            Expr::Literal(Literal::Integer(n), _) => n.checked_neg(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// bd-mdnfh: estimate whether probing the IN target and sorting beats an
+/// early-stopping rowid or `ORDER BY` index walk.
+fn should_prefer_in_probe_over_ordered_walk(
+    plan: &OrderedInProbePlan<'_, '_>,
+    table: &TableSchema,
+    limit_clause: Option<&LimitClause>,
+    walk_is_non_covering_index: bool,
+    estimates: Option<&Stat1RowEstimates>,
+) -> bool {
+    let target = &plan.target;
+    let index = target.index;
+    let pinned_terms = target.pinned_width();
+    let probe_combinations = target.probe_combinations();
+    let table_rows = estimates
+        .and_then(|est| est.table_rows.get(&table.name.to_ascii_lowercase()).copied());
+
+    let mut rows_per_probe = estimates
+        .and_then(|est| est.index_rows_per_key.get(&index.name.to_ascii_lowercase()))
+        .filter(|per_col| !per_col.is_empty())
+        .map_or_else(
+            || {
+                if index.is_unique
+                    && pinned_terms >= index.key_term_count()
+                    && index.where_clause.is_none()
+                {
+                    1
+                } else {
+                    match pinned_terms {
+                        1 => 10,
+                        2 => 2,
+                        _ => 1,
+                    }
+                }
+            },
+            |per_col| {
+                if let Some(&exact) = per_col.get(pinned_terms - 1) {
+                    exact.max(1)
+                } else if index.is_unique
+                    && pinned_terms >= index.key_term_count()
+                    && index.where_clause.is_none()
+                {
+                    1
+                } else {
+                    let mut est = per_col[per_col.len() - 1].max(1);
+                    for _ in per_col.len()..pinned_terms {
+                        est = (est / 5).max(1);
+                    }
+                    est
+                }
+            },
+        );
+    if target.range.is_some() {
+        rows_per_probe = (rows_per_probe / 4).max(1);
+    }
+    let probe_rows = probe_combinations.saturating_mul(rows_per_probe).max(1);
+
+    // Without LIMIT (or with a negative LIMIT, which means unbounded in SQLite),
+    // probing beats a full ordered walk unless statistics prove the IN list
+    // hits at least half the table.
+    let effective_limit = match limit_clause {
+        None => None,
+        Some(clause) => match literal_signed_i64(&clause.limit) {
+            Some(n) if n < 0 => None,
+            Some(0) => return false,
+            Some(n) => Some((u64::try_from(n).unwrap_or(u64::MAX), clause.offset.as_ref())),
+            None => Some((10, clause.offset.as_ref())),
+        },
+    };
+    let Some((limit_rows, offset_expr)) = effective_limit else {
+        return table_rows.is_none_or(|rows| rows == 0 || probe_rows.saturating_mul(2) < rows);
+    };
+
+    // With LIMIT, keep the early-stopping walk unless we have a table row count
+    // proving the probe is substantially cheaper than walking to fill LIMIT+OFFSET.
+    let Some(table_rows) = table_rows.filter(|&rows| rows > 0) else {
+        return false;
+    };
+    let offset_rows = offset_expr
+        .and_then(literal_signed_i64)
+        .filter(|&n| n > 0)
+        .and_then(|n| u64::try_from(n).ok())
+        .unwrap_or(0);
+    let needed = limit_rows.saturating_add(offset_rows).max(1);
+
+    let matching_rows = if target.has_residual {
+        (probe_rows / 4).max(1)
+    } else {
+        probe_rows
+    }
+    .min(table_rows)
+    .max(1);
+    let walk_rows = table_rows
+        .saturating_mul(needed)
+        .checked_div(matching_rows)
+        .unwrap_or(table_rows)
+        .min(table_rows);
+
+    let probe_per_row = if plan.covering_for_sorter { 2_u64 } else { 4_u64 };
+    let probe_cost = probe_combinations
+        .saturating_mul(8)
+        .saturating_add(probe_rows.saturating_mul(probe_per_row));
+    let walk_per_row = if walk_is_non_covering_index { 3_u64 } else { 1_u64 };
+    let walk_cost = walk_rows.saturating_mul(walk_per_row);
+    probe_cost.saturating_mul(2) < walk_cost
 }
 
 /// A key term of an [`IndexConstInList`] probe pinned beside its member:
@@ -22408,6 +23459,30 @@ fn emit_index_prefix_rows<R>(
     range: Option<&ProbeRangeRegs>,
     emit_row: impl FnOnce(&mut ProgramBuilder, crate::Label) -> R,
 ) -> R {
+    emit_index_prefix_rows_directed(
+        b,
+        idx_cursor,
+        idx_schema,
+        probe_key_regs,
+        prefix_len,
+        range,
+        false,
+        emit_row,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_index_prefix_rows_directed<R>(
+    b: &mut ProgramBuilder,
+    idx_cursor: i32,
+    idx_schema: &IndexSchema,
+    probe_key_regs: i32,
+    prefix_len: i32,
+    range: Option<&ProbeRangeRegs>,
+    reverse: bool,
+    emit_row: impl FnOnce(&mut ProgramBuilder, crate::Label) -> R,
+) -> R {
+    debug_assert!(!reverse || range.is_none());
     let next_value = b.emit_label();
     for offset in 0..prefix_len {
         b.emit_jump_to_label(
@@ -22443,7 +23518,11 @@ fn emit_index_prefix_rows<R>(
         0,
     );
     b.emit_jump_to_label(
-        Opcode::SeekGE,
+        if reverse {
+            Opcode::SeekLE
+        } else {
+            Opcode::SeekGE
+        },
         idx_cursor,
         probe_record_reg,
         next_value,
@@ -22488,7 +23567,14 @@ fn emit_index_prefix_rows<R>(
     }
     let result = emit_row(b, skip_row);
     b.resolve_label(skip_row);
-    b.emit_op(Opcode::Next, idx_cursor, run_top, 0, P4::None, 0);
+    b.emit_op(
+        if reverse { Opcode::Prev } else { Opcode::Next },
+        idx_cursor,
+        run_top,
+        0,
+        P4::None,
+        0,
+    );
     b.resolve_label(next_value);
     result
 }
@@ -22500,7 +23586,6 @@ fn emit_index_prefix_rows<R>(
 /// bd-5i6zm: with several IN lists the sorter holds one record per member
 /// combination (a NULL member drops its combinations), sorted in the key
 /// terms' order and directions, and a run of equal records is sought once.
-#[allow(clippy::too_many_lines)]
 fn emit_index_const_list_rows<R>(
     b: &mut ProgramBuilder,
     idx_cursor: i32,
@@ -22508,6 +23593,27 @@ fn emit_index_const_list_rows<R>(
     target: &IndexConstInList<'_, '_>,
     anon_placeholder_base: u32,
     emit_row: impl FnOnce(&mut ProgramBuilder, crate::Label) -> R,
+) -> R {
+    emit_index_const_list_rows_directed(
+        b,
+        idx_cursor,
+        probe_cursor,
+        target,
+        anon_placeholder_base,
+        false,
+        |b, skip_row, _probes_done| emit_row(b, skip_row),
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn emit_index_const_list_rows_directed<R>(
+    b: &mut ProgramBuilder,
+    idx_cursor: i32,
+    probe_cursor: i32,
+    target: &IndexConstInList<'_, '_>,
+    anon_placeholder_base: u32,
+    reverse: bool,
+    emit_row: impl FnOnce(&mut ProgramBuilder, crate::Label, crate::Label) -> R,
 ) -> R {
     // bd-hyoms: the probe is `(prefix.., member, suffix..)`; an equality
     // around the member is computed once and takes its key term's affinity.
@@ -22541,10 +23647,17 @@ fn emit_index_const_list_rows<R>(
         }
     }
     let width = i32::try_from(lists.len()).expect("fewer IN lists than key terms");
-    // Probes are visited in index order, as stock walks its IN lists.
+    // Probes are visited in index order (or reverse index order when `reverse`
+    // streams a descending ORDER BY), matching stock's index traversal.
     let orders: String = lists
         .iter()
-        .map(|&(pos, ..)| if target.index.key_term_descending(pos) { '-' } else { '+' })
+        .map(|&(pos, ..)| {
+            if target.index.key_term_descending(pos) ^ reverse {
+                '-'
+            } else {
+                '+'
+            }
+        })
         .collect();
     b.emit_op(Opcode::SorterOpen, probe_cursor, width, 0, P4::Str(orders), 0);
     for (reg, value, affinity) in equalities {
@@ -22651,14 +23764,15 @@ fn emit_index_const_list_rows<R>(
         b.emit_op(Opcode::Copy, reg, prior, 0, P4::None, 0);
     }
     b.emit_op(Opcode::Integer, 1, has_previous, 0, P4::None, 0);
-    let result = emit_index_prefix_rows(
+    let result = emit_index_prefix_rows_directed(
         b,
         idx_cursor,
         target.index,
         probe,
         prefix_len,
         range_regs.as_ref(),
-        emit_row,
+        reverse,
+        |b, skip_row| emit_row(b, skip_row, probes_done),
     );
     b.resolve_label(next_probe);
     b.emit_op(Opcode::SorterNext, probe_cursor, probe_loop, 0, P4::None, 0);
@@ -52209,8 +53323,16 @@ mod tests {
         assert!(mixed.iter().any(|op| op.opcode == Opcode::SeekGE));
         assert!(!mixed.iter().any(|op| op.opcode == Opcode::Rewind && op.p1 == 0));
 
+        // bd-odxzh / bd-mdnfh: `k IN (1, 2) ORDER BY id` now takes the covering
+        // IN-probe + ORDER BY sorter instead of scanning the table.
+        let ordered_in = bd_2dgf5_program("SELECT id FROM t WHERE k IN (1, 2) ORDER BY id");
+        assert!(ordered_in.iter().any(|op| op.opcode == Opcode::SeekGE));
+        assert!(!ordered_in.iter().any(|op| op.opcode == Opcode::Rewind));
+        assert!(!ordered_in.iter().any(|op| op.opcode == Opcode::SeekRowid));
+
         for sql in [
-            "SELECT id FROM t WHERE k IN (1, 2) ORDER BY id",
+            "SELECT id FROM t WHERE k IN (1, 2) ORDER BY id LIMIT 3",
+            "SELECT id FROM t NOT INDEXED WHERE k IN (1, 2) ORDER BY id",
             "SELECT id FROM t WHERE k IN (1, 2) LIMIT 3",
             "SELECT DISTINCT id FROM t WHERE k IN (1, 2)",
             "SELECT id FROM t WHERE k NOT IN (1, 2)",
@@ -52535,10 +53657,18 @@ mod tests {
         assert!(mixed.iter().any(|op| op.opcode == Opcode::SeekGE));
         assert!(!mixed.iter().any(|op| op.opcode == Opcode::Rewind && op.p1 == 0));
 
+        // bd-odxzh / bd-mdnfh: `k = 2 OR k = 3 ORDER BY id` now takes the
+        // covering IN-probe + ORDER BY sorter instead of scanning the table.
+        let ordered_or = bd_2dgf5_program("SELECT id FROM t WHERE k = 2 OR k = 3 ORDER BY id");
+        assert!(ordered_or.iter().any(|op| op.opcode == Opcode::SeekGE));
+        assert!(!ordered_or.iter().any(|op| op.opcode == Opcode::Rewind));
+        assert!(!ordered_or.iter().any(|op| op.opcode == Opcode::SeekRowid));
+
         for sql in [
             "SELECT id FROM t WHERE k = 2 OR v = 3",
             "SELECT id FROM t WHERE k = 2 OR k > 5",
-            "SELECT id FROM t WHERE k = 2 OR k = 3 ORDER BY id",
+            "SELECT id FROM t WHERE k = 2 OR k = 3 ORDER BY id LIMIT 3",
+            "SELECT id FROM t NOT INDEXED WHERE k = 2 OR k = 3 ORDER BY id",
             "SELECT id FROM t NOT INDEXED WHERE k = 2 OR k = 3",
         ] {
             assert!(
