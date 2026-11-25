@@ -3145,6 +3145,79 @@ fn expr_contains_non_numbered_placeholder(expr: &Expr) -> bool {
     }
 }
 
+/// Whether `expr` contains any SQL bind placeholder (anonymous, numbered, or named).
+fn expr_contains_placeholder(expr: &Expr) -> bool {
+    match expr {
+        Expr::Placeholder(_, _) | Expr::Subquery(_, _) | Expr::Exists { .. } => true,
+        Expr::Literal(_, _)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Column(_, _)
+        | Expr::Raise { .. } => false,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_placeholder(left) || expr_contains_placeholder(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => expr_contains_placeholder(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_placeholder(expr)
+                || expr_contains_placeholder(low)
+                || expr_contains_placeholder(high)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_contains_placeholder(expr)
+                || match set {
+                    InSet::List(items) => items.iter().any(expr_contains_placeholder),
+                    InSet::Subquery(_) => true,
+                    InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_placeholder(expr)
+                || expr_contains_placeholder(pattern)
+                || escape.as_deref().is_some_and(expr_contains_placeholder)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_contains_placeholder)
+                || whens.iter().any(|(when_expr, then_expr)| {
+                    expr_contains_placeholder(when_expr) || expr_contains_placeholder(then_expr)
+                })
+                || else_expr.as_deref().is_some_and(expr_contains_placeholder)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            matches!(args, FunctionArgs::List(items) if items.iter().any(expr_contains_placeholder))
+                || order_by
+                    .iter()
+                    .any(|term| expr_contains_placeholder(&term.expr))
+                || filter.as_deref().is_some_and(expr_contains_placeholder)
+                || over.is_some()
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            expr_contains_placeholder(expr) || expr_contains_placeholder(path)
+        }
+        Expr::RowValue(items, _) => items.iter().any(expr_contains_placeholder),
+    }
+}
+
 fn select_contains_non_numbered_placeholder(select: &SelectStatement) -> bool {
     select.with.as_ref().is_some_and(|with_clause| {
         with_clause
@@ -3510,6 +3583,7 @@ pub fn codegen_select(
                     where_clause.as_deref(),
                     table,
                     table_alias,
+                    schema,
                     PrefixIndexShape::AnyPrefix,
                     PrefixProbe::LiteralOrNumberedParameter,
                 )
@@ -3690,6 +3764,7 @@ pub fn codegen_select(
             where_clause.as_deref(),
             table,
             table_alias,
+            schema,
             PrefixIndexShape::SingleColumn,
             PrefixProbe::Literal,
         )
@@ -3723,6 +3798,7 @@ pub fn codegen_select(
                 where_clause.as_deref(),
                 table,
                 table_alias,
+                schema,
                 PrefixIndexShape::SingleColumn,
                 PrefixProbe::Literal,
             )?;
@@ -5759,7 +5835,7 @@ fn codegen_select_without_rowid_pk_lookup(
     // affinity — otherwise an INTEGER key probed by text `'5'` (or the reverse)
     // would miss a row that is present. Skip the op when the operand already
     // carries the column's affinity (byte-identical to no coercion).
-    let pk_affinity = table.columns[*pk_col].affinity;
+    let pk_affinity = index_key_affinity(table.columns[*pk_col].affinity);
     if matches!(pk_affinity, 'B' | 'C' | 'D' | 'E')
         && !bound_matches_affinity(pk_affinity, target_expr)
     {
@@ -5894,7 +5970,7 @@ fn codegen_select_without_rowid_unique_seek(
         emit_expr(b, target, dst, None);
         // Match the stored key's storage class (see the L1 lookup's affinity
         // note); skip the op when the operand already carries it.
-        let pk_affinity = table.columns[col_idx].affinity;
+        let pk_affinity = index_key_affinity(table.columns[col_idx].affinity);
         if matches!(pk_affinity, 'B' | 'C' | 'D' | 'E')
             && !bound_matches_affinity(pk_affinity, target)
         {
@@ -6002,19 +6078,117 @@ fn codegen_select_without_rowid_unique_seek(
     Ok(())
 }
 
-/// bd-gtjlv: the literals that pin a composite index's key terms after the
-/// leading one in `where_clause` (`a = 1 AND k = 'x' AND <residual>` on
-/// `(a, k)`), in key order, stopping at the first term that no exact
-/// `column = literal` conjunct pins. Exact means the comparison implies no
-/// conversion and orders like the index (an integer literal against INTEGER
-/// affinity, or a string literal against TEXT affinity with BINARY on the
-/// column and the ASC key term), so a longer probe prefix lands on exactly the
-/// rows the leading-column block would have kept.
+/// Probe plan for a single `column = target_expr` equality term on `idx_schema`
+/// at key position `term` (bd-text-probe-numeric-index-qk7vd).
 ///
-/// A bind parameter pins a term too when [`index_range_bound_is_seek_safe`]
-/// accepts it: the probe then coerces the bound value to the column's
-/// affinity before the seek (the returned affinity), exactly as the equality
-/// filter does, so the longer prefix still lands on the filter's rows.
+/// Mirrors SQLite's `sqlite3IndexAffinityOk` + `sqlite3IndexAffinityStr`
+/// (`index_key_affinity`): when the comparison's collation matches the index
+/// key's collation and the comparison affinity is compatible with the index
+/// key's storage affinity (none, TEXT on TEXT, or NUMERIC on NUMERIC/INTEGER/
+/// REAL capped at `'C'`), coercing the probe value with `affinity_to_emit`
+/// before `SeekGE` makes the seek exact with no full-table fallback scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IndexEqProbePlan {
+    affinity_to_emit: Option<char>,
+    exact_after_coercion: bool,
+}
+
+impl IndexEqProbePlan {
+    const fn inexact() -> Self {
+        Self {
+            affinity_to_emit: None,
+            exact_after_coercion: false,
+        }
+    }
+}
+
+fn index_eq_term_probe_plan(
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    idx_schema: &IndexSchema,
+    term: usize,
+    target_expr: &Expr,
+    where_clause: Option<&Expr>,
+) -> IndexEqProbePlan {
+    let Some(column) = idx_schema
+        .columns
+        .get(term)
+        .and_then(|name| table.column_index(name))
+        .and_then(|idx| table.columns.get(idx))
+    else {
+        return IndexEqProbePlan::inexact();
+    };
+    let mut matched_where_conjunct = false;
+    if let Some(where_expr) = where_clause {
+        let mut conjuncts = Vec::new();
+        collect_conjunctive_terms(where_expr, &mut conjuncts);
+        for conjunct in conjuncts {
+            let Expr::BinaryOp {
+                left,
+                op: BinaryOp::Eq,
+                right,
+                ..
+            } = conjunct
+            else {
+                continue;
+            };
+            let matches_pair = |col_side: &Expr, val_side: &Expr| {
+                column_name(strip_collate_wrappers(col_side), table, table_alias)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
+                    && (val_side == target_expr || strip_collate_wrappers(val_side) == target_expr)
+            };
+            if matches_pair(left, right) || matches_pair(right, left) {
+                matched_where_conjunct = true;
+                if !index_equality_term_uses_key_collation(
+                    conjunct,
+                    table,
+                    table_alias,
+                    idx_schema,
+                    term,
+                ) {
+                    return IndexEqProbePlan::inexact();
+                }
+            }
+        }
+    }
+    let comparison =
+        resolved_index_range_comparison(table, table_alias, schema, &column.name, target_expr);
+    if !matched_where_conjunct {
+        let cmp_coll = match &comparison.collation_p4 {
+            P4::Collation(name) => Some(name.as_str()),
+            _ => None,
+        };
+        if !collation_names_equivalent(cmp_coll, idx_schema.key_term_collation(term)) {
+            return IndexEqProbePlan::inexact();
+        }
+    }
+    let cmp_aff = comparison.cmp_p5 & !0x80;
+    let idx_aff = index_key_affinity(column.affinity);
+    match (cmp_aff, idx_aff) {
+        (0, _) => IndexEqProbePlan {
+            affinity_to_emit: None,
+            exact_after_coercion: true,
+        },
+        (aff, 'C') if aff == u16::from(b'C') => IndexEqProbePlan {
+            affinity_to_emit: (!bound_matches_affinity('C', target_expr)).then_some('C'),
+            exact_after_coercion: true,
+        },
+        (aff, 'B') if aff == u16::from(b'B') => IndexEqProbePlan {
+            affinity_to_emit: (!bound_matches_affinity('B', target_expr)).then_some('B'),
+            exact_after_coercion: true,
+        },
+        _ => IndexEqProbePlan::inexact(),
+    }
+}
+
+/// bd-gtjlv / bd-text-probe-numeric-index-qk7vd: the constant/parameter probes
+/// that pin a composite index's key terms after the leading one in
+/// `where_clause` (`a = 1 AND k = 'x' AND <residual>` on `(a, k)`), in key
+/// order, stopping at the first term that no exact-after-coercion equality
+/// conjunct pins. Each returned term carries the probe `Affinity` to apply
+/// before `SeekGE` (if any), so cross-type literals and bound parameters land
+/// on exactly the rows the WHERE filter keeps.
 fn composite_equality_scan_extra_prefix<'e>(
     idx: &IndexSchema,
     table: &TableSchema,
@@ -6037,14 +6211,7 @@ fn composite_equality_scan_extra_prefix<'e>(
             break;
         };
         let column = &table.columns[col_idx];
-        let binary = |collation: Option<&str>| {
-            collation.is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"))
-        };
-        if idx.key_term_descending(term)
-            || !binary(idx.key_term_collation(term))
-            || !binary(column.collation.as_deref())
-            || column.generated_expr.is_some()
-        {
+        if idx.key_term_descending(term) || column.generated_expr.is_some() {
             break;
         }
         let pins_column = |operand: &Expr| {
@@ -6068,30 +6235,17 @@ fn composite_equality_scan_extra_prefix<'e>(
             } if pins_column(right) => Some(left.as_ref()),
             _ => None,
         });
-        let pinned = literal.and_then(|literal| match literal {
-            Expr::Literal(Literal::Integer(_), _) if column.affinity == 'D' => {
-                Some((literal, None))
+        let pinned = literal.and_then(|literal| {
+            let safe_expr = matches!(literal, Expr::Literal(..))
+                || is_numeric_literal_bound(literal)
+                || is_placeholder_bound(literal);
+            if !safe_expr {
+                return None;
             }
-            Expr::Literal(Literal::String(_), _) if column.affinity == 'B' => {
-                Some((literal, None))
-            }
-            bound
-                if is_placeholder_bound(bound)
-                    && index_range_bound_is_seek_safe(
-                        table,
-                        table_alias,
-                        schema,
-                        &column.name,
-                        bound,
-                    ) =>
-            {
-                Some((
-                    bound,
-                    matches!(column.affinity, 'B' | 'C' | 'D' | 'E')
-                        .then_some(index_key_affinity(column.affinity)),
-                ))
-            }
-            _ => None,
+            let plan =
+                index_eq_term_probe_plan(table, table_alias, schema, idx, term, literal, where_clause);
+            plan.exact_after_coercion
+                .then_some((literal, plan.affinity_to_emit))
         });
         match pinned {
             Some(pinned) => extra.push(pinned),
@@ -6188,7 +6342,6 @@ fn codegen_select_index_equality_scan(
     rowid_bounds: Option<IndexEqRowidBounds>,
 ) -> Result<(), CodegenError> {
     let idx_cursor = 1_i32;
-    let full_scan_fallback = b.emit_label();
     let duplicate_run_done = b.emit_label();
     let rowid_bounds = rowid_bounds.filter(|_| !table.without_rowid);
     let where_placeholder_base = b.current_anon_placeholder();
@@ -6221,57 +6374,24 @@ fn codegen_select_index_equality_scan(
         b.emit_label()
     };
 
-    // Exact seek (single-column ASC index whose stored key ordering already agrees with the WHERE
-    // comparison for this probe): a 0-match seek is authoritative, so the full-scan fallback — an
-    // affinity safety net — is unnecessary and an absent key produces the empty result directly. That
-    // makes `WHERE col = <absent>` O(log n) instead of O(n). Non-exact indexes keep the fallback.
-    // bd-eq-seek-fallback-zero-match.
-    //
-    // GH#409: the safety net exists because column affinity is applied to the comparison but not to the
-    // probe record, so a probe whose storage class the column's affinity would have converted can seek
-    // into the wrong region and miss a row that does match. That is only true when a conversion is
-    // actually implied. It is not implied when the literal's storage class is already the one the
-    // column's affinity produces — an integer literal against INTEGER affinity ('D'), or a string
-    // literal against TEXT affinity ('B'). In the TEXT case the ordering argument additionally needs the
-    // comparison collation to be the index's, so BINARY on both sides is required; integers are ordered
-    // identically under every collation, so the integer case does not.
-    //
-    // Without the TEXT case, every equality probe of a `TEXT ... UNIQUE` column that matches nothing
-    // fell through to a full table scan of the whole table — the O(image) post-commit read reported in
-    // GH#409, which was only ever hidden by the per-commit-epoch result caches above this layer.
-    let probe_column = idx_schema
-        .columns
-        .first()
-        .and_then(|name| table.column_index(name))
-        .and_then(|i| table.columns.get(i));
-    let index_collation_is_binary = idx_schema
-        .key_term_collation(0)
-        .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"));
-    // bd-wp9s1: a folded scalar subquery's value (a BoundOuterValue the equality extractors admitted)
-    // is known when the program is built, so its storage class decides as a literal's does.
-    let probe_needs_no_affinity_conversion = probe_column.is_some_and(|column| {
-        let text_probe_is_exact = || {
-            column.affinity == 'B'
-                && index_collation_is_binary
-                && column
-                    .collation
-                    .as_deref()
-                    .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"))
-        };
-        match target_expr {
-            Expr::Literal(Literal::Integer(_), _)
-            | Expr::BoundOuterValue {
-                value: SqliteValue::Integer(_),
-                ..
-            } => column.affinity == 'D',
-            Expr::Literal(Literal::String(_), _)
-            | Expr::BoundOuterValue {
-                value: SqliteValue::Text(_),
-                ..
-            } => text_probe_is_exact(),
-            _ => false,
-        }
-    });
+    // Exact seek (bd-eq-seek-fallback-zero-match, GH#409, bd-text-probe-numeric-index-qk7vd):
+    // when the leading key column's comparison collation matches the index key's
+    // collation and the comparison affinity is compatible with the index key's
+    // affinity (none, TEXT on TEXT, or NUMERIC on NUMERIC/INTEGER/REAL capped at
+    // 'C'), applying `lead_plan.affinity_to_emit` before `SeekGE` aligns the
+    // probe's storage class with the index keys so the seek is authoritative —
+    // even for cross-type literals and bound parameters — with no O(n) fallback
+    // scan. Expression indexes, uncovered partial indexes, and affinity/collation
+    // mismatches keep the full-scan fallback.
+    let lead_plan = index_eq_term_probe_plan(
+        table,
+        table_alias,
+        schema,
+        idx_schema,
+        0,
+        target_expr,
+        where_clause,
+    );
     // A partial index makes a 0-match seek authoritative only when the WHERE implies its predicate:
     // otherwise rows the predicate excludes are absent from the index but can still satisfy the WHERE,
     // so those keep the fallback scan. GH#444: `k = 'v'` implies `k IS NOT NULL`, the common shape of a
@@ -6288,44 +6408,17 @@ fn codegen_select_index_equality_scan(
             )
         });
     // GH#444: the argument above concerns only the leading key term, so it holds for a composite index
-    // too. The one-field prefix probe lands on the first entry whose leading column equals the literal,
+    // too. The one-field prefix probe lands on the first entry whose leading column equals the probe,
     // that column's matching rows form one contiguous block, and a probe that finds no such block
     // cannot have missed a matching row.
     let leading_key_block_is_exact = !idx_schema.key_term_descending(0)
         && !idx_schema.columns.is_empty()
         && idx_schema.columns.len() == idx_schema.key_term_count()
         && index_holds_every_candidate;
-    let exact_seek = leading_key_block_is_exact && probe_needs_no_affinity_conversion;
-    // bd-ry6x7: a bound parameter's storage class is only known at run time, so the GH#409 argument
-    // above is checked there instead: a 0-match seek is authoritative when the parameter holds the
-    // storage class the column's affinity leaves unconverted (INTEGER for INTEGER affinity; TEXT for
-    // TEXT affinity under BINARY on both the index and the column). Any other value keeps the
-    // fallback. Trigger WHEN subqueries bind OLD/NEW this way, and their "no row holds this key yet"
-    // probes miss on every insert; without this each miss scanned the whole table.
-    let runtime_exact_type_mask = if leading_key_block_is_exact
-        && !exact_seek
-        && (matches!(target_expr, Expr::Placeholder(..)) || is_constant_seek_key_expr(target_expr))
-    {
-        probe_column.and_then(|column| match column.affinity {
-            'D' => Some(0x01_u16),
-            'B' if index_collation_is_binary
-                && column
-                    .collation
-                    .as_deref()
-                    .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY")) =>
-            {
-                Some(0x04_u16)
-            }
-            _ => None,
-        })
-    } else {
-        None
-    };
-    let runtime_exact_check = runtime_exact_type_mask.map(|_| b.emit_label());
+    let exact_seek = leading_key_block_is_exact && lead_plan.exact_after_coercion;
+    let full_scan_fallback = b.emit_label();
     let seek_miss_label = if exact_seek {
         fast_path_done_label
-    } else if let Some(check) = runtime_exact_check {
-        check
     } else {
         full_scan_fallback
     };
@@ -6366,37 +6459,43 @@ fn codegen_select_index_equality_scan(
         P4::None,
         0,
     );
+    if exact_seek && let Some(affinity) = lead_plan.affinity_to_emit {
+        b.emit_op(
+            Opcode::Affinity,
+            probe_key_regs,
+            1,
+            0,
+            P4::Affinity(affinity.to_string()),
+            0,
+        );
+    }
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for (offset, (bound, affinity)) in extra_prefix.iter().enumerate() {
         let key = probe_key_regs + 1 + offset as i32;
         emit_expr(b, bound, key, None);
-        if is_placeholder_bound(bound) {
-            // `k = NULL` holds for no row, so a NULL bind ends the scan empty.
-            b.emit_jump_to_label(Opcode::IsNull, key, 0, fast_path_done_label, P4::None, 0);
-            // The equality filter compares the bind under the column's
-            // affinity; the probe takes the same coercion so its storage
-            // class matches the stored keys (as the range seek does).
-            if let Some(affinity) = affinity {
-                b.emit_op(
-                    Opcode::Affinity,
-                    key,
-                    1,
-                    0,
-                    P4::Affinity(affinity.to_string()),
-                    0,
-                );
-            }
+        // `k = NULL` holds for no row, so a NULL key ends the scan empty.
+        b.emit_jump_to_label(Opcode::IsNull, key, 0, fast_path_done_label, P4::None, 0);
+        // The equality filter compares the probe under the column's affinity;
+        // apply the same index-capped coercion so its storage class matches
+        // the stored keys.
+        if let Some(affinity) = affinity {
+            b.emit_op(
+                Opcode::Affinity,
+                key,
+                1,
+                0,
+                P4::Affinity(affinity.to_string()),
+                0,
+            );
         }
     }
     // bd-gtjlv: the scan ends where the whole pinned prefix ends, not only the
     // leading term's block; otherwise it walks (and filters) every later entry
     // of that block. Only when an empty block is authoritative for the leading
-    // term (exact, or checked at run time): otherwise an empty narrowed block
-    // would send the scan to the full-table fallback where it used to finish
-    // the leading block. The one-term probe keeps its leading-key compare.
-    let block_end_fields = if extra_prefix.is_empty()
-        || !(exact_seek || runtime_exact_type_mask.is_some())
-    {
+    // term: otherwise an empty narrowed block would send the scan to the
+    // full-table fallback where it used to finish the leading block. The
+    // one-term probe keeps its leading-key compare.
+    let block_end_fields = if extra_prefix.is_empty() || !exact_seek {
         1
     } else {
         u16::try_from(probe_field_count).map_err(|_| {
@@ -6637,20 +6736,6 @@ fn codegen_select_index_equality_scan(
     );
     // Exact seek: 0 matches is authoritative → the empty result, not the O(n) fallback scan.
     b.emit_jump_to_label(Opcode::Goto, 0, 0, seek_miss_label, P4::None, 0);
-
-    if let (Some(check), Some(mask)) = (runtime_exact_check, runtime_exact_type_mask) {
-        // bd-ry6x7: the miss is authoritative when the parameter's storage class is the one the
-        // column's affinity leaves unconverted; anything else falls through to the scan.
-        b.resolve_label(check);
-        b.emit_jump_to_label(
-            Opcode::IsType,
-            -1,
-            probe_key_regs,
-            fast_path_done_label,
-            P4::None,
-            mask,
-        );
-    }
 
     b.resolve_label(full_scan_fallback);
     if !needs_table_lookup {
@@ -11744,7 +11829,7 @@ fn codegen_select_ordered_scan(
     done_label: crate::Label,
     end_label: crate::Label,
     eq_seek: Option<&OuterEqualitySeek<'_>>,
-    ctx: &CodegenContext,
+    _ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
     // Connection-level compilation canonicalizes anonymous and named bind
     // parameters to explicit `?NNN` slots before VDBE codegen. Direct callers
@@ -11924,16 +12009,7 @@ fn codegen_select_ordered_scan(
     let scan_done = b.emit_label();
     let (seek_loop, scan_body) = if let Some(seek) = eq_seek {
         let seek_row = b.emit_label();
-        let outer_loop = emit_outer_loop_start(
-            b,
-            Some(seek),
-            cursor,
-            seek_row,
-            scan_done,
-            &[(table, table_alias)],
-            ctx,
-            None,
-        )?;
+        let outer_loop = emit_outer_loop_start(b, Some(seek), cursor, scan_done, None);
         b.resolve_label(seek_row);
         (Some((outer_loop, seek_row)), 0)
     } else {
@@ -14766,15 +14842,15 @@ enum OuterEqualitySeek<'a> {
     /// SeekRowid, with the inner rowid lookup's NULL / non-integer handling.
     Rowid { probe: &'a Expr },
     /// `outer.col = probe` over an index led by `col` whose key order agrees
-    /// with the comparison (the GH#409 / bd-ry6x7 rule of
-    /// `codegen_select_index_equality_scan`): statically for an INTEGER
-    /// literal on INTEGER affinity or a TEXT literal on BINARY TEXT, or at
-    /// run time for a parameter of that storage class (`runtime_type_mask`,
-    /// any other value scans the outer table as before).
+    /// with the comparison (bd-text-probe-numeric-index-qk7vd): applies
+    /// `probe_affinity` (index-capped NUMERIC `'C'` or TEXT `'B'`, when the
+    /// probe is not already a literal of that class) before `SeekGE`, so both
+    /// cross-type literals and bound parameters seek directly with no scan
+    /// fallback.
     Index {
         index: &'a IndexSchema,
         probe: &'a Expr,
-        runtime_type_mask: Option<u16>,
+        probe_affinity: Option<char>,
     },
 }
 
@@ -15012,14 +15088,17 @@ fn resolve_outer_equality_seek_terms<'a>(
             let Expr::Column(col_ref, _) = column else {
                 continue;
             };
-            if !matches!(
+            if !(matches!(
                 probe,
-                Expr::Literal(Literal::Integer(_) | Literal::String(_), _)
-                    | Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
-            ) || (col_ref.table.is_none()
-                && other_table.is_some_and(|(other, other_alias)| {
-                    resolve_column_ref(column, other, other_alias).is_some()
-                }))
+                Expr::Literal(
+                    Literal::Integer(_) | Literal::Float(_) | Literal::String(_) | Literal::Blob(_),
+                    _,
+                ) | Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
+            ) || is_numeric_literal_bound(probe))
+                || (col_ref.table.is_none()
+                    && other_table.is_some_and(|(other, other_alias)| {
+                        resolve_column_ref(column, other, other_alias).is_some()
+                    }))
             {
                 continue;
             }
@@ -15045,10 +15124,13 @@ fn outer_index_equality_seek<'a>(
     required_index: Option<&str>,
 ) -> Option<OuterEqualitySeek<'a>> {
     let column = table.columns.get(col_idx)?;
-    let column_binary = column
-        .collation
-        .as_deref()
-        .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"));
+    let idx_aff = index_key_affinity(column.affinity);
+    let probe_affinity = match idx_aff {
+        'C' => (!bound_matches_affinity('C', probe)).then_some('C'),
+        'B' => (!bound_matches_affinity('B', probe)).then_some('B'),
+        'A' => None,
+        _ => return None,
+    };
     table.indexes.iter().find_map(|index| {
         let usable = required_index.is_none_or(|name| index.name.eq_ignore_ascii_case(name))
             && index
@@ -15057,26 +15139,15 @@ fn outer_index_equality_seek<'a>(
                 .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
             && index.columns.len() == index.key_term_count()
             && index.where_clause.is_none()
-            && !index.key_term_descending(0);
-        if !usable {
-            return None;
-        }
-        let text_exact = column.affinity == 'B'
-            && column_binary
-            && index
-                .key_term_collation(0)
-                .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"));
-        let runtime_type_mask = match probe {
-            Expr::Literal(Literal::Integer(_), _) if column.affinity == 'D' => None,
-            Expr::Literal(Literal::String(_), _) if text_exact => None,
-            Expr::Placeholder(..) if column.affinity == 'D' => Some(0x01_u16),
-            Expr::Placeholder(..) if text_exact => Some(0x04_u16),
-            _ => return None,
-        };
-        Some(OuterEqualitySeek::Index {
+            && !index.key_term_descending(0)
+            && collation_names_equivalent(
+                column.collation.as_deref(),
+                index.key_term_collation(0),
+            );
+        usable.then_some(OuterEqualitySeek::Index {
             index,
             probe,
-            runtime_type_mask,
+            probe_affinity,
         })
     })
 }
@@ -15087,31 +15158,24 @@ enum OuterLoop {
     Scan,
     /// The one row a rowid seek found.
     RowidSeek,
-    /// The equal-key run of an index; with `by_index_reg`, a run-time check
-    /// may instead have chosen the scan (the register holds 1 for the seek).
+    /// The equal-key run of an index.
     IndexSeek {
         idx_cursor: i32,
-        by_index_reg: Option<i32>,
         idx_row: crate::Label,
         idx_advance: crate::Label,
     },
 }
 
 /// Open the outer loop of a single-join lookup: position `left_cursor` on its
-/// first row (through `seek` when there is one) and fall through to
-/// `next_left`, which the caller resolves at the loop body; `done` ends the
-/// loop.
-#[allow(clippy::too_many_arguments)]
+/// first row (through `seek` when there is one) and fall through to the loop
+/// body; `done` ends the loop.
 fn emit_outer_loop_start(
     b: &mut ProgramBuilder,
     seek: Option<&OuterEqualitySeek<'_>>,
     left_cursor: i32,
-    next_left: crate::Label,
     done: crate::Label,
-    tables: &[(&TableSchema, Option<&str>)],
-    ctx: &CodegenContext,
     scan_floor: Option<(i64, bool)>,
-) -> Result<OuterLoop, CodegenError> {
+) -> OuterLoop {
     match seek {
         None => {
             // A scan the WHERE bounds from below starts at the bound: the
@@ -15132,35 +15196,37 @@ fn emit_outer_loop_start(
             } else {
                 b.emit_jump_to_label(Opcode::Rewind, left_cursor, 0, done, P4::None, 0);
             }
-            Ok(OuterLoop::Scan)
+            OuterLoop::Scan
         }
         Some(OuterEqualitySeek::Rowid { probe }) => {
             let probe_reg = b.alloc_reg();
-            emit_join_expr(b, probe, probe_reg, tables, ctx)?;
+            emit_expr(b, probe, probe_reg, None);
             b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, done, P4::None, 0);
             b.emit_jump_to_label(Opcode::MustBeInt, probe_reg, 0, done, P4::None, 0);
             b.emit_jump_to_label(Opcode::SeekRowid, left_cursor, probe_reg, done, P4::None, 0);
-            Ok(OuterLoop::RowidSeek)
+            OuterLoop::RowidSeek
         }
         Some(OuterEqualitySeek::Index {
             index,
             probe,
-            runtime_type_mask,
+            probe_affinity,
         }) => {
             let idx_cursor = b.alloc_aux_cursor_range(1);
             let idx_row = b.emit_label();
             let idx_advance = b.emit_label();
             let probe_base = b.alloc_regs(2);
-            emit_join_expr(b, probe, probe_base, tables, ctx)?;
-            let by_index_reg = runtime_type_mask.map(|_| b.alloc_reg());
-            let scan_start = b.emit_label();
-            if let Some(mask) = runtime_type_mask {
-                let seek_start = b.emit_label();
-                b.emit_jump_to_label(Opcode::IsType, -1, probe_base, seek_start, P4::None, *mask);
-                b.emit_jump_to_label(Opcode::Goto, 0, 0, scan_start, P4::None, 0);
-                b.resolve_label(seek_start);
-            }
+            emit_expr(b, probe, probe_base, None);
             b.emit_jump_to_label(Opcode::IsNull, probe_base, 0, done, P4::None, 0);
+            if let Some(affinity) = probe_affinity {
+                b.emit_op(
+                    Opcode::Affinity,
+                    probe_base,
+                    1,
+                    0,
+                    P4::Affinity(affinity.to_string()),
+                    0,
+                );
+            }
             // A single-key index entry is `(key, rowid)`, so `(probe, i64::MIN)` is the floor of
             // the probe's run. On a composite index the second field would line up with the next
             // key column instead, and SeekGE would skip the run's entries whose next key is NULL
@@ -15196,14 +15262,6 @@ fn emit_outer_loop_start(
                 P4::None,
                 0,
             );
-            if let Some(reg) = by_index_reg {
-                b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
-                b.emit_jump_to_label(Opcode::Goto, 0, 0, idx_row, P4::None, 0);
-                b.resolve_label(scan_start);
-                b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
-                b.emit_jump_to_label(Opcode::Rewind, left_cursor, 0, done, P4::None, 0);
-                b.emit_jump_to_label(Opcode::Goto, 0, 0, next_left, P4::None, 0);
-            }
             b.resolve_label(idx_row);
             let key_reg = b.alloc_reg();
             b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
@@ -15218,12 +15276,11 @@ fn emit_outer_loop_start(
             let rowid_reg = b.alloc_reg();
             b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
             b.emit_jump_to_label(Opcode::SeekRowid, left_cursor, rowid_reg, idx_advance, P4::None, 0);
-            Ok(OuterLoop::IndexSeek {
+            OuterLoop::IndexSeek {
                 idx_cursor,
-                by_index_reg,
                 idx_row,
                 idx_advance,
-            })
+            }
         }
     }
 }
@@ -15235,7 +15292,7 @@ fn emit_outer_loop_advance(
     outer_loop: &OuterLoop,
     left_cursor: i32,
     next_left: crate::Label,
-    done: crate::Label,
+    _done: crate::Label,
 ) {
     match outer_loop {
         OuterLoop::Scan => {
@@ -15244,15 +15301,9 @@ fn emit_outer_loop_advance(
         OuterLoop::RowidSeek => {}
         OuterLoop::IndexSeek {
             idx_cursor,
-            by_index_reg,
             idx_row,
             idx_advance,
         } => {
-            if let Some(reg) = by_index_reg {
-                b.emit_jump_to_label(Opcode::If, *reg, 0, *idx_advance, P4::None, 0);
-                b.emit_jump_to_label(Opcode::Next, left_cursor, 0, next_left, P4::None, 0);
-                b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
-            }
             b.resolve_label(*idx_advance);
             b.emit_jump_to_label(Opcode::Next, *idx_cursor, 0, *idx_row, P4::None, 0);
         }
@@ -15590,12 +15641,9 @@ fn codegen_single_join_lookup_select(
         b,
         outer_seek.as_ref(),
         left_cursor,
-        next_left_label,
         done_label,
-        &tables,
-        ctx,
         scan_floor,
-    )?;
+    );
     b.resolve_label(next_left_label);
     let outer_row_rejected = b.emit_label();
     for term in outer_row_terms {
@@ -21314,8 +21362,9 @@ enum CountIndexRange<'e> {
     Range(ColumnRangeTarget<'e>),
     Nulls,
     NotNulls,
-    /// The values of the index's leading key columns, in index order.
-    Prefix(Vec<&'e Expr>),
+    /// The values of the index's leading key columns, in index order, each
+    /// paired with the `Affinity` to emit before seeking (if any).
+    Prefix(Vec<(&'e Expr, Option<char>)>),
     /// bd-qyd3s: distinct integer values of the leading key column, each
     /// counted as its own run.
     Members(Vec<i64>),
@@ -21326,13 +21375,11 @@ enum CountIndexRange<'e> {
 /// [`aggregate_index_range_seek_target`]), `col IS NULL`
 /// ([`aggregate_index_is_null_target`]) or `col IS NOT NULL` on an ascending
 /// index's leading column counts, so the count can come from the index's
-/// pages (`Opcode::IdxCountBefore`). bd-zgbhb: also an equality prefix that is
-/// exactly the WHERE ([`aggregate_index_eq_seek_target`], which already
-/// requires each comparison's collation to be the index key's) when every
-/// pinned value is as safe a seek bound as a range's
-/// ([`index_range_bound_is_seek_safe`]): the prefix is then the inclusive
-/// range from the values to themselves. A value that could need a conversion
-/// the probe would miss keeps the equality walk and its scan fallback.
+/// pages (`Opcode::IdxCountBefore`). bd-zgbhb / bd-text-probe-numeric-index-qk7vd:
+/// also an equality prefix that is exactly the WHERE
+/// ([`aggregate_index_eq_seek_target`]) when every pinned value is exact after
+/// index-key affinity coercion ([`index_eq_term_probe_plan`]): the prefix is
+/// then the inclusive range from the coerced values to themselves.
 /// bd-qyd3s: and a WHERE that is exactly `col IN (<integer literals>)` on an
 /// INTEGER-affinity column ([`index_integer_in_list_target`]): the members are
 /// de-duplicated, so their runs are disjoint and the counts add up.
@@ -21348,12 +21395,28 @@ fn count_star_index_range_target<'t, 'e>(
     {
         return Some((index, CountIndexRange::Members(members)));
     }
-    if let Some((index, values)) = aggregate_index_eq_seek_target(where_clause, table, table_alias)
-        && values.iter().zip(&index.columns).all(|(value, column)| {
-            index_range_bound_is_seek_safe(table, table_alias, schema, column, value)
-        })
-    {
-        return Some((index, CountIndexRange::Prefix(values)));
+    if let Some((index, values)) = aggregate_index_eq_seek_target(where_clause, table, table_alias) {
+        let mut planned = Vec::with_capacity(values.len());
+        let mut all_exact = true;
+        for (pos, value) in values.into_iter().enumerate() {
+            let plan = index_eq_term_probe_plan(
+                table,
+                table_alias,
+                schema,
+                index,
+                pos,
+                value,
+                where_clause,
+            );
+            if !plan.exact_after_coercion {
+                all_exact = false;
+                break;
+            }
+            planned.push((value, plan.affinity_to_emit));
+        }
+        if all_exact {
+            return Some((index, CountIndexRange::Prefix(planned)));
+        }
     }
     if let Some((index, range, false)) =
         aggregate_index_range_seek_target(where_clause, table, table_alias, schema)
@@ -21477,25 +21540,19 @@ fn codegen_select_count_star_index_range(
                 (Some((record, Opcode::SeekGE)), Some((record, true)))
             })
             .collect(),
-        // bd-zgbhb: from the first entry the prefix pins up to the last.
+        // bd-zgbhb / bd-text-probe-numeric-index-qk7vd: from the first entry
+        // the coerced prefix pins up to the last.
         CountIndexRange::Prefix(values) => {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let base = b.alloc_regs(values.len() as i32);
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            for (pos, value) in values.iter().enumerate() {
+            for (pos, (value, affinity)) in values.iter().enumerate() {
                 let reg = base + pos as i32;
                 emit_expr(b, value, reg, None);
-                if let Some(aff) = index
-                    .columns
-                    .get(pos)
-                    .and_then(|name| table.column_index(name))
-                    .map(|i| index_key_affinity(table.columns[i].affinity))
-                    .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'))
-                    && !bound_matches_affinity(aff, value)
-                {
+                b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+                if let Some(aff) = affinity {
                     b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(aff.to_string()), 0);
                 }
-                b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
             }
             let record = b.alloc_reg();
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -21676,85 +21733,24 @@ enum PrefixIndexShape {
 /// be spelled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrefixProbe {
-    /// Integer and text literals only: the seek is exact at compile time.
+    /// Placeholder-free constants only (exact after index-key affinity coercion).
     Literal,
-    /// Literals or numbered parameters (`?NNN`, the spelling the connection
-    /// gives every bind parameter). A parameter's seek is exact once its value
-    /// holds the storage class [`index_prefix_term_exactness`] names; the
-    /// caller checks that at run time and scans for any other value
-    /// (bd-79p0a).
+    /// Constants or numbered parameters (`?NNN`, the spelling the connection
+    /// gives every bind parameter), coerced to the index key's affinity before
+    /// seeking (bd-79p0a / bd-text-probe-numeric-index-qk7vd).
     LiteralOrNumberedParameter,
-}
-
-/// Whether a seek on one index key term with a given key visits exactly the
-/// entries `column = key` matches (see [`index_prefix_term_exactness`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TermExactness {
-    /// Exact at compile time: an INTEGER literal on INTEGER affinity, or a
-    /// TEXT literal on TEXT whose column and key term collate BINARY, so no
-    /// affinity conversion or collation can make the index order disagree
-    /// with the comparison.
-    Static,
-    /// A bound parameter, exact on the same terms once its value holds the
-    /// storage class this `IsType` mask names (bd-aavtp).
-    Runtime(u16),
-    /// Neither: a seek with this key could miss a matching row.
-    Inexact,
-}
-
-impl TermExactness {
-    /// The `IsType` mask a run-time exact key is checked against.
-    const fn runtime_mask(self) -> Option<u16> {
-        match self {
-            Self::Runtime(mask) => Some(mask),
-            Self::Static | Self::Inexact => None,
-        }
-    }
-}
-
-/// How exact a seek on key term `term` of `index` with `probe` as its key
-/// is; see [`TermExactness`].
-fn index_prefix_term_exactness(
-    index: &IndexSchema,
-    table: &TableSchema,
-    term: usize,
-    probe: &Expr,
-) -> TermExactness {
-    let Some(column) = index
-        .columns
-        .get(term)
-        .and_then(|name| table.column_index(name))
-        .and_then(|ci| table.columns.get(ci))
-    else {
-        return TermExactness::Inexact;
-    };
-    let binary =
-        |collation: Option<&str>| collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
-    let text_exact = column.affinity == 'B'
-        && binary(index.key_term_collation(term))
-        && binary(column.collation.as_deref());
-    match probe {
-        Expr::Literal(Literal::Integer(_), _) if column.affinity == 'D' => TermExactness::Static,
-        Expr::Literal(Literal::String(_), _) if text_exact => TermExactness::Static,
-        bound if is_placeholder_bound(bound) => match column.affinity {
-            'D' => TermExactness::Runtime(0x01_u16),
-            'B' if text_exact => TermExactness::Runtime(0x04_u16),
-            _ => TermExactness::Inexact,
-        },
-        _ => TermExactness::Inexact,
-    }
 }
 
 /// The index and equality prefix a
 /// `COUNT(*)/SUM(...) WHERE a = <key> AND <residual>` aggregate can seek:
 /// pin the leading key column(s) with an equality, walk that block, and apply
 /// the FULL WHERE as a residual filter per row. Gated tight so it is
-/// byte-exact and safe: (1) each key is exact for its key term (see
-/// [`index_prefix_term_exactness`]; `probe` says whether a bound parameter
-/// may be a key), so the seek cannot miss a scan match; (2) the probe
-/// consumes no anonymous or named placeholder slot: a literal consumes none,
-/// and a parameter key is admitted only when every placeholder in the WHERE
-/// is numbered, so the residual filter reads the same slots as the scan path;
+/// byte-exact and safe: (1) each key is exact after index-key affinity coercion
+/// ([`index_eq_term_probe_plan`]; `probe` says whether a bound parameter may
+/// be a key), so the seek cannot miss a scan match; (2) the probe consumes no
+/// anonymous or named placeholder slot: a literal consumes none, and a
+/// parameter key is admitted only when every placeholder in the WHERE is
+/// numbered, so the residual filter reads the same slots as the scan path;
 /// (3) there is at least one residual conjunct beyond the prefix (otherwise
 /// the exact eq-seek already handles it). `shape` lets callers that depend on
 /// rowid ordering skip indexes whose block is not in rowid order (see
@@ -21764,6 +21760,7 @@ fn aggregate_index_prefix_residual_target<'t, 'e>(
     where_clause: Option<&'e Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
+    schema: &[TableSchema],
     shape: PrefixIndexShape,
     probe: PrefixProbe,
 ) -> Option<(&'t IndexSchema, Vec<&'e Expr>)> {
@@ -21801,17 +21798,15 @@ fn aggregate_index_prefix_residual_target<'t, 'e>(
         // The seek probe must land on a SUPERSET of the matching rows (the residual filter re-applies
         // the whole WHERE and narrows to exact).
         let exact = prefix.iter().enumerate().all(|(i, e)| {
-            match index_prefix_term_exactness(index, table, i, e) {
-                TermExactness::Static => true,
-                TermExactness::Runtime(_) => {
-                    probe == PrefixProbe::LiteralOrNumberedParameter
-                        && matches!(
-                            e,
-                            Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
-                        )
+            let probe_shape_ok = match probe {
+                PrefixProbe::Literal => !expr_contains_placeholder(e),
+                PrefixProbe::LiteralOrNumberedParameter => {
+                    !expr_contains_non_numbered_placeholder(e)
                 }
-                TermExactness::Inexact => false,
-            }
+            };
+            probe_shape_ok
+                && index_eq_term_probe_plan(table, table_alias, schema, index, i, e, where_clause)
+                    .exact_after_coercion
         });
         if !exact {
             continue;
@@ -23218,6 +23213,7 @@ fn codegen_select_aggregate(
             where_clause,
             table,
             table_alias,
+            schema,
             PrefixIndexShape::AnyPrefix,
             PrefixProbe::Literal,
         )
@@ -23276,8 +23272,7 @@ fn codegen_select_aggregate(
     // and the aggregate scanned in rowid order: slower than the literal
     // spelling's seek, and a bare column took another row than stock's, which
     // seeks. Taken last, so no shape that another seek serves changes. The
-    // emitter checks each parameter's storage class at run time and scans for
-    // any value the seek would not be exact for.
+    // emitter applies each term's index-capped affinity before seeking.
     let index_prefix_residual_seek = if allow_index_seek
         && having.is_none()
         && index_eq_seek.is_none()
@@ -23295,6 +23290,7 @@ fn codegen_select_aggregate(
             where_clause,
             table,
             table_alias,
+            schema,
             PrefixIndexShape::AnyPrefix,
             PrefixProbe::LiteralOrNumberedParameter,
         )
@@ -23317,6 +23313,7 @@ fn codegen_select_aggregate(
             where_clause,
             table,
             table_alias,
+            schema,
             PrefixIndexShape::FullKey,
             PrefixProbe::Literal,
         )?;
@@ -23475,7 +23472,6 @@ fn codegen_select_aggregate(
         skip_scan = true;
     } else if let Some((idx_schema, prefix_exprs)) = index_eq_seek {
         let idx_cursor = 1_i32;
-        let scan_fallback = b.emit_label();
         let duplicate_run_done = b.emit_label();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let prefix_len = prefix_exprs.len() as i32;
@@ -23485,32 +23481,22 @@ fn codegen_select_aggregate(
         // SQLite's "USING COVERING INDEX" plan for e.g. `COUNT(*)`/`SUM(rowid)`.
         let covering = aggregate_seek_is_covering(&agg_columns, idx_schema, table);
 
-        // Every pinned key column is INTEGER-affinity + integer literal ⇒ the seek is EXACT (the index's
-        // storage-class order matches the WHERE comparison), so a 0-match seek is authoritative and the
-        // full-scan fallback (an affinity safety net for mixed-type columns) is unnecessary: a miss
-        // finalizes to the empty-aggregate result (COUNT=0 / SUM=NULL) directly, making an absent-key
-        // lookup O(log n) not the O(n) fallback scan. (Non-exact keeps the fallback.) bd-eq-seek-fallback-zero-match.
-        // GH#444: a string literal against a TEXT column is exact on the same terms as the single-column
-        // seek (GH#409) — no affinity conversion is implied, and BINARY on both the index term and the
-        // column makes the index order the comparison order — so it qualifies per term too.
-        // bd-aavtp: a key known only at run time (a bound parameter) is exact on the same terms
-        // once its value holds the storage class the column's affinity leaves unconverted, as for
-        // the single-column seek (bd-ry6x7). See `index_prefix_term_exactness`.
-        let term_exactness: Vec<TermExactness> = prefix_exprs
+        // bd-text-probe-numeric-index-qk7vd: plan per-term index-capped probe
+        // affinity coercion. When every pinned key term is exact after
+        // coercion, the seek is authoritative for hits and misses alike —
+        // SeekGE misses and duplicate-run exits jump straight to
+        // `finalize_label`, never reaching the fallback scan below.
+        let term_plans: Vec<IndexEqProbePlan> = prefix_exprs
             .iter()
             .enumerate()
-            .map(|(i, e)| index_prefix_term_exactness(idx_schema, table, i, e))
+            .map(|(i, e)| {
+                index_eq_term_probe_plan(table, table_alias, schema, idx_schema, i, e, where_clause)
+            })
             .collect();
-        let exact_seek = term_exactness
-            .iter()
-            .all(|term| *term == TermExactness::Static);
-        let runtime_exact_check = (!exact_seek
-            && !term_exactness.contains(&TermExactness::Inexact))
-        .then(|| b.emit_label());
+        let exact_seek = term_plans.iter().all(|plan| plan.exact_after_coercion);
+        let scan_fallback = b.emit_label();
         let seek_miss_label = if exact_seek {
             finalize_label
-        } else if let Some(check) = runtime_exact_check {
-            check
         } else {
             scan_fallback
         };
@@ -23525,6 +23511,16 @@ fn codegen_select_aggregate(
             emit_expr(b, expr, reg, None);
             // `col = NULL` matches nothing; use the same exact/fallback miss destination as SeekGE.
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, seek_miss_label, P4::None, 0);
+            if exact_seek && let Some(aff) = term_plans[i].affinity_to_emit {
+                b.emit_op(
+                    Opcode::Affinity,
+                    reg,
+                    1,
+                    0,
+                    P4::Affinity(aff.to_string()),
+                    0,
+                );
+            }
         }
 
         let saw_index_match_reg = b.alloc_reg();
@@ -23651,22 +23647,6 @@ fn codegen_select_aggregate(
                 P4::None,
                 0,
             );
-        }
-        if let Some(check) = runtime_exact_check {
-            // bd-aavtp: the miss is authoritative when every run-time key holds the storage class
-            // its column's affinity leaves unconverted; any other key falls through to the scan.
-            b.resolve_label(check);
-            for (offset, term) in term_exactness.iter().enumerate() {
-                if let TermExactness::Runtime(mask) = *term {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    let reg = probe_key_regs + offset as i32;
-                    let next_term = b.emit_label();
-                    b.emit_jump_to_label(Opcode::IsType, -1, reg, next_term, P4::None, mask);
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, scan_fallback, P4::None, 0);
-                    b.resolve_label(next_term);
-                }
-            }
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
         }
 
         // No index match: fall through to the full scan. No AggStep ran, so the
@@ -24378,30 +24358,34 @@ fn codegen_select_aggregate(
         let prefix_len = prefix_exprs.len() as i32;
         let rowid_floor = rowid_bounds.and_then(|bounds| bounds.lower);
         let probe_field_count = prefix_len + i32::from(rowid_floor.is_some());
-        // bd-79p0a: the storage class each bound key must hold for the seek to be exact; a
-        // literal key needs none. Any other value scans below, as the eq-seek does (bd-aavtp).
-        let runtime_masks: Vec<Option<u16>> = prefix_exprs
+        // bd-79p0a / bd-text-probe-numeric-index-qk7vd: each pinned key term
+        // passed `index_eq_term_probe_plan`, so coercing it with its index-capped
+        // affinity before `SeekGE` makes the prefix walk exact with no scan
+        // fallback.
+        let term_plans: Vec<IndexEqProbePlan> = prefix_exprs
             .iter()
             .enumerate()
-            .map(|(i, e)| index_prefix_term_exactness(idx_schema, table, i, e).runtime_mask())
+            .map(|(i, e)| {
+                index_eq_term_probe_plan(table, table_alias, schema, idx_schema, i, e, where_clause)
+            })
             .collect();
-        let scan_fallback = runtime_masks
-            .iter()
-            .any(Option::is_some)
-            .then(|| b.emit_label());
 
         let probe_key_regs = b.alloc_regs(probe_field_count);
-        for (i, (expr, mask)) in prefix_exprs.iter().zip(&runtime_masks).enumerate() {
+        for (i, (expr, plan)) in prefix_exprs.iter().zip(&term_plans).enumerate() {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let reg = probe_key_regs + i as i32;
             emit_expr(b, expr, reg, None);
             // `col = NULL` matches no row, whatever spells the key.
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
-            if let (Some(mask), Some(scan)) = (*mask, scan_fallback) {
-                let exact = b.emit_label();
-                b.emit_jump_to_label(Opcode::IsType, -1, reg, exact, P4::None, mask);
-                b.emit_jump_to_label(Opcode::Goto, 0, 0, scan, P4::None, 0);
-                b.resolve_label(exact);
+            if let Some(aff) = plan.affinity_to_emit {
+                b.emit_op(
+                    Opcode::Affinity,
+                    reg,
+                    1,
+                    0,
+                    P4::Affinity(aff.to_string()),
+                    0,
+                );
             }
         }
         // A true partial record is the floor of the entire prefix block. A
@@ -24558,14 +24542,7 @@ fn codegen_select_aggregate(
         b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
         b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
         b.resolve_label(duplicate_run_done);
-        if let Some(scan) = scan_fallback {
-            // The block was walked; only a key the seek is not exact for reaches the scan, which
-            // reads the same `?NNN` slots (the target admits no other placeholder).
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
-            b.resolve_label(scan);
-        } else {
-            skip_scan = true;
-        }
+        skip_scan = true;
     } else if let Some((values, has_residual)) = rowid_in_seek {
         // bd-agg-rowid-in [+ residual]: SeekRowid per distinct listed value, accumulating each hit into the
         // aggregate. A miss skips to the next value; an all-miss leaves the accumulators Null (the
@@ -60759,6 +60736,7 @@ mod tests {
                     Some(&filter),
                     &table,
                     None,
+                    std::slice::from_ref(&table),
                     PrefixIndexShape::AnyPrefix,
                     PrefixProbe::Literal,
                 )
@@ -60816,6 +60794,7 @@ mod tests {
                 Some(&function_where),
                 &function_table,
                 None,
+                std::slice::from_ref(&function_table),
                 PrefixIndexShape::AnyPrefix,
                 PrefixProbe::Literal,
             )
@@ -60848,6 +60827,7 @@ mod tests {
                     Some(&function_where),
                     &function_table,
                     None,
+                    std::slice::from_ref(&function_table),
                     PrefixIndexShape::AnyPrefix,
                     PrefixProbe::Literal,
                 )
@@ -60869,6 +60849,7 @@ mod tests {
                     Some(&plain_where),
                     &plain_table,
                     None,
+                    std::slice::from_ref(&plain_table),
                     PrefixIndexShape::AnyPrefix,
                     PrefixProbe::Literal,
                 )
