@@ -24212,7 +24212,7 @@ impl Connection {
                             conn.execute_materialized_create_table_as_select_statement(
                                 &rewritten,
                                 col_infos,
-                                &source_rows,
+                                source_rows,
                             )
                             .await?;
                             Ok(Vec::new())
@@ -44514,6 +44514,76 @@ impl Connection {
     /// fails closed here. This helper is inline-`.await`ed (never `Box::pin`ned)
     /// so its future stays in the caller's heap-boxed state without being
     /// re-materialized on the recursive stack.
+    /// Whether `statement` mutates only the connection-local TEMP schema (never
+    /// main `sqlite_master` or main pager pages). Such statements must not open
+    /// a main write transaction, hydrate `MemDatabase` from a file DB, or write
+    /// main WAL / `-wal-cert` files (bd-s7bjg).
+    fn statement_is_temp_only_ddl(&self, statement: &Statement) -> bool {
+        let is_temp_schema = |schema: Option<&str>| {
+            schema.is_some_and(|s| s.eq_ignore_ascii_case("temp"))
+        };
+        match statement {
+            Statement::CreateTable(create) => {
+                create.temporary || is_temp_schema(create.name.schema.as_deref())
+            }
+            Statement::CreateView(view) => {
+                view.temporary || is_temp_schema(view.name.schema.as_deref())
+            }
+            Statement::CreateTrigger(trigger) => {
+                trigger.temporary
+                    || is_temp_schema(trigger.name.schema.as_deref())
+                    || (trigger.name.schema.is_none()
+                        && trigger
+                            .table_schema
+                            .as_deref()
+                            .is_none_or(|s| s.eq_ignore_ascii_case("temp"))
+                        && (self.table_exists_for_scope(&trigger.table, PragmaSchemaScope::Temp)
+                            || self
+                                .view_index_for_scope(&trigger.table, PragmaSchemaScope::Temp)
+                                .is_some()))
+            }
+            Statement::CreateIndex(index) => {
+                is_temp_schema(index.name.schema.as_deref())
+                    || (index.name.schema.is_none()
+                        && self.table_exists_for_scope(&index.table, PragmaSchemaScope::Temp))
+            }
+            Statement::AlterTable(alter) => {
+                is_temp_schema(alter.table.schema.as_deref())
+                    || (alter.table.schema.is_none()
+                        && self.table_exists_for_scope(&alter.table.name, PragmaSchemaScope::Temp))
+            }
+            Statement::Drop(drop) => {
+                if is_temp_schema(drop.name.schema.as_deref()) {
+                    return true;
+                }
+                if drop.name.schema.is_some() {
+                    return false;
+                }
+                match drop.object_type {
+                    DropObjectType::Table => {
+                        self.table_exists_for_scope(&drop.name.name, PragmaSchemaScope::Temp)
+                    }
+                    DropObjectType::View => self
+                        .view_index_for_scope(&drop.name.name, PragmaSchemaScope::Temp)
+                        .is_some(),
+                    DropObjectType::Index => self.schema.borrow().iter().any(|table| {
+                        self.temp_table_names
+                            .borrow()
+                            .contains(&table.name.to_ascii_lowercase())
+                            && table
+                                .indexes
+                                .iter()
+                                .any(|idx| idx.name.eq_ignore_ascii_case(&drop.name.name))
+                    }),
+                    DropObjectType::Trigger => self.triggers.borrow().iter().any(|trigger| {
+                        trigger.temporary && trigger.name.eq_ignore_ascii_case(&drop.name.name)
+                    }),
+                }
+            }
+            _ => false,
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn plan_statement_execution(
         &self,
@@ -44523,21 +44593,25 @@ impl Connection {
         // transaction is active for data/DDL operations outside an
         // explicit BEGIN.  Writes use Immediate mode; reads use Deferred.
         // Transaction-control statements manage their own transactions.
-        let is_write = matches!(
-            statement,
-            Statement::Insert(_)
-                | Statement::Update(_)
-                | Statement::Delete(_)
-                | Statement::CreateTable(_)
-                | Statement::CreateVirtualTable(_)
-                | Statement::CreateView(_)
-                | Statement::CreateTrigger(_)
-                | Statement::Drop(_)
-                | Statement::AlterTable(_)
-                | Statement::CreateIndex(_)
-                | Statement::Analyze(_)
-                | Statement::Reindex(_)
-        );
+        // bd-s7bjg: TEMP-only DDL mutates only the connection-local TEMP
+        // namespace (`MemDatabase`), never main pages or main WAL.
+        let temp_only_ddl = self.statement_is_temp_only_ddl(statement);
+        let is_write = !temp_only_ddl
+            && matches!(
+                statement,
+                Statement::Insert(_)
+                    | Statement::Update(_)
+                    | Statement::Delete(_)
+                    | Statement::CreateTable(_)
+                    | Statement::CreateVirtualTable(_)
+                    | Statement::CreateView(_)
+                    | Statement::CreateTrigger(_)
+                    | Statement::Drop(_)
+                    | Statement::AlterTable(_)
+                    | Statement::CreateIndex(_)
+                    | Statement::Analyze(_)
+                    | Statement::Reindex(_)
+            );
         // Issue #110: any statement that may delete or alter a parent row
         // invalidates a cached "parent present" result. Plain INSERTs only add
         // rows (safe), but UPDATE/DELETE, DDL, and INSERT OR REPLACE / upsert
@@ -44575,7 +44649,8 @@ impl Connection {
             && !matches!(statement, Statement::Rollback(_));
         let writable_schema_dml = self.statement_is_writable_schema_dml(statement);
         let schema_change_boundary =
-            statement_starts_fresh_schema_change_boundary(statement) || writable_schema_dml;
+            (!temp_only_ddl && statement_starts_fresh_schema_change_boundary(statement))
+                || writable_schema_dml;
         if self.pragma_state.borrow().query_only
             && !self.statement_is_read_only_fts5_integrity_check(statement)
             && (statement_writes_under_query_only(statement) || writable_schema_dml)
@@ -44611,6 +44686,12 @@ impl Connection {
         }
         let retained_boundary_flush_required = self.retained_autocommit_txn.borrow().is_some()
             && (schema_change_boundary
+                || (temp_only_ddl
+                    && matches!(
+                        statement,
+                        Statement::CreateTable(create)
+                            if matches!(create.body, CreateTableBody::AsSelect(_))
+                    ))
                 || matches!(
                     statement,
                     Statement::Pragma(_)
@@ -48683,7 +48764,7 @@ impl Connection {
         &self,
         create: &fsqlite_ast::CreateTableStatement,
         col_infos: Vec<ColumnInfo>,
-        rows: &[Row],
+        rows: Vec<Row>,
     ) -> Result<()> {
         if create.strict {
             return Err(FrankenError::NotImplemented(
@@ -48762,7 +48843,7 @@ impl Connection {
                 self.last_insert_rowid.get(),
             );
             let replayed = self
-                .execute_insert_select_materialized_rows_outcome(&insert, rows)
+                .execute_insert_select_materialized_rows_outcome(&insert, &rows)
                 .await;
             self.restore_change_tracking_state(
                 previous_changes.0,
@@ -48777,19 +48858,117 @@ impl Connection {
         Ok(())
     }
 
+    /// Populate a freshly created constraint-free `TEMP` table from owned CTAS
+    /// rows directly into its `MemTable`, applying inferred column affinities
+    /// in place and preserving statement atomicity on spill/cancel errors
+    /// (bd-s7bjg). Avoids per-row VDBE INSERT replay and leaves change counters
+    /// untouched.
+    fn populate_newly_created_temp_table_rows(
+        &self,
+        table_name: &str,
+        rows: Vec<Row>,
+    ) -> Result<()> {
+        let (root_page, affinities): (i32, Vec<TypeAffinity>) = {
+            let schema = self.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: table_name.to_owned(),
+                })?;
+            let affinities = table
+                .columns
+                .iter()
+                .map(|col| match col.affinity {
+                    'B' => TypeAffinity::Text,
+                    'C' => TypeAffinity::Numeric,
+                    'D' => TypeAffinity::Integer,
+                    'E' => TypeAffinity::Real,
+                    _ => TypeAffinity::Blob,
+                })
+                .collect();
+            (table.root_page, affinities)
+        };
+        let cx = self.op_cx()?;
+        let insert_result: Result<()> = {
+            let mut db = self.db.borrow_mut();
+            let table = db.get_table_mut(root_page).ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "newly created TEMP table `{table_name}` missing MemDatabase storage"
+                ))
+            })?;
+            for (idx, row) in rows.into_iter().enumerate() {
+                let mut values = row.values;
+                for (slot, &affinity) in values.iter_mut().zip(&affinities) {
+                    if matches!(slot, SqliteValue::Float(f) if f.is_nan()) {
+                        *slot = SqliteValue::Null;
+                    } else if !slot.affinity_is_noop(affinity) {
+                        let prev = std::mem::replace(slot, SqliteValue::Null);
+                        *slot = prev.apply_affinity(affinity);
+                    }
+                }
+                let rowid = i64::try_from(idx + 1).map_err(|_| FrankenError::DatabaseFull)?;
+                table.insert_checked(&cx, rowid, values)?;
+            }
+            Ok(())
+        };
+        if let Err(err) = insert_result {
+            let name_lc = table_name.to_ascii_lowercase();
+            {
+                let mut schema = self.schema.borrow_mut();
+                if let Some(pos) = schema
+                    .iter()
+                    .position(|t| t.name.eq_ignore_ascii_case(table_name))
+                {
+                    schema.remove(pos);
+                }
+                if let Some(main_table) =
+                    self.shadowed_main_tables.borrow_mut().remove(&name_lc)
+                {
+                    if let Some(slot) = main_table.columns.iter().position(|col| col.is_ipk) {
+                        self.rowid_alias_columns
+                            .borrow_mut()
+                            .insert(name_lc.clone(), slot);
+                    }
+                    schema.push(main_table);
+                }
+            }
+            self.temp_table_names.borrow_mut().remove(&name_lc);
+            self.temp_table_sql.borrow_mut().remove(&root_page);
+            self.rowid_alias_columns.borrow_mut().remove(&name_lc);
+            let in_txn_or_savepoint = self.in_transaction.get()
+                || !self.savepoints.borrow().is_empty()
+                || self.internal_statement_savepoint_depth.get() > 0;
+            {
+                let mut db = self.db.borrow_mut();
+                if in_txn_or_savepoint {
+                    db.destroy_table(root_page);
+                } else {
+                    db.destroy_table_without_undo(root_page);
+                    db.commit_undo();
+                }
+            }
+            self.rebuild_schema_indices();
+            self.reclaim_free_temp_roots();
+            self.note_temp_schema_change();
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// bd-y26jy: `CREATE TEMP TABLE x AS SELECT ...` (or `temp.x`) creates the
     /// table in the connection-local temp namespace, as stock does, and a main
     /// `CREATE TABLE x AS SELECT ...` may sit under a same-named temp table.
     /// The column list inferred from the SELECT becomes an ordinary column-list
     /// CREATE, so namespace registration, shadowing and the `sqlite_master`
     /// listing are exactly those of `CREATE [TEMP] TABLE x(...)`; the rows are
-    /// then replayed into it. Change counters are left as they were.
+    /// then populated into it. Change counters are left as they were.
     async fn execute_materialized_create_table_as_select_via_column_list(
         &self,
         create: &fsqlite_ast::CreateTableStatement,
         target_is_temp: bool,
         col_infos: Vec<ColumnInfo>,
-        rows: &[Row],
+        rows: Vec<Row>,
     ) -> Result<()> {
         if create.temporary
             && create
@@ -48844,30 +49023,33 @@ impl Connection {
         *self.pending_ddl_source.borrow_mut() = Some(create_sql);
         Box::pin(self.execute_create_table(&column_create)).await?;
         if !rows.is_empty() {
-            let Statement::Insert(insert) = parse_single_statement(&format!(
-                "INSERT INTO {}.{} VALUES (NULL)",
-                if target_is_temp { "temp" } else { "main" },
-                quote_identifier(&table_name)
-            ))?
-            else {
-                return Err(FrankenError::internal(
-                    "CREATE TABLE ... AS SELECT replay did not parse as an INSERT",
-                ));
-            };
-            let previous_changes = (
-                self.last_changes.get(),
-                self.total_changes.get(),
-                self.last_insert_rowid.get(),
-            );
-            let replayed = self
-                .execute_insert_select_materialized_rows_outcome(&insert, rows)
-                .await;
-            self.restore_change_tracking_state(
-                previous_changes.0,
-                previous_changes.1,
-                previous_changes.2,
-            );
-            replayed?;
+            if target_is_temp {
+                self.populate_newly_created_temp_table_rows(&table_name, rows)?;
+            } else {
+                let Statement::Insert(insert) = parse_single_statement(&format!(
+                    "INSERT INTO main.{} VALUES (NULL)",
+                    quote_identifier(&table_name)
+                ))?
+                else {
+                    return Err(FrankenError::internal(
+                        "CREATE TABLE ... AS SELECT replay did not parse as an INSERT",
+                    ));
+                };
+                let previous_changes = (
+                    self.last_changes.get(),
+                    self.total_changes.get(),
+                    self.last_insert_rowid.get(),
+                );
+                let replayed = self
+                    .execute_insert_select_materialized_rows_outcome(&insert, &rows)
+                    .await;
+                self.restore_change_tracking_state(
+                    previous_changes.0,
+                    previous_changes.1,
+                    previous_changes.2,
+                );
+                replayed?;
+            }
         }
         Ok(())
     }
@@ -75687,12 +75869,16 @@ impl Connection {
                     ddl_source.as_deref(),
                 );
                 return self
-                    .execute_materialized_create_table_as_select_statement(create, col_infos, &rows)
+                    .execute_materialized_create_table_as_select_statement(create, col_infos, rows)
                     .await;
             }
         }
 
-        self.increment_schema_cookie().await?;
+        if target_is_temp {
+            self.note_temp_schema_change();
+        } else {
+            self.increment_schema_cookie().await?;
+        }
         Ok(())
     }
 
@@ -76127,6 +76313,13 @@ impl Connection {
                 self.temp_table_names.borrow_mut().remove(&drop_name_lc);
                 self.rowid_alias_columns.borrow_mut().remove(&drop_name_lc);
                 self.temp_sqlite_sequence.borrow_mut().remove(&drop_name_lc);
+                // Dropping a TEMP table cascades to TEMP triggers bound to it
+                // (without touching triggers bound to a shadowed main table).
+                self.triggers.borrow_mut().retain(|trigger| {
+                    !(trigger.temporary
+                        && trigger.table_name.eq_ignore_ascii_case(obj_name)
+                        && trigger.bound_table_schema.eq_ignore_ascii_case("temp"))
+                });
                 // Restore the shadowed main table (if any) as the visible entry.
                 if let Some(main_table) =
                     self.shadowed_main_tables.borrow_mut().remove(&drop_name_lc)
@@ -76137,7 +76330,8 @@ impl Connection {
                     self.schema.borrow_mut().push(main_table);
                 }
                 self.rebuild_schema_indices();
-                self.increment_schema_cookie().await?;
+                self.reclaim_free_temp_roots();
+                self.note_temp_schema_change();
                 return Ok(Vec::new());
             }
         }
@@ -80068,12 +80262,12 @@ impl Connection {
             });
         if target_is_temp {
             self.temp_table_sql.borrow_mut().insert(root_page, create_sql);
+            self.note_temp_schema_change();
         } else {
             self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)
                 .await?;
+            self.increment_schema_cookie().await?;
         }
-
-        self.increment_schema_cookie().await?;
 
         // Phase 6: Backfill existing table rows into the new index.
         // SQLite populates a new index with all current table data during
@@ -80667,12 +80861,13 @@ impl Connection {
         self.rebuild_schema_indices();
 
         // TEMP triggers are connection-local and not persisted to sqlite_master.
-        if !is_temp_trigger {
+        if is_temp_trigger {
+            self.note_temp_schema_change();
+        } else {
             self.insert_sqlite_master_row("trigger", trigger_name, table_name, 0, &create_sql)
                 .await?;
+            self.increment_schema_cookie().await?;
         }
-
-        self.increment_schema_cookie().await?;
         Ok(())
     }
 
@@ -106252,7 +106447,7 @@ impl Connection {
     }
 
     fn is_memdb_only_root_page(&self, root_page: i32) -> bool {
-        root_page >= TEMP_MEMDB_ROOT_START
+        (root_page > self.next_temp_root_page.get() && root_page <= TEMP_MEMDB_ROOT_START)
             || self
                 .materialized_temp_root_pages
                 .borrow()

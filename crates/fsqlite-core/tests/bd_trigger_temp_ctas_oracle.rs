@@ -402,3 +402,276 @@ fn create_table_as_select_writes_stock_schema_text_and_keeps_affinity() {
         );
     });
 }
+
+fn snapshot_main_db_and_sidecars(db_path: &std::path::Path) -> Vec<(String, Option<Vec<u8>>)> {
+    let base = db_path.as_os_str();
+    ["", "-wal", "-wal-cert", "-wal-cert-head", "-shm"]
+        .into_iter()
+        .map(|suffix| {
+            let mut full = base.to_os_string();
+            full.push(suffix);
+            let path = std::path::PathBuf::from(full);
+            let bytes = match std::fs::read(&path) {
+                Ok(data) => Some(data),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => panic!("failed reading {}: {err}", path.display()),
+            };
+            (suffix.to_owned(), bytes)
+        })
+        .collect()
+}
+
+/// bd-s7bjg: `CREATE TEMP TABLE ... AS SELECT` (and other connection-local TEMP
+/// DDL) on a file-backed WAL database must NOT write to the main database file
+/// or any of its sidecars (`-wal`, `-wal-cert`, `-wal-cert-head`, `-shm`).
+/// Every main sidecar must remain byte-identical, while the negative control
+/// (`CREATE TABLE main_copy AS SELECT ...`) DOES mutate main's WAL/DB.
+#[test]
+fn bd_s7bjg_temp_ctas_leaves_main_sidecars_byte_identical_and_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let frank_path = dir.path().join("frank_s7bjg.db");
+        let stock_path = dir.path().join("stock_s7bjg.db");
+
+        // Seed a file-backed WAL database and close so we reopen cleanly with
+        // an untouched main file + sidecars (`memdb_rows_loaded == false`).
+        {
+            let frank = Connection::open(frank_path.to_str().unwrap()).await.unwrap();
+            let stock = rusqlite::Connection::open(&stock_path).unwrap();
+            for sql in [
+                "PRAGMA journal_mode = WAL",
+                "CREATE TABLE src(id INTEGER PRIMARY KEY, a INTEGER, r REAL, s TEXT, b BLOB, n NUMERIC)",
+                "BEGIN",
+            ] {
+                run_both(&frank, &stock, sql).await;
+            }
+            for i in 1..=500_i64 {
+                let sql = if i % 29 == 0 {
+                    format!("INSERT INTO src VALUES ({i}, NULL, NULL, NULL, NULL, NULL)")
+                } else {
+                    format!(
+                        "INSERT INTO src VALUES ({i}, {}, {}.5, 'row-{i}', X'{:04X}', '{}')",
+                        i % 17,
+                        i % 13,
+                        i & 0xFFFF,
+                        i % 11
+                    )
+                };
+                run_both(&frank, &stock, &sql).await;
+            }
+            run_both(&frank, &stock, "COMMIT").await;
+            frank.close().await.unwrap();
+        }
+
+        let frank = Connection::open(frank_path.to_str().unwrap()).await.unwrap();
+        let stock = rusqlite::Connection::open(&stock_path).unwrap();
+        let before = snapshot_main_db_and_sidecars(&frank_path);
+
+        // Verify change-tracking counters stay untouched across TEMP CTAS.
+        let before_counters = frank_rows(
+            &frank,
+            "SELECT changes(), total_changes(), last_insert_rowid()",
+        )
+        .await;
+        assert_eq!(
+            before_counters,
+            stock_rows(
+                &stock,
+                "SELECT changes(), total_changes(), last_insert_rowid()"
+            )
+        );
+
+        // Exercise TEMP CTAS (unqualified + temp.-qualified + empty + grouped +
+        // multi-temp roots), TEMP index, TEMP view, TEMP trigger, TEMP DML,
+        // transaction & savepoint rollback of TEMP CTAS, and DROP TEMP TABLE.
+        for sql in [
+            "CREATE TEMP TABLE t1 AS SELECT id, a, r, s, b, n FROM src WHERE id <= 300",
+            "CREATE TABLE temp.t2 AS SELECT a, count(*) AS cnt, sum(id) AS tot FROM src GROUP BY a",
+            "CREATE TEMP TABLE t_empty AS SELECT id, s FROM src WHERE id < 0",
+            "CREATE TEMP TABLE t3(x INTEGER, y TEXT)",
+            "INSERT INTO t3 VALUES (10, 'hi'), (20, 'lo')",
+            "CREATE INDEX temp.t1_a ON t1(a)",
+            "CREATE TEMP VIEW tv AS SELECT id, a, s FROM t1 WHERE id <= 15",
+            "CREATE TEMP TRIGGER t3_tr AFTER INSERT ON t3 BEGIN SELECT 1; END",
+            "BEGIN",
+            "CREATE TEMP TABLE t_roll AS SELECT id, a FROM src WHERE id <= 50",
+            "ROLLBACK",
+            "BEGIN",
+            "SAVEPOINT sp1",
+            "CREATE TEMP TABLE t_sp AS SELECT id, a FROM src WHERE id <= 25",
+            "ROLLBACK TO sp1",
+            "RELEASE sp1",
+            "COMMIT",
+            "DROP TABLE t3",
+        ] {
+            run_both(&frank, &stock, sql).await;
+        }
+
+        let after_temp = snapshot_main_db_and_sidecars(&frank_path);
+        for ((suffix, before_bytes), (_, after_bytes)) in before.iter().zip(after_temp.iter()) {
+            assert_eq!(
+                after_bytes,
+                before_bytes,
+                "bd-s7bjg: TEMP DDL/CTAS must NOT touch main file/sidecar `{suffix}` (before={:?} bytes, after={:?} bytes)",
+                before_bytes.as_ref().map(Vec::len),
+                after_bytes.as_ref().map(Vec::len),
+            );
+        }
+
+        // Compare temp table contents, affinities, catalog entries, and counters
+        // directly against live bundled SQLite.
+        for sql in [
+            "SELECT id, a, typeof(a), r, typeof(r), s, typeof(s), b, typeof(b), n, typeof(n) FROM t1 ORDER BY id",
+            "SELECT a, cnt, tot FROM temp.t2 ORDER BY a",
+            "SELECT * FROM t_empty",
+            "SELECT * FROM tv ORDER BY id",
+            "SELECT type, name, tbl_name FROM temp.sqlite_master ORDER BY type, name",
+            "SELECT type, name, tbl_name FROM main.sqlite_master ORDER BY type, name",
+            "SELECT changes(), total_changes(), last_insert_rowid()",
+        ] {
+            compare(&frank, &stock, sql).await;
+        }
+
+        // Rolled-back TEMP CTAS tables must not exist on either engine.
+        for missing in ["SELECT * FROM t_roll", "SELECT * FROM t_sp", "SELECT * FROM t3"] {
+            assert!(frank.query(missing).await.is_err(), "FrankenSQLite: {missing}");
+            assert!(stock.prepare(missing).is_err(), "SQLite: {missing}");
+        }
+
+        // PRAGMA query_only = ON must still reject CREATE TEMP TABLE like stock.
+        run_both(&frank, &stock, "PRAGMA query_only = ON").await;
+        assert!(frank.execute("CREATE TEMP TABLE blocked AS SELECT 1").await.is_err());
+        assert!(stock.execute_batch("CREATE TEMP TABLE blocked AS SELECT 1").is_err());
+        run_both(&frank, &stock, "PRAGMA query_only = OFF").await;
+
+        // Negative control: CREATE TABLE ... AS SELECT on main MUST write main's WAL/DB.
+        run_both(
+            &frank,
+            &stock,
+            "CREATE TABLE main_copy AS SELECT id, a, s FROM src WHERE id <= 50",
+        )
+        .await;
+        compare(&frank, &stock, "SELECT id, a, s FROM main_copy ORDER BY id").await;
+        let after_main = snapshot_main_db_and_sidecars(&frank_path);
+        assert_ne!(
+            after_main, before,
+            "negative control: CREATE TABLE main_copy AS SELECT must mutate main DB/WAL"
+        );
+        frank.close().await.unwrap();
+    });
+}
+
+/// bd-s7bjg live 300k-row `--profile release-perf` A/B probe vs bundled SQLite.
+/// Run via: `cargo test --profile release-perf -p fsqlite-core --test bd_trigger_temp_ctas_oracle --locked -- bd_s7bjg_temp_ctas_300k_ab_live --ignored --nocapture`
+#[test]
+#[ignore = "bd-s7bjg live 300k-row release-perf A/B probe vs bundled rusqlite"]
+#[allow(clippy::cast_precision_loss)]
+fn bd_s7bjg_temp_ctas_300k_ab_live() {
+    use std::time::Instant;
+
+    fn median(values: &mut [f64]) -> f64 {
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    }
+
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let frank_path = dir.path().join("frank_300k.db");
+        let stock_path = dir.path().join("stock_300k.db");
+
+        // Build identical 300,000-row WAL file databases.
+        {
+            let frank = Connection::open(frank_path.to_str().unwrap()).await.unwrap();
+            let stock = rusqlite::Connection::open(&stock_path).unwrap();
+            for sql in [
+                "PRAGMA journal_mode = WAL",
+                "CREATE TABLE src(id INTEGER PRIMARY KEY, a INTEGER, v INTEGER, s TEXT)",
+            ] {
+                run_both(&frank, &stock, sql).await;
+            }
+            frank.execute("BEGIN").await.unwrap();
+            let f_ins = frank
+                .prepare("INSERT INTO src(id, a, v, s) VALUES (?1, ?2, ?3, ?4)")
+                .await
+                .unwrap();
+            let s_tx = stock.unchecked_transaction().unwrap();
+            {
+                let mut s_ins = s_tx
+                    .prepare("INSERT INTO src(id, a, v, s) VALUES (?1, ?2, ?3, ?4)")
+                    .unwrap();
+                for id in 1..=300_000_i64 {
+                    let a = id % 1000;
+                    let v = (id * 7) % 97;
+                    let s = format!("val-{a}");
+                    f_ins
+                        .execute_with_params(&[
+                            SqliteValue::Integer(id),
+                            SqliteValue::Integer(a),
+                            SqliteValue::Integer(v),
+                            SqliteValue::Text(s.clone().into()),
+                        ])
+                        .await
+                        .unwrap();
+                    s_ins.execute(rusqlite::params![id, a, v, s]).unwrap();
+                }
+            }
+            drop(f_ins);
+            frank.execute("COMMIT").await.unwrap();
+            s_tx.commit().unwrap();
+            frank.close().await.unwrap();
+        }
+
+        let frank = Connection::open(frank_path.to_str().unwrap()).await.unwrap();
+        let stock = rusqlite::Connection::open(&stock_path).unwrap();
+        let before = snapshot_main_db_and_sidecars(&frank_path);
+
+        let ctas_sql = "CREATE TEMP TABLE x AS SELECT id, a, v, s FROM src";
+        let drop_sql = "DROP TABLE x";
+        let check_sql = "SELECT count(*), sum(id), sum(a), sum(v) FROM x";
+
+        for (label, pragma) in [
+            ("default temp_store (300k file DB)", None),
+            ("MEMORY temp_store (300k file DB)", Some("PRAGMA temp_store = MEMORY")),
+        ] {
+            if let Some(p) = pragma {
+                run_both(&frank, &stock, p).await;
+            }
+            let rounds = 5usize;
+            let mut f_ms = Vec::with_capacity(rounds);
+            let mut s_ms = Vec::with_capacity(rounds);
+            for round in 0..rounds {
+                if round % 2 == 0 {
+                    let t0 = Instant::now();
+                    frank.execute(ctas_sql).await.unwrap();
+                    f_ms.push(t0.elapsed().as_secs_f64() * 1e3);
+
+                    let t1 = Instant::now();
+                    stock.execute_batch(ctas_sql).unwrap();
+                    s_ms.push(t1.elapsed().as_secs_f64() * 1e3);
+                } else {
+                    let t1 = Instant::now();
+                    stock.execute_batch(ctas_sql).unwrap();
+                    s_ms.push(t1.elapsed().as_secs_f64() * 1e3);
+
+                    let t0 = Instant::now();
+                    frank.execute(ctas_sql).await.unwrap();
+                    f_ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+                if round == 0 {
+                    compare(&frank, &stock, check_sql).await;
+                }
+                run_both(&frank, &stock, drop_sql).await;
+            }
+            let after = snapshot_main_db_and_sidecars(&frank_path);
+            assert_eq!(after, before, "bd-s7bjg: main sidecars changed during {label}");
+            let fm = median(&mut f_ms);
+            let sm = median(&mut s_ms);
+            eprintln!(
+                "bd-s7bjg A/B [{label}] sqlite={} | frank={fm:.2}ms stock={sm:.2}ms ratio={:.2}x",
+                rusqlite::version(),
+                fm / sm,
+            );
+        }
+        frank.close().await.unwrap();
+    });
+}
