@@ -3123,6 +3123,19 @@ struct FlatPageSlots {
     slots: Box<[PageSlot]>,
     /// `slots.len() - 1` (capacity is always a power of two).
     mask: usize,
+    /// One bit per slot: bit `idx % 64` of word `idx / 64` is set while slot
+    /// `idx` holds a page (bd-w4pr1.13.18, lever FS1).
+    ///
+    /// The clean-buffer eviction walked every slot from its cursor and read
+    /// each page-number word: at the default 500-page budget in a
+    /// 16,384-slot table, tens of slots per evicted page, each on its own
+    /// cache line (about 230 instructions an eviction on random rowid
+    /// lookups). It now walks the set bits, in the same order. A bit
+    /// changes only while its slot's payload lock is held, in the critical
+    /// section of the page-number transition it mirrors, so at rest bit
+    /// `idx` is set exactly when slot `idx` holds a page number. Walkers
+    /// still read the slot's page number, as the full walk did.
+    occupied: Box<[AtomicU64]>,
     /// Number of occupied (non-empty, non-tombstone) slots.
     count: AtomicUsize,
     /// Conservative hint that deleted slots may be present.
@@ -3158,6 +3171,9 @@ impl FlatPageSlots {
         Self {
             mask: capacity - 1,
             slots: slots.into_boxed_slice(),
+            occupied: (0..capacity.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
             count: AtomicUsize::new(0),
             has_tombstones: AtomicBool::new(false),
             eviction_cursor: AtomicUsize::new(0),
@@ -3174,6 +3190,66 @@ impl FlatPageSlots {
         // Use the upper bits of the product for better distribution of
         // sequential page numbers (common in B-tree scans).
         (pgno.wrapping_mul(GOLDEN_RATIO_32) >> 16) as usize & self.mask
+    }
+
+    /// Set slot `idx`'s bit in [`Self::occupied`]. Called with the slot's
+    /// payload lock held, once its page number is published.
+    #[inline]
+    fn mark_occupied(&self, idx: usize) {
+        self.occupied[idx / 64].fetch_or(1_u64 << (idx % 64), Ordering::Relaxed);
+    }
+
+    /// Clear slot `idx`'s bit in [`Self::occupied`]. Called with the slot's
+    /// payload lock held, once its page number is retired.
+    #[inline]
+    fn mark_vacant(&self, idx: usize) {
+        self.occupied[idx / 64].fetch_and(!(1_u64 << (idx % 64)), Ordering::Relaxed);
+    }
+
+    /// Offer every slot holding a page to `take`, in the order a walk over all
+    /// slots from `start & mask`, wrapping once around the table, meets them,
+    /// and return `take`'s first answer. `take` gets the slot index and the
+    /// page number read from the slot during the walk.
+    ///
+    /// The walk visits only the slots whose [`Self::occupied`] bit is set:
+    /// the first word from `start`'s bit up, the following words, and after
+    /// the wrap the first word's bits below `start`'s.
+    fn find_map_occupied_from<T>(
+        &self,
+        start: usize,
+        mut take: impl FnMut(usize, PageNumber) -> Option<T>,
+    ) -> Option<T> {
+        let first = start & self.mask;
+        let words = self.occupied.len();
+        let before_first = (1_u64 << (first % 64)) - 1;
+        let mut word = first / 64;
+        let mut bits = self.occupied[word].load(Ordering::Relaxed) & !before_first;
+        let mut later_words = 0;
+        loop {
+            while bits != 0 {
+                let idx = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let raw_page_no = self.slots[idx].pgno.load(Ordering::Relaxed);
+                if raw_page_no == SLOT_TOMBSTONE {
+                    continue;
+                }
+                let Some(page_no) = PageNumber::new(raw_page_no) else {
+                    continue;
+                };
+                if let Some(found) = take(idx, page_no) {
+                    return Some(found);
+                }
+            }
+            if later_words == words {
+                return None;
+            }
+            later_words += 1;
+            word = if word + 1 == words { 0 } else { word + 1 };
+            bits = self.occupied[word].load(Ordering::Relaxed);
+            if later_words == words {
+                bits &= before_first;
+            }
+        }
     }
 
     /// Lock-free probe for a page. Returns the slot index if found.
@@ -3255,6 +3331,33 @@ impl FlatPageSlots {
     fn prefetch_slot(&self, idx: usize) {
         let slot = &self.slots[idx & self.mask];
         prefetch_l1_read(std::ptr::from_ref(slot));
+    }
+
+    /// Prefetch every cache line of slot `idx` (its page number, payload lock
+    /// and entry span two or three lines).
+    #[inline]
+    fn prefetch_slot_lines(&self, idx: usize) {
+        let start = std::ptr::from_ref(&self.slots[idx & self.mask]).cast::<u8>();
+        prefetch_l1_read(start);
+        prefetch_l1_read(start.wrapping_add(64));
+        prefetch_l1_read(start.wrapping_add(std::mem::size_of::<PageSlot>() - 1));
+    }
+
+    /// The first slot after `idx` whose [`Self::occupied`] bit is set, looking
+    /// only at the rest of `idx`'s word and the word after it (wrapping at the
+    /// table's end): where the next eviction walk from `idx + 1` will most
+    /// likely stop. `None` when both are empty.
+    fn next_occupied_after(&self, idx: usize) -> Option<usize> {
+        let idx = idx & self.mask;
+        let word = idx / 64;
+        let above = u64::MAX.checked_shl(u32::try_from(idx % 64 + 1).ok()?).unwrap_or(0);
+        let bits = self.occupied[word].load(Ordering::Relaxed) & above;
+        if bits != 0 {
+            return Some(word * 64 + bits.trailing_zeros() as usize);
+        }
+        let next_word = if word + 1 == self.occupied.len() { 0 } else { word + 1 };
+        let bits = self.occupied[next_word].load(Ordering::Relaxed);
+        (bits != 0).then(|| next_word * 64 + bits.trailing_zeros() as usize)
     }
 
     /// Best-effort software prefetch for the flat-slot probe chain and, when
@@ -3365,6 +3468,7 @@ impl FlatPageSlots {
                 } else {
                     CachedPageEntry::new(buf)
                 });
+                self.mark_occupied(avail_idx);
                 self.count.fetch_add(1, Ordering::Relaxed);
                 self.admits.fetch_add(1, Ordering::Relaxed);
                 return Ok(true);
@@ -3393,6 +3497,7 @@ impl FlatPageSlots {
             .is_ok()
         {
             let _ = data.take();
+            self.mark_vacant(idx);
             self.count.fetch_sub(1, Ordering::Relaxed);
             self.has_tombstones.store(true, Ordering::Release);
             self.evictions.fetch_add(1, Ordering::Relaxed);
@@ -3409,6 +3514,30 @@ impl FlatPageSlots {
     /// eligibility decision and eviction.
     fn take_if_clean_from_pool(&self, page_no: PageNumber, pool: &PageBufPool) -> Option<PageBuf> {
         let idx = self.find_slot(page_no)?;
+        self.take_if_clean_in_slot(idx, page_no, pool)
+    }
+
+    /// [`Self::take_if_clean_from_pool`] for a page an eviction walk just read
+    /// in slot `idx`: the probe runs only if the page has left that slot.
+    fn take_if_clean_seen_in_slot(
+        &self,
+        idx: usize,
+        page_no: PageNumber,
+        pool: &PageBufPool,
+    ) -> Option<PageBuf> {
+        if self.slots[idx].pgno.load(Ordering::Acquire) == page_no.get() {
+            self.take_if_clean_in_slot(idx, page_no, pool)
+        } else {
+            self.take_if_clean_from_pool(page_no, pool)
+        }
+    }
+
+    fn take_if_clean_in_slot(
+        &self,
+        idx: usize,
+        page_no: PageNumber,
+        pool: &PageBufPool,
+    ) -> Option<PageBuf> {
         let pgno = page_no.get();
         let mut data = self.slots[idx].data.lock();
         let reclaimable = data
@@ -3428,6 +3557,7 @@ impl FlatPageSlots {
         let entry = data
             .take()
             .expect("reclaimable flat cache entry must still be present");
+        self.mark_vacant(idx);
         self.count.fetch_sub(1, Ordering::Relaxed);
         self.has_tombstones.store(true, Ordering::Release);
         self.evictions.fetch_add(1, Ordering::Relaxed);
@@ -3437,15 +3567,11 @@ impl FlatPageSlots {
     /// Remove an arbitrary page (for eviction) and return its page number.
     fn remove_any_page(&self) -> Option<PageNumber> {
         let start = self.eviction_cursor.fetch_add(1, Ordering::Relaxed);
-        for i in 0..self.slots.len() {
-            let idx = (start + i) & self.mask;
-            let slot_pgno = self.slots[idx].pgno.load(Ordering::Relaxed);
-            if slot_pgno == SLOT_EMPTY || slot_pgno == SLOT_TOMBSTONE {
-                continue;
-            }
+        self.find_map_occupied_from(start, |idx, page_no| {
+            let slot_pgno = page_no.get();
             let mut data = self.slots[idx].data.lock();
-            if self.slots[idx].pgno.load(Ordering::Acquire) == slot_pgno
-                && self.slots[idx]
+            if self.slots[idx].pgno.load(Ordering::Acquire) != slot_pgno
+                || self.slots[idx]
                     .pgno
                     .compare_exchange(
                         slot_pgno,
@@ -3453,18 +3579,19 @@ impl FlatPageSlots {
                         Ordering::AcqRel,
                         Ordering::Relaxed,
                     )
-                    .is_ok()
+                    .is_err()
             {
-                let _ = data.take();
-                self.count.fetch_sub(1, Ordering::Relaxed);
-                self.has_tombstones.store(true, Ordering::Release);
-                self.eviction_cursor
-                    .store(idx.wrapping_add(1), Ordering::Relaxed);
-                self.evictions.fetch_add(1, Ordering::Relaxed);
-                return PageNumber::new(slot_pgno);
+                return None;
             }
-        }
-        None
+            let _ = data.take();
+            self.mark_vacant(idx);
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            self.has_tombstones.store(true, Ordering::Release);
+            self.eviction_cursor
+                .store(idx.wrapping_add(1), Ordering::Relaxed);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+            Some(page_no)
+        })
     }
 
     /// Clear all pages. Returns the number of pages evicted.
@@ -3479,7 +3606,7 @@ impl FlatPageSlots {
             return 0;
         }
         let mut removed = 0_usize;
-        for slot in self.slots.iter() {
+        for (idx, slot) in self.slots.iter().enumerate() {
             // Pre-filter with Relaxed load: the AcqRel RMW is expensive on
             // every slot even when the slot is already empty, which is the
             // dominant shape for a mostly-drained flat table.
@@ -3489,7 +3616,14 @@ impl FlatPageSlots {
             }
             let pgno = slot.pgno.swap(SLOT_EMPTY, Ordering::AcqRel);
             if pgno != SLOT_EMPTY && pgno != SLOT_TOMBSTONE {
-                let _ = slot.data.lock().take();
+                let mut data = slot.data.lock();
+                let _ = data.take();
+                // An insert that won the slot after the swap set its bit
+                // under this lock; keep the bit for its page number.
+                if slot.pgno.load(Ordering::Acquire) == SLOT_EMPTY {
+                    self.mark_vacant(idx);
+                }
+                drop(data);
                 removed += 1;
             }
         }
@@ -5014,7 +5148,14 @@ impl ShardedPageCache {
     /// protects removal. Shared [`PageData`] snapshots remain valid because
     /// they own an independent `Arc<[u8]>`; evicting the cache's `PageBuf`
     /// cannot invalidate an already-published snapshot.
-    fn take_clean_buffer_at(&self, page_no: PageNumber) -> Option<PageBuf> {
+    ///
+    /// `seen_in_flat_slot` is the flat slot an eviction walk read `page_no`
+    /// from; the flat tier then checks that slot before probing for the page.
+    fn take_clean_buffer_at(
+        &self,
+        page_no: PageNumber,
+        seen_in_flat_slot: Option<usize>,
+    ) -> Option<PageBuf> {
         if self.use_fast_path.load(Ordering::Relaxed)
             && let Some(ref fast) = self.fast_array
         {
@@ -5061,37 +5202,43 @@ impl ShardedPageCache {
             }
         }
 
-        if let Some(buffer) = self.flat_slots.take_if_clean_from_pool(page_no, &self.pool) {
+        let taken = match seen_in_flat_slot {
+            Some(idx) => self
+                .flat_slots
+                .take_if_clean_seen_in_slot(idx, page_no, &self.pool),
+            None => self.flat_slots.take_if_clean_from_pool(page_no, &self.pool),
+        };
+        if let Some(buffer) = taken {
             self.forget_eviction_page(page_no);
             return Some(buffer);
         }
         None
     }
 
-    /// Scan the flat tier from its persistent eviction cursor and atomically
-    /// reclaim the first eligible buffer.
+    /// Walk the flat tier's occupied slots from its persistent eviction
+    /// cursor and atomically reclaim the first eligible buffer.
     fn take_clean_buffer_from_flat_slots(&self) -> Option<(PageNumber, PageBuf)> {
         let start = self
             .flat_slots
             .eviction_cursor
             .fetch_add(1, Ordering::Relaxed);
-        for offset in 0..self.flat_slots.slots.len() {
-            let idx = start.wrapping_add(offset) & self.flat_slots.mask;
-            let raw_page_no = self.flat_slots.slots[idx].pgno.load(Ordering::Relaxed);
-            if raw_page_no == SLOT_EMPTY || raw_page_no == SLOT_TOMBSTONE {
-                continue;
-            }
-            let Some(page_no) = PageNumber::new(raw_page_no) else {
-                continue;
-            };
-            if let Some(buffer) = self.take_clean_buffer_at(page_no) {
+        self.flat_slots
+            .find_map_occupied_from(start, |idx, page_no| {
+                let buffer = self.take_clean_buffer_at(page_no, Some(idx))?;
                 self.flat_slots
                     .eviction_cursor
                     .store(idx.wrapping_add(1), Ordering::Relaxed);
-                return Some((page_no, buffer));
-            }
-        }
-        None
+                // The next eviction most likely takes the next occupied slot.
+                // The full slot walk warmed it as a side effect (independent
+                // loads running past the victim); the bitmap walk reaches it
+                // through the bitmap word, so warm it here instead (lever FS1
+                // v2: without this, rowid lookups ran 3-8% more cycles at
+                // fewer instructions and cache misses).
+                if let Some(next) = self.flat_slots.next_occupied_after(idx) {
+                    self.flat_slots.prefetch_slot_lines(next);
+                }
+                Some((page_no, buffer))
+            })
     }
 
     /// Probe overflow shards in round-robin order and reclaim the first
@@ -5174,7 +5321,7 @@ impl ShardedPageCache {
     #[must_use]
     pub fn take_clean_buffer_entry_legacy_for_bench(&self) -> Option<(PageNumber, PageBuf)> {
         if let Some(preferred) = self.preferred_reconstructed_victim()
-            && let Some(buffer) = self.take_clean_buffer_at(preferred)
+            && let Some(buffer) = self.take_clean_buffer_at(preferred, None)
         {
             return Some((preferred, buffer));
         }
@@ -5185,7 +5332,7 @@ impl ShardedPageCache {
             .into_iter()
             .filter(|snapshot| !snapshot.dirty)
             .find_map(|snapshot| {
-                self.take_clean_buffer_at(snapshot.page_no)
+                self.take_clean_buffer_at(snapshot.page_no, None)
                     .map(|buffer| (snapshot.page_no, buffer))
             })
     }
@@ -5264,7 +5411,7 @@ impl ShardedPageCache {
         #[cfg(not(feature = "native"))]
         self.write_page(cx, file.as_ref(), page_no).await?;
 
-        Ok(self.take_clean_buffer_at(page_no).is_some())
+        Ok(self.take_clean_buffer_at(page_no, None).is_some())
     }
 
     #[cfg(test)]
@@ -6979,7 +7126,7 @@ mod tests {
             "stale completion must leave the replacement dirty"
         );
         assert!(
-            cache.take_clean_buffer_at(page_no).is_none(),
+            cache.take_clean_buffer_at(page_no, None).is_none(),
             "the dirty replacement must remain ineligible for clean eviction"
         );
     }
@@ -7053,7 +7200,7 @@ mod tests {
                 .iter()
                 .any(|snapshot| snapshot.page_no == PageNumber::ONE && !snapshot.dirty)
         );
-        assert!(cache.take_clean_buffer_at(PageNumber::ONE).is_some());
+        assert!(cache.take_clean_buffer_at(PageNumber::ONE, None).is_some());
     }
 
     #[cfg(unix)]
@@ -8813,7 +8960,7 @@ mod tests {
         assert!(cache.shards[overflow_shard].lock().contains(overflow_page));
 
         let reclaimed = cache
-            .take_clean_buffer_at(overflow_page)
+            .take_clean_buffer_at(overflow_page, None)
             .expect("clean overflow-only resident must be reclaimable");
         assert!(
             reclaimed
@@ -9334,6 +9481,339 @@ mod tests {
                 "window {window}: mean probe {waiting_mean:.2} waiting, {other_mean:.2} not waiting"
             );
         }
+    }
+
+    /// Whether slot `idx`'s bit in the flat table's occupancy bitmap is set.
+    fn bd_w4pr1_13_18_bit(slots: &FlatPageSlots, idx: usize) -> bool {
+        slots.occupied[idx / 64].load(Ordering::Relaxed) & (1_u64 << (idx % 64)) != 0
+    }
+
+    /// The occupancy bitmap holds exactly the slots that hold a page number,
+    /// and `count` is its population.
+    fn bd_w4pr1_13_18_assert_bits_match(slots: &FlatPageSlots, context: &str) {
+        let mut holding = 0_usize;
+        for idx in 0..slots.slots.len() {
+            let raw = slots.slots[idx].pgno.load(Ordering::Acquire);
+            let holds_page = raw != SLOT_EMPTY && raw != SLOT_TOMBSTONE;
+            holding += usize::from(holds_page);
+            assert_eq!(
+                bd_w4pr1_13_18_bit(slots, idx),
+                holds_page,
+                "{context}: slot {idx} holds raw page number {raw}"
+            );
+        }
+        let population: u32 = slots
+            .occupied
+            .iter()
+            .map(|word| word.load(Ordering::Relaxed).count_ones())
+            .sum();
+        assert_eq!(usize::try_from(population).unwrap(), holding, "{context}");
+        assert_eq!(slots.len(), holding, "{context}: count");
+    }
+
+    /// The slots holding a page, as the full walk the eviction cursor made
+    /// before lever FS1 met them: every slot from `start & mask`, wrapping
+    /// once.
+    fn bd_w4pr1_13_18_linear_walk(slots: &FlatPageSlots, start: usize) -> Vec<(usize, PageNumber)> {
+        let mut seen = Vec::new();
+        for offset in 0..slots.slots.len() {
+            let idx = start.wrapping_add(offset) & slots.mask;
+            let raw = slots.slots[idx].pgno.load(Ordering::Relaxed);
+            if raw == SLOT_EMPTY || raw == SLOT_TOMBSTONE {
+                continue;
+            }
+            seen.push((idx, PageNumber::new(raw).unwrap()));
+        }
+        seen
+    }
+
+    /// `find_map_occupied_from` offers the slots in the full walk's order, and
+    /// stops at the first answer.
+    fn bd_w4pr1_13_18_assert_walk_order(slots: &FlatPageSlots, start: usize, context: &str) {
+        let expected = bd_w4pr1_13_18_linear_walk(slots, start);
+        let mut offered = Vec::new();
+        let none: Option<()> = slots.find_map_occupied_from(start, |idx, page_no| {
+            offered.push((idx, page_no));
+            None
+        });
+        assert!(none.is_none());
+        assert_eq!(offered, expected, "{context}: start {start}");
+        if !expected.is_empty() {
+            let stop = expected.len() / 2;
+            let mut calls = 0_usize;
+            let found = slots.find_map_occupied_from(start, |idx, page_no| {
+                calls += 1;
+                (calls == stop + 1).then_some((idx, page_no))
+            });
+            assert_eq!(found, Some(expected[stop]), "{context}: start {start}");
+            assert_eq!(calls, stop + 1, "{context}: start {start}");
+        }
+    }
+
+    /// bd-w4pr1.13.18 (lever FS1): the flat table's occupancy bitmap follows
+    /// every page-number transition (insert, update, remove, clean take by
+    /// probe and by a walk's slot, arbitrary removal, clear), and the walk it
+    /// guides meets the occupied slots in the order of the full slot walk it
+    /// replaced, from cursors at word boundaries, mid-word, past the table's
+    /// end and near `usize::MAX`.
+    #[test]
+    fn test_bd_w4pr1_13_18_flat_occupancy_bits_follow_every_slot_transition() {
+        let mut rng = 0xD1B5_4A32_D192_ED03_u64;
+        let pool = PageBufPool::new(PageSize::DEFAULT, 2_048);
+        let foreign_pool = PageBufPool::new(PageSize::DEFAULT, 2_048);
+        let slots = FlatPageSlots::new(FLAT_SLOTS_MIN_CAPACITY);
+        let capacity = slots.slots.len();
+        assert_eq!(capacity, FLAT_SLOTS_MIN_CAPACITY);
+        assert_eq!(slots.occupied.len(), capacity / 64);
+        let mut counts = [0_usize; 9];
+        for step in 0..30_000_usize {
+            // A universe a little larger than the table, so probe chains
+            // cluster and fill, and a page is often already resident.
+            let page_no = PageNumber::new(
+                u32::try_from(bd_w4pr1_13_18_next(&mut rng, 700) + 1).unwrap(),
+            )
+            .unwrap();
+            let roll = bd_w4pr1_13_18_next(&mut rng, 1_000);
+            let op = match roll {
+                0..=339 => 0,
+                340..=419 => 1,
+                420..=479 => 2,
+                480..=599 => 3,
+                600..=719 => 4,
+                720..=839 => 5,
+                840..=909 => 6,
+                910..=997 => 7,
+                _ => 8,
+            };
+            match op {
+                0 => {
+                    let _ = slots.try_insert(page_no, pool.acquire().unwrap());
+                }
+                1 => {
+                    let _ = slots.try_insert_dirty(page_no, pool.acquire().unwrap());
+                }
+                2 => {
+                    let _ = slots.try_insert(page_no, foreign_pool.acquire().unwrap());
+                }
+                3 => {
+                    let _ = slots.remove(page_no);
+                }
+                4 => {
+                    let _ = slots.take_if_clean_from_pool(page_no, &pool);
+                }
+                5 => {
+                    // A walk's slot: right for a resident page, or a slot the
+                    // page is not in.
+                    let idx = match slots.find_slot(page_no) {
+                        Some(idx) if bd_w4pr1_13_18_next(&mut rng, 3) != 0 => idx,
+                        _ => usize::try_from(bd_w4pr1_13_18_next(
+                            &mut rng,
+                            u64::try_from(capacity).unwrap(),
+                        ))
+                        .unwrap(),
+                    };
+                    let before = slots.find_slot(page_no);
+                    let taken = slots.take_if_clean_seen_in_slot(idx, page_no, &pool);
+                    if taken.is_some() {
+                        assert!(before.is_some(), "step {step}: took an absent page");
+                        assert!(slots.find_slot(page_no).is_none());
+                    }
+                }
+                6 => {
+                    let _ = slots.remove_any_page();
+                }
+                7 => {
+                    let start = match bd_w4pr1_13_18_next(&mut rng, 4) {
+                        0 => usize::try_from(bd_w4pr1_13_18_next(&mut rng, 16)).unwrap() * 64,
+                        1 => usize::MAX - usize::try_from(bd_w4pr1_13_18_next(&mut rng, 130)).unwrap(),
+                        _ => usize::try_from(bd_w4pr1_13_18_next(&mut rng, 4 * 4_096)).unwrap(),
+                    };
+                    bd_w4pr1_13_18_assert_walk_order(&slots, start, &format!("step {step}"));
+                }
+                _ => {
+                    let _ = slots.clear();
+                }
+            }
+            counts[op] += 1;
+            bd_w4pr1_13_18_assert_bits_match(&slots, &format!("step {step}, op {op}"));
+        }
+        assert!(counts.iter().all(|&count| count > 0), "{counts:?}");
+
+        // Crafted walks: a lone page right before the cursor in the cursor's
+        // own word comes last, after the wrap; a lone page at the cursor comes
+        // first; a page in every word but the cursor's word below the cursor.
+        let lone = FlatPageSlots::new(FLAT_SLOTS_MIN_CAPACITY);
+        let page = PageNumber::new(3).unwrap();
+        assert!(lone.try_insert(page, pool.acquire().unwrap()).unwrap());
+        let idx = lone.find_slot(page).unwrap();
+        bd_w4pr1_13_18_assert_bits_match(&lone, "lone");
+        for start in [idx, idx + 1, idx + capacity, idx.wrapping_sub(1), idx + 63, 0, capacity - 1] {
+            bd_w4pr1_13_18_assert_walk_order(&lone, start, "lone");
+            let found = lone.find_map_occupied_from(start, |slot, page_no| Some((slot, page_no)));
+            assert_eq!(found, Some((idx, page)), "lone page from start {start}");
+        }
+        let empty = FlatPageSlots::new(FLAT_SLOTS_MIN_CAPACITY);
+        let none: Option<()> = empty.find_map_occupied_from(17, |_, _| panic!("no slot holds a page"));
+        assert!(none.is_none());
+    }
+
+    /// bd-w4pr1.13.18 (lever FS1 v2): the slot prefetched after an eviction is
+    /// the first occupied slot after the victim in the rest of its bitmap word
+    /// or the next word (wrapping at the table's end), and none past those:
+    /// checked against a linear search over the same span for every slot of
+    /// generated tables, plus crafted cases (the victim's own slot is never the
+    /// answer; the last word wraps to word 0; two empty words give none even
+    /// when a later slot is occupied).
+    #[test]
+    fn test_bd_w4pr1_13_18_flat_next_occupied_after_looks_two_words_ahead() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 1_024);
+        let mut rng = 0x6A09_E667_F3BC_C908_u64;
+        let reference = |slots: &FlatPageSlots, idx: usize| {
+            let span = (63 - idx % 64) + 64;
+            (1..=span)
+                .map(|offset| (idx + offset) & slots.mask)
+                .find(|&slot| bd_w4pr1_13_18_bit(slots, slot))
+        };
+        for density in [3_u64, 30, 300, 900] {
+            let slots = FlatPageSlots::new(FLAT_SLOTS_MIN_CAPACITY);
+            for _ in 0..density {
+                let page = PageNumber::new(
+                    u32::try_from(bd_w4pr1_13_18_next(&mut rng, 5_000) + 1).unwrap(),
+                )
+                .unwrap();
+                let _ = slots.try_insert(page, pool.acquire().unwrap());
+            }
+            bd_w4pr1_13_18_assert_bits_match(&slots, "next_occupied_after table");
+            for idx in 0..slots.slots.len() {
+                assert_eq!(
+                    slots.next_occupied_after(idx),
+                    reference(&slots, idx),
+                    "density {density}, slot {idx}"
+                );
+            }
+        }
+        let crafted = FlatPageSlots::new(FLAT_SLOTS_MIN_CAPACITY);
+        let last = crafted.slots.len() - 1;
+        let page_at = |slot: usize| {
+            (1..=1_000_000_u32)
+                .map(|page| PageNumber::new(page).unwrap())
+                .find(|page| crafted.hash_pgno(page.get()) == slot)
+                .unwrap()
+        };
+        for slot in [5_usize, 9, 200, last] {
+            assert!(crafted.try_insert(page_at(slot), pool.acquire().unwrap()).unwrap());
+            assert!(bd_w4pr1_13_18_bit(&crafted, slot));
+        }
+        assert_eq!(crafted.next_occupied_after(4), Some(5));
+        assert_eq!(crafted.next_occupied_after(5), Some(9), "the victim's own slot is skipped");
+        assert_eq!(
+            crafted.next_occupied_after(9),
+            None,
+            "words 0 and 1 hold nothing after slot 9, though slot 200 is occupied"
+        );
+        assert_eq!(crafted.next_occupied_after(63), None);
+        assert_eq!(crafted.next_occupied_after(150), Some(200));
+        assert_eq!(crafted.next_occupied_after(last - 1), Some(last));
+        assert_eq!(crafted.next_occupied_after(last), Some(5), "the last word wraps to word 0");
+    }
+
+    /// bd-w4pr1.13.18 (lever FS1): through generated admissions, dirty and
+    /// foreign-pool residents, removals and budget trims, the clean-buffer
+    /// eviction reclaims the same page, leaves the same cursor and the same
+    /// residents as the full slot walk it replaced, run on a twin cache.
+    #[test]
+    fn test_bd_w4pr1_13_18_flat_eviction_takes_the_full_walks_victim() {
+        fn linear_take(cache: &ShardedPageCache) -> Option<(PageNumber, PageBuf)> {
+            let start = cache
+                .flat_slots
+                .eviction_cursor
+                .fetch_add(1, Ordering::Relaxed);
+            for offset in 0..cache.flat_slots.slots.len() {
+                let idx = start.wrapping_add(offset) & cache.flat_slots.mask;
+                let raw = cache.flat_slots.slots[idx].pgno.load(Ordering::Relaxed);
+                if raw == SLOT_EMPTY || raw == SLOT_TOMBSTONE {
+                    continue;
+                }
+                let page_no = PageNumber::new(raw).unwrap();
+                if let Some(buffer) = cache.take_clean_buffer_at(page_no, None) {
+                    cache
+                        .flat_slots
+                        .eviction_cursor
+                        .store(idx.wrapping_add(1), Ordering::Relaxed);
+                    return Some((page_no, buffer));
+                }
+            }
+            None
+        }
+        let make = || {
+            ShardedPageCache::with_pool_and_shards_and_flat_capacity(
+                PageBufPool::new(PageSize::DEFAULT, 4_096),
+                PageSize::DEFAULT,
+                4,
+                2_048,
+            )
+        };
+        let walked = make();
+        let reference = make();
+        let foreign_pool = PageBufPool::new(PageSize::DEFAULT, 4_096);
+        let mut rng = 0x4F1B_BCDC_BFA5_3E0B_u64;
+        let mut victims = 0_usize;
+        let mut victims_beside_dirty = 0_usize;
+        for step in 0..20_000_usize {
+            let page_no = PageNumber::new(
+                u32::try_from(bd_w4pr1_13_18_next(&mut rng, 3_000) + 1).unwrap(),
+            )
+            .unwrap();
+            let roll = bd_w4pr1_13_18_next(&mut rng, 100);
+            if roll < 55 {
+                for cache in [&walked, &reference] {
+                    let mut buffer = cache.pool.acquire().unwrap();
+                    buffer.as_mut_slice()[0] = u8::try_from(page_no.get() % 251).unwrap();
+                    cache.insert_buffer(page_no, buffer);
+                }
+            } else if roll < 63 {
+                for cache in [&walked, &reference] {
+                    let _ = cache.insert_tiered(page_no, cache.pool.acquire().unwrap(), true);
+                }
+            } else if roll < 66 {
+                for cache in [&walked, &reference] {
+                    let _ = cache.insert_tiered(page_no, foreign_pool.acquire().unwrap(), false);
+                }
+            } else if roll < 72 {
+                assert_eq!(walked.evict(page_no), reference.evict(page_no), "step {step}");
+            } else {
+                let dirty_before = walked
+                    .page_snapshots()
+                    .iter()
+                    .filter(|snapshot| snapshot.dirty)
+                    .count();
+                let got = walked.take_clean_buffer_from_flat_slots();
+                let want = linear_take(&reference);
+                assert_eq!(
+                    got.as_ref().map(|(page, _)| *page),
+                    want.as_ref().map(|(page, _)| *page),
+                    "step {step}: victim"
+                );
+                if let (Some((_, got)), Some((_, want))) = (&got, &want) {
+                    assert_eq!(got.as_slice()[0], want.as_slice()[0], "step {step}: bytes");
+                    victims += 1;
+                    victims_beside_dirty += usize::from(dirty_before > 0);
+                }
+            }
+            assert_eq!(
+                walked.flat_slots.eviction_cursor.load(Ordering::Relaxed),
+                reference.flat_slots.eviction_cursor.load(Ordering::Relaxed),
+                "step {step}: cursor"
+            );
+            let mut walked_residents = walked.flat_slots.resident_pages();
+            let mut reference_residents = reference.flat_slots.resident_pages();
+            walked_residents.sort_unstable();
+            reference_residents.sort_unstable();
+            assert_eq!(walked_residents, reference_residents, "step {step}: residents");
+            bd_w4pr1_13_18_assert_bits_match(&walked.flat_slots, &format!("step {step}"));
+        }
+        assert!(victims > 1_000, "{victims}");
+        assert!(victims_beside_dirty > 100, "{victims_beside_dirty}");
     }
 
     #[test]
