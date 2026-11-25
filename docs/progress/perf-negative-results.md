@@ -94,6 +94,37 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-24 - SMALL WIN (landed as 2b8fb2857; inside every kill line, the all-hits band missed on the favorable side; instructions only, x4.92 -> x4.87 stock 3.54.1, time a replicated TIE): a page-cache read flight runs its waiter fanout only when a follower joined it (bd-w4pr1.13.18, read/seek round 12, lever NW)
+
+- Target: `InFlightReadLeader::finish` calls `Notify::notify_waiters` on every page-cache miss (22.8M Ir of
+  rowid_lookups_200k on main e9dd4aa18, 121 a miss: generation fetch_add, waiter mutex, SmallVec of wakers, unlock);
+  on one connection no flight has a follower.
+- Touched (patch `scratchpad/pl12/nw_v1.patch`, sha256 aeff7069fa7a34b7): `crates/fsqlite-pager/src/page_cache.rs`.
+  `InFlightPageRead.followers`, incremented in `claim_in_flight_read`'s follower branch under the in-flight map's lock;
+  `finish` reads it under the same lock after removing the flight (final: nobody can join after) and notifies only
+  when it is nonzero. Keeper `test_bd_w4pr1_13_18_flight_counts_and_wakes_its_followers` (counting wakers: a lone
+  leader counts 0, a joined miss 1, the dropped leader wakes the follower, which leads one replacement read); mutants
+  (notify only above 1; the follower branch does not count) each fail it. Gate in job (hz4): clippy clean, keepers
+  198, pager lib 1,134 passed 0 failed.
+- Prediction: rowid -19M to -24M Ir; scans -0.6M to -0.9M; write rows +-0.3%; all-hits +-0.05%; rowid cycles TIE or
+  WIN. Kill: rowid better by less than 15M; any row above +0.5% Ir; any replicated LOSE.
+- Result (arms job on ovh-a; parent cargo ELF c16544c66fbc5a0c, lever be1deac4ce3bfc4b; stock 3.54.1 live): rowid
+  2,257.67M -> 2,236.24M Ir (-21.4M, -0.95%; x4.92 -> x4.87 stock); `finish` 215.0M -> 193.6M; all-hits control
+  -0.86M (-0.063%: its cache fill is 8k misses; prediction band +-0.05% missed on the favorable side); judge minima
+  scans -0.01% to -0.08%, write rows 0.9997 to 1.0000. Time (layout-averaged, K=6; runs nwj2 and nwj4 valid, nwj1 and
+  nwj3 VOID): every row a replicated TIE; rowid cycles 0.972 WIN / 0.982 TIE, cpu 0.959 / 0.979. Answers equal stock
+  in every run.
+- Gate (rch; NW touches only page_cache.rs, blob bbd84ae9 unchanged on main since 07a701b45): on NW on 11382864d
+  (tree 589188c7) clippy -D warnings fsqlite-pager clean, pager lib 1,144 / 0, fsqlite batches 2-7 36 / 36 / 52 / 30 /
+  55 / 26 passed 0 failed, fsqlite-e2e 82 + 46 passed with 2 tests voided by their stock self-check ("oracle invalid
+  on this host") and the target rerun 12 / 0 (hz4); on 95ce2f99d core lib 4,214, T3+XP 242, PS 184; fsqlite batch 1 on
+  674039e5b 879 passed. Three reds judged against the parent in one job each: bd-k8yl4 churn P 2/20 NW 0/20, bd-gp7t8
+  arc_cache P 1/50 NW 0/50, bd-mhat4 w9s20 NW 0/30 (and red on cde6959df, which lacks NW). Landed on 0b13c9b17 (nothing
+  under fsqlite-pager changed after 11382864d). rustfmt: ignored crate.
+- Retry / next: with CP1 and NW in, the rowid miss path's largest pieces left are the eviction walk (FS1 v2, the
+  bitmap walk plus a next-victim prefetch, judged on cycles first), the file read's full Cx checkpoint (380 Ir) and
+  the page copy to the transaction (memcpy 413 + malloc 152), per round 12's M12 callgrind (bd-w4pr1.13.18).
+
 ## 2026-11-23 - WIN (landed as 11382864d; past its gain kill line, -5.26k Ir per FULL autocommit INSERT in callgrind, -3.9k in perf, x8.61 -> x8.36 stock 3.54.1; prediction -3.6k to -4.6k): the commit's conflict-page prediction answers "freelist metadata dirty" once, with an exact early return, instead of building five freelist copies per commit (bd-fuwx0, single-writer lane round 13, lever F1)
 
 - Target: the autocommit one-row INSERT's commit path, #10 in bd-fuwx0's cost map.
