@@ -271,6 +271,107 @@ fn join_star_matches_stock() {
     asupersync::test_utils::run_test(|| assert_shapes_match_stock(SHAPES));
 }
 
+/// bd-window-using-column-guy4l: window functions over USING / NATURAL joins
+/// (including `SELECT *`, `ORDER BY`, `PARTITION BY`, `FILTER`, wrapped
+/// window expressions, outer-join USING coalescing, 3-way USING, and
+/// `GROUP BY` + window) must resolve unqualified USING columns and deduplicate
+/// `*` identically to stock SQLite, while an ambiguous `ON` join stays an error.
+#[test]
+fn bd_window_using_column_guy4l_matches_stock() {
+    const WINDOW_USING_SHAPES: &[&str] = &[
+        "SELECT *, sum(key) OVER (ORDER BY key) AS s FROM {f} a JOIN t USING(key)",
+        "SELECT *, row_number() OVER (ORDER BY key) AS r FROM {f} a JOIN t USING(key)",
+        "SELECT *, row_number() OVER () AS r FROM {f} a JOIN t USING(key)",
+        "SELECT *, count(*) OVER () AS n FROM {f} a NATURAL JOIN t",
+        "SELECT *, sum(key) OVER (PARTITION BY key ORDER BY key) AS s FROM {f} a JOIN t USING(key)",
+        "SELECT key, sum(key) OVER (ORDER BY key) AS s, note FROM {f} a JOIN t USING(key) ORDER BY key",
+        "SELECT *, sum(key) OVER (ORDER BY key) + key AS s FROM {f} a JOIN t USING(key)",
+        "SELECT *, sum(value) FILTER (WHERE key >= 0) OVER (ORDER BY key) AS s FROM {f} a JOIN t USING(key)",
+        "SELECT *, row_number() OVER (ORDER BY key) AS r FROM {f} a LEFT JOIN t USING(key)",
+        "SELECT *, row_number() OVER (ORDER BY key) AS r FROM {f} a RIGHT JOIN t USING(key)",
+        "SELECT *, row_number() OVER (ORDER BY key) AS r FROM {f} a FULL JOIN t USING(key)",
+        "SELECT *, sum(key) OVER (ORDER BY key) AS s FROM {f} a JOIN t USING(key) JOIN (SELECT 1 AS key) c USING(key)",
+        "SELECT a.*, sum(key) OVER (ORDER BY key) AS s FROM {f} a JOIN t USING(key)",
+        "SELECT *, count(*) OVER (ORDER BY key) AS c FROM {f} a JOIN t USING(key) GROUP BY key",
+    ];
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (frank, stock) = if file_backed {
+                (
+                    Connection::open(dir.path().join("f.db").to_str().unwrap())
+                        .await
+                        .unwrap(),
+                    rusqlite::Connection::open(dir.path().join("r.db")).unwrap(),
+                )
+            } else {
+                (
+                    Connection::open(":memory:").await.unwrap(),
+                    rusqlite::Connection::open_in_memory().unwrap(),
+                )
+            };
+            let db = if file_backed { "file" } else { "memory" };
+            for sql in SETUP {
+                frank.execute(sql).await.unwrap();
+                stock.execute_batch(sql).unwrap();
+            }
+            let mut failures = Vec::new();
+            let mut returned_rows = 0usize;
+            for source in SOURCES {
+                for shape in WINDOW_USING_SHAPES {
+                    let sql = shape.replace("{f}", source);
+                    let expected = stock_table(&stock, &sql);
+                    match (&expected, frank_tables(&frank, &sql).await) {
+                        (Ok(expected), Ok(tables)) => {
+                            returned_rows += expected.1.len();
+                            for (form, table) in ["ad hoc", "prepared"].iter().zip(&tables) {
+                                if let Some(reason) = difference(&sql, expected, table) {
+                                    failures.push(format!("[{db}] {sql} [{form}]: {reason}"));
+                                }
+                            }
+                        }
+                        (Ok(_), Err(error)) => {
+                            failures.push(format!(
+                                "[{db}] {sql}: stock returned rows, fsqlite: {error}"
+                            ));
+                        }
+                        (Err(error), Ok(_)) => {
+                            failures.push(format!(
+                                "[{db}] {sql}: fsqlite returned rows, stock: {error}"
+                            ));
+                        }
+                        (Err(_), Err(_)) => {}
+                    }
+                }
+                // Negative control: under `ON`, unqualified `key` is ambiguous
+                // in both engines and must NOT be coalesced.
+                let neg_sql = format!(
+                    "SELECT *, sum(key) OVER (ORDER BY key) AS s FROM {source} a JOIN t ON a.key = t.key"
+                );
+                assert!(
+                    stock_table(&stock, &neg_sql).is_err(),
+                    "[{db}] stock must reject ambiguous ON query: {neg_sql}"
+                );
+                assert!(
+                    frank_tables(&frank, &neg_sql).await.is_err(),
+                    "[{db}] fsqlite must reject ambiguous ON query: {neg_sql}"
+                );
+            }
+            frank.close().await.unwrap();
+            assert!(
+                failures.is_empty(),
+                "[{db}] {} divergence(s):\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
+            assert!(
+                returned_rows > WINDOW_USING_SHAPES.len(),
+                "[{db}] window USING shapes must return rows"
+            );
+        }
+    });
+}
+
 #[test]
 #[ignore = "bd-star-hidden-reland-nxl8a: json and root are not columns without b56e7bc7c"]
 fn hidden_column_join_shapes_match_stock() {

@@ -100299,11 +100299,25 @@ impl Connection {
         column_collations: &[Option<String>],
         column_affinities: &[TypeAffinity],
     ) -> HashMap<String, JoinUsingProjection> {
+        self.build_join_using_projections_and_coalesced_stars(
+            select,
+            column_collations,
+            column_affinities,
+        )
+        .0
+    }
+
+    fn build_join_using_projections_and_coalesced_stars(
+        &self,
+        select: &SelectStatement,
+        column_collations: &[Option<String>],
+        column_affinities: &[TypeAffinity],
+    ) -> (HashMap<String, JoinUsingProjection>, HashSet<usize>) {
         let SelectCore::Select {
             from: Some(from), ..
         } = &select.body.select
         else {
-            return HashMap::new();
+            return (HashMap::new(), HashSet::new());
         };
 
         let visible_ctes = select
@@ -100364,13 +100378,16 @@ impl Connection {
             }
         }
         let col_map = self.build_join_col_map(select);
-        build_join_using_column_projections_from_sources(
+        let projections = build_join_using_column_projections_from_sources(
             &table_sources,
             &from.joins,
             &col_map,
             column_collations,
             column_affinities,
-        )
+        );
+        let coalesced_star_indices =
+            collect_join_coalesced_star_indices(&table_sources, &from.joins);
+        (projections, coalesced_star_indices)
     }
 
     fn build_join_col_collations(&self, select: &SelectStatement) -> Vec<Option<String>> {
@@ -107045,7 +107062,69 @@ impl Connection {
                 Expr::Column(ColumnRef::bare(alias), Span::new(0, 0))
             };
 
-        for col in columns {
+        let expanded_columns: Vec<ResultColumn> = if columns
+            .iter()
+            .any(|col| matches!(col, ResultColumn::Star | ResultColumn::TableStar(_)))
+        {
+            let source_col_map = self.build_join_col_map(select);
+            let using_skip_indices = self.build_join_using_skip_indices(select);
+            let col_collations = self.build_join_col_collations(select);
+            let col_affinities = self.build_join_col_affinities(select);
+            let (_, coalesced_star_indices) = self
+                .build_join_using_projections_and_coalesced_stars(
+                    select,
+                    &col_collations,
+                    &col_affinities,
+                );
+            let join_sources: Vec<&TableOrSubquery> = from
+                .as_ref()
+                .map(|from_clause| {
+                    std::iter::once(&from_clause.source)
+                        .chain(from_clause.joins.iter().map(|join| &join.table))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let qualify_star = from
+                .as_ref()
+                .is_some_and(|from_clause| !from_clause.joins.is_empty());
+            columns
+                .iter()
+                .flat_map(|col| match col {
+                    ResultColumn::Star => source_col_map
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, (_, _, hidden))| {
+                            !*hidden && !using_skip_indices.contains(idx)
+                        })
+                        .map(|(idx, (tbl, c, _))| {
+                            let column = if !qualify_star
+                                || coalesced_star_indices.contains(&idx)
+                                || tbl.is_empty()
+                            {
+                                ColumnRef::bare(c.clone())
+                            } else {
+                                ColumnRef::qualified(tbl.clone(), c.clone())
+                            };
+                            ResultColumn::Expr {
+                                expr: Expr::Column(column, Span::new(0, 0)),
+                                alias: None,
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    ResultColumn::TableStar(tbl) => self
+                        .expand_table_star_result_columns_from_col_map(
+                            &join_sources,
+                            &source_col_map,
+                            tbl,
+                        ),
+                    other => vec![other.clone()],
+                })
+                .collect()
+        } else {
+            columns.clone()
+        };
+
+        for col in &expanded_columns {
             match col {
                 ResultColumn::Expr {
                     expr:
@@ -107253,7 +107332,7 @@ impl Connection {
         // already exists; observable expressions must not be evaluated twice.
         let mut hidden_order_expr_indices = Vec::new();
         for term in &select.order_by {
-            if resolve_order_term_idx(&term.expr, columns).is_some() {
+            if resolve_order_term_idx(&term.expr, &expanded_columns).is_some() {
                 continue;
             }
             let extra_index = if let Some(index) = extra_window_exprs
@@ -107919,8 +107998,8 @@ impl Connection {
 
         // Apply ORDER BY from the original select.
         if !select.order_by.is_empty() {
-            let visible_column_count = columns.len();
-            let mut result_columns: Vec<ResultColumn> = columns.clone();
+            let visible_column_count = expanded_columns.len();
+            let mut result_columns: Vec<ResultColumn> = expanded_columns.clone();
             let schema_snapshot = self.schema.borrow().clone();
             let mut result_col_collations = select_result_collations(select, &schema_snapshot);
             for &extra_index in &hidden_order_expr_indices {
@@ -108012,21 +108091,48 @@ impl Connection {
             .unwrap_or_default();
 
         // Build column map and expand Star/TableStar.
-        // When JOINs are present, use build_join_col_map for all sources.
-        let (col_map, expanded_columns) = if has_join {
+        // When JOINs are present, use build_join_col_map plus USING skip and
+        // outer-join coalescing metadata so `*` and unqualified USING column
+        // references resolve identically to execute_join_select
+        // (bd-window-using-column-guy4l).
+        let (col_map, using_skip_indices, window_eval_collation_ctx, expanded_columns) = if has_join
+        {
             let cmap = self.build_join_col_map(select);
+            let using_skip_indices = self.build_join_using_skip_indices(select);
+            let column_collations = self.build_join_col_collations(select);
+            let column_affinities = self.build_join_col_affinities(select);
+            let (using_column_projections, coalesced_star_indices) = self
+                .build_join_using_projections_and_coalesced_stars(
+                    select,
+                    &column_collations,
+                    &column_affinities,
+                );
+            let eval_ctx = JoinEvalCollationContext {
+                declared_json_keys: self.build_join_declared_blob_columns(select),
+                column_collations,
+                column_affinities,
+                using_column_projections,
+                registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+            };
             let expanded: Vec<ResultColumn> = columns
                 .iter()
                 .flat_map(|col| match col {
                     ResultColumn::Star => cmap
                         .iter()
-                        .filter(|(_, _, hidden)| !*hidden)
-                        .map(|(tbl, c, _)| ResultColumn::Expr {
-                            expr: Expr::Column(
-                                ColumnRef::qualified(tbl.clone(), c.clone()),
-                                Span::new(0, 0),
-                            ),
-                            alias: None,
+                        .enumerate()
+                        .filter(|(idx, (_, _, hidden))| {
+                            !*hidden && !using_skip_indices.contains(idx)
+                        })
+                        .map(|(idx, (tbl, c, _))| {
+                            let column = if coalesced_star_indices.contains(&idx) || tbl.is_empty() {
+                                ColumnRef::bare(c.clone())
+                            } else {
+                                ColumnRef::qualified(tbl.clone(), c.clone())
+                            };
+                            ResultColumn::Expr {
+                                expr: Expr::Column(column, Span::new(0, 0)),
+                                alias: None,
+                            }
                         })
                         .collect::<Vec<_>>(),
                     ResultColumn::TableStar(tbl) => self
@@ -108034,7 +108140,7 @@ impl Connection {
                     other => vec![other.clone()],
                 })
                 .collect();
-            (cmap, expanded)
+            (cmap, using_skip_indices, Some(eval_ctx), expanded)
         } else {
             // Single-table path (original logic).
             let (table_name, table_alias, table_binding_name) = match from {
@@ -108135,7 +108241,12 @@ impl Connection {
                     other => vec![other.clone()],
                 })
                 .collect();
-            (cmap, expanded)
+            (cmap, HashSet::new(), None, expanded)
+        };
+        let using_skip: Option<&HashSet<usize>> = if using_skip_indices.is_empty() {
+            None
+        } else {
+            Some(&using_skip_indices)
         };
 
         // Classify each result column as plain or window-function.
@@ -108373,6 +108484,10 @@ impl Connection {
             let custom_aggregate_keys = Arc::clone(&self.custom_aggregate_keys.borrow());
             SyncFunctionRegistryGuard::push(registry, custom_aggregate_keys)
         });
+        let join_eval_collation_guard = window_eval_collation_ctx
+            .clone()
+            .map(JoinEvalCollationContextGuard::push);
+        let join_using_skip_guard = using_skip.map(JoinUsingSkipGuard::push);
 
         // Compute window function values.  Each window function may have its
         // own PARTITION BY / ORDER BY, so we build per-function partitions and
@@ -109061,8 +109176,11 @@ impl Connection {
         }
 
         // Result expressions can execute nested SELECTs. Never leave the
-        // thread-local registry installed across their suspension points;
-        // each connection-aware expression evaluation scopes its own guard.
+        // thread-local registry or USING/collation guards installed across
+        // their suspension points; each connection-aware expression evaluation
+        // scopes its own guard.
+        drop(join_using_skip_guard);
+        drop(join_eval_collation_guard);
         drop(function_registry_guard);
 
         // Result rows come out in the first window spec's partition/order
@@ -109120,6 +109238,16 @@ impl Connection {
             })
             .collect();
         // window_results is indexed by [func][raw_row_index].
+        let eval_window_output_expr =
+            |expr: &Expr, row: &[SqliteValue]| -> Option<Result<SqliteValue>> {
+                if expr_has_any_subquery(expr) {
+                    return None;
+                }
+                let _eval_ctx_guard = window_eval_collation_ctx
+                    .clone()
+                    .map(JoinEvalCollationContextGuard::push);
+                Some(self.eval_join_expr_with_using_registry(expr, row, &col_map, using_skip))
+            };
         let mut result = Vec::with_capacity(total_rows);
         let mut result_raw_indices: Vec<usize> = Vec::with_capacity(total_rows);
         for ri in output_order {
@@ -109127,10 +109255,19 @@ impl Connection {
             for kind in &col_kinds {
                 match kind {
                     ColKind::Plain(expr) => {
-                        values.push(
-                            self.eval_row_expr_allowing_subqueries(expr, &row_values[ri], &col_map)
-                                .await?,
-                        );
+                        let value = match eval_window_output_expr(expr, &row_values[ri]) {
+                            Some(val) => val?,
+                            None => {
+                                self.eval_row_expr_allowing_subqueries_with_using(
+                                    expr,
+                                    &row_values[ri],
+                                    &col_map,
+                                    using_skip,
+                                )
+                                .await?
+                            }
+                        };
+                        values.push(value);
                     }
                     ColKind::Window(wi) => {
                         values.push(std::mem::replace(
@@ -109157,14 +109294,19 @@ impl Connection {
                             &win_vals,
                             &win_subtypes,
                         );
-                        values.push(
-                            self.eval_row_expr_allowing_subqueries(
-                                &substituted,
-                                &row_values[ri],
-                                &col_map,
-                            )
-                            .await?,
-                        );
+                        let value = match eval_window_output_expr(&substituted, &row_values[ri]) {
+                            Some(val) => val?,
+                            None => {
+                                self.eval_row_expr_allowing_subqueries_with_using(
+                                    &substituted,
+                                    &row_values[ri],
+                                    &col_map,
+                                    using_skip,
+                                )
+                                .await?
+                            }
+                        };
+                        values.push(value);
                     }
                 }
             }
@@ -109208,9 +109350,15 @@ impl Connection {
                 for (row_idx, row) in result.iter_mut().enumerate() {
                     let raw_row = &row_values[result_raw_indices[row_idx]];
                     for (_term_idx, expr) in &extra_order_terms {
-                        let val = self
-                            .eval_row_expr_allowing_subqueries(expr, raw_row, &col_map)
-                            .await?;
+                        let val = match eval_window_output_expr(expr, raw_row) {
+                            Some(val) => val?,
+                            None => {
+                                self.eval_row_expr_allowing_subqueries_with_using(
+                                    expr, raw_row, &col_map, using_skip,
+                                )
+                                .await?
+                            }
+                        };
                         row.values.push(val);
                     }
                 }
