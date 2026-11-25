@@ -472,6 +472,14 @@ fn rowid_under_a_stored_view_resolves_like_stock() {
                 "SELECT rowid FROM vu",
                 "SELECT a, (SELECT count(*) FROM main.shadow_v WHERE rowid = 2) FROM t ORDER BY id",
                 "SELECT a, (SELECT count(*) FROM vu AS q WHERE q.rowid > 1) FROM t ORDER BY id",
+                "SELECT a, (WITH vu(rowid) AS (VALUES (99)) \
+                 SELECT count(*) FROM main.vu WHERE rowid > 1) FROM t ORDER BY id",
+                "SELECT a, (WITH shadow_v(b) AS (VALUES (200)) \
+                 SELECT count(*) FROM temp.shadow_v WHERE rowid = 2) FROM t ORDER BY id",
+                "SELECT a, (WITH u(b, a) AS (VALUES (200, 300)) \
+                 SELECT count(*) FROM main.u WHERE b > a) FROM t ORDER BY id",
+                "SELECT a, (WITH vu(rowid) AS (VALUES (99)) \
+                 SELECT count(*) FROM vu WHERE rowid > 1) FROM t ORDER BY id",
             ] {
                 let stock = rowid_scope_outcome(rq(&r, sql));
                 let direct = rowid_scope_outcome(fq(&f, sql).await);

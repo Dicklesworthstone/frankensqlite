@@ -60640,19 +60640,6 @@ impl Connection {
             .await
     }
 
-    /// Whether `table_name` is an ordinary rowid table (not WITHOUT ROWID), so a
-    /// `rowid IN (...)` rewrite can key on its rowid.
-    fn table_is_rowid_table(&self, table_name: &str) -> bool {
-        self.schema_index_of(table_name)
-            .and_then(|index| {
-                self.schema
-                    .borrow()
-                    .get(index)
-                    .map(|table| !table.without_rowid)
-            })
-            .unwrap_or(false)
-    }
-
     /// Resolve the rowids of the rows a single-table WHERE matches, by running it
     /// as `SELECT <rowid> FROM <table> WHERE <where> [ORDER BY] [LIMIT]` through
     /// the interpreted SELECT path — which substitutes correlated outer refs per
@@ -143093,13 +143080,12 @@ fn collect_known_source_columns(
 ) -> Option<()> {
     match source {
         TableOrSubquery::Table { name, .. } => {
-            let name_key = name.name.to_ascii_lowercase();
-            if let Some(cte_columns) = cte_scopes.get(&name_key) {
-                // A visible CTE shadows a table of the same name. A
-                // schema-qualified name never names a CTE, but which object it
-                // names here is not proven, so it stays opaque.
-                let columns = cte_columns.as_ref().filter(|_| name.schema.is_none())?;
-                out.extend(columns.iter().cloned());
+            // Only an unqualified name is shadowed by a visible CTE. An
+            // explicit schema can use the catalog inventory below.
+            if name.schema.is_none()
+                && let Some(columns) = cte_scopes.get(&name.name.to_ascii_lowercase())
+            {
+                out.extend(columns.as_ref()?.iter().cloned());
                 return Some(());
             }
             // Resolve a TEMP view before looking in the base-table inventory,

@@ -2849,9 +2849,8 @@ fn restore_json5_integer_text(value: &mut Value, input: &mut &str) {
 /// Return a complete string, bare identifier, or scalar token from valid
 /// JSON5. Quoted text and comments are opaque, including any digits inside.
 fn next_json5_atom<'a>(input: &mut &'a str) -> Option<&'a str> {
-    let separator = |c| {
-        json5::char::is_json5_whitespace(c) || matches!(c, '[' | ']' | '{' | '}' | ',' | ':')
-    };
+    let separator =
+        |c| json5::char::is_json5_whitespace(c) || matches!(c, '[' | ']' | '{' | '}' | ',' | ':');
     loop {
         *input = input.trim_start_matches(separator);
         if let Some(comment) = input.strip_prefix("//") {
@@ -2878,7 +2877,9 @@ fn next_json5_atom<'a>(input: &mut &'a str) -> Option<&'a str> {
             }
         }
     } else {
-        input.find(|c| separator(c) || c == '/').unwrap_or(input.len())
+        input
+            .find(|c| separator(c) || c == '/')
+            .unwrap_or(input.len())
     };
     let (token, tail) = input.split_at(end);
     *input = tail;
@@ -10100,8 +10101,17 @@ mod tests {
             "dup:18446744073709551617, dup:-0,}",
         );
         for path in [
-            "$.Infinity", "$.words", "$.control", "$.values[2]", "$.values[3]", "$.values[4]",
-            "$.values[5]", "$.values[6]", "$.values[7]", "$.values[8]", "$.dup",
+            "$.Infinity",
+            "$.words",
+            "$.control",
+            "$.values[2]",
+            "$.values[3]",
+            "$.values[4]",
+            "$.values[5]",
+            "$.values[6]",
+            "$.values[7]",
+            "$.values[8]",
+            "$.dup",
         ] {
             let value = json_extract(doc, &[path]).unwrap();
             let expected = stock_json_scalar(
@@ -10174,12 +10184,8 @@ mod tests {
                 "{raw}"
             );
             let blob = SqliteValue::Blob(jsonb(&doc).unwrap().into());
-            let stock_read = stock_json_rows(
-                &stock,
-                "SELECT json(?1), json_type(?1,'$[0]')",
-                &[blob],
-            )
-            .unwrap();
+            let stock_read =
+                stock_json_rows(&stock, "SELECT json(?1), json_type(?1,'$[0]')", &[blob]).unwrap();
             assert_eq!(stock_read, vec![vec![text(&doc), text("integer")]], "{raw}");
             let SqliteValue::Blob(stock_blob) = oracle("SELECT jsonb(?1)") else {
                 panic!("expected stock JSONB for {raw}");
