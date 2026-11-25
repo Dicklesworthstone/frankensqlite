@@ -14,10 +14,15 @@ native = [
     "fsqlite-vfs/native",
     "fsqlite-wal/native",
 ]
-wasm = ["fsqlite-types/wasm", "fsqlite-vfs/wasm", "fsqlite-wal/wasm"]
+wasm = [
+    "fsqlite-types/wasm",
+    "fsqlite-vfs/wasm",
+    "fsqlite-wal/wasm",
+    "getrandom?/wasm_js",
+]
 linux-asupersync-uring = ["fsqlite-vfs/linux-asupersync-uring"]
 fault-injection = ["fsqlite-wal/fault-injection"]
-encryption = ["dep:argon2", "dep:chacha20poly1305"]
+encryption = ["dep:argon2", "dep:chacha20poly1305", "dep:getrandom"]
 # Bayesian-mixture e-value eviction scoring (IMPL-19 / AAC-P5).
 # When enabled, ShardedPageCache records accesses into an EValueEvictor and
 # prefers the lowest-e page for eviction. Falls back to the existing policy
@@ -54,6 +59,9 @@ rand = { workspace = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # The final browser package owns canonical asupersync profile selection.
 asupersync.workspace = true
+# Encryption must use system entropy, including Web Crypto in the browser.
+# The wasm feature selects the JS backend only when encryption is enabled.
+getrandom = { version = "0.4.3", optional = true }
 
 [dev-dependencies]
 # The storage stack is `async`, so inline tests must drive a runtime via

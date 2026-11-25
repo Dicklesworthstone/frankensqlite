@@ -496,57 +496,38 @@ pub fn validate_reserved_bytes(reserved_per_page: u8) -> Result<(), EncryptError
 // KeyEnvelope — Durable Authenticated Key Metadata Sidecar (bd-1vwiy.1)
 // ---------------------------------------------------------------------------
 
-/// Generate a fresh random 24-byte page nonce via OS entropy (INV-ENC-1),
-/// honoring caller cancellation via `cx.checkpoint()`. Never uses a global
-/// nonce counter.
+/// Generate a fresh random 24-byte page nonce via system entropy (INV-ENC-1),
+/// honoring caller cancellation via `cx.checkpoint()`. Entropy failure aborts
+/// the write; counters or deterministic fallbacks are never used.
 pub fn generate_fresh_page_nonce(cx: &Cx) -> fsqlite_error::Result<[u8; NONCE_SIZE]> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)?;
-    Ok(fill_csprng_24())
+    fill_csprng::<NONCE_SIZE>()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn fill_csprng_16() -> [u8; 16] {
-    rand::random::<[u8; 16]>()
+// The shared interface is fallible on WASM. Native builds retain their existing
+// thread-local CSPRNG rather than adding a system call to every page write.
+#[cfg_attr(not(target_arch = "wasm32"), allow(clippy::unnecessary_wraps))]
+fn fill_csprng<const N: usize>() -> fsqlite_error::Result<[u8; N]> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Ok(rand::random::<[u8; N]>())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        fill_csprng_with(getrandom::fill)
+    }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn fill_csprng_16() -> [u8; 16] {
-    use core::sync::atomic::AtomicU64;
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let digest = blake3::hash(&n.to_le_bytes());
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest.as_bytes()[..16]);
-    out
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn fill_csprng_24() -> [u8; NONCE_SIZE] {
-    rand::random::<[u8; NONCE_SIZE]>()
-}
-
-#[cfg(target_arch = "wasm32")]
-fn fill_csprng_24() -> [u8; NONCE_SIZE] {
-    use core::sync::atomic::AtomicU64;
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let digest = blake3::hash(&n.to_le_bytes());
-    let mut out = [0u8; NONCE_SIZE];
-    out.copy_from_slice(&digest.as_bytes()[..NONCE_SIZE]);
-    out
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn fill_csprng_32() -> [u8; KEY_SIZE] {
-    rand::random::<[u8; KEY_SIZE]>()
-}
-
-#[cfg(target_arch = "wasm32")]
-fn fill_csprng_32() -> [u8; KEY_SIZE] {
-    use core::sync::atomic::AtomicU64;
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    *blake3::hash(&n.to_le_bytes()).as_bytes()
+// Keep the buffer private until the entropy source succeeds. In particular,
+// an error after a partial fill must never yield key or nonce material.
+#[cfg(any(target_arch = "wasm32", test))]
+fn fill_csprng_with<const N: usize, E: std::fmt::Display>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), E>,
+) -> fsqlite_error::Result<[u8; N]> {
+    let mut out = [0u8; N];
+    fill(&mut out)
+        .map_err(|err| FrankenError::Internal(format!("secure random generation failed: {err}")))?;
+    Ok(out)
 }
 
 /// Durable authenticated key-envelope metadata persisted alongside an
@@ -634,9 +615,9 @@ impl KeyEnvelope {
         validate_reserved_bytes(reserved_per_page)
             .map_err(|err| FrankenError::Internal(err.to_string()))?;
 
-        let salt = fill_csprng_16();
-        let database_id = DatabaseId::from_bytes(fill_csprng_16());
-        let dek = fill_csprng_32();
+        let salt = fill_csprng::<16>()?;
+        let database_id = DatabaseId::from_bytes(fill_csprng::<DATABASE_ID_SIZE>()?);
+        let dek = fill_csprng::<KEY_SIZE>()?;
         let wrap_nonce = generate_fresh_page_nonce(cx)?;
 
         let kek = KeyManager::derive_kek(passphrase, &salt, &argon2_params)
@@ -713,7 +694,7 @@ impl KeyEnvelope {
                 "encryptor database_id does not match active key envelope".to_owned(),
             ));
         }
-        let new_salt = fill_csprng_16();
+        let new_salt = fill_csprng::<16>()?;
         let new_wrap_nonce = generate_fresh_page_nonce(cx)?;
         let new_kek = KeyManager::derive_kek(new_passphrase, &new_salt, &new_params)
             .map_err(|err| FrankenError::Internal(err.to_string()))?;
@@ -914,7 +895,7 @@ pub fn write_key_envelope_atomic(
 
     cx.checkpoint().map_err(|_| FrankenError::Abort)?;
     let bytes = envelope.to_bytes();
-    let nonce = fill_csprng_16();
+    let nonce = fill_csprng::<16>()?;
     let suffix: String = nonce.iter().take(8).map(|b| format!("{b:02x}")).collect();
     let mut tmp_os = path.as_os_str().to_os_string();
     tmp_os.push(format!(".tmp.{suffix}"));
@@ -1876,6 +1857,25 @@ mod tests {
             remove_key_envelope_if_exists(&key_path).expect("remove envelope");
             assert!(read_key_envelope(&key_path).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn test_entropy_failure_never_returns_partial_key_material() {
+        let mut calls = 0;
+        let result = fill_csprng_with::<KEY_SIZE, _>(|out| {
+            calls += 1;
+            // An entropy backend may modify the destination before failing.
+            // Those bytes must not escape as a usable DEK or trigger a fallback.
+            out[..KEY_SIZE / 2].fill(0xA5);
+            Err("injected entropy failure")
+        });
+
+        assert_eq!(calls, 1, "entropy failure must not be retried or replaced");
+        assert!(matches!(
+            result,
+            Err(FrankenError::Internal(message))
+                if message == "secure random generation failed: injected entropy failure"
+        ));
     }
 
     #[test]
