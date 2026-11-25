@@ -496,9 +496,10 @@ pub fn validate_reserved_bytes(reserved_per_page: u8) -> Result<(), EncryptError
 // KeyEnvelope — Durable Authenticated Key Metadata Sidecar (bd-1vwiy.1)
 // ---------------------------------------------------------------------------
 
-/// Generate a fresh random 24-byte page nonce via system entropy (INV-ENC-1),
-/// honoring caller cancellation via `cx.checkpoint()`. Entropy failure aborts
-/// the write; counters or deterministic fallbacks are never used.
+/// Generate a fresh random 24-byte page nonce via system entropy (INV-ENC-1).
+///
+/// Honors caller cancellation via `cx.checkpoint()`. WASM entropy failures
+/// return an error; counters or deterministic fallbacks are never used.
 pub fn generate_fresh_page_nonce(cx: &Cx) -> fsqlite_error::Result<[u8; NONCE_SIZE]> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)?;
     fill_csprng::<NONCE_SIZE>()

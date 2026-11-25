@@ -10011,14 +10011,15 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
                             self.allocated_from_freelist.drain(..),
                         );
                         // Deferred cleanup may run after later transactions
-                        // reserved higher EOF pages. Never rewind next_page;
-                        // quarantine every abandoned EOF reservation in the
-                        // in-memory freelist instead.
-                        return_pages_to_freelist(
-                            &mut inner.freelist,
-                            self.allocated_from_eof.drain(..),
-                        );
-                        return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+                        // reserved higher EOF pages. Keep these WAL reservations
+                        // in the abandonment pool: volatile freelist entries
+                        // are replaced on refresh and lost when this pager closes.
+                        inner
+                            .abandoned_eof_reservations
+                            .append(&mut self.allocated_from_eof);
+                        inner
+                            .abandoned_eof_reservations
+                            .append(&mut self.page_lease);
                         restore_quarantined_durable_freelist_pages(
                             &mut inner.freelist,
                             &mut self.savepoint_quarantine,
@@ -10032,14 +10033,12 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
                                 &mut inner.freelist,
                                 not_committed.returned_allocations.from_freelist,
                             );
-                            return_pages_to_freelist(
-                                &mut inner.freelist,
-                                not_committed.returned_allocations.from_eof,
-                            );
-                            return_pages_to_freelist(
-                                &mut inner.freelist,
-                                not_committed.returned_allocations.page_lease,
-                            );
+                            inner
+                                .abandoned_eof_reservations
+                                .append(&mut not_committed.returned_allocations.from_eof);
+                            inner
+                                .abandoned_eof_reservations
+                                .append(&mut not_committed.returned_allocations.page_lease);
                             restore_quarantined_durable_freelist_pages(
                                 &mut inner.freelist,
                                 &mut not_committed.returned_allocations.savepoint_quarantine,
@@ -33574,18 +33573,23 @@ where
                 inner.db_size = self.original_db_size;
                 rewind_eof_allocation_to_db_size(&mut inner);
             } else if self.is_writer && self.mode == TransactionMode::Concurrent {
-                // Concurrent: next_page stays advanced, so return lease
-                // pages and EOF allocations to the freelist.
-                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-                return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
                 if self.journal_mode == JournalMode::Wal {
-                    // Committed-state refresh replaces the volatile freelist.
-                    // Keep abandoned quarantine ownership in the pool until a
-                    // later WAL publication can account for these holes.
+                    // A peer may already have committed past these reservations.
+                    // Preserve ownership like explicit rollback: if this pager
+                    // closes next, its Drop hands the pool to the shared ledger
+                    // for a surviving pager's durable freelist fold.
+                    inner
+                        .abandoned_eof_reservations
+                        .append(&mut self.page_lease);
+                    inner
+                        .abandoned_eof_reservations
+                        .append(&mut self.allocated_from_eof);
                     inner
                         .abandoned_eof_reservations
                         .append(&mut self.savepoint_quarantined_allocations);
                 } else {
+                    return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+                    return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
                     return_pages_to_freelist(
                         &mut inner.freelist,
                         self.savepoint_quarantined_allocations.drain(..),
@@ -36856,49 +36860,80 @@ mod tests {
     #[test]
     fn test_ioq6x_dropped_pending_group_attempt_restores_reclaimed_abandonment_ownership() {
         asupersync::test_utils::run_test(|| async {
-            let (pager, _) = wal_pager().await;
-            let cx = Cx::new();
-            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
-            let page = PageNumber::new(57).unwrap();
-            let queue = Arc::clone(&txn.group_commit_queue);
-            txn.pending_group_commit_attempt = Some(Arc::new(PendingGroupCommitTxnAttempt::new(
-                &queue,
-                Arc::clone(&txn.inner),
-                Arc::clone(&txn.db_file),
-                Arc::clone(&txn.committed_snapshot),
-                Arc::clone(&txn.published),
-                Arc::clone(&txn.writer_idle),
-                txn.cleanup_cx.clone(),
-                txn.original_db_size,
-                txn.truncated_db_size,
-                txn.vacuum_override_freelist.clone(),
-                txn.pointer_map,
-                txn.mode,
-                txn.is_writer,
-                txn.snapshot_db_size(),
-                PendingReturnedAllocations::default(),
-                Vec::new(),
-                vec![page],
-                Vec::new(),
-            )));
+            for retain_for_savepoint in [false, true] {
+                let (pager, _) = wal_pager().await;
+                let cx = Cx::new();
+                let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                let written = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, written, &sample_page(0x51))
+                    .await
+                    .unwrap();
+                let unused = txn.allocate_page(&cx).await.unwrap();
+                assert!(!txn.write_set.contains_key(&unused));
+                assert!(!txn.page_lease.is_empty());
+                let page = PageNumber::new(57).unwrap();
+                let mut expected_abandoned = txn.allocated_from_eof.clone();
+                expected_abandoned.extend_from_slice(&txn.page_lease);
+                expected_abandoned.push(page);
+                expected_abandoned.sort_unstable();
+                if retain_for_savepoint {
+                    txn.savepoint(&cx, "keep_allocations").unwrap();
+                }
+                // Exercise both allocation owners: ordinary preparation drains
+                // unused pages into the attempt, while a live savepoint keeps
+                // them transaction-owned and gives the attempt only a clone.
+                let returned_allocations = txn.prepare_unstaged_allocations();
+                assert_eq!(
+                    returned_allocations.retained_by_transaction,
+                    retain_for_savepoint
+                );
+                assert_eq!(returned_allocations.from_eof, vec![unused]);
+                assert!(!returned_allocations.page_lease.is_empty());
+                let queue = Arc::clone(&txn.group_commit_queue);
+                txn.pending_group_commit_attempt =
+                    Some(Arc::new(PendingGroupCommitTxnAttempt::new(
+                        &queue,
+                        Arc::clone(&txn.inner),
+                        Arc::clone(&txn.db_file),
+                        Arc::clone(&txn.committed_snapshot),
+                        Arc::clone(&txn.published),
+                        Arc::clone(&txn.writer_idle),
+                        txn.cleanup_cx.clone(),
+                        txn.original_db_size,
+                        txn.truncated_db_size,
+                        txn.vacuum_override_freelist.clone(),
+                        txn.pointer_map,
+                        txn.mode,
+                        txn.is_writer,
+                        txn.staged_page_high_water(txn.snapshot_db_size()),
+                        returned_allocations,
+                        Vec::new(),
+                        vec![page],
+                        vec![written],
+                    )));
 
-            drop(txn);
-            settle_pending_group_commit_finalization(&queue)
-                .await
-                .unwrap();
+                drop(txn);
+                settle_pending_group_commit_finalization(&queue)
+                    .await
+                    .unwrap();
 
-            let inner = pager
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert!(
-                inner.abandoned_eof_reservations.contains(&page),
-                "detached NotCommitted cleanup must preserve reclaimed hole ownership"
-            );
-            assert!(
-                !inner.freelist.contains(&page),
-                "detached cleanup cannot turn a rejected reclaim commit into a volatile free page"
-            );
+                let inner = pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut abandoned = inner.abandoned_eof_reservations.clone();
+                abandoned.sort_unstable();
+                assert_eq!(
+                    abandoned, expected_abandoned,
+                    "detached NotCommitted cleanup must preserve each EOF allocation, lease page, and reclaimed hole exactly once, savepoint={retain_for_savepoint}"
+                );
+                assert!(
+                    expected_abandoned
+                        .iter()
+                        .all(|page| !inner.freelist.contains(page)),
+                    "rejected WAL reservations must survive refresh and pager close, savepoint={retain_for_savepoint}"
+                );
+            }
         });
     }
 
@@ -54288,6 +54323,106 @@ mod tests {
             (7, 2),
             "post-promote: durable page-1 preserves the freed pages on the freelist"
         );
+    }
+
+    #[test]
+    fn test_ioq6x_dropped_wal_transaction_holes_survive_pager_close() {
+        asupersync::test_utils::run_test(|| async {
+            struct RestorePublishedSnapshots(bool);
+            impl Drop for RestorePublishedSnapshots {
+                fn drop(&mut self) {
+                    MOCK_WAL_PUBLISHES_SNAPSHOTS.with(|flag| flag.set(self.0));
+                }
+            }
+            let _restore = RestorePublishedSnapshots(
+                MOCK_WAL_PUBLISHES_SNAPSHOTS.with(|flag| flag.replace(true)),
+            );
+            let cx = Cx::new();
+            for explicit_rollback in [true, false] {
+                let (pager, survivor, frames) = wal_pager_pair_with_shared_backend().await;
+                assert!(Arc::ptr_eq(
+                    &pager.group_commit_queue,
+                    &survivor.group_commit_queue,
+                ));
+
+                let mut abandoned = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                let first = abandoned.allocate_page(&cx).await.unwrap();
+                abandoned.write_page(&cx, first, &sample_page(0x51)).await.unwrap();
+                let _second = abandoned.allocate_page(&cx).await.unwrap();
+                assert!(!abandoned.page_lease.is_empty(), "must reserve an unused EOF lease");
+                let mut expected_free = abandoned.allocated_from_eof.clone();
+                expected_free.extend_from_slice(&abandoned.page_lease);
+                expected_free.sort_unstable();
+
+                // A still owns the low reservations when B commits past them.
+                let mut grow = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                let high = grow.allocate_page(&cx).await.unwrap();
+                assert!(expected_free.iter().all(|page| *page < high));
+                grow.write_page(&cx, high, &sample_page(0x71)).await.unwrap();
+                grow.commit(&cx).await.unwrap();
+                drop(grow);
+                {
+                    let committed = frames.lock().unwrap();
+                    let (_, page_one, _) = committed.iter().rev()
+                        .find(|(page, _, _)| *page == PageNumber::ONE.get()).unwrap();
+                    assert_eq!(
+                        u32::from_be_bytes(page_one[28..32].try_into().unwrap()), high.get(),
+                    );
+                    assert_eq!(
+                        u32::from_be_bytes(page_one[36..40].try_into().unwrap()), 0,
+                        "B must not publish A's live reservations on the freelist",
+                    );
+                }
+                assert!(pager.inner.lock().unwrap().committed_wal_generation.is_some());
+
+                // Explicit rollback is the positive control for implicit Drop.
+                if explicit_rollback {
+                    abandoned.rollback(&cx).await.unwrap();
+                }
+                drop(abandoned);
+                assert_eq!(
+                    Arc::strong_count(&pager.inner), 1,
+                    "closing P must drop its inner, with no retained transaction or cleanup",
+                );
+                // No intervening begin/refresh may rescue P's volatile freelist.
+                drop(pager);
+
+                let mut reclaim = survivor.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                assert_eq!(
+                    reclaim.get_page(&cx, high).await.unwrap().as_bytes(), sample_page(0x71),
+                );
+                reclaim.write_page(&cx, high, &sample_page(0x72)).await.unwrap();
+                reclaim.commit(&cx).await.unwrap();
+                drop(reclaim);
+
+                // Read the committed header and trunks, not the volatile allocator.
+                let inner = survivor.inner.lock().unwrap();
+                let page_one = inner.read_committed_page_copy(
+                    &cx, &survivor.cache, &survivor.wal_backend, PageNumber::ONE,
+                ).await.unwrap();
+                let header_bytes: [u8; DATABASE_HEADER_SIZE] =
+                    page_one[..DATABASE_HEADER_SIZE].try_into().unwrap();
+                let header = DatabaseHeader::from_bytes(&header_bytes).unwrap();
+                let mut durable_free = load_freelist_from_committed_state(
+                    &cx, &inner, &survivor.cache, &survivor.wal_backend,
+                    header.page_count, &header,
+                ).await.unwrap();
+                durable_free.sort_unstable();
+                assert_eq!(
+                    durable_free, expected_free,
+                    "every abandoned reservation must become durably free; explicit_rollback={explicit_rollback}",
+                );
+                assert_eq!(header.page_count, high.get());
+                assert_eq!(header.freelist_count, u32::try_from(expected_free.len()).unwrap());
+                assert_eq!(
+                    inner.read_committed_page_copy(
+                        &cx, &survivor.cache, &survivor.wal_backend, high,
+                    ).await.unwrap(),
+                    sample_page(0x72),
+                    "the committed peer page must remain live",
+                );
+            }
+        });
     }
 
     #[test]
