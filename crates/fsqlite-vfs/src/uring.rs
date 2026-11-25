@@ -1558,6 +1558,10 @@ impl VfsFile for IoUringFile {
         self.inner.wal_write_lock_is_free(cx)
     }
 
+    fn main_file_attached_elsewhere(&self, cx: &Cx) -> Result<bool> {
+        self.inner.main_file_attached_elsewhere(cx)
+    }
+
     fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
         self.inner.lock_external_wal_append(cx)
     }

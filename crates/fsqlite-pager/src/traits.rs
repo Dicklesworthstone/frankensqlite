@@ -439,6 +439,46 @@ pub trait WalBackend: Send + Sync {
     /// Backends without a certificate sidecar ignore it.
     fn note_own_certificate_published(&mut self, _wal_frame_start: u64, _wal_frame_end: u64) {}
 
+    /// bd-reality-check-1022-llk6g.5.7: record where this backend's
+    /// certificate sidecar ends now (the open file, its length and its last
+    /// complete record), keeping that file open so its identity cannot be
+    /// reused, for [`Self::certificate_sidecar_unchanged_since_capture`].
+    ///
+    /// Every fsqlite commit appends its record to the sidecar before it
+    /// appends a WAL frame, and the first append of a new WAL generation
+    /// truncates the sidecar first. So a sidecar found unchanged later proves
+    /// that no fsqlite commit happened in between, in any WAL generation. A
+    /// stock SQLite commit or checkpoint never touches the sidecar. This
+    /// assumes every fsqlite writer of the file writes certificate records.
+    ///
+    /// An absent sidecar is captured as absent (every fsqlite commit creates
+    /// it, and nothing removes it) and an empty one as empty. `false` means
+    /// there is nothing usable to capture (no sidecar facility, or a tail
+    /// that is not one complete current-version record), and the proof is
+    /// then unavailable. A new capture replaces an older one.
+    fn capture_certificate_sidecar_horizon<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// bd-reality-check-1022-llk6g.5.7: consume the capture of
+    /// [`Self::capture_certificate_sidecar_horizon`] and answer whether the
+    /// sidecar is still the captured file, with the captured length and last
+    /// record, and that record does not cover a commit of `generation` that
+    /// ends past WAL frame `horizon` (a commit in flight at the capture, whose
+    /// frames could have landed after the horizon). `false` whenever any of
+    /// that cannot be shown, including when there is no capture.
+    fn certificate_sidecar_unchanged_since_capture<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _generation: WalGenerationIdentity,
+        _horizon: u64,
+    ) -> WalFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Drop a capture that will not be checked, closing its file.
+    fn discard_certificate_sidecar_capture(&mut self) {}
+
     /// Retire exactly this pin before the caller releases its physical claim.
     fn end_native_read(&mut self, _token: &WalNativeReadToken) -> Result<()> {
         Err(FrankenError::Unsupported)

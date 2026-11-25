@@ -4224,6 +4224,38 @@ struct PreparedCertificateAppend<F> {
     append_offset: u64,
 }
 
+/// Where the certificate sidecar ended when a waiting commit released its
+/// read claim (bd-reality-check-1022-llk6g.5.7).
+enum CertificateSidecarCapture<F> {
+    /// No sidecar at the path. Every fsqlite commit creates it (and nothing
+    /// of ours removes it), so it is still absent only if none committed.
+    Absent,
+    /// The sidecar, held open so the identity compared later cannot belong
+    /// to a recreated file.
+    Present {
+        file: F,
+        observed: Box<ObservedCertificateHorizon>,
+    },
+}
+
+/// The certificate sidecar's identity, length and last complete record, as
+/// bytes and decoded (bd-reality-check-1022-llk6g.5.7). `last` is `None`
+/// for an empty sidecar.
+struct ObservedCertificateHorizon {
+    identity: fsqlite_vfs::FileIdentity,
+    len: u64,
+    last: Option<(Vec<u8>, ParallelWalDurableCertificateRecord)>,
+}
+
+impl ObservedCertificateHorizon {
+    fn same_as(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.len == other.len
+            && self.last.as_ref().map(|(bytes, _)| bytes)
+                == other.last.as_ref().map(|(bytes, _)| bytes)
+    }
+}
+
 pub struct PathRefreshingWalBackend<V: Vfs>
 where
     V::File: Send + Sync + 'static,
@@ -4323,6 +4355,10 @@ where
     /// with exactly the frames its digest was computed over; any other append
     /// replaces it, and a failed one clears it.
     own_certificate_record: std::sync::Mutex<Option<ParallelWalDurableCertificateRecord>>,
+    /// The sidecar horizon a commit waiting for WAL WRITE captured before it
+    /// released its read claim (bd-reality-check-1022-llk6g.5.7); consumed by
+    /// [`WalBackend::certificate_sidecar_unchanged_since_capture`].
+    certificate_sidecar_capture: Option<CertificateSidecarCapture<V::File>>,
     /// What this backend already proved inside the pager's current held
     /// append gate (see [`WalBackend::note_append_gate_held`]); `None` outside
     /// one. A commit validated the WAL path and refreshed its append baseline
@@ -4400,6 +4436,7 @@ where
             prepared_certificate_append: std::sync::Mutex::new(None),
             authorized_certificate_record: std::sync::Mutex::new(None),
             own_certificate_record: std::sync::Mutex::new(None),
+            certificate_sidecar_capture: None,
             append_gate_proof: None,
             db_file_identity: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -5497,6 +5534,55 @@ where
             return Ok(tail[tail.len() - record_len..].to_vec());
         }
         Self::read_certificate_sidecar_exact(file, cx, record_start, record_len, location).await
+    }
+
+    /// A fresh read-only descriptor of the certificate sidecar, `None` when it
+    /// does not exist (bd-reality-check-1022-llk6g.5.7).
+    fn open_certificate_sidecar_for_horizon(&self, cx: &Cx) -> Result<Option<V::File>> {
+        let path = self.certificate_sidecar_path();
+        if !self.vfs.access(cx, &path, AccessFlags::EXISTS)? {
+            return Ok(None);
+        }
+        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::WAL;
+        let (file, _) = self.vfs.open(cx, Some(&path), flags)?;
+        Ok(Some(file))
+    }
+
+    /// The sidecar's identity, length and last complete record, as bytes and
+    /// decoded (bd-reality-check-1022-llk6g.5.7); no record for an empty
+    /// sidecar. `None` for a legacy last record or a file without an identity.
+    async fn read_certificate_sidecar_horizon(
+        file: &V::File,
+        cx: &Cx,
+    ) -> Result<Option<ObservedCertificateHorizon>> {
+        let Some(identity) = file.file_identity()? else {
+            return Ok(None);
+        };
+        let len = file.file_size(cx)?;
+        if len == 0 {
+            return Ok(Some(ObservedCertificateHorizon {
+                identity,
+                len,
+                last: None,
+            }));
+        }
+        let Some((record_start, record)) =
+            Self::read_certificate_record_ending_at(file, cx, len).await?
+        else {
+            return Ok(None);
+        };
+        let record_len =
+            usize::try_from(len - record_start).map_err(|_| FrankenError::WalCorrupt {
+                detail: "parallel WAL certificate record length exceeds usize".to_owned(),
+            })?;
+        let last_record =
+            Self::read_certificate_sidecar_exact(file, cx, record_start, record_len, "horizon")
+                .await?;
+        Ok(Some(ObservedCertificateHorizon {
+            identity,
+            len,
+            last: Some((last_record, record)),
+        }))
     }
 
     async fn read_certificate_record_ending_at(
@@ -6946,6 +7032,86 @@ where
                 .get_mut()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
         }
+    }
+
+    fn capture_certificate_sidecar_horizon<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, bool> {
+        Box::pin(async move {
+            self.certificate_sidecar_capture = None;
+            let Some(mut file) = self.open_certificate_sidecar_for_horizon(cx)? else {
+                self.certificate_sidecar_capture = Some(CertificateSidecarCapture::Absent);
+                return Ok(true);
+            };
+            match Self::read_certificate_sidecar_horizon(&file, cx).await {
+                Ok(Some(observed)) => {
+                    self.certificate_sidecar_capture =
+                        Some(CertificateSidecarCapture::Present {
+                            file,
+                            observed: Box::new(observed),
+                        });
+                    Ok(true)
+                }
+                Ok(None) | Err(_) => {
+                    let cleanup_cx = cx.create_child();
+                    let _cleanup_mask = cleanup_cx.masked();
+                    let _ = file.close(&cleanup_cx);
+                    Ok(false)
+                }
+            }
+        })
+    }
+
+    fn certificate_sidecar_unchanged_since_capture<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        generation: WalGenerationIdentity,
+        horizon: u64,
+    ) -> WalFuture<'a, bool> {
+        Box::pin(async move {
+            let Some(capture) = self.certificate_sidecar_capture.take() else {
+                return Ok(false);
+            };
+            let (mut file, captured) = match capture {
+                // Still absent: no fsqlite commit created it meanwhile.
+                CertificateSidecarCapture::Absent => {
+                    let path = self.certificate_sidecar_path();
+                    return Ok(matches!(
+                        self.vfs.access(cx, &path, AccessFlags::EXISTS),
+                        Ok(false)
+                    ));
+                }
+                CertificateSidecarCapture::Present { file, observed } => (file, observed),
+            };
+            // A record of the snapshot's generation ending past the horizon
+            // belongs to a commit that was in flight at the capture: its frames
+            // may have landed after the horizon, unseen.
+            let in_flight = captured.last.as_ref().is_some_and(|(_, record)| {
+                record.wal_generation == generation && record.wal_frame_end > horizon
+            });
+            let current = if in_flight {
+                None
+            } else {
+                match self.open_certificate_sidecar_for_horizon(cx) {
+                    Ok(Some(mut current)) => {
+                        let observed = Self::read_certificate_sidecar_horizon(&current, cx).await;
+                        let cleanup_cx = cx.create_child();
+                        let _cleanup_mask = cleanup_cx.masked();
+                        let _ = current.close(&cleanup_cx);
+                        observed.ok().flatten()
+                    }
+                    Ok(None) | Err(_) => None,
+                }
+            };
+            let unchanged = current.is_some_and(|observed| observed.same_as(&captured));
+            let cleanup_cx = cx.create_child();
+            let _cleanup_mask = cleanup_cx.masked();
+            let _ = file.close(&cleanup_cx);
+            Ok(unchanged)
+        })
+    }
+
+    fn discard_certificate_sidecar_capture(&mut self) {
+        // Dropping the descriptor closes it.
+        self.certificate_sidecar_capture = None;
     }
 
     fn end_native_read(&mut self, token: &WalNativeReadToken) -> Result<()> {

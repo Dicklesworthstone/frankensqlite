@@ -5349,6 +5349,24 @@ impl VfsFile for UnixFile {
         Ok(true)
     }
 
+    fn main_file_attached_elsewhere(&self, cx: &Cx) -> Result<bool> {
+        checkpoint_or_abort(cx)?;
+        if self.takes_no_locks() {
+            return Err(FrankenError::Unsupported);
+        }
+        let inode_info = Arc::clone(self.inode_info_ref());
+        let info = inode_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Every handle of this VFS locks through the canonical descriptor, so
+        // the query from it sees only other owners' locks.
+        if !byte_range_locks_are_reportable(&info.file) {
+            return Err(FrankenError::Unsupported);
+        }
+        foreign_lock_on_range(&info.file, SHARED_FIRST, SHARED_SIZE)
+            .ok_or(FrankenError::Unsupported)
+    }
+
     fn restore_external_wal_append_attempt(&mut self, _cx: &Cx) -> Result<()> {
         let Some(attempt) = self.external_append_attempt.as_mut() else {
             return Ok(());
@@ -11852,6 +11870,50 @@ mod tests {
             vfs.probe_foreign_wal_participation(&cx, &path).unwrap(),
             ForeignWalParticipation::Unknown
         );
+        file.unlock(&cx, LockLevel::None).unwrap();
+    }
+
+    /// bd-reality-check-1022-llk6g.5.7: the close-time checkpoint asks whether
+    /// another lock owner holds the main file's shared-lock range, as every
+    /// attached connection does. This process's own handles never count;
+    /// another open file description (another process, or stock SQLite
+    /// linked in) counts while it holds a lock there, and a lock on another
+    /// byte does not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn main_file_attached_elsewhere_counts_only_other_owners_of_the_shared_range() {
+        let (_dir, path) = make_temp_path("attached.db");
+        std::fs::write(&path, vec![0_u8; 4096]).unwrap();
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let (mut sibling, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        file.lock(&cx, LockLevel::Shared).unwrap();
+        sibling.lock(&cx, LockLevel::Shared).unwrap();
+        assert!(
+            !file.main_file_attached_elsewhere(&cx).unwrap(),
+            "this process's own handles are not another owner"
+        );
+
+        let other = std::fs::File::open(&path).unwrap();
+        assert!(posix_lock(&other, libc::F_RDLCK, RESERVED_BYTE, 1).unwrap());
+        assert!(
+            !file.main_file_attached_elsewhere(&cx).unwrap(),
+            "a lock outside the shared range is no attachment"
+        );
+        posix_unlock(&other, RESERVED_BYTE, 1).unwrap();
+        assert!(posix_lock(&other, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE).unwrap());
+        assert!(
+            file.main_file_attached_elsewhere(&cx).unwrap(),
+            "another owner's SHARED claim is an attachment"
+        );
+        drop(other);
+        assert!(
+            !file.main_file_attached_elsewhere(&cx).unwrap(),
+            "the other owner's claim ends with its descriptor"
+        );
+        sibling.unlock(&cx, LockLevel::None).unwrap();
         file.unlock(&cx, LockLevel::None).unwrap();
     }
 

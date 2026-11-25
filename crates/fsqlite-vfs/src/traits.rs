@@ -1510,6 +1510,20 @@ pub trait VfsFile: Send + Sync {
         Err(FrankenError::Unsupported)
     }
 
+    /// Whether a lock owner other than this process's handles of the file
+    /// (another process, or a stock SQLite library linked into this one)
+    /// holds any lock on the main file's SQLite shared-lock range right now.
+    ///
+    /// Every WAL connection, stock or fsqlite, keeps a SHARED claim there for
+    /// as long as it is attached, so `false` is what lets stock's
+    /// `sqlite3WalClose` take EXCLUSIVE and fold the WAL in at close: no other
+    /// connection of another owner is attached (bd-reality-check-1022-llk6g.5.7).
+    /// Takes no lock and never waits. Backends that cannot answer refuse with
+    /// `Unsupported`.
+    fn main_file_attached_elsewhere(&self, _cx: &Cx) -> Result<bool> {
+        Err(FrankenError::Unsupported)
+    }
+
     /// Restore an append attempt without releasing its enclosing snapshot.
     ///
     /// This must be idempotent before acquisition and after success or failure.

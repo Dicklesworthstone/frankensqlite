@@ -445,6 +445,10 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         self.inner.wal_write_lock_is_free(cx)
     }
 
+    fn main_file_attached_elsewhere(&self, cx: &Cx) -> Result<bool> {
+        self.inner.main_file_attached_elsewhere(cx)
+    }
+
     fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
         GLOBAL_VFS_METRICS.lock_ops.fetch_add(1, Ordering::Relaxed);
         vfs_trace_lock!(

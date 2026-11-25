@@ -4569,6 +4569,16 @@ enum WalReaderWindow {
     PrivateIndex,
 }
 
+/// Whether a new transaction may join a pager's open read window
+/// (bd-reality-check-1022-llk6g.5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalReaderJoin {
+    Open,
+    /// The window's committing transaction gave its read claim up while it
+    /// waits for WAL WRITE; the window pins nothing until the claim is back.
+    BarredWhileCommitWaits,
+}
+
 struct CheckpointCleanup {
     backend: WalBackendHandle,
     // Admission is released only after backend reconciliation and every
@@ -4610,6 +4620,10 @@ struct BeginExternalLockState<F: VfsFile + 'static> {
     restore_scope: Option<ProcessRootFinalizationScope>,
     native_reader: Option<NativeReaderAttempt>,
     checkpoint: Option<CheckpointCleanup>,
+    /// The main-file snapshot fence a WAL reader needs is held by the open
+    /// transaction this claim is for, not by this attempt
+    /// (bd-reality-check-1022-llk6g.5.7: a commit re-taking its read claim).
+    snapshot_fence_held_by_transaction: bool,
 }
 
 impl<F: VfsFile + 'static> BeginExternalLockState<F> {
@@ -4622,6 +4636,7 @@ impl<F: VfsFile + 'static> BeginExternalLockState<F> {
             restore_scope: None,
             native_reader: None,
             checkpoint: None,
+            snapshot_fence_held_by_transaction: false,
         }
     }
 
@@ -5635,6 +5650,109 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
         selected.map(|slot| (slot, selected_mark)).ok_or(FrankenError::BusyRecovery)
     }
 
+    /// bd-reality-check-1022-llk6g.5.7: take a reader claim again for the
+    /// exact snapshot `original` names, after a commit released its claim to
+    /// wait for WAL WRITE and the wait ran out with the transaction still
+    /// open. That is possible only while the WAL generation is the
+    /// snapshot's and no checkpoint backfilled past its horizon. A held mark
+    /// at or below the horizon then keeps every page the snapshot reads where
+    /// it is, so the transaction keeps reading what it read before.
+    ///
+    /// `Ok(None)`: the snapshot can no longer be protected. A claim taken on
+    /// the way stays armed in `owner`, which the caller restores.
+    async fn repin_reader_into(
+        &self,
+        cx: &Cx,
+        owner: &mut BeginExternalLockState<F>,
+        original: &traits::WalNativeReadBinding,
+    ) -> Result<Option<traits::WalNativeReadBinding>> {
+        use fsqlite_vfs::shm::{SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, WAL_READ_LOCK_BASE};
+        use fsqlite_wal::wal_index::{
+            WAL_INDEX_HDR_BYTES, WalIndexReadBoundary, read_shared_wal_index_header,
+            read_shared_wal_index_read_mark,
+        };
+
+        if !Arc::ptr_eq(&self.db_file, &owner.db_file) || owner.native_reader.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let snapshot = original.header();
+        let horizon = original.boundary().maximum_wal_frame;
+        let database_only = original.boundary().database_only;
+        // Still the snapshot's generation, not yet backfilled past its horizon.
+        let protectable = |region: &fsqlite_vfs::ShmRegion| -> Result<Option<u32>> {
+            let Some(header) = read_shared_wal_index_header(region)? else {
+                return Ok(None);
+            };
+            let backfilled =
+                region.atomic_load_u32_ne(2 * WAL_INDEX_HDR_BYTES, AtomicOrdering::Acquire)?;
+            let protectable = header.a_salt == snapshot.a_salt
+                && header.sz_page == snapshot.sz_page
+                && header.mx_frame >= horizon
+                && backfilled <= horizon
+                && (!database_only || backfilled == horizon);
+            Ok(protectable.then_some(backfilled))
+        };
+        owner.native_reader = Some(NativeReaderAttempt::default());
+        owner.restore_scope = Some(ProcessRootFinalizationScope::ExactHandle(
+            shared_db_file_key(&self.db_file),
+        ));
+        let mut file = shared_db_file_write(&self.db_file, cx).await?;
+        owner
+            .native_reader
+            .as_mut()
+            .expect("reader attempt is installed")
+            .main_wal_lifetime_held = file.holds_main_wal_lifetime_read_lock();
+        let region = file.shm_map(cx, 0, fsqlite_vfs::shm::SHM_SEGMENT_SIZE, false)?;
+        if protectable(&region)?.is_none() {
+            return Ok(None);
+        }
+        let (slot, mark) = if database_only {
+            (0, 0)
+        } else {
+            match self.select_reader_mark(cx, &mut *file, &region, owner, horizon) {
+                Ok(selection) => selection,
+                Err(FrankenError::BusyRecovery) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        };
+        match file.shm_lock(
+            cx,
+            WAL_READ_LOCK_BASE + slot,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_SHARED,
+        ) {
+            Ok(()) => {}
+            Err(FrankenError::Busy) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        owner.native_reader.as_mut().expect("reader attempt remains installed").claim =
+            Some(PendingExternalUnlockTarget::NativeShmLock {
+                slot: WAL_READ_LOCK_BASE + slot,
+                exclusive: false,
+            });
+        drop(file);
+        // A checkpoint or reset between the first look and the claim.
+        let Some(backfilled) = protectable(&region)? else {
+            return Ok(None);
+        };
+        if slot != 0 && read_shared_wal_index_read_mark(&region, slot)? != mark {
+            return Ok(None);
+        }
+        let binding = traits::WalNativeReadBinding {
+            token: traits::WalNativeReadToken::new(),
+            source_key: shared_db_file_key(&self.db_file).0,
+            header: snapshot,
+            boundary: WalIndexReadBoundary {
+                backfilled_frames: backfilled,
+                maximum_wal_frame: horizon,
+                database_only,
+            },
+        };
+        owner.native_reader.as_mut().expect("shared reader owner").validated =
+            Some(binding.clone());
+        Ok(Some(binding))
+    }
+
     /// Acquire and revalidate a native shared publication before page reads.
     ///
     /// The caller holds its main-file snapshot fence. Missing or invalid SHM
@@ -5732,7 +5850,10 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
         if !Arc::ptr_eq(&self.db_file, &owner.db_file) || owner.native_reader.is_some() {
             return Err(FrankenError::BusyRecovery);
         }
-        if require_wal && owner.restore_target != Some(PendingExternalUnlockTarget::ExternalSnapshot) {
+        if require_wal
+            && owner.restore_target != Some(PendingExternalUnlockTarget::ExternalSnapshot)
+            && !owner.snapshot_fence_held_by_transaction
+        {
             return Err(FrankenError::BusyRecovery);
         }
         owner.native_reader = Some(NativeReaderAttempt::default());
@@ -8913,6 +9034,10 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// must respect. `None` outside a window or on backends without a
     /// shared reader table (memory VFS).
     wal_reader: Option<WalReaderWindow>,
+    /// bd-reality-check-1022-llk6g.5.7: whether the window's only transaction
+    /// is committing and released `wal_reader` while it waits for WAL WRITE.
+    /// No other transaction may join the window until the claim is back.
+    wal_reader_join: WalReaderJoin,
     /// Whether this pager was opened read-only (skip freelist
     /// scans during refresh since we never allocate pages).
     access_mode: PagerAccessMode,
@@ -12973,6 +13098,410 @@ async fn conflicting_pages_since_batch_snapshots(
     Ok((conflicts, route_checks))
 }
 
+/// `BusySnapshot` detail for a commit whose read claim, given up while it
+/// waited for WAL WRITE, could not protect its snapshot again
+/// (bd-reality-check-1022-llk6g.5.7).
+const COMMIT_READ_CLAIM_LOST_DETAIL: &str =
+    "the WAL moved past the snapshot while the commit waited for the write lock";
+
+/// `BusySnapshot` detail for a commit that, back under WAL WRITE after
+/// waiting without its read claim, found the WAL index needing recovery
+/// (bd-reality-check-1022-llk6g.5.7).
+const COMMIT_READMISSION_RECOVERY_DETAIL: &str =
+    "the WAL index needs recovery after the reset the commit waited behind";
+
+/// Flush retries (about 1 ms each once past the quick ones) between attempts
+/// to give the read claim up while waiting for WAL WRITE.
+const COMMIT_READ_CLAIM_RELEASE_EVERY: u32 = 16;
+
+fn busy_snapshot_on_pages(pages: &[u32]) -> FrankenError {
+    FrankenError::BusySnapshot {
+        conflicting_pages: pages
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    }
+}
+
+/// bd-reality-check-1022-llk6g.5.7: a committing transaction's read claim,
+/// given up while the commit waits for WAL WRITE.
+///
+/// A stock `wal_checkpoint(TRUNCATE/RESTART)` holds WRITE and waits for every
+/// reader mark; a commit that waited for WRITE with its mark held made both
+/// sides spend their whole busy_timeout. Stock's own writer holds no read
+/// lock while it waits for WRITE.
+struct ReleasedCommitReadClaim {
+    /// The binding the transaction's snapshot was admitted under.
+    original: traits::WalNativeReadBinding,
+    /// The snapshot's WAL generation.
+    generation: WalGenerationIdentity,
+    /// The published WAL horizon, in frames, that was checked for conflicts
+    /// while the claim was still held, and its generation: the snapshot's,
+    /// or the one a writer began in place on a WAL that had no frame (a
+    /// claim on an empty WAL does not stop that).
+    horizon: u64,
+    horizon_generation: WalGenerationIdentity,
+}
+
+/// Where a committing transaction's read claim is during its flush loop.
+enum CommitReadClaimState {
+    /// The transaction's own claim, as admitted.
+    Held,
+    /// Given up while waiting for WAL WRITE.
+    Released(ReleasedCommitReadClaim),
+    /// Taken again at the published tail, under WAL WRITE.
+    Readmitted,
+}
+
+/// bd-reality-check-1022-llk6g.5.7, steps 0-3: give the committing
+/// transaction's read claim up while its commit waits for WAL WRITE.
+///
+/// Only for a flush of this transaction's own single batch, alone on its
+/// pager, holding a native claim, on a backend that can capture its
+/// certificate sidecar. First the batch is checked against every commit
+/// published since its snapshot while the claim still forbids a WAL reset:
+/// a conflict is answered now. Then the published horizon and the sidecar
+/// are captured and the claim is released, so a checkpointer waiting for
+/// reader marks can finish. `Ok(None)` leaves the claim held and the commit
+/// waits as before.
+async fn release_commit_read_claim_for_write_wait<F: VfsFile + 'static>(
+    cx: &Cx,
+    wal_backend: &SharedWalBackend,
+    inner_arc: &Arc<Mutex<PagerInner<F>>>,
+    db_file: &SharedDbFile<F>,
+    batches: &[TransactionFrameBatch],
+) -> Result<Option<ReleasedCommitReadClaim>> {
+    let [batch] = batches else {
+        return Ok(None);
+    };
+    let Some(snapshot) = batch.conflict_snapshot else {
+        return Ok(None);
+    };
+    let original = {
+        let inner = inner_arc
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        if inner.active_transactions != 1
+            || inner.wal_reader_join != WalReaderJoin::Open
+            || inner.journal_mode != JournalMode::Wal
+            || !Arc::ptr_eq(&inner.db_file, db_file)
+        {
+            return Ok(None);
+        }
+        match &inner.wal_reader {
+            Some(WalReaderWindow::Native(reader))
+                if reader.claim.is_some() && reader.backend_pin.is_some() =>
+            {
+                match reader.validated.clone() {
+                    Some(binding) => binding,
+                    None => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        }
+    };
+    let backend = wal_backend_handle(wal_backend)?;
+    let (horizon, horizon_generation) = {
+        let mut wal_guard = async_rwlock_write(&backend, cx, "commit read claim release").await?;
+        let wal = wal_guard.as_mut();
+        match conflicting_pages_since_batch_snapshots(cx, wal, batches).await {
+            Ok((conflicts, _)) if !conflicts.is_empty() => {
+                return Err(busy_snapshot_on_pages(&conflicts));
+            }
+            // A route check (bd-1epn5, bd-p9wzl) is decided only under WRITE,
+            // against the durable tree; until then the claim stays held and
+            // the commit waits as before.
+            Ok((_, route_checks)) if !route_checks.is_empty() => return Ok(None),
+            Ok(_) => {}
+            Err(error @ FrankenError::BusySnapshot { .. }) => return Err(error),
+            Err(_) => return Ok(None),
+        }
+        let Some(published) = wal.published_snapshot() else {
+            return Ok(None);
+        };
+        let horizon = published.last_commit_frame.map_or(0, |index| {
+            u64::try_from(index).map_or(u64::MAX, |index| index + 1)
+        });
+        if !wal
+            .capture_certificate_sidecar_horizon(cx)
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        (horizon, published.generation)
+    };
+    // The window leaves PagerInner and the join barrier goes up in one step.
+    let window = {
+        let mut inner = inner_arc
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        inner.wal_reader_join = WalReaderJoin::BarredWhileCommitWaits;
+        inner.wal_reader.take()
+    };
+    let put_back = |window: Option<WalReaderWindow>| -> Result<()> {
+        let mut inner = inner_arc
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        inner.wal_reader = window;
+        inner.wal_reader_join = WalReaderJoin::Open;
+        Ok(())
+    };
+    let mut reader = match window {
+        Some(WalReaderWindow::Native(reader))
+            if reader
+                .validated
+                .as_ref()
+                .is_some_and(|binding| binding.token().matches(original.token())) =>
+        {
+            reader
+        }
+        other => {
+            put_back(other)?;
+            discard_commit_certificate_capture(&backend, cx).await;
+            return Ok(None);
+        }
+    };
+    let cleanup_cx = cleanup_child_cx(cx);
+    let _cleanup_mask = cleanup_cx.masked();
+    if reader.retire_backend(&cleanup_cx).await.is_err() {
+        put_back(Some(WalReaderWindow::Native(reader)))?;
+        discard_commit_certificate_capture(&backend, cx).await;
+        return Ok(None);
+    }
+    let restored = match shared_db_file_write(db_file, &cleanup_cx).await {
+        Ok(mut file) => reader.restore_claim(&mut *file, &cleanup_cx),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = restored {
+        // The backend pin is gone but the claim may still be held: the
+        // transaction ends with this error, and its exit releases the claim.
+        put_back(Some(WalReaderWindow::Native(reader)))?;
+        discard_commit_certificate_capture(&backend, cx).await;
+        return Err(error);
+    }
+    Ok(Some(ReleasedCommitReadClaim {
+        original,
+        generation: snapshot.generation,
+        horizon,
+        horizon_generation,
+    }))
+}
+
+async fn discard_commit_certificate_capture(backend: &WalBackendHandle, cx: &Cx) {
+    if let Ok(mut wal) = async_rwlock_write(backend, cx, "commit read claim capture").await {
+        wal.discard_certificate_sidecar_capture();
+    }
+}
+
+/// Install a re-taken native claim as the window's claim again.
+fn reinstall_commit_read_claim<F: VfsFile + 'static>(
+    inner_arc: &Arc<Mutex<PagerInner<F>>>,
+    owner: &mut BeginExternalLockState<F>,
+) -> Result<()> {
+    let mut inner = inner_arc
+        .lock()
+        .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+    if inner.wal_reader.is_some() {
+        return Err(FrankenError::internal(
+            "a released commit read claim found its window occupied",
+        ));
+    }
+    let reader = owner
+        .native_reader
+        .take()
+        .ok_or_else(|| FrankenError::internal("re-taken commit read claim was lost"))?;
+    inner.wal_reader = Some(WalReaderWindow::Native(reader));
+    inner.wal_reader_join = WalReaderJoin::Open;
+    drop(inner);
+    owner.disarm();
+    Ok(())
+}
+
+/// Bind the backend to `binding` under the claim `owner` holds.
+/// `Ok(false)`: the backend refused the binding (it asked for recovery).
+async fn bind_commit_read_claim<F: VfsFile + 'static>(
+    cx: &Cx,
+    backend: &WalBackendHandle,
+    owner: &mut BeginExternalLockState<F>,
+    binding: traits::WalNativeReadBinding,
+) -> Result<bool> {
+    let mut wal = async_rwlock_write(backend, cx, "commit read claim binding").await?;
+    if wal.native_read_binding().is_some() {
+        return Err(FrankenError::BusyRecovery);
+    }
+    let token = binding.token().clone();
+    wal.note_begin_wal_path_identity(None);
+    let outcome = wal.begin_native_read(cx, binding).await?;
+    if outcome != traits::WalNativeReadOutcome::Ready {
+        return Ok(false);
+    }
+    let reader = owner
+        .native_reader
+        .as_mut()
+        .ok_or_else(|| FrankenError::internal("re-taken commit read claim was lost"))?;
+    reader.backend_pin = Some(NativeReaderBackendPin {
+        backend: Arc::clone(backend),
+        token,
+    });
+    Ok(true)
+}
+
+/// The shared-index source a committing transaction re-takes its read claim
+/// through, with the pager's own access rights, as its begin had them.
+fn commit_read_claim_source<F: VfsFile + 'static>(
+    inner_arc: &Arc<Mutex<PagerInner<F>>>,
+    db_file: &SharedDbFile<F>,
+    queue: &GroupCommitQueueRef,
+) -> Result<WalIndexShmSource<F>> {
+    let access_mode = inner_arc
+        .lock()
+        .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?
+        .access_mode;
+    Ok(WalIndexShmSource {
+        db_file: Arc::clone(db_file),
+        cleanup_queue: Arc::downgrade(queue),
+        can_publish_reader_marks: !access_mode.is_readonly(),
+        may_rebuild_index: access_mode.may_rebuild_wal_index(),
+    })
+}
+
+/// bd-reality-check-1022-llk6g.5.7, step 5: with WAL WRITE held, take a read
+/// claim again at the published tail before the commit's preflight.
+///
+/// Same generation: the batch's conflict snapshot still names the original
+/// horizon, so the append's own conflict scan covers every commit since.
+/// A generation changed by a reset is accepted only with proof that no
+/// fsqlite commit happened since the claim was released (the certificate
+/// sidecar is unchanged and no commit was in flight past the checked
+/// horizon): only an fsqlite writer makes byte-identical structural claims
+/// (bd-73pfl), so every hidden commit was a stock one, and the append's
+/// conflict scan compares each candidate page with the database file byte for
+/// byte. Without the proof the transaction is refused with `BusySnapshot`.
+async fn readmit_commit_read_claim<F: VfsFile + 'static>(
+    cx: &Cx,
+    wal_backend: &SharedWalBackend,
+    inner_arc: &Arc<Mutex<PagerInner<F>>>,
+    db_file: &SharedDbFile<F>,
+    queue: &GroupCommitQueueRef,
+    released: &ReleasedCommitReadClaim,
+) -> Result<()> {
+    let backend = wal_backend_handle(wal_backend)?;
+    let source = commit_read_claim_source(inner_arc, db_file, queue)?;
+    let mut owner = BeginExternalLockState::new(queue, Arc::clone(db_file), cx);
+    owner.snapshot_fence_held_by_transaction = true;
+    let admitted = match source.acquire_reader_into(cx, &mut owner, true).await {
+        Ok(traits::WalNativeReadOutcome::Ready) => true,
+        Ok(traits::WalNativeReadOutcome::RecoveryRequired(_)) => false,
+        Err(error) => {
+            owner.restore().await?;
+            return Err(error);
+        }
+    };
+    let binding = owner
+        .native_reader
+        .as_ref()
+        .and_then(|reader| reader.validated.clone())
+        .filter(|_| admitted);
+    // With WRITE held nobody can publish or reset, so an index that asks for
+    // recovery now (a stock RESTART whose first write is still pending
+    // leaves a header the WAL file does not match yet) stays that way for
+    // the rest of the wait. Recovery needs fences this commit cannot take
+    // while it holds WRITE: refuse the transaction now instead, and its
+    // retry's begin recovers.
+    let Some(binding) = binding else {
+        owner.restore().await?;
+        return Err(FrankenError::BusySnapshot {
+            conflicting_pages: COMMIT_READMISSION_RECOVERY_DETAIL.to_owned(),
+        });
+    };
+    if !bind_commit_read_claim(cx, &backend, &mut owner, binding).await? {
+        owner.restore().await?;
+        return Err(FrankenError::BusySnapshot {
+            conflicting_pages: COMMIT_READMISSION_RECOVERY_DETAIL.to_owned(),
+        });
+    }
+    let proven = {
+        let mut wal = async_rwlock_write(&backend, cx, "commit read claim readmission").await?;
+        let generation = wal
+            .published_snapshot()
+            .map(|published| published.generation);
+        if generation == Some(released.generation) {
+            wal.discard_certificate_sidecar_capture();
+            true
+        } else {
+            wal.certificate_sidecar_unchanged_since_capture(
+                cx,
+                released.horizon_generation,
+                released.horizon,
+            )
+            .await
+            .unwrap_or(false)
+        }
+    };
+    if !proven {
+        owner.restore().await?;
+        return Err(FrankenError::BusySnapshot {
+            conflicting_pages: "WAL generation changed".to_owned(),
+        });
+    }
+    reinstall_commit_read_claim(inner_arc, &mut owner)
+}
+
+/// bd-reality-check-1022-llk6g.5.7, step 5c: the wait for WAL WRITE ran out
+/// with the claim released. A retryable `Busy` leaves the transaction open,
+/// so its exact snapshot must be protected again first. `Ok(false)`: it can
+/// no longer be, and the commit must end the transaction instead.
+async fn repin_commit_read_claim<F: VfsFile + 'static>(
+    cx: &Cx,
+    wal_backend: &SharedWalBackend,
+    inner_arc: &Arc<Mutex<PagerInner<F>>>,
+    db_file: &SharedDbFile<F>,
+    queue: &GroupCommitQueueRef,
+    released: &ReleasedCommitReadClaim,
+) -> Result<bool> {
+    let backend = wal_backend_handle(wal_backend)?;
+    discard_commit_certificate_capture(&backend, cx).await;
+    let source = commit_read_claim_source(inner_arc, db_file, queue)?;
+    let mut owner = BeginExternalLockState::new(queue, Arc::clone(db_file), cx);
+    let binding = match source
+        .repin_reader_into(cx, &mut owner, &released.original)
+        .await
+    {
+        Ok(Some(binding)) => binding,
+        Ok(None) => {
+            owner.restore().await?;
+            return Ok(false);
+        }
+        Err(error) => {
+            owner.restore().await?;
+            return Err(error);
+        }
+    };
+    if !bind_commit_read_claim(cx, &backend, &mut owner, binding).await? {
+        owner.restore().await?;
+        return Ok(false);
+    }
+    reinstall_commit_read_claim(inner_arc, &mut owner)?;
+    Ok(true)
+}
+
+/// Forget a released claim the flush ends without: the transaction is
+/// ending, and its exit has no claim left to release.
+async fn abandon_released_commit_read_claim<F: VfsFile + 'static>(
+    cx: &Cx,
+    wal_backend: &SharedWalBackend,
+    inner_arc: &Arc<Mutex<PagerInner<F>>>,
+) {
+    if let Ok(backend) = wal_backend_handle(wal_backend) {
+        discard_commit_certificate_capture(&backend, cx).await;
+    }
+    if let Ok(mut inner) = inner_arc.lock() {
+        inner.wal_reader_join = WalReaderJoin::Open;
+    }
+}
+
 /// Read one page's CURRENT durable image while the append gate is held:
 /// WAL-first through the already-locked backend, then the main database file.
 /// Returns `None` when the page lies beyond the main file and has no WAL
@@ -16421,6 +16950,12 @@ where
                 && inner.rollback_journal_recovery_state.is_pending()
             {
                 return Err(FrankenError::BusyRecovery);
+            }
+            // bd-reality-check-1022-llk6g.5.7: the window's committing
+            // transaction gave its read claim up while it waits for WRITE;
+            // joining now would share a window that pins nothing.
+            if inner.wal_reader_join != WalReaderJoin::Open {
+                return Err(FrankenError::Busy);
             }
 
             // ── In-memory fast path ─────────────────────────────────────
@@ -21991,6 +22526,7 @@ where
                 freelist_repair_pending: open_freelist_entries_dropped > 0,
                 freelist_repair_dropped: open_freelist_entries_dropped,
                 wal_reader: None,
+                wal_reader_join: WalReaderJoin::Open,
                 disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
                 disowned_page_ledger_generation: Some(Arc::clone(
                     &group_commit_queue.disowned_pages_generation,
@@ -22515,6 +23051,7 @@ where
                 freelist_repair_pending: false,
                 freelist_repair_dropped: 0,
                 wal_reader: None,
+                wal_reader_join: WalReaderJoin::Open,
                 disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
                 disowned_page_ledger_generation: Some(Arc::clone(
                     &group_commit_queue.disowned_pages_generation,
@@ -28091,6 +28628,12 @@ where
                 let mut frames_written_end: u64 = 0;
                 let mut fsync_seq: u64 = 0;
                 let mut retry_attempt = 0_u32;
+                // bd-reality-check-1022-llk6g.5.7: while this flush waits for
+                // WAL WRITE, the read claim of a transaction committing alone
+                // may be given up (see `release_commit_read_claim_for_write_wait`).
+                let mut read_claim = CommitReadClaimState::Held;
+                let own_single_batch =
+                    batches.len() == 1 && batches[0].context.batch_id == waiter_id;
                 loop {
                     if cx.checkpoint().is_err() {
                         flush_result = Err(FrankenError::Abort);
@@ -28137,6 +28680,9 @@ where
                     // by a transaction-level lock of another handle of this
                     // process.
                     let mut append_blocked_by_local_transaction = false;
+                    // bd-reality-check-1022-llk6g.5.7: set once this attempt
+                    // holds the external WAL append lock.
+                    let mut write_acquired = false;
                     flush_result = async {
                         let t_excl_start = phase_timing.then(Instant::now);
                         // Arm cleanup before acquiring either native WRITE or
@@ -28175,7 +28721,23 @@ where
                                 return Err(error);
                             }
                             drop(append_handle);
+                            write_acquired = true;
                             exclusive_lock_us = elapsed_profile_us(t_excl_start);
+                            // bd-reality-check-1022-llk6g.5.7: a claim given
+                            // up for the wait is taken again at the tail
+                            // before anything reads the WAL for this append.
+                            if let CommitReadClaimState::Released(released) = &read_claim {
+                                readmit_commit_read_claim(
+                                    cx,
+                                    wal_backend,
+                                    inner_arc,
+                                    &db_file,
+                                    queue,
+                                    released,
+                                )
+                                .await?;
+                                read_claim = CommitReadClaimState::Readmitted;
+                            }
                             let backend = wal_backend_handle(wal_backend)?;
                             #[cfg(test)]
                             record_commit_fast_path_lock(CommitFastPathLockClass::WalBackendWrite);
@@ -28903,6 +29465,16 @@ where
                     }
                     match &flush_result {
                         Err(FrankenError::Busy | FrankenError::BusyRecovery) => {
+                            // bd-reality-check-1022-llk6g.5.7: the claim was
+                            // taken again at the tail, so the transaction's
+                            // own snapshot is no longer protected; it cannot
+                            // wait on and stay open.
+                            if matches!(read_claim, CommitReadClaimState::Readmitted) {
+                                flush_result = Err(FrankenError::BusySnapshot {
+                                    conflicting_pages: COMMIT_READ_CLAIM_LOST_DETAIL.to_owned(),
+                                });
+                                break;
+                            }
                             // Every physical retry spends the same admission
                             // budget as the first native lock wait. A stale
                             // snapshot cannot improve without a new logical
@@ -28913,6 +29485,38 @@ where
                                 .remaining();
                             if remaining.is_zero() {
                                 break;
+                            }
+                            // bd-reality-check-1022-llk6g.5.7: WAL WRITE is
+                            // still busy after the quick retries. Wait on
+                            // without the read claim a stock checkpointer
+                            // holding WRITE may be waiting for. A release that
+                            // cannot be done now (say, the holder is mid-append)
+                            // is tried again about every 16 ms.
+                            if !write_acquired
+                                && own_single_batch
+                                && retry_attempt >= FLUSH_BUSY_HANDOFF_YIELD_EVERY
+                                && (retry_attempt - FLUSH_BUSY_HANDOFF_YIELD_EVERY)
+                                    .is_multiple_of(COMMIT_READ_CLAIM_RELEASE_EVERY)
+                                && matches!(read_claim, CommitReadClaimState::Held)
+                            {
+                                match release_commit_read_claim_for_write_wait(
+                                    cx,
+                                    wal_backend,
+                                    inner_arc,
+                                    &db_file,
+                                    &batches,
+                                )
+                                .await
+                                {
+                                    Ok(Some(released)) => {
+                                        read_claim = CommitReadClaimState::Released(released);
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        flush_result = Err(error);
+                                        break;
+                                    }
+                                }
                             }
                             retry_attempt = retry_attempt.saturating_add(1);
                             if append_blocked_by_local_transaction {
@@ -28952,6 +29556,46 @@ where
                             GLOBAL_CONSOLIDATION_METRICS.record_busy_retry();
                         }
                         _ => break,
+                    }
+                }
+
+                // bd-reality-check-1022-llk6g.5.7, step 5c: the flush ends
+                // with the claim still given up. A retryable busy keeps the
+                // transaction open, so its snapshot is protected again first;
+                // any other outcome ends the transaction, which has no claim
+                // left for its exit to release.
+                if let CommitReadClaimState::Released(released) = &read_claim {
+                    if matches!(
+                        flush_result,
+                        Err(FrankenError::Busy | FrankenError::BusyRecovery)
+                    ) {
+                        let db_file = {
+                            let inner = inner_arc.lock().map_err(|_| {
+                                FrankenError::internal("SimpleTransaction lock poisoned")
+                            })?;
+                            Arc::clone(&inner.db_file)
+                        };
+                        match repin_commit_read_claim(
+                            cx,
+                            wal_backend,
+                            inner_arc,
+                            &db_file,
+                            queue,
+                            released,
+                        )
+                        .await
+                        {
+                            Ok(true) => read_claim = CommitReadClaimState::Held,
+                            Ok(false) => {
+                                flush_result = Err(FrankenError::BusySnapshot {
+                                    conflicting_pages: COMMIT_READ_CLAIM_LOST_DETAIL.to_owned(),
+                                });
+                            }
+                            Err(error) => flush_result = Err(error),
+                        }
+                    }
+                    if !matches!(read_claim, CommitReadClaimState::Held) {
+                        abandon_released_commit_read_claim(cx, wal_backend, inner_arc).await;
                     }
                 }
 
@@ -29893,6 +30537,10 @@ async fn release_wal_reader_slot<F: VfsFile>(
     cx: &Cx,
     restore_external_snapshot: bool,
 ) -> Result<()> {
+    // The window is closing: a claim its committing transaction gave up
+    // (bd-reality-check-1022-llk6g.5.7) no longer bars anyone, even when that
+    // commit was dropped before it could take the claim back.
+    inner.wal_reader_join = WalReaderJoin::Open;
     if inner.wal_reader.is_none() && !restore_external_snapshot {
         return Ok(());
     }
@@ -29913,6 +30561,7 @@ async fn release_wal_reader_slot<F: VfsFile>(
 fn release_wal_reader_claim<F: VfsFile>(
     inner: &mut PagerInner<F>, file: &mut F, cx: &Cx,
 ) -> Result<()> {
+    inner.wal_reader_join = WalReaderJoin::Open;
     match &mut inner.wal_reader {
         Some(WalReaderWindow::Registered(slot)) => file.wal_reader_slot_release(cx, *slot)?,
         Some(WalReaderWindow::Native(reader)) => reader.restore_claim(file, cx)?,
@@ -34731,6 +35380,23 @@ where
             let _ = txn.rollback(cx).await;
         }
         Ok(())
+    }
+
+    /// Whether a connection of another lock owner (another process, or a
+    /// stock SQLite library in this one) is attached to the database file
+    /// now. See [`VfsFile::main_file_attached_elsewhere`]; `Unsupported` when
+    /// the VFS cannot tell (bd-reality-check-1022-llk6g.5.7).
+    pub async fn main_file_attached_elsewhere(&self, cx: &Cx) -> Result<bool> {
+        let db_file = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            Arc::clone(&inner.db_file)
+        };
+        shared_db_file_read(&db_file, cx)
+            .await?
+            .main_file_attached_elsewhere(cx)
     }
 
     /// Run a WAL checkpoint to transfer frames from the WAL to the database.

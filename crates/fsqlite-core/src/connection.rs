@@ -5877,6 +5877,20 @@ impl PagerBackend {
         }
     }
 
+    /// Whether a connection of another lock owner is attached to the database
+    /// file (`VfsFile::main_file_attached_elsewhere`).
+    async fn main_file_attached_elsewhere(&self, cx: &Cx) -> Result<bool> {
+        match self {
+            Self::Memory(p) => p.main_file_attached_elsewhere(cx).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.main_file_attached_elsewhere(cx).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.main_file_attached_elsewhere(cx).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.main_file_attached_elsewhere(cx).await,
+        }
+    }
+
     async fn export_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
         match self {
             Self::Memory(p) => p.export_database_bytes(cx).await,
@@ -31593,6 +31607,14 @@ impl Connection {
             // still mutating the file here.
             && self.data_version_own_commits.get() > 0
             && !self.wal_checkpoint_blocked_by_active_concurrent_txns()
+            // bd-reality-check-1022-llk6g.5.7: as stock's sqlite3WalClose,
+            // only a connection no other process shares the file with folds
+            // the WAL in at close (stock needs EXCLUSIVE on the database file
+            // for it). The passive checkpoint holds the WAL checkpoint lock,
+            // and a stock wal_checkpoint(TRUNCATE/RESTART) that meets it
+            // answers SQLITE_BUSY at once, without its busy handler. A VFS
+            // that cannot tell keeps the checkpoint.
+            && !matches!(self.pager.main_file_attached_elsewhere(&cx).await, Ok(true))
         {
             if best_effort {
                 let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive).await;
