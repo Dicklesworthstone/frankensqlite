@@ -517,13 +517,37 @@ impl IndexSchema {
         }
     }
 
-    /// Return the SQL fragment for the `key_pos`th key term.
+    /// Return the display/label SQL fragment for the `key_pos`th key term.
+    ///
+    /// For plain-column indexes this returns the raw unquoted column name from
+    /// [`Self::columns`]. Callers that need an executable [`Expr`] MUST use
+    /// [`Self::key_term_expr`] instead of parsing this string as SQL
+    /// (bd-0t3y0: column names may contain spaces, punctuation, quotes, or SQL
+    /// keywords).
     #[must_use]
     pub fn key_term_sql(&self, key_pos: usize) -> Option<&str> {
         if self.key_expressions.is_empty() {
             self.columns.get(key_pos).map(String::as_str)
         } else {
             self.key_expressions.get(key_pos).map(String::as_str)
+        }
+    }
+
+    /// Return the `key_pos`th key term as an [`Expr`].
+    ///
+    /// Plain-column indexes construct [`Expr::Column`] directly from the raw
+    /// column name so spaced, punctuated, quoted, numeric, or keyword column
+    /// names (e.g. `[na me]`, `"a+b"`, `"select"`, `"null"`, `"1"`) are never
+    /// re-parsed as SQL (bd-0t3y0). Expression indexes parse their quoted SQL
+    /// fragment from [`Self::key_expressions`].
+    #[must_use]
+    pub fn key_term_expr(&self, key_pos: usize) -> Option<Expr> {
+        if self.key_expressions.is_empty() {
+            self.columns
+                .get(key_pos)
+                .map(|col| Expr::Column(ColumnRef::bare(col.as_str()), Span::ZERO))
+        } else {
+            parse_sql_expr(self.key_expressions.get(key_pos)?).ok()
         }
     }
 
@@ -1570,7 +1594,7 @@ pub fn find_upsert_target_index<'a>(
             None
         } else {
             let Some(exprs) = (0..key_terms)
-                .map(|key_pos| parse_sql_expr(index.key_term_sql(key_pos)?).ok())
+                .map(|key_pos| index.key_term_expr(key_pos))
                 .collect::<Option<Vec<Expr>>>()
             else {
                 continue;
@@ -39117,11 +39141,22 @@ fn emit_index_key_term(
     dest_reg: i32,
     scan_ctx: &ScanCtx<'_>,
 ) {
-    let Some(term_sql) = index.key_term_sql(key_pos) else {
-        b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
-        return;
+    // bd-0t3y0: plain-column indexes store unquoted column names in `columns`
+    // (which may contain spaces, operators, quotes, digits, or SQL keywords).
+    // Build `Expr::Column` directly instead of re-parsing the raw name as SQL;
+    // only expression indexes parse SQL text from `key_expressions`.
+    let expr = if index.key_expressions.is_empty() {
+        index
+            .columns
+            .get(key_pos)
+            .map(|col| Expr::Column(ColumnRef::bare(col.as_str()), Span::ZERO))
+    } else {
+        index
+            .key_expressions
+            .get(key_pos)
+            .and_then(|term_sql| parse_table_expr(term_sql, scan_ctx.table))
     };
-    if let Some(expr) = parse_table_expr(term_sql, scan_ctx.table) {
+    if let Some(expr) = expr {
         b.with_schema_evaluation_context(SchemaEvaluationContext::Index, |b| {
             emit_expr(b, &expr, dest_reg, Some(scan_ctx));
         });
@@ -44760,7 +44795,8 @@ fn extract_expression_index_equality_expr<'a>(
     table_alias: Option<&str>,
 ) -> Option<&'a Expr> {
     let root = where_clause?;
-    let key_expr = parse_sql_expr(index.key_term_sql(0)?).ok()?;
+    let mut key_expr = index.key_term_expr(0)?;
+    resolve_table_true_false_columns(&mut key_expr, table);
     let mut pending = vec![root];
     let mut residuals = Vec::new();
     let mut target = None;
@@ -44816,7 +44852,8 @@ fn extract_expression_index_range_target(
     table_alias: Option<&str>,
 ) -> Option<PlannerIndexRangeTarget> {
     let expr = where_clause?;
-    let key_expr = parse_sql_expr(index.key_term_sql(0)?).ok()?;
+    let mut key_expr = index.key_term_expr(0)?;
+    resolve_table_true_false_columns(&mut key_expr, table);
     let mut target = PlannerIndexRangeTarget::default();
     let mut residuals = Vec::new();
     if collect_expression_index_range_bounds(
@@ -75054,5 +75091,87 @@ mod tests {
                 .iter()
                 .any(|op| op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Index(_)))
         );
+    }
+
+    #[test]
+    fn bd_0t3y0_emit_index_key_term_reads_spaced_and_special_column_names() {
+        let col_names = ["id", "na me", "a+b", "select", "null", "1", "na\"me"];
+        let table = TableSchema {
+            name: "p".to_owned(),
+            root_page: 2,
+            columns: col_names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| ColumnInfo {
+                    name: (*name).to_owned(),
+                    affinity: if i == 0 { 'D' } else { 'B' },
+                    is_ipk: i == 0,
+                    type_name: None,
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                    conflict_action: None,
+                })
+                .collect(),
+            indexes: Vec::new(),
+            strict: false,
+            primary_key_constraints: vec![],
+            check_constraints: vec![],
+            without_rowid: false,
+            foreign_keys: vec![],
+        };
+        let index = IndexSchema {
+            name: "pi_special".to_owned(),
+            root_page: 3,
+            columns: col_names[1..].iter().map(|s| (*s).to_owned()).collect(),
+            key_expressions: Vec::new(),
+            key_sort_directions: Vec::new(),
+            where_clause: None,
+            is_unique: false,
+            key_collations: Vec::new(),
+            conflict_action: None,
+        };
+
+        for (key_pos, expected_col) in col_names[1..].iter().enumerate() {
+            assert_eq!(
+                index.key_term_expr(key_pos),
+                Some(Expr::Column(ColumnRef::bare(*expected_col), Span::ZERO)),
+                "key_term_expr({key_pos}) must preserve raw column name `{expected_col}`"
+            );
+            let mut b = ProgramBuilder::new();
+            let row_regs = b.alloc_regs(i32::try_from(col_names.len()).expect("fits i32"));
+            let rowid_reg = b.alloc_reg();
+            let scan = ScanCtx {
+                cursor: 0,
+                table: &table,
+                table_alias: None,
+                schema: None,
+                register_base: Some(RegisterRow::with_rowid(row_regs, rowid_reg)),
+                secondaries: &[],
+            };
+            let dst = b.alloc_reg();
+            emit_index_key_term(&mut b, &index, key_pos, dst, &scan);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            let prog = b.finish().expect("program");
+            let prog_ops = prog.ops();
+            let expected_src = row_regs + i32::try_from(key_pos + 1).expect("fits i32");
+            assert!(
+                prog_ops
+                    .iter()
+                    .any(|op| op.opcode == Opcode::Copy && op.p1 == expected_src && op.p2 == dst),
+                "emit_index_key_term for `{expected_col}` must copy column reg {expected_src} -> {dst}, got {prog_ops:?}"
+            );
+            assert!(
+                !prog_ops.iter().any(|op| matches!(
+                    op.opcode,
+                    Opcode::Null | Opcode::Add | Opcode::Integer
+                )),
+                "emit_index_key_term for `{expected_col}` must not re-parse or emit Null/Add/Integer: {prog_ops:?}"
+            );
+        }
     }
 }

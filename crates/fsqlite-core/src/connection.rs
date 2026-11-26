@@ -67876,10 +67876,7 @@ impl Connection {
                     val,
                 )
             } else {
-                let Some(expr_sql) = index.key_term_sql(key_pos) else {
-                    return UpsertIndexConflictMatch::Indeterminate;
-                };
-                let Ok(mut expr) = fsqlite_parser::expr::parse_expr(expr_sql) else {
+                let Some(mut expr) = index.key_term_expr(key_pos) else {
                     return UpsertIndexConflictMatch::Indeterminate;
                 };
                 resolve_table_true_false_columns(&mut expr, table);
@@ -164493,7 +164490,7 @@ fn planner_directive_expression_index_equality_target_impl(
     table_true_false: (bool, bool),
 ) -> Option<Expr> {
     let root = where_clause?;
-    let mut key_expr = fsqlite_parser::expr::parse_expr(index.key_term_sql(0)?).ok()?;
+    let mut key_expr = index.key_term_expr(0)?;
     fsqlite_ast::resolve_table_true_false_columns_in_expr(
         &mut key_expr,
         table_true_false.0,
@@ -164606,7 +164603,7 @@ fn planner_directive_expression_index_range_target_impl(
     table_true_false: (bool, bool),
 ) -> Option<PlannerIndexRangeTarget> {
     let expr = where_clause?;
-    let mut key_expr = fsqlite_parser::expr::parse_expr(index.key_term_sql(0)?).ok()?;
+    let mut key_expr = index.key_term_expr(0)?;
     fsqlite_ast::resolve_table_true_false_columns_in_expr(
         &mut key_expr,
         table_true_false.0,
