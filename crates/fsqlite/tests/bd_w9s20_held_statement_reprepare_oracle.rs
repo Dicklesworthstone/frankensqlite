@@ -9,13 +9,56 @@
 //! SQLite 3.54.1 (`rusqlite`), while reusing the compiled program with zero
 //! recompiles when neither schema nor pragma changed.
 
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
 use fsqlite::Connection as AsyncConnection;
 use fsqlite::blocking::Connection as BlockingConnection;
 use fsqlite_core::connection::{
-    hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
+    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+    set_hot_path_profile_enabled,
 };
 use fsqlite_types::SqliteValue;
 use rusqlite::types::Value as StockValue;
+
+/// `set_hot_path_profile_enabled` toggles a process-global flag outside
+/// `#[cfg(test)]` (including integration test binaries). Sibling tests in this
+/// binary acquire a shared read lock (so they still execute concurrently with
+/// one another), while the profile-counting test acquires an exclusive write
+/// lock so parallel prepares/re-prepares cannot increment the process-global
+/// parser/cache counters during its measurement window (bd-mhat4).
+static HOT_PATH_PROFILE_GATE: RwLock<()> = RwLock::new(());
+
+fn profile_reader_guard() -> RwLockReadGuard<'static, ()> {
+    HOT_PATH_PROFILE_GATE
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn profile_writer_guard() -> RwLockWriteGuard<'static, ()> {
+    HOT_PATH_PROFILE_GATE
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+struct HotPathProfileScope {
+    previous_enabled: bool,
+}
+
+impl HotPathProfileScope {
+    fn enter() -> Self {
+        let previous_enabled = hot_path_profile_enabled();
+        set_hot_path_profile_enabled(true);
+        reset_hot_path_profile();
+        Self { previous_enabled }
+    }
+}
+
+impl Drop for HotPathProfileScope {
+    fn drop(&mut self) {
+        set_hot_path_profile_enabled(self.previous_enabled);
+        reset_hot_path_profile();
+    }
+}
 
 fn stock_to_sqlite(v: StockValue) -> SqliteValue {
     match v {
@@ -86,6 +129,7 @@ async fn step_async(stmt: &fsqlite::PreparedStatement<'_>) -> Result<StepOutcome
 
 #[test]
 fn blocking_held_select_star_reprepares_after_cross_and_same_conn_alter() {
+    let _profile_gate = profile_reader_guard();
     let dir = tempfile::tempdir().expect("tempdir");
     let frank_path = dir.path().join("frank_blocking.db");
     let stock_path = dir.path().join("stock_blocking.db");
@@ -210,6 +254,7 @@ fn blocking_held_select_star_reprepares_after_cross_and_same_conn_alter() {
 
 #[test]
 fn async_and_blocking_held_statements_reprepare_on_reverse_unordered_selects() {
+    let _profile_gate = profile_reader_guard();
     let dir = tempfile::tempdir().expect("tempdir");
     let frank_path = dir.path().join("frank_rev.db");
     let stock_path = dir.path().join("stock_rev.db");
@@ -361,6 +406,7 @@ fn async_and_blocking_held_statements_reprepare_on_reverse_unordered_selects() {
 
 #[test]
 fn held_statement_reuses_program_when_schema_and_pragma_unchanged() {
+    let _profile_gate = profile_writer_guard();
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("reuse.db");
@@ -381,17 +427,17 @@ fn held_statement_reuses_program_when_schema_and_pragma_unchanged() {
             assert_eq!(stmt.program_identity(), initial_program_id, "{label}");
 
             // Negative case: no schema or pragma change -> 0 re-prepares across 5 steps.
-            set_hot_path_profile_enabled(true);
-            reset_hot_path_profile();
-            for _ in 0..5 {
-                let rows = stmt.query().await.expect("steady query");
-                assert_eq!(rows.len(), 3, "{label}");
-                assert_eq!(rows[0].values().len(), 2, "{label}");
-                assert_eq!(stmt.reprepare_count(), 0, "{label}");
-                assert_eq!(stmt.program_identity(), initial_program_id, "{label}");
-            }
-            let steady = hot_path_profile_snapshot().parser;
-            set_hot_path_profile_enabled(false);
+            let steady = {
+                let _profile_scope = HotPathProfileScope::enter();
+                for _ in 0..5 {
+                    let rows = stmt.query().await.expect("steady query");
+                    assert_eq!(rows.len(), 3, "{label}");
+                    assert_eq!(rows[0].values().len(), 2, "{label}");
+                    assert_eq!(stmt.reprepare_count(), 0, "{label}");
+                    assert_eq!(stmt.program_identity(), initial_program_id, "{label}");
+                }
+                hot_path_profile_snapshot().parser
+            };
             assert_eq!(
                 steady.prepared_cache_hits + steady.prepared_cache_misses,
                 0,
@@ -402,23 +448,23 @@ fn held_statement_reuses_program_when_schema_and_pragma_unchanged() {
             conn.execute("PRAGMA reverse_unordered_selects = ON")
                 .await
                 .expect("pragma on");
-            set_hot_path_profile_enabled(true);
-            reset_hot_path_profile();
-            let mut reversed_program_id = None;
-            for _ in 0..5 {
-                let rows = stmt.query().await.expect("reversed query");
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(3), "{label}");
-                assert_eq!(stmt.reprepare_count(), 1, "{label}");
-                let pid = stmt.program_identity();
-                assert_ne!(pid, initial_program_id, "{label}");
-                if let Some(prev) = reversed_program_id {
-                    assert_eq!(pid, prev, "{label}: reversed program must be reused");
-                } else {
-                    reversed_program_id = Some(pid);
+            let after_pragma = {
+                let _profile_scope = HotPathProfileScope::enter();
+                let mut reversed_program_id = None;
+                for _ in 0..5 {
+                    let rows = stmt.query().await.expect("reversed query");
+                    assert_eq!(rows[0].values()[0], SqliteValue::Integer(3), "{label}");
+                    assert_eq!(stmt.reprepare_count(), 1, "{label}");
+                    let pid = stmt.program_identity();
+                    assert_ne!(pid, initial_program_id, "{label}");
+                    if let Some(prev) = reversed_program_id {
+                        assert_eq!(pid, prev, "{label}: reversed program must be reused");
+                    } else {
+                        reversed_program_id = Some(pid);
+                    }
                 }
-            }
-            let after_pragma = hot_path_profile_snapshot().parser;
-            set_hot_path_profile_enabled(false);
+                hot_path_profile_snapshot().parser
+            };
             assert_eq!(
                 after_pragma.prepared_cache_hits + after_pragma.prepared_cache_misses,
                 1,
