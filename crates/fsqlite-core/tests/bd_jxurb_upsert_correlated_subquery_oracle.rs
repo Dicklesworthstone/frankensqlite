@@ -382,10 +382,15 @@ const STATEMENTS: &[(&str, &str)] = &[
     (RESET, NO_ROWS),
     // Only the DO UPDATE a row takes runs: a subquery whose second arm
     // overflows errors for a conflicting row, and not for a row inserted.
-    // bd-7zeum: fsqlite also evaluates a compound scalar subquery's later
-    // arms after its first row, so the probe whose first arm has a row
-    // (`s.k = excluded.k` for k = 2, stock 80 with no error) is left out
-    // until that is fixed; restore it then.
+    // bd-7zeum: a compound scalar subquery stops at its first row, so a first
+    // arm with a row (`s.k = excluded.k` for k = 2) gives 80 with no error.
+    (
+        "INSERT INTO t VALUES (2, 0, 'q') ON CONFLICT(k) DO UPDATE \
+         SET n = (SELECT v FROM s WHERE s.k = excluded.k UNION ALL SELECT abs(-9223372036854775808))",
+        NO_ROWS,
+    ),
+    (READ, "rows=[[\"1\", \"1\", \"'x'\"], [\"2\", \"80\", \"'y'\"]]"),
+    (RESET, NO_ROWS),
     (
         "INSERT INTO t VALUES (2, 0, 'q') ON CONFLICT(k) DO UPDATE \
          SET n = (SELECT v FROM s WHERE s.k = excluded.k + 10 UNION ALL SELECT abs(-9223372036854775808))",
