@@ -5870,6 +5870,7 @@ impl PagerBackend {
         db_path: &str,
         allow_readonly: bool,
         force_readonly_shm: bool,
+        materialize_missing_wal: bool,
     ) -> Result<bool> {
         self.validate_namespace_binding()?;
         let wal_path = wal_path_for_db_path(db_path);
@@ -5883,6 +5884,7 @@ impl PagerBackend {
                     &wal_path,
                     allow_readonly,
                     force_readonly_shm,
+                    materialize_missing_wal,
                 )
                 .await
             }
@@ -5896,6 +5898,7 @@ impl PagerBackend {
                     &wal_path,
                     allow_readonly,
                     force_readonly_shm,
+                    materialize_missing_wal,
                 )
                 .await
             }
@@ -5909,6 +5912,7 @@ impl PagerBackend {
                     &wal_path,
                     allow_readonly,
                     force_readonly_shm,
+                    materialize_missing_wal,
                 )
                 .await
             }
@@ -5922,19 +5926,29 @@ impl PagerBackend {
                     &wal_path,
                     allow_readonly,
                     force_readonly_shm,
+                    materialize_missing_wal,
                 )
                 .await
             }
         }
     }
 
+    /// `materialize_missing_wal` is false only for a private image
+    /// (bd-gfx4q): a missing `-wal` then stays missing and no `-shm` is built.
     async fn install_existing_wal_backend_allow_readonly(
         &self,
         cx: &Cx,
         db_path: &str,
+        materialize_missing_wal: bool,
     ) -> Result<bool> {
-        self.install_existing_wal_backend_with_mode(cx, db_path, true, false)
-            .await
+        self.install_existing_wal_backend_with_mode(
+            cx,
+            db_path,
+            true,
+            false,
+            materialize_missing_wal,
+        )
+        .await
     }
 
     async fn install_existing_wal_backend_allow_readonly_with_shm_mode(
@@ -5943,7 +5957,7 @@ impl PagerBackend {
         db_path: &str,
         force_readonly_shm: bool,
     ) -> Result<bool> {
-        self.install_existing_wal_backend_with_mode(cx, db_path, true, force_readonly_shm)
+        self.install_existing_wal_backend_with_mode(cx, db_path, true, force_readonly_shm, true)
             .await
     }
 
@@ -6755,6 +6769,7 @@ async fn install_existing_wal_backend_with_vfs<V>(
     wal_path: &Path,
     allow_readonly: bool,
     force_readonly_shm: bool,
+    materialize_missing_wal: bool,
 ) -> Result<bool>
 where
     V: Vfs + Send + Sync + 'static,
@@ -6762,7 +6777,9 @@ where
 {
     let readonly_shm = allow_readonly && (pager.reads_shm_readonly() || force_readonly_shm);
     if !vfs.access(cx, wal_path, AccessFlags::EXISTS)? {
-        if !allow_readonly {
+        // bd-gfx4q: a private image (VACUUM's own candidate) must stay
+        // self-contained, so its validation open never creates companions.
+        if !allow_readonly || !materialize_missing_wal {
             return Ok(false);
         }
         // bd-cf0be: a cleanly closed WAL database has header bytes 18/19 == 2
@@ -16616,6 +16633,14 @@ pub struct Connection {
     /// when opened against a rollback-journal database, so a later external
     /// switch to WAL mode still binds `-shm` read-only and refuses writes.
     readonly_shm: bool,
+    /// bd-gfx4q: true only for the validation open of a private image this
+    /// process wrote itself (`SchemaOnlyPagerDisposition::PrivateImage`).
+    /// That image must stay self-contained until it is published, so this
+    /// connection reads its main file alone and never creates the empty
+    /// `-wal` and 32 KiB `-shm` that bd-cf0be's stock-parity rule creates for
+    /// a user's read-only open of a cleanly closed WAL database; nor does it
+    /// adopt an external WAL switch, since a private image has no peer.
+    private_image_open: bool,
     /// #368 defect 3: when set, the schema reload keeps the bare (empty) FTS5
     /// vtab instance and does NOT read/validate its `%_data` shadow structure,
     /// so a database whose FTS5 shadow is corrupt (e.g. "structure segment
@@ -17875,6 +17900,12 @@ enum SchemaOnlyPagerDisposition {
     RecoverWalIndex,
     /// `immutable=1` (bd-j2dtf): the main file alone, no locks.
     Immutable,
+    /// bd-gfx4q: a read-only open of a private image this process wrote
+    /// itself (VACUUM's rebuild candidate or `VACUUM INTO` output), to
+    /// validate it before publication. Admitted like `Ordinary` read-only, but
+    /// it never materializes a missing `-wal`/`-shm` pair; see
+    /// `Connection::private_image_open`.
+    PrivateImage,
     #[cfg(not(target_arch = "wasm32"))]
     ReservedEmptyRollback(FileIdentity),
 }
@@ -18244,6 +18275,30 @@ impl Connection {
         .await
     }
 
+    /// bd-gfx4q: open a private image this process just wrote (VACUUM's
+    /// rebuild candidate or `VACUUM INTO` output) read-only, to validate it
+    /// before publication, without creating any `-wal`/`-shm` companion.
+    ///
+    /// The image is published only while it is self-contained
+    /// (`ensure_vacuum_candidate_is_self_contained_in_vfs` refuses any
+    /// `-shm`). A user's read-only open of a cleanly closed WAL database
+    /// creates both companions as stock does (bd-cf0be); this open must not,
+    /// or VACUUM of a WAL database refuses its own candidate.
+    async fn open_private_image_schema_only(
+        path: String,
+        expected_identity: Option<FileIdentity>,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
+            path,
+            expected_identity,
+            ConnectionEnv::default(),
+            false,
+            false,
+            SchemaOnlyPagerDisposition::PrivateImage,
+        )
+        .await
+    }
+
     async fn open_schema_only_with_optional_expected_identity_and_env_and_disposition(
         path: impl Into<String>,
         expected_identity: Option<FileIdentity>,
@@ -18257,7 +18312,9 @@ impl Connection {
             || (writable && path == ":memory:")
             || (matches!(
                 disposition,
-                SchemaOnlyPagerDisposition::RecoverWalIndex | SchemaOnlyPagerDisposition::Immutable
+                SchemaOnlyPagerDisposition::RecoverWalIndex
+                    | SchemaOnlyPagerDisposition::Immutable
+                    | SchemaOnlyPagerDisposition::PrivateImage
             ) && path == ":memory:")
             || (expected_identity.is_some() && path == ":memory:")
         {
@@ -18273,7 +18330,9 @@ impl Connection {
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         let locked_key_envelope = if matches!(
             disposition,
-            SchemaOnlyPagerDisposition::Ordinary | SchemaOnlyPagerDisposition::RecoverWalIndex
+            SchemaOnlyPagerDisposition::Ordinary
+                | SchemaOnlyPagerDisposition::RecoverWalIndex
+                | SchemaOnlyPagerDisposition::PrivateImage
         ) {
             detect_locked_encrypted_database(&path)
         } else {
@@ -18317,7 +18376,8 @@ impl Connection {
                 }
                 SchemaOnlyPagerDisposition::Ordinary
                 | SchemaOnlyPagerDisposition::RecoverWalIndex
-                | SchemaOnlyPagerDisposition::Immutable => {
+                | SchemaOnlyPagerDisposition::Immutable
+                | SchemaOnlyPagerDisposition::PrivateImage => {
                     let mode = match disposition {
                         SchemaOnlyPagerDisposition::RecoverWalIndex => {
                             ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
@@ -18607,6 +18667,7 @@ impl Connection {
             allow_lazy_contentless_fts5: true,
             schema_only_open: true,
             readonly_shm: env.readonly_shm(),
+            private_image_open: matches!(disposition, SchemaOnlyPagerDisposition::PrivateImage),
             defer_fts5_hydration,
             skip_statement_memdb_refresh: Cell::new(false),
             reject_mem_fallback_strict: RefCell::new(false),
@@ -19303,6 +19364,7 @@ impl Connection {
             allow_lazy_contentless_fts5: true,
             schema_only_open: false,
             readonly_shm: env.readonly_shm(),
+            private_image_open: false,
             defer_fts5_hydration: false,
             skip_statement_memdb_refresh: Cell::new(false),
             // Strict fallback rejection is opt-in for certifying runs.
@@ -30852,7 +30914,10 @@ impl Connection {
         cx: &Cx,
         snapshot: PagerPublishedSnapshot,
     ) -> Result<PagerPublishedSnapshot> {
-        if self.pager.is_memory()
+        // bd-gfx4q: a private image has no peer to switch it, and adopting
+        // would build the `-wal`/`-shm` pair its publication refuses.
+        if self.private_image_open
+            || self.pager.is_memory()
             || self.pager.is_immutable()
             || self.pager.journal_mode() != JournalMode::Delete
             || self.in_transaction.get()
@@ -80600,10 +80665,12 @@ impl Connection {
                 .ok_or_else(|| FrankenError::CannotOpen {
                     path: rebuild_target.path().to_owned(),
                 })?;
+        // bd-gfx4q: a private-image open, so validating a WAL-format image
+        // does not create the `-wal`/`-shm` pair that publication refuses.
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-        let validation_conn = Self::open_schema_only_with_expected_identity(
+        let validation_conn = Self::open_private_image_schema_only(
             rebuild_path_text.to_owned(),
-            rebuild_target.identity(),
+            Some(rebuild_target.identity()),
         )
         .await
         .map_err(|err| {
@@ -80612,7 +80679,7 @@ impl Connection {
             ))
         })?;
         #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
-        let validation_conn = Self::open_schema_only(rebuild_path_text.to_owned())
+        let validation_conn = Self::open_private_image_schema_only(rebuild_path_text.to_owned(), None)
             .await
             .map_err(|err| {
                 FrankenError::Internal(format!(
@@ -99148,7 +99215,7 @@ impl Connection {
         }
 
         self.pager
-            .install_existing_wal_backend_allow_readonly(&cx, &self.path)
+            .install_existing_wal_backend_allow_readonly(&cx, &self.path, !self.private_image_open)
             .await?;
         match self.pager.set_journal_mode(&cx, JournalMode::Wal).await {
             // Unsupported: no WAL was bound, so the main file is the whole
@@ -263164,15 +263231,19 @@ fts5(title, body, content=docs, content_rowid=id)'
         });
     }
 
+    /// bd-gfx4q re-pin (expectation change). This test asserted that a
+    /// schema-only open of a cleanly closed WAL database creates no `-wal`.
+    /// A schema-only open is fsqlite's read-only open (the compat layer maps
+    /// `SQLITE_OPEN_READONLY` to it), and stock's read-only open of this shape
+    /// creates an empty `-wal` and a 32 KiB `-shm`, which b1b1a76df (bd-cf0be)
+    /// matched. The test now runs stock live on a twin database and pins
+    /// parity: the same companions with the same sizes, and the same rows.
     #[test]
-    fn test_open_schema_only_wal_mode_database_does_not_create_missing_wal_sidecar() {
+    fn test_open_schema_only_wal_mode_database_creates_the_sidecars_stock_read_only_creates() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("from_c_checkpointed_wal_mode.db");
-            let db_str = db_path.to_str().unwrap();
-            let wal_path = std::path::PathBuf::from(format!("{db_str}-wal"));
-
-            {
+            let seed = |name: &str| {
+                let db_path = dir.path().join(name);
                 let rconn = rusqlite::Connection::open(&db_path).unwrap();
                 let journal_mode: String = rconn
                     .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
@@ -263184,26 +263255,61 @@ fts5(title, body, content=docs, content_rowid=id)'
                  INSERT INTO t(v) VALUES ('alpha');",
                     )
                     .unwrap();
+                drop(rconn);
+                db_path
+            };
+            let companions = |db_path: &std::path::Path| {
+                let len = |suffix: &str| {
+                    std::fs::metadata(format!("{}{suffix}", db_path.display()))
+                        .ok()
+                        .map(|metadata| metadata.len())
+                };
+                (len("-wal"), len("-shm"))
+            };
+            let stock_db = seed("stock_twin_checkpointed_wal_mode.db");
+            let db_path = seed("from_c_checkpointed_wal_mode.db");
+            for twin in [&stock_db, &db_path] {
+                assert_eq!(
+                    companions(twin),
+                    (None, None),
+                    "closing the C SQLite connection should checkpoint and remove both sidecars"
+                );
             }
 
-            assert!(
-                !wal_path.exists(),
-                "closing the C SQLite connection should checkpoint and remove the WAL sidecar"
+            let stock = rusqlite::Connection::open_with_flags(
+                &stock_db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let stock_rows: i64 = stock
+                .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
+                .unwrap();
+            let stock_companions = companions(&stock_db);
+            // The stock evidence for the re-pin, live in this run.
+            assert_eq!(
+                stock_companions,
+                (Some(0), Some(32 * 1024)),
+                "stock {}'s read-only open of a checkpointed WAL database",
+                rusqlite::version()
             );
 
-            let conn = Connection::open_schema_only(db_str)
+            let conn = Connection::open_schema_only(db_path.to_str().unwrap())
                 .await
-                .expect("schema-only open should work without recreating a missing WAL sidecar");
+                .expect("schema-only open of a checkpointed WAL database");
             let rows = conn
                 .query("SELECT COUNT(*) FROM t;")
                 .await
                 .expect("schema-only query should read the checkpointed main database");
             assert_eq!(rows.len(), 1);
-            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
-            assert!(
-                !wal_path.exists(),
-                "schema-only open must not create a WAL sidecar just because the header still advertises WAL mode"
+            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(stock_rows));
+            assert_eq!(
+                companions(&db_path),
+                stock_companions,
+                "schema-only open must create the (-wal, -shm) companions stock {}'s read-only open creates, with the same sizes",
+                rusqlite::version()
             );
+            drop(stock);
+            conn.close().await.unwrap();
         });
     }
 
