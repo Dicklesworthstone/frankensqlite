@@ -11895,6 +11895,22 @@ fn emit_limit_offset_registers(
     limit_clause: Option<&LimitClause>,
     done_label: crate::Label,
 ) -> (Option<i32>, Option<i32>) {
+    let registers = emit_limit_offset_registers_untracked(b, limit_clause, done_label);
+    if let Some(offset_register) = registers.1 {
+        b.set_result_offset_register(offset_register);
+    }
+    registers
+}
+
+/// Emit counters without publishing them as top-level result progress.
+///
+/// Nested subqueries count a different row stream. Root emitters with a
+/// successful exit before counter initialization also cannot report progress.
+fn emit_limit_offset_registers_untracked(
+    b: &mut ProgramBuilder,
+    limit_clause: Option<&LimitClause>,
+    done_label: crate::Label,
+) -> (Option<i32>, Option<i32>) {
     let Some(clause) = limit_clause else {
         return (None, None);
     };
@@ -20129,7 +20145,10 @@ fn codegen_select_skip_scan(
     b.emit_jump_to_label(Opcode::IsNull, const_reg, 0, done_label, P4::None, 0);
 
     // LIMIT/OFFSET streaming (only reached when a matching ORDER BY makes the top-N deterministic).
-    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
+    // A NULL probe exits before initialization, so these counters cannot
+    // report top-level OFFSET progress on every successful execution.
+    let (limit_reg, offset_reg) =
+        emit_limit_offset_registers_untracked(b, limit_clause, done_label);
 
     let covering = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
     let needs_table = covering.is_none();
@@ -20383,7 +20402,10 @@ fn codegen_select_skip_scan_range(
     });
 
     // LIMIT/OFFSET streaming (only reached when a matching ORDER BY makes the top-N deterministic).
-    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
+    // A NULL bound exits before initialization, so these counters cannot
+    // report top-level OFFSET progress on every successful execution.
+    let (limit_reg, offset_reg) =
+        emit_limit_offset_registers_untracked(b, limit_clause, done_label);
 
     let covering = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
     let needs_table = covering.is_none();
@@ -46300,7 +46322,7 @@ fn try_emit_complex_in_subquery(
     // does not reevaluate a dynamic LIMIT for every outer row.
     let selected_done = b.emit_label();
     let (limit_reg, offset_reg) =
-        emit_limit_offset_registers(b, subquery.limit.as_ref(), selected_done);
+        emit_limit_offset_registers_untracked(b, subquery.limit.as_ref(), selected_done);
     let top_n_bound_reg = if has_order_by && limit_clause_can_enable_top_n(subquery.limit.as_ref())
     {
         emit_top_n_bound_register(b, limit_reg, offset_reg)
@@ -62114,6 +62136,262 @@ mod tests {
             .find(|op| op.opcode == Opcode::IfPos)
             .expect("must have IfPos");
         assert_eq!(ifpos.p3, 1, "IfPos should decrement offset by 1");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn result_offset_progress_survives_row_collection_and_engine_reuse() {
+        let schema = test_schema_with_subquery_source();
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        let registry = Arc::new(registry);
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .expect("build OFFSET progress test runtime");
+        let mut engine = VdbeEngine::new(0);
+        let cx = fsqlite_types::cx::Cx::new();
+        let cases: &[(&str, &[i64], Option<i64>)] = &[
+            (
+                "SELECT a FROM t WHERE abs(a) > 0 LIMIT 1 OFFSET 1",
+                &[2],
+                Some(0),
+            ),
+            ("SELECT a FROM t WHERE a > 0 LIMIT 1 OFFSET 5", &[], Some(3)),
+            ("SELECT a FROM t LIMIT 1 OFFSET 5", &[], Some(2)),
+            (
+                "SELECT a FROM t WHERE rowid = 2 LIMIT 1 OFFSET 3",
+                &[],
+                Some(2),
+            ),
+            ("SELECT sum(b) FROM t LIMIT 1 OFFSET 2", &[], Some(1)),
+            (
+                "SELECT sum(b) FROM t WHERE 0 LIMIT 1 OFFSET 2",
+                &[],
+                Some(1),
+            ),
+            (
+                "SELECT sum(b) FROM t HAVING sum(b) > 100 LIMIT 1 OFFSET 2",
+                &[],
+                Some(2),
+            ),
+            (
+                "SELECT sum(b) FROM t GROUP BY a LIMIT 1 OFFSET 5",
+                &[],
+                Some(2),
+            ),
+            (
+                "SELECT t.a FROM t JOIN s ON t.a = s.b LIMIT 1 OFFSET 5",
+                &[],
+                Some(3),
+            ),
+            (
+                "SELECT a FROM t WHERE a IN \
+                 (SELECT b FROM s LIMIT 1 OFFSET 1) LIMIT 1 OFFSET 3",
+                &[],
+                Some(2),
+            ),
+            ("SELECT a FROM t LIMIT 1 OFFSET -7", &[1], Some(0)),
+            ("SELECT a FROM t LIMIT 1", &[1], None),
+            (
+                "SELECT a FROM t LIMIT 0 OFFSET abs(-9223372036854775808)",
+                &[],
+                None,
+            ),
+        ];
+
+        for &(sql, expected_values, expected_remaining) in cases {
+            let stmt = select_sql(sql);
+            let mut builder = ProgramBuilder::new();
+            codegen_select(&mut builder, &stmt, &schema, &CodegenContext::default())
+                .expect("OFFSET progress fixture should compile");
+            let program = builder
+                .finish()
+                .expect("OFFSET progress program should finish");
+            engine.reset_for_reuse(
+                program.register_count(),
+                &cx,
+                fsqlite_types::PageSize::DEFAULT,
+            );
+            assert_eq!(
+                engine.remaining_result_offset(&program),
+                None,
+                "a reused engine must not report an earlier counter: {sql}"
+            );
+
+            let mut db = MemDatabase::new();
+            db.create_table_at(2, 2);
+            for (rowid, a, b) in [(1, 1, 10), (2, 2, 20), (3, i64::MIN, 30)] {
+                db.get_table_mut(2)
+                    .expect("outer table should exist")
+                    .insert_row(
+                        rowid,
+                        vec![SqliteValue::Integer(a), SqliteValue::Integer(b)],
+                    );
+            }
+            db.create_table_at(3, 1);
+            for value in 1..=3 {
+                db.get_table_mut(3)
+                    .expect("subquery table should exist")
+                    .insert_row(value, vec![SqliteValue::Integer(value)]);
+            }
+            engine.enable_storage_read_cursors(true);
+            engine.set_database(db);
+            engine.set_reject_mem_fallback(false);
+            engine.set_function_registry(Arc::clone(&registry));
+            let outcome = runtime
+                .block_on(async { engine.execute(&program).await })
+                .expect("OFFSET progress execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done, "{sql}");
+            assert_eq!(
+                engine.remaining_result_offset(&program),
+                expected_remaining,
+                "OFFSET counts qualifying output rows, including aggregate rows: {sql}"
+            );
+            let rows = engine
+                .take_results()
+                .into_iter()
+                .map(|row| row.into_vec())
+                .collect::<Vec<_>>();
+            let expected_rows = expected_values
+                .iter()
+                .map(|&value| vec![SqliteValue::Integer(value)])
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected_rows, "{sql}");
+            assert_eq!(
+                engine.remaining_result_offset(&program),
+                expected_remaining,
+                "collecting rows must leave OFFSET progress available: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn result_offset_progress_limit_zero_does_not_reuse_an_earlier_counter() {
+        let stmt = select_sql("SELECT id FROM bench LIMIT ?1 OFFSET 5");
+        let mut builder = ProgramBuilder::new();
+        codegen_select(
+            &mut builder,
+            &stmt,
+            &test_small_bench_schema(),
+            &CodegenContext::default(),
+        )
+        .expect("rebound LIMIT fixture should compile");
+        let program = builder
+            .finish()
+            .expect("rebound LIMIT program should finish");
+        let mut engine = VdbeEngine::new(program.register_count());
+        engine.enable_storage_read_cursors(true);
+        engine.set_database(seed_small_bench_db(3));
+        engine.set_reject_mem_fallback(false);
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .expect("build rebound LIMIT test runtime");
+
+        for (limit, expected_remaining) in [(1, Some(2)), (0, None), (1, Some(2))] {
+            let bindings = [SqliteValue::Integer(limit)];
+            let outcome = runtime
+                .block_on(async {
+                    engine
+                        .execute_with_borrowed_bindings(&program, Some(&bindings))
+                        .await
+                })
+                .expect("rebound LIMIT execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+            assert!(engine.take_results().is_empty());
+            assert_eq!(
+                engine.remaining_result_offset(&program),
+                expected_remaining,
+                "LIMIT zero must not inherit a preceding run's OFFSET"
+            );
+        }
+    }
+
+    #[test]
+    fn result_offset_register_excludes_skip_scan_null_probe_exits() {
+        let mut table = bd_2dgf5_table();
+        table.indexes[0].name = "idx_t_k_v".to_owned();
+        table.indexes[0].columns = vec!["k".to_owned(), "v".to_owned()];
+        table.indexes[0].key_expressions = table.indexes[0].columns.clone();
+        let schema = vec![table];
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .expect("build skip-scan OFFSET capability test runtime");
+
+        for sql in [
+            "SELECT id FROM t WHERE v = ?1 ORDER BY k, id LIMIT 1 OFFSET 3",
+            "SELECT id FROM t WHERE v >= ?1 ORDER BY k, v, id LIMIT 1 OFFSET 3",
+            "SELECT id FROM t WHERE v < ?1 ORDER BY k, v, id LIMIT 1 OFFSET 3",
+        ] {
+            let stmt = select_sql(sql);
+            let mut builder = ProgramBuilder::new();
+            codegen_select(&mut builder, &stmt, &schema, &CodegenContext::default())
+                .expect("skip-scan capability fixture should compile");
+            let program = builder.finish().expect("skip-scan program should finish");
+            let null_probe = program
+                .ops()
+                .iter()
+                .position(|op| op.opcode == Opcode::IsNull)
+                .expect("skip scan must have a NULL-probe exit");
+            let limit_guard = program
+                .ops()
+                .iter()
+                .position(|op| op.opcode == Opcode::IfNot)
+                .expect("skip scan must have a LIMIT guard");
+            assert!(
+                null_probe < limit_guard,
+                "fixture must exercise the pre-initialization success exit: {sql}"
+            );
+            assert_eq!(
+                program.result_offset_register(),
+                None,
+                "a caller must decline unsupported progress before executing: {sql}"
+            );
+
+            let bindings = [SqliteValue::Null];
+            let mut engine = VdbeEngine::new(program.register_count());
+            let outcome = runtime
+                .block_on(async {
+                    engine
+                        .execute_with_borrowed_bindings(&program, Some(&bindings))
+                        .await
+                })
+                .expect("NULL probe should finish before opening the index");
+            assert_eq!(outcome, ExecOutcome::Done, "{sql}");
+            assert!(engine.results().is_empty(), "{sql}");
+            assert_eq!(engine.remaining_result_offset(&program), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn result_offset_register_excludes_nested_and_unsupported_counters() {
+        let schema = test_schema_with_subquery_source();
+        for sql in [
+            "SELECT a IN (SELECT b FROM s LIMIT 1 OFFSET 1) FROM t",
+            "SELECT 99 LIMIT 1 OFFSET 1",
+            "VALUES (1), (2)",
+        ] {
+            let stmt = select_sql(sql);
+            let mut builder = ProgramBuilder::new();
+            codegen_select(&mut builder, &stmt, &schema, &CodegenContext::default())
+                .expect("OFFSET metadata fixture should compile");
+            let program = builder
+                .finish()
+                .expect("OFFSET metadata program should finish");
+            assert_eq!(
+                program.result_offset_register(),
+                None,
+                "only an implemented top-level result counter may report progress: {sql}"
+            );
+            if sql.contains("SELECT b FROM s") {
+                assert!(
+                    program.ops().iter().any(|op| op.opcode == Opcode::IfPos),
+                    "the nested subquery must still have its local OFFSET counter"
+                );
+            }
+        }
     }
 
     // === Test 13: SELECT without LIMIT has no DecrJumpZero ===

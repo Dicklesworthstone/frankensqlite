@@ -13735,6 +13735,12 @@ impl VdbeEngine {
         if self.registers.len() < reg_count {
             self.registers.resize(reg_count, SqliteValue::Null);
         }
+        // A reused engine can execute again without a reset. LIMIT zero may
+        // bypass OFFSET initialization, so never expose the previous run's
+        // counter as progress for this execution.
+        if let Some(register) = program.result_offset_register() {
+            self.set_reg(register, SqliteValue::Null);
+        }
 
         let statement_debug_enabled =
             tracing::enabled!(target: "fsqlite_vdbe::statement", tracing::Level::DEBUG);
@@ -19428,6 +19434,20 @@ impl VdbeEngine {
         }
 
         Ok(outcome)
+    }
+
+    /// Read the top-level SELECT's remaining OFFSET after successful execution.
+    ///
+    /// Call with the program just executed, before resetting or reusing this
+    /// engine. Taking result rows does not consume the counter. A missing or
+    /// uninitialized counter returns `None`, including when LIMIT zero bypassed
+    /// OFFSET evaluation; it must not be interpreted as a consumed offset.
+    #[must_use]
+    pub fn remaining_result_offset(&self, program: &VdbeProgram) -> Option<i64> {
+        program
+            .result_offset_register()
+            .and_then(|register| self.get_reg(register).as_integer())
+            .map(|remaining| remaining.max(0))
     }
 
     /// Get the collected result rows.

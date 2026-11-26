@@ -600,6 +600,8 @@ pub struct ProgramBuilder {
     /// bd-w4pr1.13.11: the aggregate loop the engine may run on several
     /// threads instead (see [`Self::set_parallel_aggregate`]).
     parallel_aggregate: Option<parallel_aggregate::ParallelAggregatePlan>,
+    /// The top-level SELECT's remaining OFFSET, excluding nested subqueries.
+    result_offset_register: Option<i32>,
 }
 
 /// A literal a program loads once, before its first instruction after
@@ -629,7 +631,16 @@ impl ProgramBuilder {
             materialized_virtual_generated_roots: Vec::new(),
             hoisted_literals: Vec::new(),
             parallel_aggregate: None,
+            result_offset_register: None,
         }
+    }
+
+    /// Record the top-level SELECT's OFFSET counter.
+    ///
+    /// Nested subqueries must not replace the enclosing SELECT's counter.
+    pub(crate) fn set_result_offset_register(&mut self, register: i32) {
+        debug_assert!(register > 0 && register <= self.regs.count());
+        self.result_offset_register = Some(register);
     }
 
     /// bd-w4pr1.13.11: record that the aggregate loop starting at `plan`'s
@@ -1050,6 +1061,7 @@ impl ProgramBuilder {
                 ConstraintFailureRows::Discard
             },
             parallel_aggregate: self.parallel_aggregate.map(Arc::new),
+            result_offset_register: self.result_offset_register,
         };
         program.verify_control_flow_targets()?;
         Ok(program)
@@ -1380,6 +1392,8 @@ pub struct VdbeProgram {
     /// bd-w4pr1.13.11: an aggregate loop the engine may run on several
     /// threads instead, continuing at its `ResultRow`.
     parallel_aggregate: Option<Arc<parallel_aggregate::ParallelAggregatePlan>>,
+    /// The top-level SELECT's remaining OFFSET, excluding nested subqueries.
+    result_offset_register: Option<i32>,
 }
 
 impl VdbeProgram {
@@ -1561,6 +1575,15 @@ impl VdbeProgram {
     /// Number of registers required.
     pub fn register_count(&self) -> i32 {
         self.register_count
+    }
+
+    /// The top-level SELECT's OFFSET counter, when codegen exposes one.
+    ///
+    /// Absence means this program cannot report OFFSET progress. In particular,
+    /// a nested subquery's counter is never a substitute for the result counter.
+    #[must_use]
+    pub fn result_offset_register(&self) -> Option<i32> {
+        self.result_offset_register
     }
 
     /// Highest 1-based bind parameter index referenced by the program.
