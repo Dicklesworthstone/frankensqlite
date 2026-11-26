@@ -1518,6 +1518,192 @@ fn review_update_not_null_on_conflict_ignore_skips_row() {
 }
 
 // ---------------------------------------------------------------------------
+// WITHOUT ROWID UPDATE FROM validates constraints while applying each row
+// ---------------------------------------------------------------------------
+
+/// These tables have no triggers, so UPDATE FROM reaches the clustered-table
+/// VDBE path directly. FAIL must preserve earlier writes, IGNORE must continue
+/// past the bad row, and ABORT/ROLLBACK must retain their distinct boundaries.
+#[test]
+fn review_without_rowid_update_from_statement_constraint_actions() {
+    let mut cases = Vec::new();
+    for mode in MODES {
+        for txn in TXNS {
+            for (kind, bad_value, bad_check) in [
+                ("NOT NULL", "NULL", "1"),
+                ("CHECK", "12", "-1"),
+            ] {
+                cases.push(Case {
+                    name: format!("WITHOUT ROWID UPDATE FROM {kind}, {mode}, {txn:?}"),
+                    setup: vec![
+                        "CREATE TABLE w(k TEXT PRIMARY KEY, v INTEGER NOT NULL DEFAULT 17, \
+                         checked INTEGER CHECK(checked > 0)) WITHOUT ROWID"
+                            .to_owned(),
+                        "CREATE INDEX w_v ON w(v)".to_owned(),
+                        "INSERT INTO w VALUES ('a', 1, 1), ('b', 2, 1), ('c', 3, 1)"
+                            .to_owned(),
+                        "CREATE TABLE src(k TEXT PRIMARY KEY, nv, nc)".to_owned(),
+                        format!(
+                            "INSERT INTO src VALUES ('a', 11, 1), \
+                             ('b', {bad_value}, {bad_check}), ('c', 13, 1)"
+                        ),
+                    ],
+                    steps: in_txn(
+                        txn,
+                        "INSERT INTO w VALUES ('z', 99, 1)",
+                        format!(
+                            "UPDATE {mode} w SET v = src.nv, checked = src.nc \
+                             FROM src WHERE w.k = src.k"
+                        ),
+                    ),
+                    queries: strs(&[
+                        "SELECT k, v, checked FROM w ORDER BY k",
+                        "SELECT changes()",
+                        "PRAGMA integrity_check",
+                    ]),
+                });
+            }
+        }
+    }
+    assert_matches_stock(
+        "WITHOUT ROWID UPDATE FROM statement constraint actions",
+        &cases,
+        &BASIC_LANES,
+        no_normalize,
+    );
+}
+
+/// A schema NOT NULL action is local to that constraint. IGNORE skips the
+/// entire candidate before CHECK, but does not suppress CHECK on a non-NULL
+/// candidate. An explicit statement clause overrides the column's action.
+#[test]
+fn review_without_rowid_update_from_column_constraint_actions() {
+    let mut cases = Vec::new();
+    for algorithm in ALGORITHMS {
+        for mode in ["", "OR ABORT"] {
+            for (kind, bad_value) in [("both constraints", "NULL"), ("CHECK only", "12")] {
+                cases.push(Case {
+                    name: format!(
+                        "WITHOUT ROWID UPDATE FROM NOT NULL {algorithm}, {mode}, {kind}"
+                    ),
+                    setup: vec![
+                        format!(
+                            "CREATE TABLE w(k TEXT PRIMARY KEY, \
+                             v INTEGER NOT NULL ON CONFLICT {algorithm} DEFAULT 17, \
+                             checked INTEGER CHECK(checked > 0)) WITHOUT ROWID"
+                        ),
+                        "CREATE INDEX w_v ON w(v)".to_owned(),
+                        "INSERT INTO w VALUES ('a', 1, 1), ('b', 2, 1), ('c', 3, 1)"
+                            .to_owned(),
+                        "CREATE TABLE src(k TEXT PRIMARY KEY, nv, nc)".to_owned(),
+                        format!(
+                            "INSERT INTO src VALUES ('a', 11, 1), \
+                             ('b', {bad_value}, -1), ('c', 13, 1)"
+                        ),
+                    ],
+                    steps: in_txn(
+                        Txn::Explicit,
+                        "INSERT INTO w VALUES ('z', 99, 1)",
+                        format!(
+                            "UPDATE {mode} w SET v = src.nv, checked = src.nc \
+                             FROM src WHERE w.k = src.k"
+                        ),
+                    ),
+                    queries: strs(&[
+                        "SELECT k, v, checked FROM w ORDER BY k",
+                        "SELECT changes()",
+                        "PRAGMA integrity_check",
+                    ]),
+                });
+            }
+        }
+    }
+    assert_matches_stock(
+        "WITHOUT ROWID UPDATE FROM column constraint actions",
+        &cases,
+        &BASIC_LANES,
+        no_normalize,
+    );
+}
+
+/// Skipped rows contribute neither RETURNING rows nor change counts, and both
+/// the table and secondary index remain valid when stock opens the result.
+#[test]
+fn review_without_rowid_update_from_ignore_returning() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for schema_ignore in [false, true] {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let path = dir.path().join("update_from_ignore.db");
+                    let conn = Connection::open(if file_backed {
+                        path.to_str().expect("UTF-8 path")
+                    } else {
+                        ":memory:"
+                    })
+                    .await
+                    .expect("open fsqlite");
+                    let stock = rusqlite::Connection::open_in_memory().expect("open stock");
+                    let action = if schema_ignore { "ON CONFLICT IGNORE" } else { "" };
+                    let setup = format!(
+                        "CREATE TABLE w(k TEXT PRIMARY KEY, v INTEGER NOT NULL {action}) \
+                         WITHOUT ROWID; \
+                         CREATE INDEX w_v ON w(v); \
+                         INSERT INTO w VALUES ('a', 1), ('b', 2), ('c', 3); \
+                         CREATE TABLE src(k TEXT PRIMARY KEY, nv); \
+                         INSERT INTO src VALUES ('a', 11), ('b', NULL), ('c', 13);"
+                    );
+                    conn.execute_batch(&setup).await.expect("fsqlite setup");
+                    stock.execute_batch(&setup).expect("stock setup");
+                    let mode = if schema_ignore { "" } else { "OR IGNORE" };
+                    let sql = format!(
+                        "UPDATE {mode} w SET v = src.nv FROM src \
+                         WHERE w.k = src.k RETURNING k, v"
+                    );
+                    let mut expected = stock_rows(&stock, &sql);
+                    let rows = if prepared {
+                        conn.prepare(&sql)
+                            .await
+                            .expect("prepare")
+                            .query()
+                            .await
+                            .expect("prepared query")
+                    } else {
+                        conn.query(&sql).await.expect("query")
+                    };
+                    let mut actual: Rows = rows
+                        .iter()
+                        .map(|row| row.values().iter().map(tag_f).collect())
+                        .collect();
+                    expected.sort();
+                    actual.sort();
+                    assert_eq!(actual, expected, "{sql}");
+                    for query in [
+                        "SELECT k, v FROM w ORDER BY k",
+                        "SELECT changes()",
+                        "PRAGMA integrity_check",
+                    ] {
+                        assert_eq!(frank_rows(&conn, query).await, stock_rows(&stock, query));
+                    }
+                    conn.close().await.expect("close");
+                    if file_backed {
+                        let reopened = rusqlite::Connection::open(&path).expect("stock reopen");
+                        assert_eq!(
+                            stock_rows(&reopened, "PRAGMA integrity_check"),
+                            vec![vec!["text:ok".to_owned()]]
+                        );
+                        assert_eq!(
+                            stock_rows(&reopened, "SELECT k, v FROM w ORDER BY k"),
+                            stock_rows(&stock, "SELECT k, v FROM w ORDER BY k")
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // FOREIGN KEY errors next to conflict clauses
 // ---------------------------------------------------------------------------
 

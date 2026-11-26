@@ -38861,7 +38861,9 @@ fn codegen_update_from_without_rowid(
 
     // Match: build the OLD image, seed the NEW image from it, apply the
     // assignments (RHS resolves target cols via the cursor and FROM cols via the
-    // secondaries), validate, and stash [OLD || seq || NEW] into the sorter.
+    // secondaries), and stash [OLD || seq || NEW] into the sorter. Generated
+    // columns and constraints belong to the rewrite pass: only the selected
+    // match is applied, and FAIL must retain earlier successful rewrites.
     let row_regs = b.alloc_regs((2 * n_cols + 1) as i32);
     let old_regs = row_regs;
     let seq_slot = row_regs + n_cols as i32;
@@ -38886,27 +38888,6 @@ fn codegen_update_from_without_rowid(
     }
     b.set_next_anon_placeholder(1);
     emit_update_assignments(b, &stmt.assignments, table, new_regs, None, &scan)?;
-    emit_stored_generated_columns(b, table, new_regs);
-    emit_strict_type_check(b, table, new_regs);
-    // GH #169: coerce to column affinity before CHECK/NOT NULL so the
-    // constraints see the affinity-coerced value (SQLite applies affinity, then
-    // evaluates constraints).
-    b.emit_op(
-        Opcode::Affinity,
-        new_regs,
-        n_cols as i32,
-        0,
-        P4::Affinity(table.affinity_string()),
-        0,
-    );
-    emit_check_constraints(
-        b,
-        table,
-        RegisterRow::columns(new_regs),
-        stmt.or_conflict,
-        None,
-    );
-    emit_not_null_constraints(b, table, new_regs, stmt.or_conflict, None);
     b.emit_op(Opcode::AddImm, seq_reg, -1, 0, P4::None, 0);
     b.emit_op(Opcode::Copy, seq_reg, seq_slot, 0, P4::None, 0);
     let stash_rec = b.alloc_reg();
@@ -39025,10 +39006,36 @@ fn codegen_update_from_without_rowid(
         0,
     );
 
-    // bd-yuj70: apply affinities before probing, then rewrite through the
-    // shared victim-safe path. UPDATE FROM computed the NEW image during pass 1
-    // while the FROM cursors were live, so only conflict resolution and the
-    // OLD/NEW mutation order are shared with the plain UPDATE emission.
+    // Validate the selected NEW image only after re-seeking its OLD row.
+    // Checking while collecting the join rejects discarded matches and makes
+    // FAIL lose the successful rows that should precede the failing rewrite.
+    // IGNORE must skip this row before any table or index entry is deleted.
+    emit_stored_generated_columns(b, table, new_img);
+    emit_strict_type_check(b, table, new_img);
+    b.emit_op(
+        Opcode::Affinity,
+        new_img,
+        n_cols as i32,
+        0,
+        P4::Affinity(table.affinity_string()),
+        0,
+    );
+    let check_ignore = (stmt.or_conflict == Some(ConflictAction::Ignore)).then_some(row_done);
+    // A column's NOT NULL policy applies only to that constraint. In
+    // particular, its IGNORE must not suppress a CHECK on a non-NULL row.
+    // Supply the row-skip destination unconditionally: the helper consults
+    // each column's effective algorithm before emitting an IGNORE jump.
+    emit_not_null_constraints(b, table, new_img, stmt.or_conflict, Some(row_done));
+    emit_check_constraints(
+        b,
+        table,
+        RegisterRow::columns(new_img),
+        stmt.or_conflict,
+        check_ignore,
+    );
+
+    // NOT NULL REPLACE may have substituted a DEFAULT. Reapply affinity so the
+    // primary-key probe and stored row use the same representation.
     b.emit_op(
         Opcode::Affinity,
         new_img,
