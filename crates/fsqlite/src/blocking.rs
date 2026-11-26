@@ -1388,75 +1388,94 @@ pub mod functions {
 ///
 /// Positional: `[]`, arrays, tuples, slices of `&dyn ToSql`, [`params!`],
 /// [`params_from_iter`]. Named: slices of `(&str, &dyn ToSql)`,
-/// [`named_params!`].
+/// [`named_params!`]. Omitted named parameters retain their previous values;
+/// a parameter that has never been bound is NULL.
 pub trait Params {
     #[doc(hidden)]
-    fn bind_to(self, slots: &BindParameterSlots) -> Result<Vec<SqliteValue>>;
+    fn bind_to(self, slots: &BindParameterSlots, bindings: &mut [SqliteValue]) -> Result<()>;
 }
 
-fn bind_positional<'v>(
+fn bind_positional<I>(
     slots: &BindParameterSlots,
-    values: impl ExactSizeIterator<Item = &'v (dyn ToSql + 'v)>,
-) -> Result<Vec<SqliteValue>> {
-    if values.len() != slots.count {
-        return Err(Error::InvalidParameterCount(values.len(), slots.count));
+    bindings: &mut [SqliteValue],
+    values: I,
+) -> Result<()>
+where
+    I: IntoIterator,
+    I::Item: ToSql,
+{
+    let mut count = 0;
+    for value in values {
+        count += 1;
+        if count > slots.count {
+            break;
+        }
+        bindings[count - 1] = bind_one(&value)?;
     }
-    values.map(bind_one).collect()
+    if count != slots.count {
+        return Err(Error::InvalidParameterCount(count, slots.count));
+    }
+    Ok(())
 }
 
 fn bind_named<'v>(
     slots: &BindParameterSlots,
+    bindings: &mut [SqliteValue],
     pairs: impl Iterator<Item = (&'v str, &'v (dyn ToSql + 'v))>,
-) -> Result<Vec<SqliteValue>> {
-    let mut bound = vec![SqliteValue::Null; slots.count];
+) -> Result<()> {
     for (name, value) in pairs {
         let index = slots
             .index_of(name)
             .ok_or_else(|| Error::InvalidParameterName(name.to_owned()))?;
-        bound[index - 1] = bind_one(value)?;
+        bindings[index - 1] = bind_one(value)?;
     }
-    Ok(bound)
+    Ok(())
 }
 
 impl Params for [&(dyn ToSql + Send + Sync); 0] {
-    fn bind_to(self, slots: &BindParameterSlots) -> Result<Vec<SqliteValue>> {
-        bind_positional(slots, std::iter::empty())
+    fn bind_to(self, slots: &BindParameterSlots, _bindings: &mut [SqliteValue]) -> Result<()> {
+        if slots.count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidParameterCount(0, slots.count))
+        }
     }
 }
 
 impl Params for () {
-    fn bind_to(self, slots: &BindParameterSlots) -> Result<Vec<SqliteValue>> {
-        bind_positional(slots, std::iter::empty())
+    fn bind_to(self, slots: &BindParameterSlots, bindings: &mut [SqliteValue]) -> Result<()> {
+        let empty: [&(dyn ToSql + Send + Sync); 0] = [];
+        empty.bind_to(slots, bindings)
     }
 }
 
 impl Params for &[&dyn ToSql] {
-    fn bind_to(self, slots: &BindParameterSlots) -> Result<Vec<SqliteValue>> {
-        bind_positional(slots, self.iter().copied())
+    fn bind_to(self, slots: &BindParameterSlots, bindings: &mut [SqliteValue]) -> Result<()> {
+        bind_positional(slots, bindings, self.iter().copied())
     }
 }
 
 impl Params for &[(&str, &dyn ToSql)] {
-    fn bind_to(self, slots: &BindParameterSlots) -> Result<Vec<SqliteValue>> {
-        bind_named(slots, self.iter().map(|(name, value)| (*name, *value)))
+    fn bind_to(self, slots: &BindParameterSlots, bindings: &mut [SqliteValue]) -> Result<()> {
+        bind_named(slots, bindings, self.iter().map(|(name, value)| (*name, *value)))
     }
 }
 
 macro_rules! params_for_arrays {
     ($($n:literal)+) => {$(
         impl<T: ToSql> Params for [T; $n] {
-            fn bind_to(self, slots: &BindParameterSlots) -> Result<Vec<SqliteValue>> {
-                bind_positional(slots, self.iter().map(|value| value as &dyn ToSql))
+            fn bind_to(self, slots: &BindParameterSlots, bindings: &mut [SqliteValue]) -> Result<()> {
+                bind_positional(slots, bindings, self)
             }
         }
         impl<T: ToSql + ?Sized> Params for &[&T; $n] {
-            fn bind_to(self, slots: &BindParameterSlots) -> Result<Vec<SqliteValue>> {
-                bind_positional(slots, self.iter().map(|value| value as &dyn ToSql))
+            fn bind_to(self, slots: &BindParameterSlots, bindings: &mut [SqliteValue]) -> Result<()> {
+                bind_positional(slots, bindings, self.iter().copied())
             }
         }
         impl<T: ToSql + ?Sized> Params for &[(&str, &T); $n] {
-            fn bind_to(self, slots: &BindParameterSlots) -> Result<Vec<SqliteValue>> {
-                bind_named(slots, self.iter().map(|(name, value)| (*name, value as &dyn ToSql)))
+            fn bind_to(self, slots: &BindParameterSlots, bindings: &mut [SqliteValue]) -> Result<()> {
+                bind_named(slots, bindings, self.iter().map(|(name, value)| (*name, value as &dyn ToSql)))
             }
         }
     )+};
@@ -1467,9 +1486,12 @@ params_for_arrays!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 2
 macro_rules! params_for_tuples {
     ($(($($field:tt $ty:ident),+))+) => {$(
         impl<$($ty: ToSql),+> Params for ($($ty,)+) {
-            fn bind_to(self, slots: &BindParameterSlots) -> Result<Vec<SqliteValue>> {
+            fn bind_to(self, slots: &BindParameterSlots, bindings: &mut [SqliteValue]) -> Result<()> {
                 let values: &[&dyn ToSql] = &[$(&self.$field),+];
-                bind_positional(slots, values.iter().copied())
+                if values.len() != slots.count {
+                    return Err(Error::InvalidParameterCount(values.len(), slots.count));
+                }
+                bind_positional(slots, bindings, values.iter().copied())
             }
         }
     )+};
@@ -1512,16 +1534,8 @@ where
     I: IntoIterator,
     I::Item: ToSql,
 {
-    fn bind_to(self, slots: &BindParameterSlots) -> Result<Vec<SqliteValue>> {
-        let bound = self
-            .0
-            .into_iter()
-            .map(|value| bind_one(&value))
-            .collect::<Result<Vec<_>>>()?;
-        if bound.len() != slots.count {
-            return Err(Error::InvalidParameterCount(bound.len(), slots.count));
-        }
-        Ok(bound)
+    fn bind_to(self, slots: &BindParameterSlots, bindings: &mut [SqliteValue]) -> Result<()> {
+        bind_positional(slots, bindings, self.0)
     }
 }
 
@@ -1740,7 +1754,9 @@ impl Connection {
 
     /// Run one statement with `params`; returns the number of rows changed.
     pub fn execute<P: Params>(&self, sql: &str, params: P) -> Result<usize> {
-        let values = params.bind_to(&self.slots(sql))?;
+        let slots = self.slots(sql);
+        let mut values = vec![SqliteValue::Null; slots.count];
+        params.bind_to(&slots, &mut values)?;
         Ok(block_on(self.as_async().execute_with_params(sql, &values))?)
     }
 
@@ -1758,6 +1774,7 @@ impl Connection {
         Ok(Statement {
             conn: self,
             stmt: Box::new(stmt),
+            bindings: vec![SqliteValue::Null; slots.count],
             slots,
             names,
             reprepare_count,
@@ -2085,6 +2102,7 @@ pub struct Statement<'conn> {
     conn: &'conn Connection,
     stmt: Box<dyn EngineStatement + 'conn>,
     slots: Rc<BindParameterSlots>,
+    bindings: Vec<SqliteValue>,
     names: Vec<String>,
     reprepare_count: u64,
 }
@@ -2112,10 +2130,15 @@ impl Statement<'_> {
 
     /// Run the statement with `params`; returns the number of rows changed.
     pub fn execute<P: Params>(&mut self, params: P) -> Result<usize> {
-        let values = params.bind_to(&self.slots)?;
-        let result = self.stmt.execute(&values);
+        params.bind_to(&self.slots, &mut self.bindings)?;
+        let result = self.stmt.execute(&self.bindings);
         self.sync_metadata_if_reprepared();
         result
+    }
+
+    /// Reset every bound parameter to NULL.
+    pub fn clear_bindings(&mut self) {
+        self.bindings.fill(SqliteValue::Null);
     }
 
     /// Run an INSERT that must insert exactly one row; returns its rowid.
@@ -2128,8 +2151,8 @@ impl Statement<'_> {
 
     /// Run the query; step through its rows with [`Rows::next`].
     pub fn query<P: Params>(&mut self, params: P) -> Result<Rows<'_>> {
-        let values = params.bind_to(&self.slots)?;
-        let result = self.stmt.query(&values);
+        params.bind_to(&self.slots, &mut self.bindings)?;
+        let result = self.stmt.query(&self.bindings);
         self.sync_metadata_if_reprepared();
         let rows = result?;
         Ok(Rows {
@@ -2683,6 +2706,227 @@ mod tests {
 
     mod ours {
         pub use crate::blocking::*;
+    }
+
+    /// Reuse a single statement, including after failed binding attempts. The
+    /// successful prefix of a bind survives an error, just as in rusqlite.
+    macro_rules! retained_binding_scenario {
+        ($m:ident) => {{
+            use $m::{Connection, named_params, params, params_from_iter};
+
+            struct Refused;
+
+            impl $m::types::ToSql for Refused {
+                fn to_sql(&self) -> $m::Result<$m::types::ToSqlOutput<'_>> {
+                    Err($m::Error::ToSqlConversionFailure(Box::new(
+                        std::io::Error::other("refused binding"),
+                    )))
+                }
+            }
+
+            fn snapshot(stmt: &mut $m::Statement<'_>) -> String {
+                let values: Vec<$m::types::Value> = stmt
+                    .query_row(named_params! {}, |row| {
+                        Ok(vec![row.get(0)?, row.get(1)?, row.get(2)?])
+                    })
+                    .unwrap();
+                format!("{values:?}")
+            }
+
+            fn failure<T>(result: $m::Result<T>) -> String {
+                match result {
+                    Err($m::Error::InvalidParameterCount(given, needed)) => {
+                        format!("count {given}/{needed}")
+                    }
+                    Err($m::Error::InvalidParameterName(name)) => format!("name {name}"),
+                    Err($m::Error::ToSqlConversionFailure(_)) => "conversion".to_owned(),
+                    Err(other) => panic!("unexpected binding error: {other}"),
+                    Ok(_) => panic!("binding unexpectedly succeeded"),
+                }
+            }
+
+            let conn = Connection::open_in_memory().unwrap();
+            let mut stmt = conn.prepare("SELECT :a, :b, :c").unwrap();
+            let mut trace = vec![format!("initial {}", snapshot(&mut stmt))];
+            stmt.query_row((1, 2, 3), |_| Ok(())).unwrap();
+            stmt.query_row(named_params! { ":a": 4 }, |_| Ok(()))
+                .unwrap();
+            trace.push(format!("partial {}", snapshot(&mut stmt)));
+            stmt.query_row(named_params! { ":b": None::<i64> }, |_| Ok(()))
+                .unwrap();
+            trace.push(format!("null {}", snapshot(&mut stmt)));
+            stmt.query_row(named_params! { ":c": 5, ":c": 6 }, |_| Ok(()))
+                .unwrap();
+            trace.push(format!("duplicate {}", snapshot(&mut stmt)));
+
+            trace.push(failure(stmt.query_row(
+                named_params! { ":a": 7, ":missing": 9 },
+                |_| Ok(()),
+            )));
+            trace.push(format!("unknown-name {}", snapshot(&mut stmt)));
+            trace.push(failure(stmt.query_row(
+                named_params! { ":a": 8, ":b": Refused },
+                |_| Ok(()),
+            )));
+            trace.push(format!("named-conversion {}", snapshot(&mut stmt)));
+            trace.push(failure(stmt.query_row((9, Refused, 10), |_| Ok(()))));
+            trace.push(format!("tuple-conversion {}", snapshot(&mut stmt)));
+
+            // Tuples check their arity before binding. Slices and arrays bind
+            // a successful prefix before discovering too few parameters.
+            trace.push(failure(stmt.query_row((20, 21), |_| Ok(()))));
+            trace.push(format!("short-tuple {}", snapshot(&mut stmt)));
+            trace.push(failure(stmt.query_row([30, 31], |_| Ok(()))));
+            trace.push(format!("short-array {}", snapshot(&mut stmt)));
+            // The first excess item is counted but must not be converted.
+            trace.push(failure(
+                stmt.query_row(params![40, 41, 42, Refused, 44], |_| Ok(())),
+            ));
+            trace.push(format!("long-slice {}", snapshot(&mut stmt)));
+
+            let consumed = std::cell::Cell::new(0);
+            let items = [50, 51, 52, 53, 54]
+                .into_iter()
+                .inspect(|_| consumed.set(consumed.get() + 1));
+            trace.push(failure(
+                stmt.query_row(params_from_iter(items), |_| Ok(())),
+            ));
+            trace.push(format!("iterator-consumed {}", consumed.get()));
+            trace.push(format!("long-iterator {}", snapshot(&mut stmt)));
+            trace.push(failure(stmt.query_row(params_from_iter([60]), |_| Ok(()))));
+            trace.push(format!("short-iterator {}", snapshot(&mut stmt)));
+            trace.push(failure(stmt.query_row([], |_| Ok(()))));
+            trace.push(failure(stmt.query_row((), |_| Ok(()))));
+            trace.push(format!("empty-positional {}", snapshot(&mut stmt)));
+
+            stmt.clear_bindings();
+            trace.push(format!("cleared {}", snapshot(&mut stmt)));
+            stmt.query_row(named_params! { ":c": 70 }, |_| Ok(()))
+                .unwrap();
+            trace.push(format!("after-clear {}", snapshot(&mut stmt)));
+            let mut other = conn.prepare("SELECT :a, :b, :c").unwrap();
+            trace.push(format!("other-statement {}", snapshot(&mut other)));
+            trace
+        }};
+    }
+
+    #[test]
+    fn retained_bindings_and_partial_binding_failures_match_rusqlite() {
+        let expected = retained_binding_scenario!(stock);
+        let actual = retained_binding_scenario!(ours);
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual,
+            [
+                "initial [Null, Null, Null]",
+                "partial [Integer(4), Integer(2), Integer(3)]",
+                "null [Integer(4), Null, Integer(3)]",
+                "duplicate [Integer(4), Null, Integer(6)]",
+                "name :missing",
+                "unknown-name [Integer(7), Null, Integer(6)]",
+                "conversion",
+                "named-conversion [Integer(8), Null, Integer(6)]",
+                "conversion",
+                "tuple-conversion [Integer(9), Null, Integer(6)]",
+                "count 2/3",
+                "short-tuple [Integer(9), Null, Integer(6)]",
+                "count 2/3",
+                "short-array [Integer(30), Integer(31), Integer(6)]",
+                "count 4/3",
+                "long-slice [Integer(40), Integer(41), Integer(42)]",
+                "count 4/3",
+                "iterator-consumed 4",
+                "long-iterator [Integer(50), Integer(51), Integer(52)]",
+                "count 1/3",
+                "short-iterator [Integer(60), Integer(51), Integer(52)]",
+                "count 0/3",
+                "count 0/3",
+                "empty-positional [Integer(60), Integer(51), Integer(52)]",
+                "cleared [Null, Null, Null]",
+                "after-clear [Null, Null, Integer(70)]",
+                "other-statement [Null, Null, Null]",
+            ]
+        );
+    }
+
+    macro_rules! retained_write_scenario {
+        ($m:ident) => {{
+            use $m::types::{ToSqlOutput, Value, ValueRef};
+            use $m::{Connection, named_params};
+
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE retained(id INTEGER PRIMARY KEY, label TEXT, data BLOB)")
+                .unwrap();
+            let mut insert = conn
+                .prepare("INSERT INTO retained VALUES (:id, :label, :data)")
+                .unwrap();
+            {
+                let text = String::from("borrowed");
+                let label = ToSqlOutput::Borrowed(ValueRef::Text(text.as_bytes()));
+                let data = ToSqlOutput::Owned(Value::Blob(vec![0, 128, 255]));
+                assert_eq!(
+                    insert
+                        .execute(named_params! { ":id": 1, ":label": label, ":data": data })
+                        .unwrap(),
+                    1
+                );
+            }
+            assert_eq!(insert.execute(named_params! { ":id": 2 }).unwrap(), 1);
+            // Execution errors do not clear the successfully bound values.
+            assert!(
+                insert
+                    .execute(named_params! { ":label": "after-error" })
+                    .is_err()
+            );
+            assert_eq!(insert.execute(named_params! { ":id": 3 }).unwrap(), 1);
+            assert_eq!(
+                insert
+                    .execute(named_params! { ":id": 4, ":label": None::<String> })
+                    .unwrap(),
+                1
+            );
+            insert.clear_bindings();
+            assert_eq!(insert.execute(named_params! { ":id": 5 }).unwrap(), 1);
+
+            let rows: Vec<(i64, Option<String>, Option<Vec<u8>>)> = conn
+                .prepare("SELECT id, label, data FROM retained ORDER BY id")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<$m::Result<_>>()
+                .unwrap();
+            let mut select = conn.prepare("SELECT * FROM retained WHERE id = :id").unwrap();
+            assert_eq!(
+                select
+                    .query_row(named_params! { ":id": 3 }, |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                3
+            );
+            conn.execute_batch("ALTER TABLE retained ADD COLUMN extra TEXT DEFAULT 'new'")
+                .unwrap();
+            let after_schema_change: (i64, String) = select
+                .query_row(named_params! {}, |row| Ok((row.get(0)?, row.get("extra")?)))
+                .unwrap();
+            (rows, after_schema_change)
+        }};
+    }
+
+    #[test]
+    fn retained_owned_values_writes_and_reprepare_match_rusqlite() {
+        let expected = retained_write_scenario!(stock);
+        let actual = retained_write_scenario!(ours);
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.0,
+            vec![
+                (1, Some("borrowed".to_owned()), Some(vec![0, 128, 255])),
+                (2, Some("borrowed".to_owned()), Some(vec![0, 128, 255])),
+                (3, Some("after-error".to_owned()), Some(vec![0, 128, 255])),
+                (4, None, Some(vec![0, 128, 255])),
+                (5, None, None),
+            ]
+        );
+        assert_eq!(actual.1, (3, "new".to_owned()));
     }
 
     /// The same rusqlite-style code, compiled against module `$m`, run on a
