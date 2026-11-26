@@ -94,6 +94,52 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-26 - FIX (landed as 57a7b6c82; a correctness fix measured like a lever, inside its kill lines by exact instruction counts; time cells VOID under the powersave governor): the first attacher's open reclaims EOF holes a concurrent holder left below a peer's growth, gated by a `<db>.fsqlite-holes` marker that such a growth publishes (bd-ioq6x, GH#346, single-writer lane r16/r17)
+
+- Target: GH#346's at-rest leak. A CONCURRENT holder's EOF pages below a peer's committed growth are in no b-tree
+  and not free until the holder returns them. A crash in that window, or a rollback with no later commit before the
+  process exits, left them as permanent "page N is never used" pages. The leak hit every fsqlite-created (marked)
+  database, because the migration pass, the only repair, runs once per version.
+- Touched:
+  - `crates/fsqlite-pager/src/pager.rs`: `commit_growth_leaves_unwritten_pages`, the gap check on every WAL commit
+    build. The marker is published once per process per file, before the WAL append. A close fold sends the
+    connection's own pool through one Immediate commit's Phase A abandonment fold.
+  - `crates/fsqlite-vfs/src/{traits,unix,memory,uring}.rs`: stock's first-attach EXCLUSIVE try on the -shm DMS byte.
+  - `crates/fsqlite-core/src/{connection,migration}.rs`: when the marker exists, the open requests the try. The
+    first attacher runs `repair_orphaned_pages` under the claim, commits, removes the marker, then downgrades.
+  - Keepers: `crates/fsqlite-core/tests/bd_ioq6x_hole_reclaim.rs` and `connection/hole_reclaim_tests.rs`, each red
+    on a planted mutant.
+  - The change is OPEN-time locking only; writer concurrency is untouched.
+- Cost in exact Ir. Setup: callgrind on thinkstation1, one ELF per arm built on vmi1153651, stock SQLite 3.54.1
+  live in every invocation, synchronous=FULL, tmpfs, means of 6 runs per arm.
+  - mt-mvcc-bench, parent 356f68bb vs up 7233c8a5:
+    - one writer, one-row INSERT transactions, per INSERT = (N800 - N400)/400: fsqlite 259,055 -> 258,292 (L/P
+      0.9971; worst pair 1.0029). Stock is 16,029 per transaction: x16.16 -> x16.11.
+    - 4 writers, separate tables, one-row transactions, per committed transaction over 400 transactions: whole
+      process 459,868 -> 456,924 (L/P 0.9936; the 2-SE top is +0.50% of the fsqlite share).
+    - No marker was written in any of the 72 runs; the commit path pays only the gap check.
+  - ioq6x_open_probe, parent a771cac2 vs up 14692edb: +6,702 Ir per fsqlite+stock open pair (+0.21%).
+  - Kill lines: +1.0% on the commit path, +5% on open. Both hold.
+  - The prediction for the commit path was [1.000, 1.002]. It missed on the favorable side, within 1-2 SE of the
+    run-to-run spread; the gain is not claimed.
+- Time:
+  - The mt-mvcc cells (2/4/16 writers, separate tables; one-row 16 writers; synchronous=NORMAL) are VOID, not LOSE.
+    Every A/A null fell outside 1% on a host running the powersave governor (coordinator decision; owner: fix the
+    host, retest).
+  - Open latency did not replicate: L/P 1.231, then 0.989, with both arms swinging 10-19 ms.
+- Deviations:
+  - The two arms were non-job rch builds pinned to the same worker; the coordinator accepted this once.
+  - The bench arms have no bare-autocommit mode and predate `--rows-per-transaction`, so each unit is a one-row
+    BEGIN CONCURRENT transaction.
+- Retry or follow-up:
+  - Re-time the mt-mvcc cells and open latency once the governor is fixed (bd-j0jc0 / bd-gvews), with an A/A null
+    inside 1%.
+  - Measure the marked first-attacher reclaim walk itself (a full reachability pass) on a multi-GB file before
+    relying on it there.
+  - The older on-open disowned-ledger sweep (`sweep_disowned_ledger_on_open`) reclaims nothing on the file WAL. Its
+    keeper is RED on main bc49ec280: 8 disowned holes are still never used after the reopen. The details are on
+    bd-ioq6x, 2026-11-26.
+
 ## 2026-11-25 - WIN (landed as c71e4a99e; past its gain kill line at 4 and 8 writers; FULL separate-table F/C 2.04 -> 3.39 at 4 writers and 3.90 -> 6.32 at 8, stock 3.54.1 live): at synchronous=FULL a group-commit epoch waits (bounded) for its file's peers, so N writers stop alternating a 1-member and an (N-1)-member sync (bd-6a8a5, group-commit lane round 1, lever L1, on bd-acuhw's workload)
 
 - Target: concurrent writers committing short transactions at synchronous=FULL (or EXTRA). Workload (bd-acuhw,
