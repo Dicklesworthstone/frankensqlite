@@ -255826,10 +255826,9 @@ mod autocommit_txn_tests {
     /// decision) and rebuilds nothing; so does an aggregate over such a GROUP
     /// BY in a derived table (only the outer `group_by_join_fallback` is
     /// recorded). With the mirror loaded the in-memory path runs; a NOCASE key
-    /// keeps the collation-aware path; a HAVING keeps the in-memory path (the
-    /// substrate's HAVING answers are wrong for an aggregate inside an
-    /// expression or outside the result columns); inside BEGIN the substrate
-    /// reads the transaction's writes. Every result matches rusqlite.
+    /// keeps the collation-aware path; a HAVING over an aggregate inside an
+    /// expression runs the substrate too (bd-w4pr1.13.32); inside BEGIN the
+    /// substrate reads the transaction's writes. Every result matches rusqlite.
     #[test]
     fn test_memory_group_by_without_loaded_mirror_runs_substrate_match_rusqlite() {
         const GROUP: &str = "SELECT a, count(*), sum(c), sum(id) FROM t GROUP BY a ORDER BY a";
@@ -255891,10 +255890,10 @@ mod autocommit_txn_tests {
                     !conn.memdb_rows_loaded.get(),
                     "a GROUP BY after `{write}` must not rebuild the mirror"
                 );
-                // A HAVING keeps the in-memory path (the substrate drops or
-                // keeps the wrong groups for these on file connections), and
-                // so pays the rebuild.
-                check_route(&conn, &oracle, HAVING_EXPR, &["group_by_fallback"]).await;
+                // Since 272e49c55 (bd-w4pr1.13.32) the substrate evaluates a
+                // HAVING over an aggregate inside an expression as well: no
+                // fallback, and the rows still match rusqlite.
+                check_route(&conn, &oracle, HAVING_EXPR, &[]).await;
                 check(&conn, &oracle, HAVING_HIDDEN).await;
             }
 

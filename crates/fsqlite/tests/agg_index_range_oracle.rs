@@ -246,17 +246,29 @@ fn grouped_index_range_matches_sqlite() {
                 sqlite_rows(&r, having, &[]),
                 "diverged: `{having}` at {path}"
             );
+            // A HAVING that compares with a subquery.
+            let subquery_having = "SELECT x, sum(a) FROM t WHERE a >= -100 AND a <= 100 \
+                      AND x <> 5 GROUP BY x HAVING sum(a) > (SELECT avg(a) FROM t)";
+            assert_eq!(
+                frank_rows(&f, subquery_having, &[]).await,
+                sqlite_rows(&r, subquery_having, &[]),
+                "diverged: `{subquery_having}` at {path}"
+            );
             if path != ":memory:" {
                 f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
                     .await
                     .unwrap();
-                let error = f.query(having).await.expect_err("unprojected HAVING count");
-                assert!(
-                    error
-                        .to_string()
-                        .contains("decision_reason=group_by_fallback"),
-                    "{error}"
-                );
+                // Since 272e49c55 the program under test evaluates a HAVING over
+                // an aggregate the result columns do not hold, and one that
+                // compares with a subquery: strict mode runs both, and their
+                // rows are stock's.
+                for sql in [having, subquery_having] {
+                    assert_eq!(
+                        frank_rows(&f, sql, &[]).await,
+                        sqlite_rows(&r, sql, &[]),
+                        "strict: `{sql}`"
+                    );
+                }
             }
             let cases: &[(&str, &[i64])] = &[
                 ("SELECT a, count(*) FROM t WHERE a < 100 GROUP BY a", &[]),
@@ -417,17 +429,13 @@ fn grouped_index_order_streams_and_matches_sqlite() {
                     .await
                     .unwrap();
                 let having = "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1";
-                let fallback = "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) + 0 > 1";
+                let arithmetic = "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) + 0 > 1";
                 let expected = sqlite_rows(&r, having, &[]);
-                assert_eq!(expected, sqlite_rows(&r, fallback, &[]));
+                assert_eq!(expected, sqlite_rows(&r, arithmetic, &[]));
                 assert_eq!(frank_rows(&f, having, &[]).await, expected);
-                let error = f.query(fallback).await.expect_err("HAVING arithmetic");
-                assert!(
-                    error
-                        .to_string()
-                        .contains("decision_reason=group_by_fallback"),
-                    "{error}"
-                );
+                // Since 272e49c55 the substrate evaluates arithmetic over an
+                // aggregate in HAVING: strict mode runs it.
+                assert_eq!(frank_rows(&f, arithmetic, &[]).await, expected);
             }
             for &(sql, params) in streamed {
                 let mut got = frank_rows(&f, sql, params).await;
