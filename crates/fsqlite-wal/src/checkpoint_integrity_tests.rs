@@ -426,3 +426,162 @@ fn checkpoint_integrity_empty_wal_still_allows_checkpoint_modes() {
         assert_eq!(result.wal_was_reset, mode == CheckpointMode::Truncate);
     }
 }
+
+/// The bytes of frame `frame` as the file holds them.
+fn checkpoint_integrity_frame_bytes(wal: &WalFile<impl VfsFile>, cx: &Cx, frame: usize) -> Vec<u8> {
+    let start = crate::checksum::WAL_HEADER_SIZE + frame * wal.frame_size();
+    checkpoint_integrity_wal_bytes(wal, cx)[start..start + wal.frame_size()].to_vec()
+}
+
+/// bd-fuwx0 (3b-i): validation digests exactly the frames the copy pass can
+/// read, each page's last frame in the window, and every digest is that of
+/// the frame's bytes in the file. Pages 1, 2, 1, 3, 2: frames 0 and 1 are
+/// superseded within the full window; from frame 1 on only frame 1 is.
+#[test]
+fn checkpoint_integrity_validation_digests_each_pages_last_frame_only() {
+    let cx = test_cx();
+    let vfs = MemoryVfs::new();
+    let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+        .expect("create WAL");
+    let pages = [1_u32, 2, 1, 3, 2];
+    for (frame, page) in pages.iter().enumerate() {
+        let db_size = if frame + 1 == pages.len() { 3 } else { 0 };
+        let payload = sample_page(u8::try_from(frame).expect("frame") + 1);
+        wal.append_frame(&cx, *page, &payload, db_size)
+            .expect("append frame");
+    }
+    for (start, digested) in [
+        (0, vec![false, false, true, true, true]),
+        (1, vec![false, true, true, true]),
+        (3, vec![true, true]),
+    ] {
+        let frames = read_checkpoint_frame_headers(&wal, &cx, start, pages.len())
+            .wait()
+            .expect("valid window");
+        assert_eq!(frames.len(), pages.len() - start);
+        for (offset, (header, digest)) in frames.iter().enumerate() {
+            let frame = start + offset;
+            assert_eq!(header.page_number, pages[frame]);
+            assert_eq!(
+                digest.is_some(),
+                digested[offset],
+                "bead_id=bd-fuwx0 case=digest_iff_last_frame_of_page start={start} frame={frame}"
+            );
+            if let Some(digest) = digest {
+                assert!(
+                    digest.verify(&checkpoint_integrity_frame_bytes(&wal, &cx, frame)),
+                    "bead_id=bd-fuwx0 case=digest_of_file_bytes frame={frame}"
+                );
+            }
+        }
+    }
+}
+
+/// bd-fuwx0 (3b-i): the handle's recorded page numbers only pick the frames
+/// to digest; the file decides. Frames 1 and 2 are rewritten on disk, with a
+/// valid checksum chain, from pages 2, 3 to pages 3, 3, so the handle still
+/// remembers 2, 2, 3 while the file's window holds 2, 3, 3. Frame 0 is then
+/// page 2's last frame and must carry a digest, which only the pass that
+/// digests every frame gives it.
+#[test]
+fn checkpoint_integrity_validation_falls_back_when_recorded_pages_differ() {
+    let cx = test_cx();
+    let vfs = MemoryVfs::new();
+    let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+        .expect("create WAL");
+    for (frame, page) in [2_u32, 2, 3, 4].into_iter().enumerate() {
+        let db_size = if frame == 3 { 4 } else { 0 };
+        let payload = sample_page(u8::try_from(frame).expect("frame") + 1);
+        wal.append_frame(&cx, page, &payload, db_size)
+            .expect("append frame");
+    }
+    let page_size = usize::try_from(PAGE_SIZE).expect("page size");
+    let big_endian = wal.header().big_endian_checksum();
+    let mut seed = wal.read_frame_header(&cx, 0).expect("frame 0").checksum;
+    for frame in [1_usize, 2] {
+        let mut bytes = checkpoint_integrity_frame_bytes(&wal, &cx, frame);
+        bytes[..4].copy_from_slice(&3_u32.to_be_bytes());
+        seed = crate::checksum::write_wal_frame_checksum(&mut bytes, page_size, seed, big_endian)
+            .expect("rewrite checksum");
+        let offset = u64::try_from(crate::checksum::WAL_HEADER_SIZE + frame * wal.frame_size())
+            .expect("offset");
+        wal.file()
+            .write(&cx, &bytes, offset)
+            .expect("rewrite frame");
+    }
+    assert_eq!(
+        wal.read_frame_header(&cx, 1).expect("recorded").page_number,
+        2,
+        "bead_id=bd-fuwx0 case=precondition_handle_remembers_the_old_page"
+    );
+    // The window stops before frame 3, whose chain the rewrite broke.
+    let frames = read_checkpoint_frame_headers(&wal, &cx, 0, 3)
+        .wait()
+        .expect("valid window");
+    let on_disk: Vec<u32> = frames
+        .iter()
+        .map(|(header, _)| header.page_number)
+        .collect();
+    assert_eq!(on_disk, vec![2, 3, 3]);
+    for (frame, (_, digest)) in frames.iter().enumerate() {
+        let digest = digest.unwrap_or_else(|| {
+            panic!("bead_id=bd-fuwx0 case=fallback_digests_every_frame frame={frame}")
+        });
+        assert!(digest.verify(&checkpoint_integrity_frame_bytes(&wal, &cx, frame)));
+    }
+}
+
+/// bd-fuwx0 (3b-i): with a page written twice in the window, the copy pass is
+/// still bound to the bytes validation checked. Pages 1, 2, 2: after page 1
+/// is written, page 2's LAST frame is replaced by a self-consistent frame, and
+/// the checkpoint must refuse it before writing page 2.
+#[test]
+fn checkpoint_integrity_copy_pass_binds_a_rewritten_pages_last_frame() {
+    let cx = test_cx();
+    let vfs = MemoryVfs::new();
+    let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+        .expect("create WAL");
+    for (frame, page) in [1_u32, 2, 2].into_iter().enumerate() {
+        let db_size = if frame == 2 { 2 } else { 0 };
+        let payload = sample_page(u8::try_from(frame).expect("frame") + 1);
+        wal.append_frame(&cx, page, &payload, db_size)
+            .expect("append frame");
+    }
+    let mut replacement = checkpoint_integrity_frame_bytes(&wal, &cx, 2);
+    replacement[crate::checksum::WAL_FRAME_HEADER_SIZE + 123] ^= 0x80;
+    let seed = wal.read_frame_header(&cx, 1).expect("predecessor").checksum;
+    crate::checksum::write_wal_frame_checksum(
+        &mut replacement,
+        usize::try_from(PAGE_SIZE).expect("page size"),
+        seed,
+        wal.header().big_endian_checksum(),
+    )
+    .expect("recompute replacement checksum");
+    let mut target = CheckpointSourceMutationTarget {
+        inner: ReadbackTarget::new(&vfs, &cx),
+        peer: open_wal_file(&vfs, &cx),
+        replacement: Some((
+            u64::try_from(crate::checksum::WAL_HEADER_SIZE + 2 * wal.frame_size()).expect("offset"),
+            replacement,
+        )),
+    };
+    let error = execute_checkpoint(
+        &cx,
+        &mut wal,
+        CheckpointMode::Truncate,
+        CheckpointState {
+            total_frames: 3,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        },
+        &mut target,
+    )
+    .expect_err("copy pass must reject a changed last frame before writing it");
+    assert!(
+        matches!(error, FrankenError::WalCorrupt { .. }),
+        "bead_id=bd-fuwx0 case=changed_last_frame_is_wal_corrupt error={error:?}"
+    );
+    assert_eq!(target.inner.written_pages, vec![PageNumber::ONE]);
+    assert!(target.inner.published_prefixes.is_empty());
+    assert_eq!(wal.frame_count(), 3);
+}

@@ -988,6 +988,18 @@ impl<F: VfsFile> WalFile<F> {
         self.frame_count
     }
 
+    /// The page number this handle recorded for frame `frame_index` of the
+    /// current generation (see `frame_headers`), or `None` when it holds no
+    /// header for that frame. Memory only: a caller that needs the file's own
+    /// header reads it.
+    #[must_use]
+    pub(crate) fn recorded_frame_page_number(&self, frame_index: usize) -> Option<u32> {
+        self.frame_headers
+            .get(frame_index)
+            .filter(|_| frame_index < self.frame_count)
+            .map(|recorded| recorded.page_number)
+    }
+
     /// The parsed WAL header.
     #[must_use]
     pub fn header(&self) -> &WalHeader {

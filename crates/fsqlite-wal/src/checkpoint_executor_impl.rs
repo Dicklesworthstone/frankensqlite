@@ -282,8 +282,12 @@ pub async fn execute_checkpoint<F: VfsFile>(
         let count = usize::try_from(plan.frames_to_backfill).unwrap_or(usize::MAX);
         let end = start.saturating_add(count).min(wal.frame_count());
 
-        let mut latest_frames: std::collections::HashMap<PageNumber, CheckpointPageExpectation> =
-            std::collections::HashMap::new();
+        // Each page's last frame in the window and its digest (bd-fuwx0 3b-i:
+        // validation digests only the frames no later frame supersedes).
+        let mut latest_frames: std::collections::HashMap<
+            PageNumber,
+            (usize, Option<Xxh3Checksum128>),
+        > = std::collections::HashMap::new();
 
         // Validate every source frame before deduplication or database mutation.
         // Readback alone would bless bytes already corrupt before this checkpoint.
@@ -295,14 +299,7 @@ pub async fn execute_checkpoint<F: VfsFile>(
                     value: header.page_number.to_string(),
                 })?;
 
-            latest_frames.insert(
-                page_no,
-                CheckpointPageExpectation {
-                    page: page_no,
-                    frame_index: frame_idx,
-                    source_checksum,
-                },
-            );
+            latest_frames.insert(page_no, (frame_idx, source_checksum));
             frames_backfilled += 1;
 
             if header.is_commit() && header.db_size > 0 {
@@ -317,8 +314,23 @@ pub async fn execute_checkpoint<F: VfsFile>(
         wal.durable_sync(cx, SyncKind::FullDurable)?;
 
         // Pass 2: Bind each sorted write to the bytes validated in pass 1.
-        let mut sorted_pages: Vec<CheckpointPageExpectation> =
-            latest_frames.into_values().collect();
+        let mut sorted_pages = latest_frames
+            .into_iter()
+            .map(|(page, (frame_index, source_checksum))| {
+                source_checksum
+                    .map(|source_checksum| CheckpointPageExpectation {
+                        page,
+                        frame_index,
+                        source_checksum,
+                    })
+                    .ok_or_else(|| {
+                        FrankenError::internal(format!(
+                            "checkpoint validation left page {} without a source digest",
+                            page.get()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<CheckpointPageExpectation>>>()?;
         sorted_pages.sort_unstable_by_key(|expected| expected.page.get());
 
         let mut frame_buf = vec![0u8; wal.frame_size()];

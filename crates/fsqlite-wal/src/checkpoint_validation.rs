@@ -85,17 +85,30 @@ pub(super) async fn checkpoint_header_checksum<F: VfsFile>(
     })
 }
 
+/// One validated frame of a checkpoint window: its header, and the digest of
+/// its bytes unless a later frame of the window carries the same page.
+pub(super) type CheckpointSourceFrame = (WalFrameHeader, Option<Xxh3Checksum128>);
+
 /// Validate every frame in the new backfill window before deduplication and
-/// retain its digest for the later copy pass. The predecessor of `start` is an
-/// already-backfilled boundary supplied by the checkpoint owner; only its
+/// retain the digest the later copy pass checks. The predecessor of `start` is
+/// an already-backfilled boundary supplied by the checkpoint owner; only its
 /// header supplies the rolling seed, avoiding a repeated scan from frame zero.
+///
+/// bd-fuwx0 (3b-i): the copy pass writes only the last frame of each page in
+/// the window, so only that frame's digest is ever read. A frame that a later
+/// frame of the same page supersedes is validated as before but gets no
+/// digest. Which frames are superseded is decided from the page numbers this
+/// handle recorded for the window, and the pass checks each frame's on-disk
+/// page number against its recorded one. If the handle holds no header for
+/// some frame of the window, or any of them differs, the pass runs again with
+/// a digest for every frame. Either way the digests handed to the copy pass
+/// are those of the bytes this pass validated.
 pub(super) async fn read_checkpoint_frame_headers<F: VfsFile>(
     wal: &WalFile<F>,
     cx: &Cx,
     start: usize,
     end: usize,
-) -> Result<Vec<(WalFrameHeader, Xxh3Checksum128)>> {
-    const MAX_READ_BYTES: usize = 64 * 1024;
+) -> Result<Vec<CheckpointSourceFrame>> {
     if start > end || end > wal.frame_count() {
         return Err(FrankenError::WalCorrupt {
             detail: format!("invalid checkpoint frame range {start}..{end}"),
@@ -105,7 +118,50 @@ pub(super) async fn read_checkpoint_frame_headers<F: VfsFile>(
     if start == end {
         return Ok(Vec::new());
     }
+    if let Some(superseded) = recorded_superseded_frames(wal, start, end)
+        && let Some(frames) =
+            validate_checkpoint_frames(wal, cx, start, end, header_checksum, Some(&superseded))
+                .await?
+    {
+        return Ok(frames);
+    }
+    validate_checkpoint_frames(wal, cx, start, end, header_checksum, None)
+        .await?
+        .ok_or_else(|| {
+            FrankenError::internal("a checkpoint pass that digests every frame stopped early")
+        })
+}
 
+/// bd-fuwx0 (3b-i): for each frame of `start..end`, whether a later frame of
+/// the window carries the same page, by the page numbers this handle recorded;
+/// `None` when it holds no header for some frame of the window.
+fn recorded_superseded_frames<F: VfsFile>(
+    wal: &WalFile<F>,
+    start: usize,
+    end: usize,
+) -> Option<Vec<bool>> {
+    let mut later_pages = std::collections::HashSet::new();
+    let mut superseded = vec![false; end - start];
+    for frame in (start..end).rev() {
+        let page = wal.recorded_frame_page_number(frame)?;
+        superseded[frame - start] = !later_pages.insert(page);
+    }
+    Some(superseded)
+}
+
+/// One validating pass over `start..end`, the body of
+/// [`read_checkpoint_frame_headers`]. With `superseded`, a frame it marks gets
+/// no digest, and the pass returns `Ok(None)` at the first valid frame whose
+/// on-disk page number differs from the one this handle recorded for it.
+async fn validate_checkpoint_frames<F: VfsFile>(
+    wal: &WalFile<F>,
+    cx: &Cx,
+    start: usize,
+    end: usize,
+    header_checksum: SqliteWalChecksum,
+    superseded: Option<&[bool]>,
+) -> Result<Option<Vec<CheckpointSourceFrame>>> {
+    const MAX_READ_BYTES: usize = 64 * 1024;
     let mut previous = if start == 0 {
         header_checksum
     } else {
@@ -136,6 +192,7 @@ pub(super) async fn read_checkpoint_frame_headers<F: VfsFile>(
             });
         }
         for (offset, bytes) in bytes.chunks_exact(frame_size).enumerate() {
+            let index = frame + offset;
             let header = WalFrameHeader::from_bytes(&bytes[..WAL_FRAME_HEADER_SIZE])?;
             let checksum = compute_wal_frame_checksum(
                 bytes,
@@ -148,11 +205,20 @@ pub(super) async fn read_checkpoint_frame_headers<F: VfsFile>(
                 || header.checksum != checksum
             {
                 return Err(FrankenError::WalCorrupt {
-                    detail: format!("invalid WAL source at checkpoint frame {}", frame + offset),
+                    detail: format!("invalid WAL source at checkpoint frame {index}"),
                 });
             }
             previous = checksum;
-            headers.push((header, Xxh3Checksum128::compute(bytes)));
+            let digest = match superseded {
+                None => Some(Xxh3Checksum128::compute(bytes)),
+                Some(superseded) => {
+                    if wal.recorded_frame_page_number(index) != Some(header.page_number) {
+                        return Ok(None);
+                    }
+                    (!superseded[index - start]).then(|| Xxh3Checksum128::compute(bytes))
+                }
+            };
+            headers.push((header, digest));
         }
         frame += count;
     }
@@ -161,5 +227,5 @@ pub(super) async fn read_checkpoint_frame_headers<F: VfsFile>(
             detail: "checkpoint checksum tail differs from the accepted WAL tail".to_owned(),
         });
     }
-    Ok(headers)
+    Ok(Some(headers))
 }
