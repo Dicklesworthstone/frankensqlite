@@ -9238,6 +9238,51 @@ pub struct ReplaceVictim {
     pub rowid: Option<i64>,
 }
 
+/// `(index_root_page, encoded_key_bytes)` for a staged REPLACE write.
+pub type StagedIndexEntry = (i32, Vec<u8>);
+
+/// Old-row deletion deferred by a staged UPDATE REPLACE write.
+#[derive(Debug, Clone)]
+pub struct StagedUpdateOldDelete {
+    pub old_rowid: i64,
+    pub old_index_entries: Vec<StagedIndexEntry>,
+}
+
+/// Final row write held back after REPLACE conflict victims are deleted (bd-ygcuj).
+///
+/// Victim DELETE triggers (`recursive_triggers`) and inbound FK actions run
+/// BEFORE this write lands, matching C SQLite's `sqlite3GenerateRowDelete`
+/// ordering. If a victim callback fails (for example `FAIL` in a cascade
+/// trigger), this staged write is discarded and never written.
+#[derive(Debug, Clone)]
+pub enum StagedReplaceWrite {
+    RowidStorage {
+        table_root_page: i32,
+        rowid: i64,
+        payload: Vec<u8>,
+        /// Secondary-index entries inserted for the new row.
+        new_index_entries: Vec<StagedIndexEntry>,
+        /// For UPDATE: the old row and secondary-index entries to delete on commit.
+        update_old_delete: Option<StagedUpdateOldDelete>,
+        /// `Some(rowid)` for INSERT (`last_insert_rowid()`); `None` for UPDATE.
+        insert_rowid: Option<i64>,
+    },
+    RowidMem {
+        table_root_page: i32,
+        rowid: i64,
+        values: Vec<SqliteValue>,
+        update_old_rowid: Option<i64>,
+        insert_rowid: Option<i64>,
+    },
+    WithoutRowidStorage {
+        pk_root_page: i32,
+        /// `(root_page, key_bytes)` deleted for the OLD row of an UPDATE.
+        old_deletes: Vec<StagedIndexEntry>,
+        /// `(root_page, key_bytes)` inserted for the NEW row (PK first, then secondary indexes).
+        new_inserts: Vec<StagedIndexEntry>,
+    },
+}
+
 /// Inline register storage for the 1-indexed VDBE register file.
 ///
 /// The engine keeps `SqliteValue` cells directly in a `SmallVec` so the hot
@@ -9585,6 +9630,11 @@ pub struct VdbeEngine {
     changes: usize,
     /// Exact logical rows implicitly deleted by REPLACE during this execution.
     replace_victims: Vec<ReplaceVictim>,
+    /// bd-ygcuj: when true, a single-row INSERT/UPDATE that deleted REPLACE
+    /// victims stages and unwinds its final row write before returning, so
+    /// connection-layer victim DELETE triggers and FK actions observe the
+    /// post-victim-delete pre-write state (matching stock SQLite).
+    stage_write_on_replace_victims: bool,
     /// Rowid of the last INSERT operation (for `last_insert_rowid()` support).
     last_insert_rowid: i64,
     /// Whether this execution recorded a real last-insert rowid.
@@ -10055,6 +10105,12 @@ struct ColdVdbeState {
     /// `IdxDelete | OPFLAG_ISUPDATE` opcodes (cursor_id, exact stored key).
     /// The row's `Delete` moves them into its `PendingUpdateRestore`.
     pending_update_idx_deletes: Vec<(i32, Vec<u8>)>,
+    /// bd-ygcuj: old clustered-PK and secondary-index entries removed by a
+    /// WITHOUT ROWID UPDATE after REPLACE victims were deleted, recorded only
+    /// when `stage_write_on_replace_victims` is enabled.
+    staged_without_rowid_old_deletes: Vec<(i32, Vec<u8>)>,
+    /// bd-ygcuj: final row write unwound by [`VdbeEngine::stash_staged_replace_write`].
+    staged_replace_write: Option<StagedReplaceWrite>,
     /// RowSet data structures for OR-optimized queries (keyed by register).
     rowsets: SwissIndex<i32, RowSet>,
     /// Per-cursor monotonic sequence counters for `Opcode::Sequence`.
@@ -10090,6 +10146,8 @@ impl ColdVdbeState {
             conflict_skip_idx: false,
             pending_idx_entries: Vec::new(),
             pending_update_idx_deletes: Vec::new(),
+            staged_without_rowid_old_deletes: Vec::new(),
+            staged_replace_write: None,
             rowsets: SwissIndex::new(),
             sequence_counters: HashMap::new(),
             vtab_cursors: SwissIndex::new(),
@@ -10328,6 +10386,7 @@ impl VdbeEngine {
             last_compare_result: None,
             changes: 0,
             replace_victims: Vec::new(),
+            stage_write_on_replace_victims: false,
             last_insert_rowid: 0,
             last_insert_rowid_valid: false,
             autoinc_alloc_high_water: BTreeMap::new(),
@@ -10697,6 +10756,7 @@ impl VdbeEngine {
         self.last_compare_result = None;
         self.changes = 0;
         self.replace_victims.clear();
+        self.stage_write_on_replace_victims = false;
         self.last_insert_rowid = 0;
         self.last_insert_rowid_valid = false;
         self.autoinc_alloc_high_water.clear();
@@ -11301,6 +11361,481 @@ impl VdbeEngine {
     /// engine is reset or reused.
     pub fn take_replace_victims(&mut self) -> Vec<ReplaceVictim> {
         std::mem::take(&mut self.replace_victims)
+    }
+
+    /// Whether no REPLACE conflict victims have been recorded during this run.
+    #[must_use]
+    pub fn replace_victims_is_empty(&self) -> bool {
+        self.replace_victims.is_empty()
+    }
+
+    /// Enable or disable bd-ygcuj staged-write deferral when REPLACE victims
+    /// are deleted during a single-row INSERT or UPDATE.
+    pub fn set_stage_write_on_replace_victims(&mut self, enabled: bool) {
+        self.stage_write_on_replace_victims = enabled;
+    }
+
+    /// Take the staged REPLACE write captured by
+    /// [`Self::stash_staged_replace_write`], if any.
+    pub fn take_staged_replace_write(&mut self) -> Option<StagedReplaceWrite> {
+        self.cold_state_mut()
+            .and_then(|cold| cold.staged_replace_write.take())
+    }
+
+    /// Capture and unwind the final write of a single-row REPLACE DML (bd-ygcuj).
+    ///
+    /// Leaves only the victim deletions applied so connection-layer DELETE
+    /// triggers and inbound FK actions observe the exact stock SQLite pre-write
+    /// database state.
+    #[allow(clippy::too_many_lines)]
+    pub async fn stash_staged_replace_write(&mut self) -> Result<()> {
+        if !self.stage_write_on_replace_victims || self.replace_victims.is_empty() {
+            return Ok(());
+        }
+
+        // Case 1: rowid table INSERT or UPDATE (`pending_insert_rollback` set).
+        let pending_rollback = self
+            .cold_state
+            .as_ref()
+            .and_then(|cold| cold.pending_insert_rollback.clone());
+        if let Some(rollback) = pending_rollback {
+            if self.storage_cursors.contains_key(&rollback.cursor_id) {
+                let (table_root_page, payload) = {
+                    let tsc = self
+                        .storage_cursors
+                        .get_mut(&rollback.cursor_id)
+                        .ok_or_else(|| {
+                            FrankenError::internal(
+                                "stash_staged_replace_write: table storage cursor missing",
+                            )
+                        })?;
+                    if !tsc
+                        .cursor
+                        .table_move_to(&tsc.cx, rollback.rowid)
+                        .await?
+                        .is_found()
+                    {
+                        return Err(FrankenError::internal(
+                            "stash_staged_replace_write: staged table row missing",
+                        ));
+                    }
+                    let root = tsc.root_page;
+                    let bytes = tsc.cursor.payload(&tsc.cx).await?;
+                    (root, bytes)
+                };
+                let new_index_entries: Vec<(i32, Vec<u8>)> = self
+                    .cold_state
+                    .as_ref()
+                    .map(|cold| {
+                        cold.pending_idx_entries
+                            .iter()
+                            .filter_map(|(cid, key)| {
+                                self.storage_cursors
+                                    .get(cid)
+                                    .map(|sc| (sc.root_page, key.clone()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let update_old_delete = match &rollback.update_restore {
+                    Some(PendingUpdateRestore::Storage {
+                        rowid: old_rowid,
+                        index_entries,
+                        ..
+                    }) => {
+                        let mapped: Vec<StagedIndexEntry> = index_entries
+                            .iter()
+                            .filter_map(|(cid, key)| {
+                                self.storage_cursors
+                                    .get(cid)
+                                    .map(|sc| (sc.root_page, key.clone()))
+                            })
+                            .collect();
+                        Some(StagedUpdateOldDelete {
+                            old_rowid: *old_rowid,
+                            old_index_entries: mapped,
+                        })
+                    }
+                    _ => None,
+                };
+                let insert_rowid = rollback.update_restore.is_none().then_some(rollback.rowid);
+                self.rollback_pending_insert_after_index_conflict(true, false)
+                    .await?;
+                self.ensure_cold_state_for(StatementColdState::CONFLICT_TRACKING)
+                    .staged_replace_write = Some(StagedReplaceWrite::RowidStorage {
+                    table_root_page,
+                    rowid: rollback.rowid,
+                    payload,
+                    new_index_entries,
+                    update_old_delete,
+                    insert_rowid,
+                });
+                return Ok(());
+            }
+
+            // TEMP / MemDatabase rowid table.
+            let Some(table_root_page) = self.cursor_root_pages.get(&rollback.cursor_id).copied()
+            else {
+                return Ok(());
+            };
+            let Some(rollback) = self.take_pending_insert_rollback() else {
+                return Ok(());
+            };
+            let mem_op_cx = self.derive_execution_cx();
+            let values = self
+                .db
+                .as_ref()
+                .and_then(|db| db.get_table(table_root_page))
+                .map(|table| table.read_row_values_by_rowid(&mem_op_cx, rollback.rowid))
+                .transpose()?
+                .flatten()
+                .map(Cow::into_owned);
+            let Some(values) = values else {
+                return Ok(());
+            };
+            if let Some(db) = self.db.as_mut() {
+                db.delete_rowid(&mem_op_cx, table_root_page, rollback.rowid)?;
+            }
+            let update_old_rowid = match rollback.update_restore {
+                Some(PendingUpdateRestore::Mem {
+                    root_page,
+                    rowid: old_rowid,
+                    values: old_values,
+                }) => {
+                    if let Some(db) = self.db.as_mut() {
+                        db.upsert_row_checked(&mem_op_cx, root_page, old_rowid, old_values)?;
+                    }
+                    Some(old_rowid)
+                }
+                _ => None,
+            };
+            let insert_rowid = update_old_rowid.is_none().then_some(rollback.rowid);
+            self.changes = self.changes.saturating_sub(1);
+            self.last_insert_rowid = rollback.previous_last_insert_rowid;
+            self.last_insert_rowid_valid = rollback.previous_last_insert_rowid_valid;
+            self.last_insert_cursor_id = None;
+            self.ensure_cold_state_for(StatementColdState::CONFLICT_TRACKING)
+                .staged_replace_write = Some(StagedReplaceWrite::RowidMem {
+                table_root_page,
+                rowid: rollback.rowid,
+                values,
+                update_old_rowid,
+                insert_rowid,
+            });
+            return Ok(());
+        }
+
+        // Case 2: WITHOUT ROWID table INSERT or UPDATE.
+        let entries = self.take_pending_idx_entries();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut new_inserts = Vec::with_capacity(entries.len());
+        for (cid, key) in &entries {
+            if let Some(sc) = self.storage_cursors.get(cid) {
+                new_inserts.push((sc.root_page, key.clone()));
+            }
+        }
+        if new_inserts.is_empty() {
+            return Ok(());
+        }
+        let pk_root_page = new_inserts[0].0;
+        for (cid, key) in entries.into_iter().rev() {
+            if self
+                .storage_cursor_find_exact_index_key(
+                    cid,
+                    &key,
+                    "stash_staged_replace_write: missing collation registry for WITHOUT ROWID unwind",
+                )
+                .await?
+                && let Some(sc) = self.storage_cursors.get_mut(&cid)
+            {
+                sc.cursor.delete(&sc.cx).await?;
+                invalidate_storage_cursor_row_cache_with_reason(
+                    sc,
+                    self.collect_vdbe_metrics,
+                    DecodeCacheInvalidationReason::WriteMutation,
+                );
+            }
+        }
+        let old_deletes_by_cid = self.cold_state_mut().map_or_else(Vec::new, |cold| {
+            std::mem::take(&mut cold.staged_without_rowid_old_deletes)
+        });
+        let mut old_deletes = Vec::with_capacity(old_deletes_by_cid.len());
+        for (cid, key) in old_deletes_by_cid {
+            if let Some(sc) = self.storage_cursors.get_mut(&cid) {
+                old_deletes.push((sc.root_page, key.clone()));
+                sc.cursor.index_insert(&sc.cx, &key).await?;
+                invalidate_storage_cursor_row_cache_with_reason(
+                    sc,
+                    self.collect_vdbe_metrics,
+                    DecodeCacheInvalidationReason::WriteMutation,
+                );
+            }
+        }
+        self.changes = self.changes.saturating_sub(1);
+        self.ensure_cold_state_for(StatementColdState::CONFLICT_TRACKING)
+            .staged_replace_write = Some(StagedReplaceWrite::WithoutRowidStorage {
+            pk_root_page,
+            old_deletes,
+            new_inserts,
+        });
+        Ok(())
+    }
+
+    async fn open_staged_replace_cursor_for_root(
+        &mut self,
+        root_to_cid: &mut HashMap<i32, i32>,
+        next_cid: &mut i32,
+        root_page: i32,
+    ) -> Result<i32> {
+        if let Some(&cid) = root_to_cid.get(&root_page) {
+            return Ok(cid);
+        }
+        let cid = *next_cid;
+        *next_cid += 1;
+        if !self.open_storage_cursor(cid, root_page, true).await? {
+            return Err(FrankenError::internal(format!(
+                "apply_staged_replace_write: could not open writable cursor on root page {root_page}"
+            )));
+        }
+        root_to_cid.insert(root_page, cid);
+        Ok(cid)
+    }
+
+    /// bd-ygcuj: commit a [`StagedReplaceWrite`] after victim DELETE triggers
+    /// and inbound FK actions have succeeded. Returns `(changes, insert_rowid)`.
+    #[allow(clippy::too_many_lines)]
+    pub async fn apply_staged_replace_write(
+        &mut self,
+        staged: StagedReplaceWrite,
+    ) -> Result<(usize, Option<i64>)> {
+        let mut root_to_cid: HashMap<i32, i32> = HashMap::new();
+        let mut next_cid: i32 = 0;
+
+        match staged {
+            StagedReplaceWrite::RowidStorage {
+                table_root_page,
+                rowid,
+                payload,
+                new_index_entries,
+                update_old_delete,
+                insert_rowid,
+            } => {
+                let tbl_cid = self
+                    .open_staged_replace_cursor_for_root(
+                        &mut root_to_cid,
+                        &mut next_cid,
+                        table_root_page,
+                    )
+                    .await?;
+                if let Some(StagedUpdateOldDelete {
+                    old_rowid,
+                    old_index_entries,
+                }) = update_old_delete
+                {
+                    let found = {
+                        let tsc = self.storage_cursors.get_mut(&tbl_cid).ok_or_else(|| {
+                            FrankenError::internal(
+                                "apply_staged_replace_write: table cursor missing",
+                            )
+                        })?;
+                        tsc.cursor.table_move_to(&tsc.cx, old_rowid).await?.is_found()
+                    };
+                    if !found {
+                        // A victim DELETE trigger or cascade already removed
+                        // the row being updated; skip updating it (stock rule).
+                        return Ok((0, None));
+                    }
+                    if let Some(tsc) = self.storage_cursors.get_mut(&tbl_cid) {
+                        tsc.cursor.delete(&tsc.cx).await?;
+                        invalidate_storage_cursor_row_cache_with_reason(
+                            tsc,
+                            self.collect_vdbe_metrics,
+                            DecodeCacheInvalidationReason::WriteMutation,
+                        );
+                    }
+                    for (idx_root, old_key) in old_index_entries {
+                        let idx_cid = self
+                            .open_staged_replace_cursor_for_root(
+                                &mut root_to_cid,
+                                &mut next_cid,
+                                idx_root,
+                            )
+                            .await?;
+                        if self
+                            .storage_cursor_find_exact_index_key(
+                                idx_cid,
+                                &old_key,
+                                "apply_staged_replace_write: missing collation registry for UPDATE old index delete",
+                            )
+                            .await?
+                            && let Some(isc) = self.storage_cursors.get_mut(&idx_cid)
+                        {
+                            isc.cursor.delete(&isc.cx).await?;
+                            invalidate_storage_cursor_row_cache_with_reason(
+                                isc,
+                                self.collect_vdbe_metrics,
+                                DecodeCacheInvalidationReason::WriteMutation,
+                            );
+                        }
+                    }
+                }
+
+                let concurrent_allocator = self.concurrent_rowid_allocator.clone();
+                let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
+                let session_id = self.concurrent_rowid_session_id;
+                let statement = self.concurrent_rowid_statement;
+                {
+                    let tsc = self.storage_cursors.get_mut(&tbl_cid).ok_or_else(|| {
+                        FrankenError::internal("apply_staged_replace_write: table cursor missing")
+                    })?;
+                    if tsc.cursor.table_move_to(&tsc.cx, rowid).await?.is_found() {
+                        tsc.cursor.delete(&tsc.cx).await?;
+                    }
+                    tsc.cursor.table_insert(&tsc.cx, rowid, &payload).await?;
+                    invalidate_storage_cursor_row_cache_with_reason(
+                        tsc,
+                        self.collect_vdbe_metrics,
+                        DecodeCacheInvalidationReason::WriteMutation,
+                    );
+                    if let Some(allocator) = concurrent_allocator.as_ref() {
+                        let rowid_mode = tsc.rowid_mode;
+                        let autoinc_max = tsc.autoincrement_high_water;
+                        Self::bump_concurrent_storage_rowid_floor(
+                            allocator,
+                            concurrent_schema_epoch,
+                            session_id,
+                            statement,
+                            table_root_page,
+                            rowid_mode,
+                            autoinc_max,
+                            tsc,
+                            rowid,
+                        )
+                        .await?;
+                    }
+                }
+                self.mark_storage_root_page_dirty(table_root_page);
+
+                for (idx_root, new_key) in new_index_entries {
+                    let idx_cid = self
+                        .open_staged_replace_cursor_for_root(
+                            &mut root_to_cid,
+                            &mut next_cid,
+                            idx_root,
+                        )
+                        .await?;
+                    if self
+                        .storage_cursor_find_exact_index_key(
+                            idx_cid,
+                            &new_key,
+                            "apply_staged_replace_write: missing collation registry for index insert",
+                        )
+                        .await?
+                        && let Some(isc) = self.storage_cursors.get_mut(&idx_cid)
+                    {
+                        isc.cursor.delete(&isc.cx).await?;
+                    }
+                    if let Some(isc) = self.storage_cursors.get_mut(&idx_cid) {
+                        isc.cursor.index_insert(&isc.cx, &new_key).await?;
+                        invalidate_storage_cursor_row_cache_with_reason(
+                            isc,
+                            self.collect_vdbe_metrics,
+                            DecodeCacheInvalidationReason::WriteMutation,
+                        );
+                    }
+                }
+                Ok((1, insert_rowid))
+            }
+            StagedReplaceWrite::WithoutRowidStorage {
+                pk_root_page,
+                old_deletes,
+                new_inserts,
+            } => {
+                if !old_deletes.is_empty() {
+                    if let Some((_, old_pk_key)) =
+                        old_deletes.iter().find(|(root, _)| *root == pk_root_page)
+                    {
+                        let pk_cid = self
+                            .open_staged_replace_cursor_for_root(
+                                &mut root_to_cid,
+                                &mut next_cid,
+                                pk_root_page,
+                            )
+                            .await?;
+                        let found = self
+                            .storage_cursor_find_exact_index_key(
+                                pk_cid,
+                                old_pk_key,
+                                "apply_staged_replace_write: missing collation registry for WITHOUT ROWID PK check",
+                            )
+                            .await?;
+                        if !found {
+                            return Ok((0, None));
+                        }
+                    }
+                    for (root_page, old_key) in old_deletes {
+                        let cid = self
+                            .open_staged_replace_cursor_for_root(
+                                &mut root_to_cid,
+                                &mut next_cid,
+                                root_page,
+                            )
+                            .await?;
+                        if self
+                            .storage_cursor_find_exact_index_key(
+                                cid,
+                                &old_key,
+                                "apply_staged_replace_write: missing collation registry for WITHOUT ROWID old delete",
+                            )
+                            .await?
+                            && let Some(sc) = self.storage_cursors.get_mut(&cid)
+                        {
+                            sc.cursor.delete(&sc.cx).await?;
+                            invalidate_storage_cursor_row_cache_with_reason(
+                                sc,
+                                self.collect_vdbe_metrics,
+                                DecodeCacheInvalidationReason::WriteMutation,
+                            );
+                        }
+                    }
+                }
+                for (root_page, new_key) in new_inserts {
+                    let cid = self
+                        .open_staged_replace_cursor_for_root(
+                            &mut root_to_cid,
+                            &mut next_cid,
+                            root_page,
+                        )
+                        .await?;
+                    if self
+                        .storage_cursor_find_exact_index_key(
+                            cid,
+                            &new_key,
+                            "apply_staged_replace_write: missing collation registry for WITHOUT ROWID insert",
+                        )
+                        .await?
+                        && let Some(sc) = self.storage_cursors.get_mut(&cid)
+                    {
+                        sc.cursor.delete(&sc.cx).await?;
+                    }
+                    if let Some(sc) = self.storage_cursors.get_mut(&cid) {
+                        sc.cursor.index_insert(&sc.cx, &new_key).await?;
+                        invalidate_storage_cursor_row_cache_with_reason(
+                            sc,
+                            self.collect_vdbe_metrics,
+                            DecodeCacheInvalidationReason::WriteMutation,
+                        );
+                    }
+                }
+                self.mark_storage_root_page_dirty(pk_root_page);
+                Ok((1, None))
+            }
+            StagedReplaceWrite::RowidMem { .. } => Err(FrankenError::internal(
+                "apply_staged_replace_write: RowidMem must be applied directly to MemDatabase",
+            )),
+        }
     }
 
     /// Returns the rowid of the last INSERT operation, if this execution
@@ -16814,7 +17349,11 @@ impl VdbeEngine {
                             })
                             .await?
                         {
+                            let capture_wr_old_delete = self.stage_write_on_replace_victims
+                                && (op.p5 & OPFLAG_REPLACE_VICTIM) == 0
+                                && !self.replace_victims.is_empty();
                             let mut removed_entry = None;
+                            let mut staged_wr_entry = None;
                             if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                                 sc.last_rightmost_unique_index_prefix = None;
                                 sc.last_rightmost_unique_index_position = None;
@@ -16822,6 +17361,8 @@ impl VdbeEngine {
                                 // UPDATE row removes, for its conflict restore.
                                 if op.p5 & OPFLAG_ISUPDATE != 0 {
                                     removed_entry = Some(lean_future(|| sc.cursor.payload(&sc.cx)).await?);
+                                } else if capture_wr_old_delete {
+                                    staged_wr_entry = Some(lean_future(|| sc.cursor.payload(&sc.cx)).await?);
                                 }
                                 lean_future(|| sc.cursor.delete(&sc.cx)).await?;
                                 deleted = true;
@@ -16835,10 +17376,25 @@ impl VdbeEngine {
                                 self.ensure_cold_state_for(StatementColdState::CONFLICT_TRACKING)
                                     .pending_update_idx_deletes
                                     .push((cursor_id, entry));
+                            } else if let Some(entry) = staged_wr_entry {
+                                self.ensure_cold_state_for(StatementColdState::CONFLICT_TRACKING)
+                                    .staged_without_rowid_old_deletes
+                                    .push((cursor_id, entry));
                             }
                         }
-                    } else if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
-                        if sc.writable && !sc.cursor.eof() {
+                    } else {
+                        let capture_wr_old_delete = self.stage_write_on_replace_victims
+                            && (op.p5 & OPFLAG_REPLACE_VICTIM) == 0
+                            && !self.replace_victims.is_empty();
+                        let mut staged_wr_entry = None;
+                        if let Some(sc) = self.storage_cursors.get_mut(&cursor_id)
+                            && sc.writable
+                            && !sc.cursor.eof()
+                        {
+                            if capture_wr_old_delete {
+                                staged_wr_entry =
+                                    Some(lean_future(|| sc.cursor.payload(&sc.cx)).await?);
+                            }
                             // Delete at current position.
                             sc.last_rightmost_unique_index_prefix = None;
                             sc.last_rightmost_unique_index_position = None;
@@ -16849,6 +17405,11 @@ impl VdbeEngine {
                                 self.collect_vdbe_metrics,
                                 DecodeCacheInvalidationReason::WriteMutation,
                             );
+                        }
+                        if let Some(entry) = staged_wr_entry {
+                            self.ensure_cold_state_for(StatementColdState::CONFLICT_TRACKING)
+                                .staged_without_rowid_old_deletes
+                                .push((cursor_id, entry));
                         }
                     }
                     if deleted && let Some(replace_victim) = replace_victim {

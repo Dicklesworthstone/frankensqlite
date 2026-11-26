@@ -1736,3 +1736,253 @@ fn review_recorded_algorithm_is_per_failure() {
         no_normalize,
     );
 }
+
+/// bd-ygcuj Repro 2: REPLACE deletes victims and runs callbacks before writing.
+///
+/// Stock deletes the REPLACE conflict victim and executes its DELETE triggers
+/// and inbound FK actions BEFORE inserting the new row (or updating the source
+/// row). A `FAIL` or `RAISE(FAIL)` inside a REPLACE's FK cascade or victim
+/// DELETE trigger must leave the old victim deleted and never write the new
+/// row, and any query inside a victim DELETE or FK cascade trigger must not
+/// observe the new row yet.
+#[test]
+fn review_replace_fk_cascade_and_trigger_fail_never_writes_new_row() {
+    let mut cases = Vec::new();
+
+    // 1. Exact bd-ygcuj Repro 2 across autocommit, BEGIN, and SAVEPOINT.
+    for txn in TXNS {
+        cases.push(Case {
+            name: format!("bd-ygcuj repro 2: INSERT OR REPLACE FK cascade FAIL, {txn:?}"),
+            setup: strs(&[
+                "PRAGMA foreign_keys = ON",
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT)",
+                "CREATE INDEX p_v ON p(v)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+                "CREATE TABLE log(x INTEGER UNIQUE)",
+                "INSERT INTO log VALUES (2)",
+                "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+                "INSERT INTO c VALUES (1, 1), (2, 2), (3, 3)",
+                "CREATE TRIGGER cd AFTER DELETE ON c BEGIN INSERT OR FAIL INTO log VALUES (OLD.id); END",
+            ]),
+            steps: in_txn(
+                txn,
+                "INSERT INTO p VALUES (9, 'prior')",
+                "INSERT OR REPLACE INTO p VALUES (1, 'x'), (2, 'y'), (3, 'z')".to_owned(),
+            ),
+            queries: strs(&[
+                "SELECT id, v FROM p ORDER BY id",
+                "SELECT id, pid FROM c ORDER BY id",
+                "SELECT x FROM log ORDER BY x",
+                "PRAGMA integrity_check",
+            ]),
+        });
+    }
+
+    // 2. Column-level ON CONFLICT REPLACE (PK and secondary UNIQUE) + FK cascade FAIL.
+    for (label, schema, stmt) in [
+        (
+            "PK ON CONFLICT REPLACE",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, k INTEGER, v TEXT)",
+            "INSERT INTO p VALUES (1, 11, 'x'), (2, 22, 'y'), (3, 33, 'z')",
+        ),
+        (
+            "UNIQUE ON CONFLICT REPLACE",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, k INTEGER UNIQUE ON CONFLICT REPLACE, v TEXT)",
+            "INSERT INTO p VALUES (10, 10, 'x'), (20, 20, 'y'), (30, 30, 'z')",
+        ),
+    ] {
+        cases.push(Case {
+            name: format!("bd-ygcuj {label} FK cascade FAIL"),
+            setup: vec![
+                "PRAGMA foreign_keys = ON".to_owned(),
+                schema.to_owned(),
+                "CREATE INDEX p_v ON p(v)".to_owned(),
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)".to_owned(),
+                "CREATE TABLE log(x INTEGER UNIQUE)".to_owned(),
+                "INSERT INTO log VALUES (2)".to_owned(),
+                "INSERT INTO p VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')".to_owned(),
+                "INSERT INTO c VALUES (1, 1), (2, 2), (3, 3)".to_owned(),
+                "CREATE TRIGGER cd AFTER DELETE ON c BEGIN INSERT OR FAIL INTO log VALUES (OLD.id); END".to_owned(),
+            ],
+            steps: strs(&["BEGIN", stmt]),
+            queries: strs(&[
+                "SELECT id, k, v FROM p ORDER BY id",
+                "SELECT id, pid FROM c ORDER BY id",
+                "SELECT x FROM log ORDER BY x",
+                "PRAGMA integrity_check",
+            ]),
+        });
+    }
+
+    // 3. WITHOUT ROWID parent table + FK cascade FAIL.
+    cases.push(Case {
+        name: "bd-ygcuj WITHOUT ROWID INSERT OR REPLACE FK cascade FAIL".to_owned(),
+        setup: strs(&[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID",
+            "CREATE INDEX p_v ON p(v)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+            "CREATE TABLE log(x INTEGER UNIQUE)",
+            "INSERT INTO log VALUES (2)",
+            "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "INSERT INTO c VALUES (1, 1), (2, 2), (3, 3)",
+            "CREATE TRIGGER cd AFTER DELETE ON c BEGIN INSERT OR FAIL INTO log VALUES (OLD.id); END",
+        ]),
+        steps: strs(&[
+            "BEGIN",
+            "INSERT OR REPLACE INTO p VALUES (1, 'x'), (2, 'y'), (3, 'z')",
+        ]),
+        queries: strs(&[
+            "SELECT id, v FROM p ORDER BY id",
+            "SELECT id, pid FROM c ORDER BY id",
+            "SELECT x FROM log ORDER BY x",
+            "PRAGMA integrity_check",
+        ]),
+    });
+
+    // 4. UPDATE OR REPLACE colliding with another parent row + FK cascade FAIL:
+    //    old victim (2,'b') and c(2,2) are deleted, source row (1,'a') stays un-updated.
+    cases.push(Case {
+        name: "bd-ygcuj UPDATE OR REPLACE FK cascade FAIL keeps source row intact".to_owned(),
+        setup: strs(&[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT)",
+            "CREATE INDEX p_v ON p(v)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+            "CREATE TABLE log(x INTEGER UNIQUE)",
+            "INSERT INTO log VALUES (2)",
+            "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "INSERT INTO c VALUES (1, 1), (2, 2), (3, 3)",
+            "CREATE TRIGGER cd AFTER DELETE ON c BEGIN INSERT OR FAIL INTO log VALUES (OLD.id); END",
+        ]),
+        steps: strs(&[
+            "BEGIN",
+            "UPDATE OR REPLACE p SET id = 2, v = 'y' WHERE id = 1",
+        ]),
+        queries: strs(&[
+            "SELECT id, v FROM p ORDER BY id",
+            "SELECT id, pid FROM c ORDER BY id",
+            "SELECT x FROM log ORDER BY x",
+            "PRAGMA integrity_check",
+        ]),
+    });
+
+    // 5. Cascade trigger observes p BEFORE the new row lands (and succeeds).
+    cases.push(Case {
+        name: "bd-ygcuj FK cascade trigger sees victim gone and new row not yet written".to_owned(),
+        setup: strs(&[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+            "CREATE TABLE seen(step INTEGER PRIMARY KEY, p_ids TEXT)",
+            "INSERT INTO p VALUES (1, 'a'), (2, 'b')",
+            "INSERT INTO c VALUES (1, 1), (2, 2)",
+            "CREATE TRIGGER cd AFTER DELETE ON c BEGIN \
+             INSERT INTO seen(p_ids) SELECT coalesce(group_concat(id || ':' || v, ','), '') \
+             FROM (SELECT id, v FROM p ORDER BY id); END",
+        ]),
+        steps: strs(&[
+            "BEGIN",
+            "INSERT OR REPLACE INTO p VALUES (1, 'x'), (2, 'y')",
+            "COMMIT",
+        ]),
+        queries: strs(&[
+            "SELECT id, v FROM p ORDER BY id",
+            "SELECT id, pid FROM c ORDER BY id",
+            "SELECT step, p_ids FROM seen ORDER BY step",
+            "PRAGMA integrity_check",
+        ]),
+    });
+
+    // 6. Self-referencing ON DELETE CASCADE: new row must NOT be deleted by its own victim's cascade.
+    cases.push(Case {
+        name: "bd-ygcuj self-referencing ON DELETE CASCADE preserves new replaced row".to_owned(),
+        setup: strs(&[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE, v TEXT)",
+            "INSERT INTO p VALUES (1, 1, 'old'), (2, 1, 'child')",
+        ]),
+        steps: strs(&[
+            "BEGIN",
+            "INSERT OR REPLACE INTO p VALUES (1, 1, 'new')",
+            "COMMIT",
+        ]),
+        queries: strs(&[
+            "SELECT id, pid, v FROM p ORDER BY id",
+            "PRAGMA integrity_check",
+        ]),
+    });
+
+    // 7. ON DELETE NO ACTION vs ON DELETE RESTRICT on INSERT OR REPLACE with same PK.
+    cases.push(Case {
+        name: "bd-ygcuj ON DELETE NO ACTION succeeds when new row restores parent key".to_owned(),
+        setup: strs(&[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id))",
+            "INSERT INTO p VALUES (1, 'a'), (2, 'b')",
+            "INSERT INTO c VALUES (1, 1), (2, 2)",
+        ]),
+        steps: strs(&[
+            "BEGIN",
+            "INSERT OR REPLACE INTO p VALUES (1, 'x'), (2, 'y')",
+            "COMMIT",
+        ]),
+        queries: strs(&[
+            "SELECT id, v FROM p ORDER BY id",
+            "SELECT id, pid FROM c ORDER BY id",
+            "PRAGMA integrity_check",
+        ]),
+    });
+
+    cases.push(Case {
+        name: "bd-ygcuj ON DELETE RESTRICT fails immediately even when new row keeps same PK".to_owned(),
+        setup: strs(&[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE RESTRICT)",
+            "INSERT INTO p VALUES (1, 'a'), (2, 'b')",
+            "INSERT INTO c VALUES (2, 2)",
+        ]),
+        steps: strs(&[
+            "BEGIN",
+            "INSERT OR REPLACE INTO p VALUES (1, 'x'), (2, 'y')",
+        ]),
+        queries: strs(&[
+            "SELECT id, v FROM p ORDER BY id",
+            "SELECT id, pid FROM c ORDER BY id",
+            "PRAGMA integrity_check",
+        ]),
+    });
+
+    // 8. recursive_triggers = ON without FKs: RAISE(FAIL) in victim DELETE trigger never writes new row.
+    cases.push(Case {
+        name: "bd-ygcuj recursive_triggers DELETE trigger RAISE(FAIL) never writes new row".to_owned(),
+        setup: strs(&[
+            "PRAGMA recursive_triggers = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT)",
+            "CREATE TABLE seen(id INTEGER, cnt INTEGER)",
+            "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "CREATE TRIGGER pd AFTER DELETE ON p BEGIN \
+             INSERT INTO seen VALUES (OLD.id, (SELECT count(*) FROM p WHERE id = OLD.id)); \
+             SELECT CASE WHEN OLD.id = 2 THEN RAISE(FAIL, 'stop on 2') END; \
+             END",
+        ]),
+        steps: strs(&[
+            "BEGIN",
+            "INSERT OR REPLACE INTO p VALUES (1, 'x'), (2, 'y'), (3, 'z')",
+        ]),
+        queries: strs(&[
+            "SELECT id, v FROM p ORDER BY id",
+            "SELECT id, cnt FROM seen ORDER BY rowid",
+            "PRAGMA integrity_check",
+        ]),
+    });
+
+    assert_matches_stock(
+        "bd-ygcuj REPLACE victim ordering before write",
+        &cases,
+        &ALL_LANES,
+        no_normalize,
+    );
+}

@@ -748,8 +748,14 @@ impl Connection {
                 .await?;
             }
             Statement::Update(_) | Statement::Delete(_) => {
-                let (_, affected, _) = lean_future(|| {
-                    self.execute_table_program_with_cx(
+                let stage_replace_write = match statement {
+                    Statement::Update(update) => {
+                        self.table_has_replace_victim_callbacks(&update.table.name.name)
+                    }
+                    _ => false,
+                };
+                let (_, mut affected, _) = lean_future(|| {
+                    self.execute_table_program_with_cx_and_replace_staging(
                         &kernel.program,
                         params,
                         false,
@@ -758,13 +764,17 @@ impl Connection {
                         true,
                         Vec::new(),
                         None,
+                        stage_replace_write,
                     )
                 })
                 .await?;
                 if let Statement::Update(update) = statement {
                     // UPDATE OR REPLACE may delete another row: the arm's
                     // victim pass (a no-op without victims).
-                    boxed_future(|| self.enforce_fk_on_replace_victims(&update.table.name)).await?;
+                    let (staged_changes, _) =
+                        boxed_future(|| self.enforce_fk_on_replace_victims(&update.table.name))
+                            .await?;
+                    affected += staged_changes;
                 }
                 self.record_statement_changes(affected);
             }
@@ -1775,8 +1785,9 @@ impl Connection {
         };
         let runtime_requirements = self.insert_runtime_requirements(insert)?;
         let vtab_instances = self.insert_program_vtab_instances(insert, program)?;
-        let (mut rows, affected, last_insert_rowid) = self
-            .execute_table_program_with_cx(
+        let stage_replace_write = self.table_has_replace_victim_callbacks(table_name);
+        let (mut rows, mut affected, mut last_insert_rowid) = self
+            .execute_table_program_with_cx_and_replace_staging(
                 program,
                 params,
                 true,
@@ -1785,15 +1796,24 @@ impl Connection {
                 true,
                 vtab_instances,
                 None,
+                stage_replace_write,
             )
             .await?;
 
         // Implicit REPLACE deletes are parent-row deletions for inbound
-        // FK purposes. Enforce their exact OLD rows before child-side
-        // validation and AFTER INSERT processing. Only a program that
-        // deleted rows left victims; without any the boxed pass is skipped.
-        if !self.last_replace_victims.borrow().is_empty() {
-            Box::pin(self.enforce_fk_on_replace_victims(&insert.table)).await?;
+        // FK purposes. Enforce their exact OLD rows before the staged new row
+        // lands, before child-side validation, and before AFTER INSERT
+        // processing (bd-ygcuj). Only a program that deleted rows left victims;
+        // without any the boxed pass is skipped.
+        if !self.last_replace_victims.borrow().is_empty()
+            || self.pending_staged_replace_write.borrow().is_some()
+        {
+            let (staged_changes, staged_rowid) =
+                Box::pin(self.enforce_fk_on_replace_victims(&insert.table)).await?;
+            affected += staged_changes;
+            if let Some(rid) = staged_rowid {
+                last_insert_rowid = Some(rid);
+            }
         }
 
         // bd-d8s37: an UPSERT checks the row the write program produced.

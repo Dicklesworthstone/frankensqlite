@@ -265,7 +265,8 @@ use fsqlite_vdbe::codegen::{
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
 use fsqlite_vdbe::engine::{
     ConstraintFailureAction, ExactResultRowOutcome, ExecOutcome, MemDatabase, MemDbVersionToken,
-    MemRowValues, MemTable, ReplaceVictim, ReusableTableExecutionState, SharedTxnPageIo, VdbeEngine,
+    MemRowValues, MemTable, ReplaceVictim, ReusableTableExecutionState, SharedTxnPageIo,
+    StagedReplaceWrite, VdbeEngine,
     VdbeMetricsSnapshot, reset_vdbe_metrics, vdbe_metrics_snapshot,
 };
 #[cfg(feature = "diagnostic-pragmas")]
@@ -10914,6 +10915,7 @@ impl PreparedStatement<'_> {
             Vec::new(),
             self.conn.statement_parallel_workers(),
             self.conn.build_temp_store_runtime(),
+            false,
         )
         .await;
         let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -10962,7 +10964,8 @@ impl PreparedStatement<'_> {
                 {
                     let victim_table = fast_path.table_name.clone();
                     *self.conn.last_replace_victims.borrow_mut() = replace_victims;
-                    self.conn
+                    let _ = self
+                        .conn
                         .enforce_fk_on_replace_victims(&QualifiedName::bare(victim_table))
                         .await?;
                 }
@@ -11292,6 +11295,7 @@ impl PreparedStatement<'_> {
                 Vec::new(),
                 self.conn.statement_parallel_workers(),
                 self.conn.build_temp_store_runtime(),
+                false,
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -11353,6 +11357,7 @@ impl PreparedStatement<'_> {
                 Vec::new(),
                 self.conn.statement_parallel_workers(),
                 self.conn.build_temp_store_runtime(),
+                false,
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -16210,6 +16215,10 @@ pub struct Connection {
     /// Exact logical rows implicitly deleted by the most recent successful
     /// VDBE REPLACE execution.
     last_replace_victims: RefCell<Vec<ReplaceVictim>>,
+    /// bd-ygcuj: final row write unwound after REPLACE victims were deleted so
+    /// victim DELETE triggers and inbound FK actions run before the new row
+    /// lands (matching stock SQLite's `sqlite3GenerateRowDelete` ordering).
+    pending_staged_replace_write: RefCell<Option<StagedReplaceWrite>>,
     /// Cache for successful FK parent-existence probes.
     ///
     /// Two activation modes share this slot:
@@ -18399,6 +18408,7 @@ impl Connection {
             statement_fk_validation_rechecking: Cell::new(false),
             statement_fk_set_default_changes: Cell::new(0),
             last_replace_victims: RefCell::new(Vec::new()),
+            pending_staged_replace_write: RefCell::new(None),
             fk_parent_validation_cache: RefCell::new(None),
             conflict_observer: Arc::clone(&shared_mvcc_state.conflict_observer),
             trace_registration: RefCell::new(None),
@@ -19076,6 +19086,7 @@ impl Connection {
             statement_fk_validation_rechecking: Cell::new(false),
             statement_fk_set_default_changes: Cell::new(0),
             last_replace_victims: RefCell::new(Vec::new()),
+            pending_staged_replace_write: RefCell::new(None),
             fk_parent_validation_cache: RefCell::new(None),
             // MVCC conflict observability (bd-t6sv2.1)
             conflict_observer: Arc::clone(&shared_mvcc_state.conflict_observer),
@@ -46880,14 +46891,24 @@ impl Connection {
                 } else {
                     None
                 };
-                let pins_one_row = (returning_needs_select_path || computes_new_images)
+                let update_may_fire_replace_callbacks = self
+                    .table_has_replace_victim_callbacks(table_name)
+                    && (effective_update.or_conflict == Some(fsqlite_ast::ConflictAction::Replace)
+                        || self.table_declares_replace_conflict(
+                            table_name,
+                            effective_update.table.name.schema.as_deref(),
+                        ));
+                let pins_one_row = (returning_needs_select_path
+                    || computes_new_images
+                    || update_may_fire_replace_callbacks)
                     && self.dml_where_pins_one_row(
                         &effective_update.table,
                         effective_update.where_clause.as_ref(),
                     );
                 let needs_row_by_row_replay = set_needs_select_path
                     || (returning_needs_select_path && !pins_one_row)
-                    || (computes_new_images && (effective_update.from.is_some() || !pins_one_row));
+                    || ((computes_new_images || update_may_fire_replace_callbacks)
+                        && (effective_update.from.is_some() || !pins_one_row));
                 let replay_locators = if !needs_row_by_row_replay {
                     None
                 } else if effective_update.from.is_some() {
@@ -47162,8 +47183,9 @@ impl Connection {
                     .await?;
                     &arc_prog
                 };
-                let (rows, affected, _) = lean_future(|| {
-                    self.execute_table_program_with_cx(
+                let stage_replace_write = self.table_has_replace_victim_callbacks(table_name);
+                let (rows, mut affected, _) = lean_future(|| {
+                    self.execute_table_program_with_cx_and_replace_staging(
                         program,
                         params,
                         false,
@@ -47172,14 +47194,19 @@ impl Connection {
                         true,
                         Vec::new(),
                         None,
+                        stage_replace_write,
                     )
                 })
                 .await?;
 
                 // UPDATE OR REPLACE may implicitly delete a different row.
                 // Apply inbound FK effects for that exact victim before the
-                // existing parent UPDATE actions and AFTER UPDATE processing.
-                boxed_future(|| self.enforce_fk_on_replace_victims(&effective_update.table.name)).await?;
+                // staged UPDATE write lands, before existing parent UPDATE
+                // actions, and before AFTER UPDATE processing (bd-ygcuj).
+                let (staged_changes, _) =
+                    boxed_future(|| self.enforce_fk_on_replace_victims(&effective_update.table.name))
+                        .await?;
+                affected += staged_changes;
 
                 // bd-c1vth: when the program updated no row (UPDATE OR IGNORE
                 // skipped it on a conflict, or a BEFORE trigger removed it), no
@@ -55597,11 +55624,18 @@ impl Connection {
             })
             .collect();
         let update_event = fsqlite_ast::TriggerEvent::Update(update_cols);
-        let static_fallback_reason = self.prepared_update_delete_static_fallback_reason(
-            table_name,
-            !update.returning.is_empty(),
-            &update_event,
-        );
+        let update_can_replace = update.or_conflict == Some(fsqlite_ast::ConflictAction::Replace)
+            || self.table_declares_replace_conflict(table_name, update.table.name.schema.as_deref());
+        let static_fallback_reason = self
+            .prepared_update_delete_static_fallback_reason(
+                table_name,
+                !update.returning.is_empty(),
+                &update_event,
+            )
+            .or_else(|| {
+                (update_can_replace && self.table_has_delete_triggers(table_name))
+                    .then_some(PreparedUpdateDeleteFallbackReason::Trigger)
+            });
         let foreign_key_work = self.table_has_foreign_key_work(table_name);
         let direct_simple_update = if static_fallback_reason.is_none() && !foreign_key_work {
             self.try_build_prepared_direct_simple_update(update)
@@ -82703,16 +82737,24 @@ impl Connection {
     /// bd-5ofes (GH#496): whether `insert` can implicitly delete a row of a
     /// foreign-key parent table (`OR REPLACE` or schema-level `ON CONFLICT
     /// REPLACE` on a table referenced by any child FK).
-    fn insert_may_delete_fk_parent_victim(&self, insert: &fsqlite_ast::InsertStatement) -> bool {
-        if !self.fk_cascade_propagation_enabled()
-            || !self.table_is_foreign_key_parent(&insert.table.name)
-        {
-            return false;
-        }
-        if matches!(insert.or_conflict, Some(fsqlite_ast::ConflictAction::Replace)) {
-            return true;
-        }
-        self.local_dml_target_table(&insert.table.name, insert.table.schema.as_deref())
+    fn table_has_delete_triggers(&self, table_name: &str) -> bool {
+        let delete_event = fsqlite_ast::TriggerEvent::Delete;
+        self.has_matching_triggers(table_name, fsqlite_ast::TriggerTiming::Before, &delete_event)
+            || self.has_matching_triggers(
+                table_name,
+                fsqlite_ast::TriggerTiming::After,
+                &delete_event,
+            )
+    }
+
+    fn table_has_replace_victim_callbacks(&self, table_name: &str) -> bool {
+        (self.fk_cascade_propagation_enabled() && self.table_is_foreign_key_parent(table_name))
+            || (self.pragma_state.borrow().recursive_triggers
+                && self.table_has_delete_triggers(table_name))
+    }
+
+    fn table_declares_replace_conflict(&self, table_name: &str, schema: Option<&str>) -> bool {
+        self.local_dml_target_table(table_name, schema)
             .is_none_or(|table| {
                 table.columns.iter().any(|column| {
                     column.conflict_action == Some(fsqlite_ast::ConflictAction::Replace)
@@ -82720,6 +82762,16 @@ impl Connection {
                     index.conflict_action == Some(fsqlite_ast::ConflictAction::Replace)
                 })
             })
+    }
+
+    fn insert_may_delete_fk_parent_victim(&self, insert: &fsqlite_ast::InsertStatement) -> bool {
+        if !self.table_has_replace_victim_callbacks(&insert.table.name) {
+            return false;
+        }
+        if matches!(insert.or_conflict, Some(fsqlite_ast::ConflictAction::Replace)) {
+            return true;
+        }
+        self.table_declares_replace_conflict(&insert.table.name, insert.table.schema.as_deref())
     }
 
     /// bd-5ofes (GH#496): strict positive admission rule for batched/morsel
@@ -84076,12 +84128,19 @@ impl Connection {
 
             // Check if any child rows reference this parent row.
             // bd-01rla: when `plan_fk_on_delete` runs BEFORE the parent row is
-            // physically removed, a self-referencing row (`child_table ==
-            // table_name` whose own FK child columns match its parent key) will
-            // still appear in the table scan. Deleting a row that only
-            // references itself does not leave any surviving child orphaned, so
-            // require at least 2 matching rows in that case.
-            let self_references_deleted_row = child_table.eq_ignore_ascii_case(table_name)
+            // physically removed (`!defer_no_action_to_statement_end`), a
+            // self-referencing row (`child_table == table_name` whose own FK
+            // child columns match its parent key) will still appear in the
+            // table scan. Deleting a row that only references itself does not
+            // leave any surviving child orphaned, so require at least 2
+            // matching rows in that case.
+            // bd-ygcuj: for REPLACE victims (`defer_no_action_to_statement_end`),
+            // the victim row has already been physically removed and the staged
+            // replacement row has been unwound out of the table, so every
+            // matching row still present is a genuine surviving child and
+            // `min_matching_rows` must be 1.
+            let self_references_deleted_row = !defer_no_action_to_statement_end
+                && child_table.eq_ignore_ascii_case(table_name)
                 && fk
                     .child_columns
                     .iter()
@@ -84186,7 +84245,112 @@ impl Connection {
             return Ok(());
         }
         *self.last_replace_victims.borrow_mut() = victims;
-        self.enforce_fk_on_replace_victims(&QualifiedName::bare(table_name)).await
+        let _ = self
+            .enforce_fk_on_replace_victims(&QualifiedName::bare(table_name))
+            .await?;
+        Ok(())
+    }
+
+    /// Commit a staged REPLACE write after victim callbacks succeed (bd-ygcuj).
+    async fn apply_staged_replace_write(
+        &self,
+        staged: StagedReplaceWrite,
+    ) -> Result<(usize, Option<i64>)> {
+        let op_cx = self.op_cx_after_background_status();
+        if let StagedReplaceWrite::RowidMem {
+            table_root_page,
+            rowid,
+            values,
+            update_old_rowid,
+            insert_rowid,
+        } = staged
+        {
+            let mut db = self.db.borrow_mut();
+            if let Some(old_rowid) = update_old_rowid {
+                let exists = db
+                    .get_table(table_root_page)
+                    .and_then(|table| table.find_by_rowid(old_rowid))
+                    .is_some();
+                if !exists {
+                    return Ok((0, None));
+                }
+                db.delete_rowid(&op_cx, table_root_page, old_rowid)?;
+            }
+            db.upsert_row_checked(&op_cx, table_root_page, rowid, values)?;
+            drop(db);
+            if let Some(rid) = insert_rowid {
+                self.set_last_insert_rowid_without_sync(rid);
+            }
+            return Ok((1, insert_rowid));
+        }
+
+        let func_reg = self.func_registry.borrow().clone();
+        let reject_mem = *self.reject_mem_fallback.borrow();
+        let runtime_inputs =
+            self.table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path());
+        let page_size = page_size_from_pragma_state(self.pragma_state.borrow().page_size)?;
+        let txn = self.active_txn.borrow_mut().take();
+        let cookie = *self.schema_cookie.borrow();
+        let concurrent_ctx = self.concurrent_exec_context()?;
+        let mut engine = VdbeEngine::new_with_execution_cx(1, &op_cx, page_size);
+        let _ = engine.apply_reusable_table_execution_state(ReusableTableExecutionState {
+            func_registry: Arc::clone(&func_reg),
+            collation_registry: Arc::clone(&self.collation_registry),
+            schema_cookie: cookie,
+            autoincrement_seq_by_root_page: runtime_inputs.autoincrement_seq_by_root_page,
+            rowid_alias_col_by_root_page: runtime_inputs.rowid_alias_col_by_root_page,
+            table_column_count_by_root_page: runtime_inputs.table_column_count_by_root_page,
+            first_not_null_non_ipk_col_by_root_page: runtime_inputs
+                .first_not_null_non_ipk_col_by_root_page,
+            ipk_label_by_root_page: runtime_inputs.ipk_label_by_root_page,
+            column_defaults_by_root_page: runtime_inputs.column_defaults_by_root_page,
+            index_desc_flags_by_root_page: runtime_inputs.index_desc_flags_by_root_page,
+            index_collations_by_root_page: runtime_inputs.index_collations_by_root_page,
+            reject_mem_fallback: reject_mem,
+            memdb_rows_loaded: self.memdb_rows_loaded.get(),
+            storage_cursor_memdb_count_shortcuts_safe: self
+                .memdb_storage_count_shortcuts_safe
+                .get(),
+            version_store: None,
+            collect_result_rows: false,
+            max_collected_result_rows: None,
+            text_encoding: self.db_text_encoding.get(),
+        });
+        if let Some(txn) = txn {
+            if let Some(ctx) = concurrent_ctx {
+                engine.set_transaction_concurrent(
+                    txn,
+                    ctx.handle,
+                    ctx.lock_table,
+                    ctx.commit_index,
+                    ctx.busy_timeout_ms,
+                );
+                engine.set_concurrent_rowid_allocator(
+                    ctx.rowid_allocator,
+                    ctx.schema_epoch,
+                    ctx.session_id,
+                    ctx.rowid_statement,
+                    ctx.rowid_begin_generation,
+                );
+            } else {
+                engine.set_transaction(txn);
+            }
+        }
+        let apply_res = engine.apply_staged_replace_write(staged).await;
+        let txn_back = engine.take_transaction()?;
+        if let Some(txn) = txn_back {
+            *self.active_txn.borrow_mut() = Some(txn);
+        }
+        let (applied_changes, insert_rowid) = apply_res?;
+        if applied_changes > 0 {
+            self.memdb_storage_count_shortcuts_safe.set(false);
+            self.memdb_rows_loaded.set(false);
+            self.memdb_requires_active_txn_reload.set(true);
+            if let Some(rid) = insert_rowid {
+                self.set_last_insert_rowid_without_sync(rid);
+            }
+        }
+        Ok((applied_changes, insert_rowid))
     }
 
     /// Apply inbound FK semantics for exact rows deleted by VDBE REPLACE
@@ -84195,15 +84359,24 @@ impl Connection {
     ///
     /// C SQLite fires DELETE triggers for rows removed by REPLACE conflict
     /// resolution if and only if `PRAGMA recursive_triggers = ON`, and those
-    /// trigger programs run during conflict resolution — before the causing
-    /// statement's own AFTER triggers. This method is invoked before those
-    /// AFTER triggers, so firing the victim triggers here preserves that
-    /// ordering.
-    async fn enforce_fk_on_replace_victims(&self, target: &QualifiedName) -> Result<()> {
+    /// trigger programs run during conflict resolution — before the new row is
+    /// written and before the causing statement's own AFTER triggers. When a
+    /// staged write was held back (bd-ygcuj), it is committed only after all
+    /// victim DELETE triggers and FK actions succeed, and inside the statement
+    /// FK validation scope so deferred `ON DELETE NO ACTION` checks observe the
+    /// newly written row while `FAIL` in a cascade or trigger never writes it.
+    async fn enforce_fk_on_replace_victims(
+        &self,
+        target: &QualifiedName,
+    ) -> Result<(usize, Option<i64>)> {
         let table_name = target.name.as_str();
         let victims = std::mem::take(&mut *self.last_replace_victims.borrow_mut());
+        let staged_write = self.pending_staged_replace_write.borrow_mut().take();
         if victims.is_empty() {
-            return Ok(());
+            return match staged_write {
+                Some(staged) => self.apply_staged_replace_write(staged).await,
+                None => Ok((0, None)),
+            };
         }
 
         let table_root_page = self
@@ -84224,18 +84397,8 @@ impl Connection {
             }
         }
 
-        let fire_victim_delete_triggers = self.pragma_state.borrow().recursive_triggers && {
-            let delete_event = fsqlite_ast::TriggerEvent::Delete;
-            self.has_matching_triggers(
-                table_name,
-                fsqlite_ast::TriggerTiming::Before,
-                &delete_event,
-            ) || self.has_matching_triggers(
-                table_name,
-                fsqlite_ast::TriggerTiming::After,
-                &delete_event,
-            )
-        };
+        let fire_victim_delete_triggers = self.pragma_state.borrow().recursive_triggers
+            && self.table_has_delete_triggers(table_name);
         if fire_victim_delete_triggers {
             // A victim is deleted under the resolved REPLACE algorithm even
             // when that algorithm came from the violated constraint rather
@@ -84277,7 +84440,10 @@ impl Connection {
         }
 
         if !self.fk_cascade_propagation_enabled() {
-            return Ok(());
+            return match staged_write {
+                Some(staged) => self.apply_staged_replace_write(staged).await,
+                None => Ok((0, None)),
+            };
         }
 
         self.with_statement_fk_validation_scope(false, false, async move || {
@@ -84289,7 +84455,10 @@ impl Connection {
                     self.execute_fk_delete_action(&action).await?;
                 }
             }
-            Ok(())
+            match staged_write {
+                Some(staged) => self.apply_staged_replace_write(staged).await,
+                None => Ok((0, None)),
+            }
         })
         .await
     }
@@ -121084,7 +121253,35 @@ impl Connection {
         vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
         row_sink: Option<TableRowSink<'_, '_>>,
     ) -> Result<(Vec<Row>, usize, Option<i64>)> {
+        self.execute_table_program_with_cx_and_replace_staging(
+            program,
+            params,
+            track_last_insert_rowid,
+            runtime_requirements,
+            execution_cx,
+            invalidate_memdb_count_shortcuts_on_success,
+            vtab_instances,
+            row_sink,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+    async fn execute_table_program_with_cx_and_replace_staging(
+        &self,
+        program: &VdbeProgram,
+        params: Option<&[SqliteValue]>,
+        track_last_insert_rowid: bool,
+        runtime_requirements: TableExecutionRuntimeRequirements,
+        execution_cx: &Cx,
+        invalidate_memdb_count_shortcuts_on_success: bool,
+        vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
+        row_sink: Option<TableRowSink<'_, '_>>,
+        stage_write_on_replace_victims: bool,
+    ) -> Result<(Vec<Row>, usize, Option<i64>)> {
         self.last_replace_victims.borrow_mut().clear();
+        *self.pending_staged_replace_write.borrow_mut() = None;
         let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
             .then(|| {
                 let span = tracing::span!(
@@ -121154,6 +121351,7 @@ impl Connection {
             vtab_instances,
             self.statement_parallel_workers(),
             self.build_temp_store_runtime(),
+            stage_write_on_replace_victims,
         )
         .await;
         let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -121163,6 +121361,9 @@ impl Connection {
             .as_deref_mut()
             .map(VdbeEngine::take_replace_victims)
             .unwrap_or_default();
+        let staged_replace_write = engine_back
+            .as_deref_mut()
+            .and_then(VdbeEngine::take_staged_replace_write);
         // Park the engine for reuse by the next statement.
         *self.cached_vdbe_engine.borrow_mut() = engine_back;
         // Always restore the transaction handle, even on error.
@@ -121172,6 +121373,7 @@ impl Connection {
         match result {
             Ok((rows, changes, last_insert_rowid)) => {
                 *self.last_replace_victims.borrow_mut() = replace_victims;
+                *self.pending_staged_replace_write.borrow_mut() = staged_replace_write;
                 self.clear_table_program_error_state();
                 if track_last_insert_rowid && let Some(last_insert_rowid) = last_insert_rowid {
                     // Defer the thread-local sync until the caller records
@@ -164835,6 +165037,7 @@ async fn execute_table_program_with_db(
     vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
     parallel_workers: usize,
     temp_store_runtime: TempStoreRuntime,
+    stage_write_on_replace_victims: bool,
 ) -> (TableProgramExecOutcome, Option<Box<VdbeEngine>>) {
     // bd-5bq6u: statement-scoped atomicity for the MemDatabase (TEMP) lane.
     //
@@ -164889,7 +165092,10 @@ async fn execute_table_program_with_db(
             page_size,
         ))
     };
-    engine.set_retain_storage_cursors_on_close(allow_retained_cursor_reuse);
+    engine.set_retain_storage_cursors_on_close(
+        allow_retained_cursor_reuse || stage_write_on_replace_victims,
+    );
+    engine.set_stage_write_on_replace_victims(stage_write_on_replace_victims);
     engine.set_parallel_workers(parallel_workers);
     engine.set_temp_store_runtime(temp_store_runtime);
     // bd-i3csr.2: the table-valued-function instances the program's VOpen
@@ -165012,6 +165218,17 @@ async fn execute_table_program_with_db(
     if exec_res.is_err() || matches!(exec_res, Ok(ExecOutcome::Error { .. })) {
         record_trace_export_error();
     }
+    let exec_res = if stage_write_on_replace_victims
+        && matches!(exec_res, Ok(ExecOutcome::Done))
+        && !engine.replace_victims_is_empty()
+    {
+        match engine.stash_staged_replace_write().await {
+            Ok(()) => exec_res,
+            Err(error) => Err(error),
+        }
+    } else {
+        exec_res
+    };
     let engine_rowid = engine.last_insert_rowid();
 
     if attach_memdb && let Some(db_value) = engine.take_database() {
