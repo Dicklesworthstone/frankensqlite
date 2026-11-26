@@ -29,11 +29,13 @@
 //! [`DropBehavior`], pragmas,
 //! `busy_timeout`, `changes`, `last_insert_rowid`, [`OptionalExtension`],
 //! user-defined scalar functions ([`Connection::create_scalar_function`]),
+//! custom collations ([`Connection::create_collation`]),
 //! and an [`Error`] whose variants and [`ErrorCode`]s match rusqlite's. Not
 //! yet: aggregate and window functions, online backup, blob I/O, hooks, and
 //! the `chrono`/`uuid`/`serde_json` conversions.
 
 use std::cell::RefCell;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -290,6 +292,8 @@ pub enum Error {
     IntegralValueOutOfRange(usize, i64),
     /// TEXT that is not UTF-8 was read as a string.
     Utf8Error(std::str::Utf8Error),
+    /// A name passed to an API contains an embedded NUL byte.
+    NulError(std::ffi::NulError),
     /// A named parameter that the statement does not have.
     InvalidParameterName(String),
     /// A path that is not valid UTF-8.
@@ -364,6 +368,12 @@ impl From<std::str::Utf8Error> for Error {
     }
 }
 
+impl From<std::ffi::NulError> for Error {
+    fn from(error: std::ffi::NulError) -> Self {
+        Self::NulError(error)
+    }
+}
+
 impl From<types::FromSqlError> for Error {
     fn from(error: types::FromSqlError) -> Self {
         match error {
@@ -405,6 +415,7 @@ impl fmt::Display for Error {
                 }
             }
             Self::Utf8Error(error) => write!(f, "{error}"),
+            Self::NulError(error) => write!(f, "{error}"),
             Self::InvalidParameterName(name) => write!(f, "Invalid parameter name: {name}"),
             Self::InvalidPath(path) => write!(f, "Invalid path: {}", path.to_string_lossy()),
             Self::ExecuteReturnedResults => {
@@ -441,6 +452,7 @@ impl std::error::Error for Error {
         match self {
             Self::SqliteFailure(error, _) => Some(error),
             Self::Utf8Error(error) => Some(error),
+            Self::NulError(error) => Some(error),
             Self::FromSqlConversionFailure(_, _, error)
             | Self::ToSqlConversionFailure(error)
             | Self::UserFunctionError(error) => Some(&**error),
@@ -1424,6 +1436,36 @@ fn sql_literal(value: &dyn ToSql) -> Result<String> {
 /// Entries kept in a connection's parameter-layout cache before it is reset.
 const PARAMETER_CACHE_LIMIT: usize = 512;
 
+/// A mutex accepts Send callbacks with interior state that is not Sync,
+/// preserving rusqlite's public callback bound.
+struct CollationClosure<F> {
+    name: String,
+    compare: std::sync::Mutex<F>,
+}
+
+impl<F> fsqlite_func::collation::CollationFunction for CollationClosure<F>
+where
+    F: Fn(&str, &str) -> CmpOrdering + Send,
+{
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn compare(&self, left: &[u8], right: &[u8]) -> CmpOrdering {
+        let left = String::from_utf8_lossy(left);
+        let right = String::from_utf8_lossy(right);
+        let compare = self
+            .compare
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Collations have no SQL error channel. Match rusqlite's trampoline.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (*compare)(left.as_ref(), right.as_ref())
+        }))
+        .unwrap_or(CmpOrdering::Less)
+    }
+}
+
 /// A connection to a database file or an in-memory database.
 pub struct Connection {
     /// Boxed: the engine connection is kilobytes, and this handle is moved.
@@ -1747,6 +1789,30 @@ impl Connection {
             self.as_async()
                 .register_nondeterministic_scalar_function(function);
         }
+        Ok(())
+    }
+
+    /// Add or replace a collation used by comparisons, sorting, grouping,
+    /// and indexes on this connection. Names are ASCII case-insensitive;
+    /// built-in names such as `NOCASE` can also be replaced.
+    ///
+    /// The comparator must define a deterministic, transitive ordering.
+    /// It receives UTF-8 text, with invalid byte sequences replaced as in
+    /// rusqlite. A panic is contained and returns [`std::cmp::Ordering::Less`],
+    /// matching rusqlite's collation callback behavior.
+    ///
+    /// Registration invalidates cached comparison bindings. Rebuild any
+    /// existing index with `REINDEX` after changing its collation's ordering.
+    /// Names containing NUL are rejected with [`Error::NulError`].
+    pub fn create_collation<F>(&self, collation_name: &str, x_compare: F) -> Result<()>
+    where
+        F: Fn(&str, &str) -> CmpOrdering + Send + 'static,
+    {
+        let _validated_name = std::ffi::CString::new(collation_name)?;
+        self.as_async().register_collation_function(CollationClosure {
+            name: collation_name.to_owned(),
+            compare: std::sync::Mutex::new(x_compare),
+        });
         Ok(())
     }
 
@@ -2977,6 +3043,175 @@ mod tests {
                 "the scenario must reach {needle:?}: {theirs:?}"
             );
         }
+    }
+
+    /// The same caller code exercises collation binding in scalar expressions,
+    /// indexes, sorters, and aggregate grouping against both implementations.
+    macro_rules! collation_scenario {
+        ($m:ident) => {{
+            fn text(conn: &$m::Connection, sql: &str) -> Vec<String> {
+                conn.prepare(sql)
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<$m::Result<Vec<_>>>()
+                    .unwrap()
+            }
+            fn integer(conn: &$m::Connection, sql: &str) -> i64 {
+                conn.query_row(sql, [], |row| row.get(0)).unwrap()
+            }
+
+            let conn = $m::Connection::open_in_memory().unwrap();
+            conn.create_collation("fold", |left, right| {
+                left.to_lowercase().cmp(&right.to_lowercase())
+            })
+            .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items(value TEXT COLLATE fold UNIQUE);
+                 INSERT INTO items VALUES ('b'), ('Ä'), ('a');
+                 CREATE TABLE duplicates(value TEXT);
+                 INSERT INTO duplicates VALUES ('a'), ('A'), ('b'), ('B'), ('Ä'), ('ä');",
+            )
+            .unwrap();
+            assert_eq!(
+                text(&conn, "SELECT value FROM items ORDER BY value COLLATE FoLd"),
+                ["a", "b", "Ä"]
+            );
+            assert_eq!(
+                text(&conn, "SELECT value FROM items WHERE value = 'B'"),
+                ["b"]
+            );
+            let error = conn
+                .execute("INSERT INTO items VALUES ('B')", [])
+                .unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some($m::ErrorCode::ConstraintViolation)
+            );
+            assert_eq!(integer(&conn, "SELECT count(*) FROM items"), 3);
+            assert_eq!(
+                text(
+                    &conn,
+                    "SELECT CAST(count(*) AS TEXT) FROM duplicates
+                     GROUP BY value COLLATE fold ORDER BY value COLLATE fold"
+                ),
+                ["2", "2", "2"]
+            );
+            assert_eq!(
+                integer(&conn, "SELECT count(DISTINCT value COLLATE fold) FROM duplicates"),
+                3
+            );
+
+            conn.create_collation("switch", str::cmp).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE collated_items(value TEXT COLLATE switch UNIQUE);
+                 INSERT INTO collated_items VALUES ('a'), ('c'), ('b');",
+            )
+            .unwrap();
+            let mut held = conn.prepare("SELECT ?1 COLLATE switch < ?2").unwrap();
+            assert_eq!(
+                held.query_row(["a", "z"], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            conn.create_collation("SWITCH", |left, right| right.cmp(left))
+                .unwrap();
+            assert_eq!(
+                held.query_row(["a", "z"], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            conn.execute_batch("REINDEX switch").unwrap();
+            assert_eq!(
+                text(&conn, "SELECT value FROM collated_items ORDER BY value"),
+                ["c", "b", "a"]
+            );
+
+            assert_eq!(integer(&conn, "SELECT 'x' = 'x ' COLLATE RTRIM"), 1);
+            conn.create_collation("RTRIM", str::cmp).unwrap();
+            assert_eq!(integer(&conn, "SELECT 'x' = 'x ' COLLATE RTRIM"), 0);
+            conn.execute_batch(
+                "CREATE TEMP TABLE temp_items(value TEXT COLLATE RTRIM UNIQUE);
+                 INSERT INTO temp_items VALUES ('x'), ('x ');",
+            )
+            .unwrap();
+            assert_eq!(
+                text(&conn, "SELECT value FROM temp_items ORDER BY value"),
+                ["x", "x "]
+            );
+
+            let other = $m::Connection::open_in_memory().unwrap();
+            assert!(
+                other
+                    .query_row("SELECT 'a' COLLATE fold < 'b'", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .is_err()
+            );
+        }};
+    }
+
+    #[test]
+    fn custom_collations_behave_like_rusqlite() {
+        collation_scenario!(stock);
+        collation_scenario!(ours);
+    }
+
+    macro_rules! collation_boundary_scenario {
+        ($m:ident) => {{
+            let conn = $m::Connection::open_in_memory().unwrap();
+            assert!(matches!(
+                conn.create_collation("bad\0name", str::cmp),
+                Err($m::Error::NulError(_))
+            ));
+            let long_name = "x".repeat(256);
+            for name in ["", long_name.as_str()] {
+                conn.create_collation(name, str::cmp).unwrap();
+                let sql = format!("SELECT 'a' COLLATE \"{name}\" < 'z'");
+                assert_eq!(
+                    conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    1
+                );
+            }
+
+            conn.create_collation("lossy", str::cmp).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT CAST(x'80' AS TEXT) COLLATE lossy = '�'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+
+            // Cell is Send but not Sync: it must be accepted by this API.
+            // Catching the first panic must not poison later comparisons.
+            let panicked = std::cell::Cell::new(false);
+            conn.create_collation("fragile", move |left, right| {
+                assert!(panicked.replace(true), "collation panic on purpose");
+                left.cmp(right)
+            })
+            .unwrap();
+            let mut held = conn.prepare("SELECT ?1 COLLATE fragile < ?2").unwrap();
+            assert_eq!(
+                held.query_row(["z", "a"], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                held.query_row(["z", "a"], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }};
+    }
+
+    #[test]
+    fn custom_collation_boundaries_behave_like_rusqlite() {
+        collation_boundary_scenario!(stock);
+        collation_boundary_scenario!(ours);
     }
 
     /// rusqlite code that hits PRIMARY KEY and UNIQUE conflicts, compiled

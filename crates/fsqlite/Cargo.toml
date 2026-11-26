@@ -79,7 +79,7 @@ fsqlite-func = { workspace = true }
 fsqlite-pager = { workspace = true }
 fsqlite-wal = { workspace = true }
 rand = { workspace = true }
-rusqlite = { workspace = true, features = ["functions"] }
+rusqlite = { workspace = true, features = ["functions", "collation"] }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 
