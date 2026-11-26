@@ -30,6 +30,190 @@ use fsqlite_func::{
 use fsqlite_types::{SmallText, SqliteValue, cx::Cx};
 use serde_json::Number;
 
+/// Maximum inline UTF-8 byte length stored inside [`InlineStr`] without heap
+/// allocation. With `Box<str>` (16 bytes) for the heap variant, `InlineStr` is
+/// 24 bytes — the same size as `String` — while eliminating heap allocations
+/// for virtually all JSON object keys, float literals, and short string values.
+const INLINE_STR_CAP: usize = 22;
+
+#[derive(Clone)]
+enum InlineStr {
+    Inline { len: u8, buf: [u8; INLINE_STR_CAP] },
+    Heap(Box<str>),
+}
+
+impl InlineStr {
+    #[inline]
+    fn new(s: &str) -> Self {
+        if s.len() <= INLINE_STR_CAP {
+            let mut buf = [0u8; INLINE_STR_CAP];
+            buf[..s.len()].copy_from_slice(s.as_bytes());
+            Self::Inline {
+                len: u8::try_from(s.len()).expect("len <= INLINE_STR_CAP fits in u8"),
+                buf,
+            }
+        } else {
+            Self::Heap(Box::from(s))
+        }
+    }
+
+    #[inline]
+    fn from_string(s: String) -> Self {
+        if s.len() <= INLINE_STR_CAP {
+            Self::new(&s)
+        } else {
+            Self::Heap(s.into_boxed_str())
+        }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, buf } => &buf[..usize::from(*len)],
+            Self::Heap(text) => text.as_bytes(),
+        }
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Inline { len, buf } => std::str::from_utf8(&buf[..usize::from(*len)])
+                .expect("InlineStr invariant: valid UTF-8"),
+            Self::Heap(text) => text,
+        }
+    }
+}
+
+impl std::ops::Deref for InlineStr {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for InlineStr {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<str> for InlineStr {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq for InlineStr {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for InlineStr {}
+
+impl PartialEq<str> for InlineStr {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl PartialEq<&str> for InlineStr {
+    #[inline]
+    fn eq(&self, other: &&str) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl std::hash::Hash for InlineStr {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Match `str::hash` verbatim so `Borrow<str>` hash invariants hold.
+        std::hash::Hash::hash(self.as_str(), state);
+    }
+}
+
+impl std::fmt::Debug for InlineStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl From<String> for InlineStr {
+    #[inline]
+    fn from(value: String) -> Self {
+        Self::from_string(value)
+    }
+}
+
+impl From<&str> for InlineStr {
+    #[inline]
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+/// Fast non-cryptographic hasher for large JSON objects (`>= INDEX_THRESHOLD`
+/// members), avoiding SipHash overhead while keeping key order in `Object`.
+#[derive(Debug, Default, Clone)]
+struct FxBuildHasher;
+
+struct FxHasher {
+    hash: u64,
+}
+
+impl std::hash::BuildHasher for FxBuildHasher {
+    type Hasher = FxHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> Self::Hasher {
+        FxHasher { hash: 0 }
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut hash = self.hash;
+        let (chunks, rem) = bytes.as_chunks::<8>();
+        for &chunk in chunks {
+            let word = u64::from_ne_bytes(chunk);
+            hash = (hash.rotate_left(5) ^ word).wrapping_mul(K);
+        }
+        if !rem.is_empty() {
+            let mut tail = 0u64;
+            for (i, &b) in rem.iter().enumerate() {
+                tail |= u64::from(b) << (i * 8);
+            }
+            hash = (hash.rotate_left(5) ^ tail).wrapping_mul(K);
+        }
+        self.hash = hash;
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        self.hash = (self.hash.rotate_left(5) ^ u64::from(i)).wrapping_mul(K);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        self.hash = (self.hash.rotate_left(5) ^ (i as u64)).wrapping_mul(K);
+    }
+}
+
 /// JSON objects are ordered sequences of members, not maps: SQLite retains
 /// repeated labels and a path selects the first matching member. Keep this
 /// representation private so every parser, renderer and edit shares that rule.
@@ -38,10 +222,14 @@ enum Value {
     Null,
     Bool(bool),
     Number(Number),
-    /// Exact decimal digits when a Number would round them or lose the sign of -0.
+    /// Exact decimal digits when a `Number` would round them or lose `-0`.
     IntegerText(String),
+    /// Exact float literal or SQLite-formatted REAL text (`1.50`, `1E2`,
+    /// `9e999`, `1.0e+300`, `0.33333333333333332`). Carried as its own variant
+    /// so genuine strings never need sentinel escaping (bd-oahj7).
+    FloatText(InlineStr),
     HexInteger(HexInteger),
-    String(String),
+    String(InlineStr),
     Array(Vec<Self>),
     Object(Object),
 }
@@ -87,7 +275,7 @@ impl HexInteger {
             out.push('-');
         }
         if let Some(magnitude) = self.magnitude {
-            out.push_str(&magnitude.to_string());
+            let _ = std::fmt::Write::write_fmt(out, format_args!("{magnitude}"));
         } else {
             out.push_str("9.0e999");
         }
@@ -134,18 +322,25 @@ impl Value {
         }
     }
 
-    fn is_null(&self) -> bool {
+    const fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
 }
 
+/// Boxed first-member key index for large JSON objects (`>= Object::INDEX_THRESHOLD`),
+/// keeping `Object` at 32 bytes (`Value` at 40 bytes) so small/medium objects pay
+/// zero hashing or inline size overhead.
+#[derive(Debug, Clone)]
+struct ObjectKeyIndex(HashMap<InlineStr, usize, FxBuildHasher>);
+
 /// Members retain their source order, including duplicate labels. Large
-/// objects also keep a first-member index, avoiding a linear search for each
-/// path lookup; small objects need neither a hash table nor a second key copy.
+/// objects (`>= INDEX_THRESHOLD` members) also keep a boxed non-SipHash
+/// first-member index so `Object` stays 32 bytes (`Value` stays 40 bytes) and
+/// typical small/medium objects pay zero hashing or key-copy overhead.
 #[derive(Debug, Clone, Default)]
 struct Object {
-    members: Vec<(String, Value)>,
-    first_by_key: Option<HashMap<String, usize>>,
+    members: Vec<(InlineStr, Value)>,
+    first_by_key: Option<Box<ObjectKeyIndex>>,
 }
 
 impl PartialEq for Object {
@@ -155,10 +350,20 @@ impl PartialEq for Object {
 }
 
 impl Object {
-    const INDEX_THRESHOLD: usize = 16;
+    const INDEX_THRESHOLD: usize = 64;
 
-    fn new() -> Self {
-        Self::default()
+    const fn new() -> Self {
+        Self {
+            members: Vec::new(),
+            first_by_key: None,
+        }
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            members: Vec::with_capacity(capacity),
+            first_by_key: None,
+        }
     }
 
     fn len(&self) -> usize {
@@ -169,14 +374,19 @@ impl Object {
         self.members.is_empty()
     }
 
-    fn iter(&self) -> std::slice::Iter<'_, (String, Value)> {
+    fn iter(&self) -> std::slice::Iter<'_, (InlineStr, Value)> {
         self.members.iter()
     }
 
     fn first_index(&self, key: &str) -> Option<usize> {
         match &self.first_by_key {
-            Some(index) => index.get(key).copied(),
-            None => self.members.iter().position(|(label, _)| label == key),
+            Some(index) => index.0.get(key).copied(),
+            None => {
+                let target = key.as_bytes();
+                self.members
+                    .iter()
+                    .position(|(label, _)| label.as_bytes() == target)
+            }
         }
     }
 
@@ -194,9 +404,10 @@ impl Object {
     }
 
     /// Parsing always appends: even an existing label names another member.
-    fn append(&mut self, key: String, value: Value) {
+    fn append(&mut self, key: impl Into<InlineStr>, value: Value) {
+        let key = key.into();
         if let Some(index) = &mut self.first_by_key {
-            index.entry(key.clone()).or_insert(self.members.len());
+            index.0.entry(key.clone()).or_insert(self.members.len());
         }
         self.members.push((key, value));
         if self.first_by_key.is_none() && self.members.len() >= Self::INDEX_THRESHOLD {
@@ -205,8 +416,9 @@ impl Object {
     }
 
     /// Edits replace the first matching member without disturbing duplicates.
-    fn insert(&mut self, key: String, value: Value) {
-        if let Some(prior) = self.get_mut(&key) {
+    fn insert(&mut self, key: impl Into<InlineStr>, value: Value) {
+        let key = key.into();
+        if let Some(prior) = self.get_mut(key.as_str()) {
             *prior = value;
         } else {
             self.append(key, value);
@@ -228,16 +440,16 @@ impl Object {
             self.first_by_key = None;
             return;
         }
-        let mut index = HashMap::with_capacity(self.members.len());
+        let mut index = HashMap::with_capacity_and_hasher(self.members.len(), FxBuildHasher);
         for (position, (key, _)) in self.members.iter().enumerate() {
             index.entry(key.clone()).or_insert(position);
         }
-        self.first_by_key = Some(index);
+        self.first_by_key = Some(Box::new(ObjectKeyIndex(index)));
     }
 }
 
 impl IntoIterator for Object {
-    type Item = (String, Value);
+    type Item = (InlineStr, Value);
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -246,8 +458,8 @@ impl IntoIterator for Object {
 }
 
 impl<'a> IntoIterator for &'a Object {
-    type Item = &'a (String, Value);
-    type IntoIter = std::slice::Iter<'a, (String, Value)>;
+    type Item = &'a (InlineStr, Value);
+    type IntoIter = std::slice::Iter<'a, (InlineStr, Value)>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.members.iter()
@@ -279,90 +491,26 @@ const JSONB_TEXTRAW_TYPE: u8 = 0xA;
 const JSONB_ARRAY_TYPE: u8 = 0xB;
 const JSONB_OBJECT_TYPE: u8 = 0xC;
 
-/// Private sentinel prefix that marks a `Value::String` as carrying a JSON NUMBER
-/// as its exact text, rather than genuine text.
-///
-/// Two kinds of number need their text kept, and a `serde_json::Number` keeps
-/// neither:
-/// - A non-finite number (`9e999` -> +Inf). `serde_json::Number` cannot hold
-///   ±Inf, and with the viral `arbitrary_precision` feature deliberately OFF
-///   (bd-uxmhz / GH#375), serde's parser hard-errors on a literal that
-///   overflows f64. Stock keeps it through parse/extract/render (GH#212,
-///   bd-yalqc).
-/// - A finite number whose stock text is not Rust's shortest form of its value
-///   (bd-1nxwh). Stock writes a REAL built from an SQL value as
-///   `1.0e+300` / `0.33333333333333332`, and copies a JSONB FLOAT payload as
-///   stored. A `Number` would render `1e300` / `0.3333333333333333`.
-///
-/// Such a number is carried inside the `Value` tree as a `Value::String` whose
-/// bytes begin with this tag followed by the numeric text. Every renderer, the
-/// JSONB encoder, `json_type` and the SQL readers treat it as a REAL.
-///
-/// Genuine strings can contain these control bytes too. Every string-value
-/// ingress doubles an initial tag, and every string-value output removes that
-/// extra tag exactly once. Numeric carriers keep a single tag followed by
-/// numeric text. Object labels remain raw strings outside this representation.
+/// Historical sentinel prefix kept for unit tests verifying that user strings
+/// containing arbitrary control bytes and NULs remain plain JSON strings.
+#[cfg(test)]
 const NUMBER_TEXT_TAG: &str = "\u{0}\u{0}fsqlite\u{1}nonfinite\u{0}";
 
-/// Build the tagged `Value::String` that carries a JSON number as its exact
-/// text (`9e999`, `9.0e+999`, `1.0e+300`, `0.33333333333333332`, ...).
+/// Build a `Value::FloatText` carrying exact numeric text (`9e999`, `9.0e+999`,
+/// `1.0e+300`, `0.33333333333333332`, `1.50`, `1E2`, ...).
+#[inline]
 fn number_text_value(raw: &str) -> Value {
-    Value::String(format!("{NUMBER_TEXT_TAG}{raw}"))
+    Value::FloatText(InlineStr::new(raw))
 }
 
-/// Import genuine text without allowing it to impersonate a number carrier.
-fn json_string_value(mut text: String) -> Value {
-    if text.starts_with(NUMBER_TEXT_TAG) {
-        text.insert_str(0, NUMBER_TEXT_TAG);
-    }
-    Value::String(text)
+/// Construct a genuine JSON string value.
+#[inline]
+fn json_string_value(text: String) -> Value {
+    Value::String(InlineStr::from_string(text))
 }
 
-/// Recover genuine text from an internal string value, removing one escape.
-fn json_string_text(text: &str) -> &str {
-    text.strip_prefix(NUMBER_TEXT_TAG)
-        .filter(|raw| raw.starts_with(NUMBER_TEXT_TAG))
-        .unwrap_or(text)
-}
-
-/// If `s` is a tagged number-text carrier, return its numeric text; otherwise
-/// `None` (a genuine string value).
-fn as_number_text(s: &str) -> Option<&str> {
-    s.strip_prefix(NUMBER_TEXT_TAG)
-        .filter(|raw| !raw.starts_with(NUMBER_TEXT_TAG))
-}
-
-/// Whether a JSON number token must be carried as its text
-/// ([`NUMBER_TEXT_TAG`]) rather than as a `serde_json::Number`.
-///
-/// Stock copies a number's source text verbatim (3.54.1: `[9e+999, 1e+2, 1E2,
-/// 1.50]` stays exactly that through json(), json_set, jsonb and nesting). A
-/// `Number` renders in Rust's shortest form, so a token needs its text when
-/// it overflows f64 (GH#212), or when it is a float (`.`, `e` or `E`) whose
-/// text is not that shortest form (bd-1nxwh). Integers fit i64/u64 and render
-/// as written. Integers outside serde's signed/unsigned range and integer -0
-/// also need their original digits. A non-RFC 8259 token (`5.`, `01`) is left to
-/// the strict parse to reject, so JSON5 input still reaches its fallback.
-///
-/// Every number of every parsed document passes through here, so the common
-/// tokens are decided without parsing: an integer shorter than 19 digits fits
-/// in i64, and [`is_shortest_fixed_decimal`] recognizes the usual decimal.
-fn number_token_needs_text(raw: &str) -> bool {
-    let bytes = raw.as_bytes();
-    if !bytes.iter().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
-        return integer_needs_text(raw);
-    }
-    if is_shortest_fixed_decimal(bytes) {
-        return false;
-    }
-    match raw.parse::<f64>() {
-        Ok(value) if value.is_infinite() => is_strict_json_number(raw),
-        Ok(value) => is_strict_json_number(raw) && !float_renders_as(value, raw),
-        Err(_) => false,
-    }
-}
-
-/// Decimal integer tokens that cannot round-trip through serde's i64/u64.
+/// Decimal integer tokens that cannot round-trip through `serde_json::Number`'s
+/// `i64`/`u64` representation (including `-0`).
 fn integer_needs_text(raw: &str) -> bool {
     raw == "-0"
         || (raw.len() >= 20
@@ -377,15 +525,8 @@ fn integer_needs_text(raw: &str) -> bool {
 }
 
 /// Whether `text` is a fixed-point decimal that is already the shortest
-/// round-trip form of its value, which is what Rust's `{:?}` prints for it
-/// (bd-1nxwh). That is `-?D+.D+` with:
-/// - no exponent;
-/// - at most 15 significant digits. Every such decimal round-trips through f64
-///   exactly, so no shorter decimal names the same value;
-/// - no trailing zero after the first fraction digit (`3.0`, not `3.00`);
-/// - a magnitude Rust prints in fixed notation (1e-4 <= |x| < 1e16, or zero).
-///
-/// `false` means "not decided here", not "different".
+/// round-trip form of its value, which is what Rust's `{:?}` prints for it.
+#[cfg(test)]
 fn is_shortest_fixed_decimal(text: &[u8]) -> bool {
     let digits = text.strip_prefix(b"-").unwrap_or(text);
     let Some(dot) = digits.iter().position(|&byte| byte == b'.') else {
@@ -444,49 +585,9 @@ fn is_strict_json_number(raw: &str) -> bool {
     rest.is_empty()
 }
 
-/// Whether Rust's shortest form of `value` (`{value:?}`, what a JSON `Number`
-/// renders as) is exactly `text`, compared without allocating.
-fn float_renders_as(value: f64, text: &str) -> bool {
-    struct Matches<'a> {
-        rest: &'a [u8],
-        equal: bool,
-    }
-    impl std::fmt::Write for Matches<'_> {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            match self.rest.strip_prefix(s.as_bytes()) {
-                Some(rest) if self.equal => self.rest = rest,
-                _ => self.equal = false,
-            }
-            Ok(())
-        }
-    }
-    let mut matches = Matches {
-        rest: text.as_bytes(),
-        equal: true,
-    };
-    let _ = std::fmt::write(&mut matches, format_args!("{value:?}"));
-    matches.equal && matches.rest.is_empty()
-}
-
-/// JSON-aware rewrite that wraps every NUMERIC token that must keep its text
-/// ([`number_token_needs_text`]) in a tagged JSON string literal. serde_json
-/// (with `arbitrary_precision` off) can then parse a document holding an
-/// out-of-range number without hard-erroring (GH#212, bd-yalqc), and a float
-/// written other than in Rust's shortest form keeps its source text, as stock
-/// keeps it (bd-1nxwh).
-///
-/// The scanner walks bytes, respecting `\"` and `\\` in string literals and
-/// identifying numeric tokens OUTSIDE strings: optional `-`, integer digits,
-/// optional `.`digits, optional `e`/`E` with optional sign and digits. Original
-/// string values beginning with the reserved tag are escaped before any
-/// numeric carriers are synthesized; object labels remain unchanged.
-/// Such a token is replaced by the JSON string literal
-/// `"<escaped NUMBER_TEXT_TAG><raw>"` (serde escapes the tag's control bytes,
-/// keeping the output valid JSON). Returns `Some(rewritten)` iff at least one
-/// token was wrapped or a genuine string escaped, else `None`, so the common
-/// document is parsed as given without a copy.
 /// Whether `input` can hold a float token: a `.`, or an exponent marker right
-/// after a digit. Wide integers are checked separately.
+/// after a digit.
+#[cfg(test)]
 fn may_hold_float_token(input: &str) -> bool {
     let bytes = input.as_bytes();
     memchr::memchr(b'.', bytes).is_some()
@@ -495,7 +596,8 @@ fn may_hold_float_token(input: &str) -> bool {
 }
 
 /// A wide integer has at least 19 consecutive digits (negative i64 overflow
-/// starts at 19). Skip past the last non-digit in each candidate window.
+/// starts at 19). Used by the JSON5 fallback to know when to recover wide
+/// integer spellings from the input.
 fn may_hold_integer_text(input: &str) -> bool {
     if input.contains("-0") {
         return true;
@@ -508,139 +610,6 @@ fn may_hold_integer_text(input: &str) -> bool {
         bytes = &bytes[last_non_digit + 1..];
     }
     false
-}
-
-/// [`rewrite_number_text_tokens`] when the document may need it.
-fn number_text_rewrite_for_parse(input: &str) -> Option<String> {
-    // The tag starts with NUL, which strict JSON can spell only as \u0000.
-    // A float-free document can still contain genuine text needing escape.
-    if may_hold_float_token(input) || may_hold_integer_text(input) || input.contains(r"\u0000") {
-        rewrite_number_text_tokens(input)
-    } else {
-        None
-    }
-}
-
-fn rewrite_number_text_tokens(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let n = bytes.len();
-    // Built only from the first wrapped token on: `input[copied..]` is still
-    // to be copied.
-    let mut out: Option<String> = None;
-    let mut copied = 0usize;
-    let mut i = 0usize;
-
-    while i < n {
-        // `"`, `-` and the digits are ASCII and never part of a multibyte
-        // UTF-8 sequence, so byte-level scanning is safe.
-        let b = bytes[i];
-        if b == b'"' {
-            // String literal: scan it, honoring backslash escapes. (A plain
-            // position search beats memchr2 here: JSON strings are mostly
-            // short keys.)
-            let start = i;
-            let mut closed = false;
-            i += 1;
-            while i < n {
-                let Some(offset) = bytes[i..]
-                    .iter()
-                    .position(|&byte| byte == b'"' || byte == b'\\')
-                else {
-                    i = n;
-                    break;
-                };
-                i += offset;
-                if bytes[i] == b'\\' {
-                    i += 2; // skip the escape and its escaped byte
-                } else {
-                    i += 1;
-                    closed = true;
-                    break;
-                }
-            }
-            // Only original string VALUES need escaping. Keys stay raw for
-            // object lookup, and malformed literals must reach the parser
-            // unchanged. Checking the first escape avoids decoding ordinary
-            // strings; numeric carriers inserted below are never rescanned.
-            if closed
-                && input[start + 1..i].starts_with(r"\u0000")
-                && !input[i..]
-                    .trim_start_matches([' ', '\t', '\r', '\n'])
-                    .starts_with(':')
-                && let Ok(text) = serde_json::from_str::<String>(&input[start..i])
-                && text.starts_with(NUMBER_TEXT_TAG)
-            {
-                let literal = serde_json::to_string(&format!("{NUMBER_TEXT_TAG}{text}"))
-                    .expect("serializing a String to JSON is infallible");
-                let rewritten = out.get_or_insert_with(|| String::with_capacity(n + 32));
-                rewritten.push_str(&input[copied..start]);
-                rewritten.push_str(&literal);
-                copied = i;
-            }
-        } else if b.is_ascii_digit() || (b == b'-' && i + 1 < n && bytes[i + 1].is_ascii_digit()) {
-            // Numeric token start (a bare `-` not followed by a digit is
-            // stepped over below).
-            let start = i;
-            if bytes[i] == b'-' {
-                i += 1;
-            }
-            while i < n && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i < n && bytes[i] == b'.' {
-                i += 1;
-                while i < n && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-            }
-            if i < n && (bytes[i] == b'e' || bytes[i] == b'E') {
-                // Only consume the exponent if it is well-formed (marker,
-                // optional sign, at least one digit); otherwise the token ends
-                // at the marker and the `e`/`E` is copied on the next iteration.
-                let mut j = i + 1;
-                if j < n && (bytes[j] == b'+' || bytes[j] == b'-') {
-                    j += 1;
-                }
-                if j < n && bytes[j].is_ascii_digit() {
-                    i = j;
-                    while i < n && bytes[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                }
-            }
-            let raw = &input[start..i];
-            if number_token_needs_text(raw) {
-                // A number is legal only as a value, never as an unquoted
-                // object key. Replacing a key such as 1e2 with a string would
-                // otherwise make malformed input acceptable to serde. In a
-                // valid rewritten document, a key must be followed by ':'
-                // after JSON whitespace, so leave that token for the parser
-                // to reject. Only inspect this uncommon rewritten-token path.
-                if input[i..]
-                    .trim_start_matches([' ', '\t', '\r', '\n'])
-                    .starts_with(':')
-                {
-                    continue;
-                }
-                // serde escapes the tag's control bytes; the raw numeric text is
-                // already JSON-string-safe. String serialization is infallible.
-                let literal = serde_json::to_string(&format!("{NUMBER_TEXT_TAG}{raw}"))
-                    .expect("serializing a String to JSON is infallible");
-                let rewritten = out.get_or_insert_with(|| String::with_capacity(n + 32));
-                rewritten.push_str(&input[copied..start]);
-                rewritten.push_str(&literal);
-                copied = i;
-            }
-        } else {
-            // Any other byte, or a bare `-`.
-            i += 1;
-        }
-    }
-
-    out.map(|mut rewritten| {
-        rewritten.push_str(&input[copied..]);
-        rewritten
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -662,26 +631,20 @@ enum EditMode {
 ///
 /// Returns a canonical minified JSON string or a `FunctionError` if invalid.
 pub fn json(input: &str) -> Result<String> {
-    // Strict RFC-8259 JSON: minify whitespace but preserve every token of the
-    // source verbatim (number literals, string escapes, duplicate keys). Parse
-    // only to validate, then lexically minify — re-serializing a parsed
-    // `serde_json::Value` would normalize exponents, unescape `\/`, and drop
-    // duplicate keys (bd-6b0pe / bd-p2xrc).
-    let strict_error = match parse_json_text(input) {
-        Ok(_) => return Ok(minify_json_text(input)),
-        Err(error) => error,
-    };
+    // Strict RFC-8259 JSON: validate with zero allocations, then lexically
+    // minify so every source token (number literals, string escapes, duplicate
+    // keys) is preserved verbatim (bd-6b0pe / bd-p2xrc / bd-oahj7).
+    if validate_json_text(input) {
+        return Ok(minify_json_text(input));
+    }
     // JSON5 fallback (bd-qear2): stock SQLite 3.42+ accepts JSON5 — unquoted
     // object keys, single-quoted strings, trailing commas, // and /* */
     // comments, hex integers, leading/trailing decimal points, Infinity/NaN —
     // and canonicalizes it to standard JSON. Parse ONLY to validate, then
-    // translate LEXICALLY (bd-4gqeu): stock's translator is token-level, so a
-    // value-tree round-trip would drop duplicate object keys and normalize
-    // exponent literals (`{a:1,a:2}` and `{a:1e2,}` must stay `{"a":1,"a":2}`
-    // and `{"a":1e2}`), exactly the fidelity rule the strict path above
-    // follows. On total failure surface the strict error ("malformed JSON").
+    // translate LEXICALLY (bd-4gqeu). On total failure surface the strict
+    // error ("malformed JSON").
     if parse_json5_text(input).is_err() {
-        return Err(strict_error);
+        return Err(malformed_json());
     }
     Ok(translate_json5_to_json(input))
 }
@@ -714,7 +677,7 @@ pub fn json_valid_blob(input: &[u8], flags: Option<u8>) -> i64 {
     if (allow_json || allow_json5)
         && let Ok(text) = std::str::from_utf8(input)
     {
-        if allow_json && parse_json_text(text).is_ok() {
+        if validate_json_text(text) {
             return 1;
         }
         if allow_json5 && parse_json5_text(text).is_ok() {
@@ -741,14 +704,13 @@ pub fn jsonb(input: &str) -> Result<Vec<u8>> {
 /// Convert JSONB bytes back into minified JSON text.
 pub fn json_from_jsonb(input: &[u8]) -> Result<String> {
     let value = decode_jsonb_root(input)?;
-    encode_json_text("json_from_jsonb encode failed", &value)
+    Ok(encode_json_text(&value))
 }
 
-fn encode_json_text(context: &str, value: &Value) -> Result<String> {
-    let mut out = String::new();
-    write_canonical_json_text(value, &mut out)
-        .map_err(|error| FrankenError::function_error(format!("{context}: {error}")))?;
-    Ok(out)
+fn encode_json_text(value: &Value) -> String {
+    let mut out = String::with_capacity(64);
+    write_canonical_json_text(value, &mut out);
+    out
 }
 
 /// Minify already-validated JSON *text* the way stock `json()` does: strip only
@@ -1028,57 +990,81 @@ fn minify_json_text(input: &str) -> String {
     out
 }
 
+/// Append `text` as a double-quoted RFC-8259 JSON string literal directly into
+/// `out` without allocating an intermediate `String`.
+fn write_json_escaped_string(text: &str, out: &mut String) {
+    out.push('"');
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' || b == b'\\' || b < 0x20 {
+            if start < i {
+                out.push_str(&text[start..i]);
+            }
+            match b {
+                b'"' => out.push_str("\\\""),
+                b'\\' => out.push_str("\\\\"),
+                0x08 => out.push_str("\\b"),
+                0x0C => out.push_str("\\f"),
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                control => {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    let buf = [
+                        b'\\',
+                        b'u',
+                        b'0',
+                        b'0',
+                        HEX[usize::from(control >> 4)],
+                        HEX[usize::from(control & 0x0f)],
+                    ];
+                    out.push_str(
+                        std::str::from_utf8(&buf).expect("ASCII hex escape is valid UTF-8"),
+                    );
+                }
+            }
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < bytes.len() {
+        out.push_str(&text[start..]);
+    }
+    out.push('"');
+}
+
 /// Minified JSON writer with stock-SQLite-canonical float text: `{:?}` is
 /// Rust's shortest round-trip form ("1e300", "-0.0", "0.1"), whereas
 /// `serde_json::to_string` renders exponents with a non-canonical '+'
 /// ("1e+300") that diverges from stock `json()` output (bd-t75hg).
-fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
+fn write_canonical_json_text(value: &Value, out: &mut String) {
+    use std::fmt::Write as _;
+
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
         Value::Bool(false) => out.push_str("false"),
         Value::IntegerText(digits) => out.push_str(digits),
+        Value::FloatText(raw) => out.push_str(raw),
         Value::HexInteger(integer) => integer.write_text(out),
         Value::Number(number) => {
-            if number.is_i64() || number.is_u64() {
-                out.push_str(&number.to_string());
+            if let Some(int) = number.as_i64() {
+                let _ = write!(out, "{int}");
+            } else if let Some(uint) = number.as_u64() {
+                let _ = write!(out, "{uint}");
             } else if let Some(float) = number.as_f64().filter(|value| value.is_finite()) {
-                // Finite float: Rust's shortest round-trip text (`{float:?}` ->
-                // "1e300", "0.1"). A `Number` holds a float only when this text
-                // is also stock's: a constructed REAL or JSONB FLOAT payload whose
-                // stock text differs ("1.0e+300") is carried as its text instead
-                // (`number_text_value`, bd-1nxwh). This branch is reached by
-                // json(BLOB) (decode -> Value -> render), json_object/json_array/
-                // json_set, and json_extract-to-JSON — NOT by the text-input
-                // json() path, which preserves the source literal via
-                // `minify_json_text` (bd-6b0pe). `Number::to_string()` would emit
-                // the arbitrary_precision-normalized form, inserting a '+' into
-                // the exponent ("1e300" -> "1e+300"), which diverges from stock
-                // on the json(BLOB) round-trip and breaks byte-compatible JSONB
-                // interop (bd-t75hg; bd-p2xrc's number.to_string here was
-                // superseded by minify and reverted).
-                out.push_str(&format!("{float:?}"));
+                let _ = write!(out, "{float:?}");
             } else {
-                // Unreachable: without `arbitrary_precision`, `serde_json::Number`
-                // only ever holds i64/u64/finite-f64. Non-finite JSON numbers are
-                // carried as tagged `Value::String` (see `number_text_value`), so
-                // this arm just keeps the match exhaustive (bd-yalqc).
-                out.push_str(&number.to_string());
+                let _ = write!(out, "{number}");
             }
         }
         Value::String(text) => {
-            if let Some(raw) = as_number_text(text) {
-                // A number carried as its text: emit that text, reproducing
-                // stock's construct-vs-preserve forms (parsed `9e999` stays
-                // `9e999`; constructed `9.0e+999` and `1.0e+300` stay as they
-                // are) — GH#212, bd-yalqc, bd-1nxwh.
-                out.push_str(raw);
-            } else {
-                let escaped = serde_json::to_string(json_string_text(text)).map_err(|error| {
-                    FrankenError::function_error(format!("JSON string escape failed: {error}"))
-                })?;
-                out.push_str(&escaped);
-            }
+            write_json_escaped_string(text, out);
         }
         Value::Array(items) => {
             out.push('[');
@@ -1086,7 +1072,7 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
                 if index > 0 {
                     out.push(',');
                 }
-                write_canonical_json_text(item, out)?;
+                write_canonical_json_text(item, out);
             }
             out.push(']');
         }
@@ -1096,17 +1082,13 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
                 if index > 0 {
                     out.push(',');
                 }
-                let escaped = serde_json::to_string(key).map_err(|error| {
-                    FrankenError::function_error(format!("JSON key escape failed: {error}"))
-                })?;
-                out.push_str(&escaped);
+                write_json_escaped_string(key, out);
                 out.push(':');
-                write_canonical_json_text(item, out)?;
+                write_canonical_json_text(item, out);
             }
             out.push('}');
         }
     }
-    Ok(())
 }
 
 fn parse_json_input_blob(input: &[u8]) -> Result<Value> {
@@ -1144,8 +1126,8 @@ fn json_extract_value(root: &Value, paths: &[&str]) -> Result<SqliteValue> {
         out.push(selected.cloned().unwrap_or(Value::Null));
     }
 
-    let encoded = encode_json_text("json_extract array encode failed", &Value::Array(out))?;
-    Ok(SqliteValue::Text(encoded.into()))
+    let encoded = encode_json_text(&Value::Array(out));
+    Ok(SqliteValue::Text(SmallText::from_string(encoded)))
 }
 
 fn jsonb_extract_value(root: &Value, paths: &[&str]) -> Result<Vec<u8>> {
@@ -1177,8 +1159,8 @@ fn json_arrow_value(root: &Value, path: &str) -> Result<SqliteValue> {
     let Some(value) = selected else {
         return Ok(SqliteValue::Null);
     };
-    let encoded = encode_json_text("json_arrow encode failed", value)?;
-    Ok(SqliteValue::Text(encoded.into()))
+    let encoded = encode_json_text(value);
+    Ok(SqliteValue::Text(SmallText::from_string(encoded)))
 }
 
 fn json_extract_single_path(root: &Value, path: &str) -> Result<SqliteValue> {
@@ -1212,22 +1194,21 @@ fn json_error_position_blob(input: &[u8]) -> usize {
     }
 }
 
-fn json_pretty_value(root: &Value, indent: Option<&str>) -> Result<String> {
+fn json_pretty_value(root: &Value, indent: Option<&str>) -> String {
     let indent_unit = match indent {
         Some(indent) => indent.to_owned(),
         None => " ".repeat(JSON_PRETTY_DEFAULT_INDENT_WIDTH),
     };
     let mut out = String::new();
-    write_pretty_value(root, &indent_unit, 0, &mut out)?;
-    Ok(out)
+    write_pretty_value(root, &indent_unit, 0, &mut out);
+    out
 }
 
 fn edit_json_paths_value(
-    root: &Value,
+    mut edited: Value,
     pairs: &[(&str, SqliteValue)],
     mode: EditMode,
 ) -> Result<Value> {
-    let mut edited = root.clone();
     for (path, value) in pairs {
         let segments = parse_path(path)?;
         let replacement = sqlite_to_json(value)?;
@@ -1243,13 +1224,12 @@ fn edit_json_paths_value(
 /// `args[idx + 1]` with subtype `arg_subtypes[idx + 1]`. (GH #233)
 fn edit_json_paths_value_with_subtypes(
     name: &str,
-    input: &Value,
+    mut edited: Value,
     args: &[SqliteValue],
     arg_subtypes: &[u32],
     start: usize,
     mode: EditMode,
 ) -> Result<Value> {
-    let mut edited = input.clone();
     let mut idx = start;
     while idx + 1 < args.len() {
         // Stock skips a pair whose PATH is NULL.
@@ -1266,8 +1246,7 @@ fn edit_json_paths_value_with_subtypes(
     Ok(edited)
 }
 
-fn json_remove_value(root: &Value, paths: &[&str]) -> Result<Option<Value>> {
-    let mut edited = root.clone();
+fn json_remove_value(mut edited: Value, paths: &[&str]) -> Result<Option<Value>> {
     for path in paths {
         let segments = parse_path(path)?;
         if segments.is_empty() {
@@ -1278,14 +1257,17 @@ fn json_remove_value(root: &Value, paths: &[&str]) -> Result<Option<Value>> {
     Ok(Some(edited))
 }
 
-fn json_patch_value(root: &Value, patch: &Value) -> Value {
-    merge_patch(root.clone(), patch.clone())
+fn json_patch_value(root: Value, patch: Value) -> Value {
+    merge_patch(root, patch)
 }
 
 /// Return JSON type name at the root or an optional path.
 ///
 /// Returns `None` when the path does not resolve.
 pub fn json_type(input: &str, path: Option<&str>) -> Result<Option<&'static str>> {
+    if let FastLookup::Resolved(result) = try_strict_json_type(input, path)? {
+        return Ok(result);
+    }
     let root = parse_json_value_lenient(input)?;
     json_type_value(&root, path)
 }
@@ -1295,6 +1277,11 @@ pub fn json_type(input: &str, path: Option<&str>) -> Result<Option<&'static str>
 /// - One path: return SQL-native value (text unwrapped, number typed, JSON null -> SQL NULL)
 /// - Multiple paths: return JSON array text of extracted values (missing paths become `null`)
 pub fn json_extract(input: &str, paths: &[&str]) -> Result<SqliteValue> {
+    if paths.len() == 1
+        && let Some((value, _)) = try_strict_json_extract_single(input, paths[0])?
+    {
+        return Ok(value);
+    }
     let root = parse_json_value_lenient(input)?;
     json_extract_value(&root, paths)
 }
@@ -1311,6 +1298,9 @@ pub fn jsonb_extract(input: &str, paths: &[&str]) -> Result<Vec<u8>> {
 ///
 /// Missing paths yield SQL NULL.
 pub fn json_arrow(input: &str, path: &str) -> Result<SqliteValue> {
+    if let Some(value) = try_strict_json_arrow(input, path)? {
+        return Ok(value);
+    }
     let root = parse_json_value_lenient(input)?;
     json_arrow_value(&root, path)
 }
@@ -1325,6 +1315,9 @@ pub fn json_double_arrow(input: &str, path: &str) -> Result<SqliteValue> {
 /// Matches SQLite JSON1 semantics: a missing path returns SQL NULL, while an
 /// existing non-array target returns 0.
 pub fn json_array_length(input: &str, path: Option<&str>) -> Result<Option<usize>> {
+    if let FastLookup::Resolved(result) = try_strict_json_array_length(input, path)? {
+        return Ok(result);
+    }
     let root = parse_json_value_lenient(input)?;
     json_array_length_value(&root, path)
 }
@@ -1967,7 +1960,7 @@ impl StockJsonErrorScanner<'_> {
 /// Pretty-print JSON with default 4-space indentation or custom indent token.
 pub fn json_pretty(input: &str, indent: Option<&str>) -> Result<String> {
     let root = parse_json_value_lenient(input)?;
-    json_pretty_value(&root, indent)
+    Ok(json_pretty_value(&root, indent))
 }
 
 /// Quote a SQL value as JSON.
@@ -1990,7 +1983,9 @@ pub fn json_quote(value: &SqliteValue) -> Result<String> {
             }
         }
         SqliteValue::Text(text) => {
-            Ok(serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned()))
+            let mut out = String::with_capacity(text.len() + 2);
+            write_json_escaped_string(text, &mut out);
+            Ok(out)
         }
         // Stock `jsonAppendSqlValue`: a JSONB blob is rendered as JSON text.
         SqliteValue::Blob(bytes) => json_from_jsonb(bytes)
@@ -2029,10 +2024,7 @@ pub fn json_array(values: &[SqliteValue]) -> Result<String> {
     for value in values {
         out.push(sqlite_to_json(value)?);
     }
-    // Route through the canonical writer (not `serde_json::to_string`) so floats
-    // render in stock-canonical form and non-finite numbers (tagged carriers)
-    // render as their numeric literal (GH#212, bd-t75hg, bd-yalqc).
-    encode_json_text("json_array encode failed", &Value::Array(out))
+    Ok(encode_json_text(&Value::Array(out)))
 }
 
 /// Build a JSON array from SQL values, embedding JSON-subtyped arguments as
@@ -2043,32 +2035,26 @@ pub fn json_array_with_subtypes(values: &[SqliteValue], subtypes: &[u32]) -> Res
         let subtype = subtypes.get(i).copied().unwrap_or(0);
         out.push(sqlite_to_json_with_subtype(value, subtype)?);
     }
-    encode_json_text("json_array encode failed", &Value::Array(out))
+    Ok(encode_json_text(&Value::Array(out)))
 }
 
 /// Serialize an ordered key/value list as JSON object text.
 ///
 /// Preserves argument order AND duplicate labels verbatim — stock SQLite
-/// semantics (`json_object('a',1,'a',2)` -> `{"a":1,"a":2}`). serde_json's `Map`
-/// collapses duplicate labels to the last value, so the object text is assembled
-/// directly instead of routing through `Value::Object`.
-fn encode_json_object_members(members: &[(String, Value)]) -> Result<String> {
-    let mut out = String::from("{");
+/// semantics (`json_object('a',1,'a',2)` -> `{"a":1,"a":2}`).
+fn encode_json_object_members(members: &[(String, Value)]) -> String {
+    let mut out = String::with_capacity(64);
+    out.push('{');
     for (index, (key, value)) in members.iter().enumerate() {
         if index > 0 {
             out.push(',');
         }
-        let key_json = serde_json::to_string(key).map_err(|error| {
-            FrankenError::function_error(format!("json_object key encode failed: {error}"))
-        })?;
-        out.push_str(&key_json);
+        write_json_escaped_string(key, &mut out);
         out.push(':');
-        // Canonical writer (not `serde_json::to_string`): stock-canonical floats
-        // and correct non-finite rendering of tagged carriers (GH#212, bd-yalqc).
-        write_canonical_json_text(value, &mut out)?;
+        write_canonical_json_text(value, &mut out);
     }
     out.push('}');
-    Ok(out)
+    out
 }
 
 /// Build a JSON object from alternating key/value arguments, embedding
@@ -2099,7 +2085,7 @@ pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Resu
         idx += 2;
     }
 
-    encode_json_object_members(&members)
+    Ok(encode_json_object_members(&members))
 }
 
 /// Build a JSONB object from alternating key/value SQL arguments while
@@ -2163,7 +2149,7 @@ pub fn json_object(args: &[SqliteValue]) -> Result<String> {
         idx += 2;
     }
 
-    encode_json_object_members(&members)
+    Ok(encode_json_object_members(&members))
 }
 
 /// Build JSONB from SQL values.
@@ -2229,7 +2215,7 @@ pub fn json_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<Strin
         };
         members.push((label, sqlite_to_json(value)?));
     }
-    encode_json_object_members(&members)
+    Ok(encode_json_object_members(&members))
 }
 
 /// JSONB variant of `json_group_object`.
@@ -2250,8 +2236,8 @@ pub fn jsonb_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<Vec<
 /// Set JSON values at path(s), creating object keys when missing.
 pub fn json_set(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
     let root = parse_json_value_lenient(input)?;
-    let edited = edit_json_paths_value(&root, pairs, EditMode::Set)?;
-    encode_json_text("json edit encode failed", &edited)
+    let edited = edit_json_paths_value(root, pairs, EditMode::Set)?;
+    Ok(encode_json_text(&edited))
 }
 
 /// JSONB variant of `json_set`.
@@ -2263,8 +2249,8 @@ pub fn jsonb_set(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> 
 /// Insert JSON values at path(s) only when path does not already exist.
 pub fn json_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
     let root = parse_json_value_lenient(input)?;
-    let edited = edit_json_paths_value(&root, pairs, EditMode::Insert)?;
-    encode_json_text("json edit encode failed", &edited)
+    let edited = edit_json_paths_value(root, pairs, EditMode::Insert)?;
+    Ok(encode_json_text(&edited))
 }
 
 /// JSONB variant of `json_insert`.
@@ -2286,7 +2272,7 @@ pub fn json_array_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<S
         let segments = parse_path(path)?;
         apply_array_insert(&mut edited, &segments, sqlite_to_json(value)?, path)?;
     }
-    encode_json_text("json_array_insert encode failed", &edited)
+    Ok(encode_json_text(&edited))
 }
 
 /// JSONB variant of `json_array_insert`.
@@ -2298,8 +2284,8 @@ pub fn jsonb_array_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<
 /// Replace JSON values at path(s) only when path already exists.
 pub fn json_replace(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
     let root = parse_json_value_lenient(input)?;
-    let edited = edit_json_paths_value(&root, pairs, EditMode::Replace)?;
-    encode_json_text("json edit encode failed", &edited)
+    let edited = edit_json_paths_value(root, pairs, EditMode::Replace)?;
+    Ok(encode_json_text(&edited))
 }
 
 /// JSONB variant of `json_replace`.
@@ -2311,10 +2297,10 @@ pub fn jsonb_replace(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u
 /// Remove JSON values at path(s). Array removals compact the array.
 pub fn json_remove(input: &str, paths: &[&str]) -> Result<String> {
     let root = parse_json_value_lenient(input)?;
-    let Some(edited) = json_remove_value(&root, paths)? else {
+    let Some(edited) = json_remove_value(root, paths)? else {
         return Ok("null".to_owned());
     };
-    encode_json_text("json_remove encode failed", &edited)
+    Ok(encode_json_text(&edited))
 }
 
 /// JSONB variant of `json_remove`.
@@ -2330,15 +2316,15 @@ pub fn jsonb_remove(input: &str, paths: &[&str]) -> Result<Vec<u8>> {
 pub fn json_patch(input: &str, patch: &str) -> Result<String> {
     let root = parse_json_value_lenient(input)?;
     let patch_value = parse_json_value_lenient(patch)?;
-    let merged = json_patch_value(&root, &patch_value);
-    encode_json_text("json_patch encode failed", &merged)
+    let merged = json_patch_value(root, patch_value);
+    Ok(encode_json_text(&merged))
 }
 
 /// JSONB variant of `json_patch`.
 pub fn jsonb_patch(input: &str, patch: &str) -> Result<Vec<u8>> {
     let root = parse_json_value_lenient(input)?;
     let patch_value = parse_json_value_lenient(patch)?;
-    let merged = json_patch_value(&root, &patch_value);
+    let merged = json_patch_value(root, patch_value);
     encode_jsonb_root(&merged)
 }
 
@@ -2651,44 +2637,1050 @@ fn json_table_cursor_rowid(pos: usize, row_count: usize) -> Result<i64> {
 }
 
 fn parse_json_text(input: &str) -> Result<Value> {
-    // Numbers that must keep their text (an f64 overflow, which serde with
-    // `arbitrary_precision` off rejects; a float not in Rust's shortest form)
-    // travel as tagged carriers (GH#212, bd-yalqc, bd-1nxwh).
-    let rewritten = number_text_rewrite_for_parse(input);
-    serde_json::from_str::<Value>(rewritten.as_deref().unwrap_or(input))
-        .map_err(|_| malformed_json())
+    let mut parser = StrictJsonParser::new(input);
+    parser.skip_ws();
+    let value = parser.parse_value()?;
+    parser.skip_ws();
+    if parser.pos != parser.bytes.len() {
+        return Err(malformed_json());
+    }
+    Ok(value)
+}
+
+/// Zero-allocation strict RFC-8259 validator (bd-oahj7).
+fn validate_json_text(input: &str) -> bool {
+    let mut parser = StrictJsonParser::new(input);
+    parser.skip_ws();
+    if parser.validate_value().is_err() {
+        return false;
+    }
+    parser.skip_ws();
+    parser.pos == parser.bytes.len()
+}
+
+#[derive(Clone, Copy)]
+enum FastPathStep<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+const MAX_FAST_PATH_STEPS: usize = 8;
+
+struct FastPath<'a> {
+    steps: [FastPathStep<'a>; MAX_FAST_PATH_STEPS],
+    len: usize,
+}
+
+impl<'a> FastPath<'a> {
+    #[inline]
+    fn as_slice(&self) -> &[FastPathStep<'a>] {
+        &self.steps[..self.len]
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExtractedKind {
+    Null,
+    True,
+    False,
+    Int,
+    Float,
+    String { has_escapes: bool },
+    Array { len: usize },
+    Object,
+}
+
+#[derive(Clone, Copy)]
+struct ExtractedSpan {
+    kind: ExtractedKind,
+    start: usize,
+    end: usize,
+}
+
+enum StrictExtractOutcome<T> {
+    Matched(T),
+    NotStrictJson,
+    UnsupportedPath,
+}
+
+fn parse_fast_path(path: &str) -> Option<FastPath<'_>> {
+    let bytes = path.as_bytes();
+    if bytes.first().copied() != Some(b'$') {
+        return None;
+    }
+    let mut steps = [FastPathStep::Index(0); MAX_FAST_PATH_STEPS];
+    let mut len = 0usize;
+    let mut idx = 1usize;
+
+    while idx < bytes.len() {
+        if len >= MAX_FAST_PATH_STEPS {
+            return None;
+        }
+        match bytes[idx] {
+            b'.' => {
+                idx += 1;
+                if idx >= bytes.len() {
+                    return None;
+                }
+                if bytes[idx] == b'"' {
+                    idx += 1;
+                    let start = idx;
+                    while idx < bytes.len() {
+                        let b = bytes[idx];
+                        if b == b'\\' {
+                            // Escaped quoted path keys fall back to the full resolver.
+                            return None;
+                        }
+                        if b == b'"' {
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    if idx >= bytes.len() {
+                        return None;
+                    }
+                    steps[len] = FastPathStep::Key(&path[start..idx]);
+                    len += 1;
+                    idx += 1;
+                } else {
+                    let start = idx;
+                    while idx < bytes.len() && bytes[idx] != b'.' && bytes[idx] != b'[' {
+                        idx += 1;
+                    }
+                    if start == idx {
+                        return None;
+                    }
+                    steps[len] = FastPathStep::Key(&path[start..idx]);
+                    len += 1;
+                }
+            }
+            b'[' => {
+                idx += 1;
+                let start = idx;
+                while idx < bytes.len() && bytes[idx] != b']' {
+                    if !bytes[idx].is_ascii_digit() {
+                        return None;
+                    }
+                    idx += 1;
+                }
+                if idx >= bytes.len() || start == idx {
+                    return None;
+                }
+                let index = parse_path_index(&path[start..idx])?;
+                steps[len] = FastPathStep::Index(index);
+                len += 1;
+                idx += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(FastPath { steps, len })
+}
+
+enum StrictScanSpan {
+    Found(ExtractedSpan),
+    Missing,
+    NotStrictJson,
+}
+
+enum FastLookup<T> {
+    Resolved(Option<T>),
+    Fallback,
+}
+
+fn extract_strict_json_span(input: &str, path: &[FastPathStep<'_>]) -> StrictScanSpan {
+    let mut parser = StrictJsonParser::new(input);
+    let mut found = None;
+    parser.skip_ws();
+    if parser.extract_value(path, &mut found).is_err() {
+        return StrictScanSpan::NotStrictJson;
+    }
+    parser.skip_ws();
+    if parser.pos != parser.bytes.len() {
+        return StrictScanSpan::NotStrictJson;
+    }
+    match found {
+        Some(span) => StrictScanSpan::Found(span),
+        None => StrictScanSpan::Missing,
+    }
+}
+
+#[inline]
+fn parse_integer_value(raw: &str) -> Value {
+    if raw == "-0" {
+        return Value::IntegerText("-0".to_owned());
+    }
+    let bytes = raw.as_bytes();
+    let (neg, digits) = if bytes.first() == Some(&b'-') {
+        (true, &bytes[1..])
+    } else {
+        (false, bytes)
+    };
+    if digits.len() <= 18 {
+        let mut acc: i64 = 0;
+        for &b in digits {
+            acc = acc * 10 + i64::from(b - b'0');
+        }
+        return Value::Number(Number::from(if neg { -acc } else { acc }));
+    }
+    if let Ok(int) = raw.parse::<i64>() {
+        return Value::Number(Number::from(int));
+    }
+    if !neg && let Ok(uint) = raw.parse::<u64>() {
+        return Value::Number(Number::from(uint));
+    }
+    Value::IntegerText(raw.to_owned())
+}
+
+#[inline]
+fn parse_integer_to_sqlite(raw: &str) -> SqliteValue {
+    if raw == "-0" {
+        return SqliteValue::Integer(0);
+    }
+    let bytes = raw.as_bytes();
+    let (neg, digits) = if bytes.first() == Some(&b'-') {
+        (true, &bytes[1..])
+    } else {
+        (false, bytes)
+    };
+    if digits.len() <= 18 {
+        let mut acc: i64 = 0;
+        for &b in digits {
+            acc = acc * 10 + i64::from(b - b'0');
+        }
+        return SqliteValue::Integer(if neg { -acc } else { acc });
+    }
+    if let Ok(int) = raw.parse::<i64>() {
+        return SqliteValue::Integer(int);
+    }
+    SqliteValue::Float(raw.parse::<f64>().unwrap_or(0.0))
+}
+
+#[inline]
+fn hex_nibble(b: u8) -> Option<u16> {
+    match b {
+        b'0'..=b'9' => Some(u16::from(b - b'0')),
+        b'a'..=b'f' => Some(u16::from(b - b'a' + 10)),
+        b'A'..=b'F' => Some(u16::from(b - b'A' + 10)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn parse_hex4(bytes: &[u8], pos: usize) -> Option<u16> {
+    let slice = bytes.get(pos..pos + 4)?;
+    let h0 = hex_nibble(slice[0])?;
+    let h1 = hex_nibble(slice[1])?;
+    let h2 = hex_nibble(slice[2])?;
+    let h3 = hex_nibble(slice[3])?;
+    Some((h0 << 12) | (h1 << 8) | (h2 << 4) | h3)
+}
+
+fn decode_validated_json_string(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    let mut start = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        if start < i {
+            out.push_str(&raw[start..i]);
+        }
+        i += 1;
+        match bytes[i] {
+            b'"' => out.push('"'),
+            b'\\' => out.push('\\'),
+            b'/' => out.push('/'),
+            b'b' => out.push('\u{0008}'),
+            b'f' => out.push('\u{000C}'),
+            b'n' => out.push('\n'),
+            b'r' => out.push('\r'),
+            b't' => out.push('\t'),
+            b'u' => {
+                let unit = parse_hex4(bytes, i + 1).expect("validated \\uXXXX escape");
+                i += 4;
+                if (0xD800..=0xDBFF).contains(&unit) {
+                    let low = parse_hex4(bytes, i + 3).expect("validated surrogate pair");
+                    i += 6;
+                    let code =
+                        0x10000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(low) - 0xDC00);
+                    out.push(char::from_u32(code).expect("valid Unicode scalar"));
+                } else {
+                    out.push(char::from_u32(u32::from(unit)).expect("valid Unicode scalar"));
+                }
+            }
+            _ => unreachable!("validated JSON escape"),
+        }
+        i += 1;
+        start = i;
+    }
+    if start < bytes.len() {
+        out.push_str(&raw[start..]);
+    }
+    out
+}
+
+/// Single-pass strict RFC-8259 parser, validator, and streaming single-path
+/// extractor (bd-oahj7). Preserves float literal text verbatim without a
+/// second byte pass or `serde_json` string-rewriting round trip.
+struct StrictJsonParser<'a> {
+    input: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+    depth: usize,
+}
+
+impl<'a> StrictJsonParser<'a> {
+    #[inline]
+    const fn new(input: &'a str) -> Self {
+        Self {
+            input,
+            bytes: input.as_bytes(),
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    #[inline]
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
+                _ => break,
+            }
+        }
+    }
+
+    fn scan_string_span(&mut self) -> Result<(usize, usize, bool)> {
+        if self.bytes.get(self.pos) != Some(&b'"') {
+            return Err(malformed_json());
+        }
+        self.pos += 1;
+        let content_start = self.pos;
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            if b == b'"' {
+                let content_end = self.pos;
+                self.pos += 1;
+                return Ok((content_start, content_end, false));
+            }
+            if b == b'\\' {
+                return self.finish_validate_escaped_string(content_start);
+            }
+            if b < 0x20 {
+                return Err(malformed_json());
+            }
+            self.pos += 1;
+        }
+        Err(malformed_json())
+    }
+
+    fn finish_validate_escaped_string(
+        &mut self,
+        content_start: usize,
+    ) -> Result<(usize, usize, bool)> {
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            if b == b'"' {
+                let content_end = self.pos;
+                self.pos += 1;
+                return Ok((content_start, content_end, true));
+            }
+            if b < 0x20 {
+                return Err(malformed_json());
+            }
+            self.pos += 1;
+            if b == b'\\' {
+                let Some(&esc) = self.bytes.get(self.pos) else {
+                    return Err(malformed_json());
+                };
+                match esc {
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                        self.pos += 1;
+                    }
+                    b'u' => {
+                        self.pos += 1;
+                        let unit = parse_hex4(self.bytes, self.pos).ok_or_else(malformed_json)?;
+                        self.pos += 4;
+                        if (0xD800..=0xDBFF).contains(&unit) {
+                            if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                                return Err(malformed_json());
+                            }
+                            self.pos += 2;
+                            let low =
+                                parse_hex4(self.bytes, self.pos).ok_or_else(malformed_json)?;
+                            if !(0xDC00..=0xDFFF).contains(&low) {
+                                return Err(malformed_json());
+                            }
+                            self.pos += 4;
+                        } else if (0xDC00..=0xDFFF).contains(&unit) {
+                            return Err(malformed_json());
+                        }
+                    }
+                    _ => return Err(malformed_json()),
+                }
+            }
+        }
+        Err(malformed_json())
+    }
+
+    fn parse_string(&mut self) -> Result<InlineStr> {
+        let (start, end, has_escapes) = self.scan_string_span()?;
+        if !has_escapes {
+            Ok(InlineStr::new(&self.input[start..end]))
+        } else {
+            Ok(InlineStr::from_string(decode_validated_json_string(
+                &self.input[start..end],
+            )))
+        }
+    }
+
+    fn scan_number_span(&mut self) -> Result<(usize, usize, bool)> {
+        let start = self.pos;
+        if self.bytes.get(self.pos) == Some(&b'-') {
+            self.pos += 1;
+        }
+        match self.bytes.get(self.pos).copied() {
+            Some(b'0') => {
+                self.pos += 1;
+                if self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                    return Err(malformed_json());
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                    self.pos += 1;
+                }
+            }
+            _ => return Err(malformed_json()),
+        }
+        let mut is_float = false;
+        if self.bytes.get(self.pos) == Some(&b'.') {
+            is_float = true;
+            self.pos += 1;
+            if !self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                return Err(malformed_json());
+            }
+            while self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.bytes.get(self.pos), Some(b'e' | b'E')) {
+            is_float = true;
+            self.pos += 1;
+            if matches!(self.bytes.get(self.pos), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if !self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                return Err(malformed_json());
+            }
+            while self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                self.pos += 1;
+            }
+        }
+        Ok((start, self.pos, is_float))
+    }
+
+    fn parse_value(&mut self) -> Result<Value> {
+        match self.bytes.get(self.pos).copied() {
+            Some(b'n') => {
+                if self.bytes.get(self.pos..self.pos + 4) == Some(b"null") {
+                    self.pos += 4;
+                    Ok(Value::Null)
+                } else {
+                    Err(malformed_json())
+                }
+            }
+            Some(b't') => {
+                if self.bytes.get(self.pos..self.pos + 4) == Some(b"true") {
+                    self.pos += 4;
+                    Ok(Value::Bool(true))
+                } else {
+                    Err(malformed_json())
+                }
+            }
+            Some(b'f') => {
+                if self.bytes.get(self.pos..self.pos + 5) == Some(b"false") {
+                    self.pos += 5;
+                    Ok(Value::Bool(false))
+                } else {
+                    Err(malformed_json())
+                }
+            }
+            Some(b'"') => self.parse_string().map(Value::String),
+            Some(b'-' | b'0'..=b'9') => {
+                let (start, end, is_float) = self.scan_number_span()?;
+                let raw = &self.input[start..end];
+                if is_float {
+                    Ok(Value::FloatText(InlineStr::new(raw)))
+                } else {
+                    Ok(parse_integer_value(raw))
+                }
+            }
+            Some(b'[') => self.parse_array(),
+            Some(b'{') => self.parse_object(),
+            _ => Err(malformed_json()),
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<Value> {
+        self.depth += 1;
+        if self.depth > STOCK_JSON_MAX_DEPTH {
+            self.depth -= 1;
+            return Err(malformed_json());
+        }
+        self.pos += 1; // '['
+        self.skip_ws();
+        if self.bytes.get(self.pos) == Some(&b']') {
+            self.pos += 1;
+            self.depth -= 1;
+            return Ok(Value::Array(Vec::new()));
+        }
+        let mut items = Vec::with_capacity(4);
+        loop {
+            items.push(self.parse_value()?);
+            self.skip_ws();
+            match self.bytes.get(self.pos).copied() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    self.depth -= 1;
+                    return Ok(Value::Array(items));
+                }
+                _ => {
+                    self.depth -= 1;
+                    return Err(malformed_json());
+                }
+            }
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<Value> {
+        self.depth += 1;
+        if self.depth > STOCK_JSON_MAX_DEPTH {
+            self.depth -= 1;
+            return Err(malformed_json());
+        }
+        self.pos += 1; // '{'
+        self.skip_ws();
+        if self.bytes.get(self.pos) == Some(&b'}') {
+            self.pos += 1;
+            self.depth -= 1;
+            return Ok(Value::Object(Object::new()));
+        }
+        let mut object = Object::with_capacity(8);
+        loop {
+            let key = self.parse_string()?;
+            self.skip_ws();
+            if self.bytes.get(self.pos) != Some(&b':') {
+                self.depth -= 1;
+                return Err(malformed_json());
+            }
+            self.pos += 1;
+            self.skip_ws();
+            let value = self.parse_value()?;
+            object.append(key, value);
+            self.skip_ws();
+            match self.bytes.get(self.pos).copied() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    self.depth -= 1;
+                    return Ok(Value::Object(object));
+                }
+                _ => {
+                    self.depth -= 1;
+                    return Err(malformed_json());
+                }
+            }
+        }
+    }
+
+    fn validate_value(&mut self) -> Result<()> {
+        match self.bytes.get(self.pos).copied() {
+            Some(b'n') => {
+                if self.bytes.get(self.pos..self.pos + 4) == Some(b"null") {
+                    self.pos += 4;
+                    Ok(())
+                } else {
+                    Err(malformed_json())
+                }
+            }
+            Some(b't') => {
+                if self.bytes.get(self.pos..self.pos + 4) == Some(b"true") {
+                    self.pos += 4;
+                    Ok(())
+                } else {
+                    Err(malformed_json())
+                }
+            }
+            Some(b'f') => {
+                if self.bytes.get(self.pos..self.pos + 5) == Some(b"false") {
+                    self.pos += 5;
+                    Ok(())
+                } else {
+                    Err(malformed_json())
+                }
+            }
+            Some(b'"') => {
+                let _ = self.scan_string_span()?;
+                Ok(())
+            }
+            Some(b'-' | b'0'..=b'9') => {
+                let _ = self.scan_number_span()?;
+                Ok(())
+            }
+            Some(b'[') => {
+                let _ = self.validate_array_len()?;
+                Ok(())
+            }
+            Some(b'{') => self.validate_object(),
+            _ => Err(malformed_json()),
+        }
+    }
+
+    fn validate_value_with_kind(&mut self) -> Result<ExtractedKind> {
+        match self.bytes.get(self.pos).copied() {
+            Some(b'n') => {
+                if self.bytes.get(self.pos..self.pos + 4) == Some(b"null") {
+                    self.pos += 4;
+                    Ok(ExtractedKind::Null)
+                } else {
+                    Err(malformed_json())
+                }
+            }
+            Some(b't') => {
+                if self.bytes.get(self.pos..self.pos + 4) == Some(b"true") {
+                    self.pos += 4;
+                    Ok(ExtractedKind::True)
+                } else {
+                    Err(malformed_json())
+                }
+            }
+            Some(b'f') => {
+                if self.bytes.get(self.pos..self.pos + 5) == Some(b"false") {
+                    self.pos += 5;
+                    Ok(ExtractedKind::False)
+                } else {
+                    Err(malformed_json())
+                }
+            }
+            Some(b'"') => {
+                let (_, _, has_escapes) = self.scan_string_span()?;
+                Ok(ExtractedKind::String { has_escapes })
+            }
+            Some(b'-' | b'0'..=b'9') => {
+                let (_, _, is_float) = self.scan_number_span()?;
+                Ok(if is_float {
+                    ExtractedKind::Float
+                } else {
+                    ExtractedKind::Int
+                })
+            }
+            Some(b'[') => {
+                let len = self.validate_array_len()?;
+                Ok(ExtractedKind::Array { len })
+            }
+            Some(b'{') => {
+                self.validate_object()?;
+                Ok(ExtractedKind::Object)
+            }
+            _ => Err(malformed_json()),
+        }
+    }
+
+    fn validate_array_len(&mut self) -> Result<usize> {
+        self.depth += 1;
+        if self.depth > STOCK_JSON_MAX_DEPTH {
+            self.depth -= 1;
+            return Err(malformed_json());
+        }
+        self.pos += 1; // '['
+        self.skip_ws();
+        if self.bytes.get(self.pos) == Some(&b']') {
+            self.pos += 1;
+            self.depth -= 1;
+            return Ok(0);
+        }
+        let mut count = 0usize;
+        loop {
+            self.validate_value()?;
+            count += 1;
+            self.skip_ws();
+            match self.bytes.get(self.pos).copied() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    self.depth -= 1;
+                    return Ok(count);
+                }
+                _ => {
+                    self.depth -= 1;
+                    return Err(malformed_json());
+                }
+            }
+        }
+    }
+
+    fn validate_object(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > STOCK_JSON_MAX_DEPTH {
+            self.depth -= 1;
+            return Err(malformed_json());
+        }
+        self.pos += 1; // '{'
+        self.skip_ws();
+        if self.bytes.get(self.pos) == Some(&b'}') {
+            self.pos += 1;
+            self.depth -= 1;
+            return Ok(());
+        }
+        loop {
+            let _ = self.scan_string_span()?;
+            self.skip_ws();
+            if self.bytes.get(self.pos) != Some(&b':') {
+                self.depth -= 1;
+                return Err(malformed_json());
+            }
+            self.pos += 1;
+            self.skip_ws();
+            self.validate_value()?;
+            self.skip_ws();
+            match self.bytes.get(self.pos).copied() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    self.depth -= 1;
+                    return Ok(());
+                }
+                _ => {
+                    self.depth -= 1;
+                    return Err(malformed_json());
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn key_matches(&self, start: usize, end: usize, has_escapes: bool, target: &str) -> bool {
+        if !has_escapes {
+            &self.bytes[start..end] == target.as_bytes()
+        } else {
+            decode_validated_json_string(&self.input[start..end]) == target
+        }
+    }
+
+    fn extract_value(
+        &mut self,
+        steps: &[FastPathStep<'_>],
+        found: &mut Option<ExtractedSpan>,
+    ) -> Result<()> {
+        let Some((&step, rest)) = steps.split_first() else {
+            let start = self.pos;
+            let kind = self.validate_value_with_kind()?;
+            *found = Some(ExtractedSpan {
+                kind,
+                start,
+                end: self.pos,
+            });
+            return Ok(());
+        };
+        match (self.bytes.get(self.pos).copied(), step) {
+            (Some(b'{'), FastPathStep::Key(target_key)) => {
+                self.extract_object(target_key, rest, found)
+            }
+            (Some(b'['), FastPathStep::Index(target_idx)) => {
+                self.extract_array(target_idx, rest, found)
+            }
+            _ => self.validate_value(),
+        }
+    }
+
+    fn extract_object(
+        &mut self,
+        target_key: &str,
+        rest: &[FastPathStep<'_>],
+        found: &mut Option<ExtractedSpan>,
+    ) -> Result<()> {
+        self.depth += 1;
+        if self.depth > STOCK_JSON_MAX_DEPTH {
+            self.depth -= 1;
+            return Err(malformed_json());
+        }
+        self.pos += 1; // '{'
+        self.skip_ws();
+        if self.bytes.get(self.pos) == Some(&b'}') {
+            self.pos += 1;
+            self.depth -= 1;
+            return Ok(());
+        }
+        let mut matched = false;
+        loop {
+            let (ks, ke, has_escapes) = self.scan_string_span()?;
+            self.skip_ws();
+            if self.bytes.get(self.pos) != Some(&b':') {
+                self.depth -= 1;
+                return Err(malformed_json());
+            }
+            self.pos += 1;
+            self.skip_ws();
+            if !matched && self.key_matches(ks, ke, has_escapes, target_key) {
+                matched = true;
+                self.extract_value(rest, found)?;
+            } else {
+                self.validate_value()?;
+            }
+            self.skip_ws();
+            match self.bytes.get(self.pos).copied() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    self.depth -= 1;
+                    return Ok(());
+                }
+                _ => {
+                    self.depth -= 1;
+                    return Err(malformed_json());
+                }
+            }
+        }
+    }
+
+    fn extract_array(
+        &mut self,
+        target_idx: usize,
+        rest: &[FastPathStep<'_>],
+        found: &mut Option<ExtractedSpan>,
+    ) -> Result<()> {
+        self.depth += 1;
+        if self.depth > STOCK_JSON_MAX_DEPTH {
+            self.depth -= 1;
+            return Err(malformed_json());
+        }
+        self.pos += 1; // '['
+        self.skip_ws();
+        if self.bytes.get(self.pos) == Some(&b']') {
+            self.pos += 1;
+            self.depth -= 1;
+            return Ok(());
+        }
+        let mut elem_idx = 0usize;
+        loop {
+            if elem_idx == target_idx {
+                self.extract_value(rest, found)?;
+            } else {
+                self.validate_value()?;
+            }
+            elem_idx += 1;
+            self.skip_ws();
+            match self.bytes.get(self.pos).copied() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    self.depth -= 1;
+                    return Ok(());
+                }
+                _ => {
+                    self.depth -= 1;
+                    return Err(malformed_json());
+                }
+            }
+        }
+    }
+}
+
+fn extracted_span_to_sqlite_scalar(
+    input: &str,
+    span: ExtractedSpan,
+) -> Result<(SqliteValue, Option<u32>)> {
+    let slice = &input[span.start..span.end];
+    match span.kind {
+        ExtractedKind::Null => Ok((SqliteValue::Null, None)),
+        ExtractedKind::True => Ok((SqliteValue::Integer(1), None)),
+        ExtractedKind::False => Ok((SqliteValue::Integer(0), None)),
+        ExtractedKind::Int => Ok((parse_integer_to_sqlite(slice), None)),
+        ExtractedKind::Float => Ok((
+            SqliteValue::Float(slice.parse::<f64>().unwrap_or(0.0)),
+            None,
+        )),
+        ExtractedKind::String { has_escapes: false } => Ok((
+            SqliteValue::Text(SmallText::new(&input[span.start + 1..span.end - 1])),
+            None,
+        )),
+        ExtractedKind::String { has_escapes: true } => Ok((
+            SqliteValue::Text(SmallText::from_string(decode_validated_json_string(
+                &input[span.start + 1..span.end - 1],
+            ))),
+            None,
+        )),
+        ExtractedKind::Array { .. } | ExtractedKind::Object => {
+            let sub = parse_json_text(slice)?;
+            let encoded = encode_json_text(&sub);
+            Ok((
+                SqliteValue::Text(SmallText::from_string(encoded)),
+                Some(JSON_SUBTYPE),
+            ))
+        }
+    }
+}
+
+fn strict_extract_single_with_subtype(
+    input: &str,
+    path: &str,
+) -> Result<StrictExtractOutcome<(SqliteValue, Option<u32>)>> {
+    let Some(fast_path) = parse_fast_path(path) else {
+        return Ok(StrictExtractOutcome::UnsupportedPath);
+    };
+    match extract_strict_json_span(input, fast_path.as_slice()) {
+        StrictScanSpan::NotStrictJson => Ok(StrictExtractOutcome::NotStrictJson),
+        StrictScanSpan::Missing => Ok(StrictExtractOutcome::Matched((SqliteValue::Null, None))),
+        StrictScanSpan::Found(span) => Ok(StrictExtractOutcome::Matched(
+            extracted_span_to_sqlite_scalar(input, span)?,
+        )),
+    }
+}
+
+fn try_strict_json_extract_single(
+    input: &str,
+    path: &str,
+) -> Result<Option<(SqliteValue, Option<u32>)>> {
+    match strict_extract_single_with_subtype(input, path)? {
+        StrictExtractOutcome::Matched(val) => Ok(Some(val)),
+        StrictExtractOutcome::NotStrictJson => {
+            let root = parse_json5_text(input).map_err(|_| malformed_json())?;
+            let selected = resolve_path(&root, path)?;
+            let subtype = matches!(selected, Some(Value::Array(_) | Value::Object(_)))
+                .then_some(JSON_SUBTYPE);
+            Ok(Some((
+                selected.map_or(Ok(SqliteValue::Null), json_to_sqlite_scalar)?,
+                subtype,
+            )))
+        }
+        StrictExtractOutcome::UnsupportedPath => Ok(None),
+    }
+}
+
+fn try_strict_json_arrow(input: &str, path: &str) -> Result<Option<SqliteValue>> {
+    let Some(fast_path) = parse_fast_path(path) else {
+        return Ok(None);
+    };
+    let span = match extract_strict_json_span(input, fast_path.as_slice()) {
+        StrictScanSpan::NotStrictJson => {
+            let root = parse_json5_text(input).map_err(|_| malformed_json())?;
+            return json_arrow_value(&root, path).map(Some);
+        }
+        StrictScanSpan::Missing => return Ok(Some(SqliteValue::Null)),
+        StrictScanSpan::Found(span) => span,
+    };
+    let slice = &input[span.start..span.end];
+    let rendered = match span.kind {
+        ExtractedKind::Null
+        | ExtractedKind::True
+        | ExtractedKind::False
+        | ExtractedKind::Int
+        | ExtractedKind::Float
+        | ExtractedKind::String { has_escapes: false } => SqliteValue::Text(SmallText::new(slice)),
+        ExtractedKind::String { has_escapes: true }
+        | ExtractedKind::Array { .. }
+        | ExtractedKind::Object => {
+            let sub = parse_json_text(slice)?;
+            let encoded = encode_json_text(&sub);
+            SqliteValue::Text(SmallText::from_string(encoded))
+        }
+    };
+    Ok(Some(rendered))
+}
+
+fn try_strict_json_type(input: &str, path: Option<&str>) -> Result<FastLookup<&'static str>> {
+    let scan = match path {
+        None => extract_strict_json_span(input, &[]),
+        Some(path_expr) => {
+            let Some(fast_path) = parse_fast_path(path_expr) else {
+                return Ok(FastLookup::Fallback);
+            };
+            extract_strict_json_span(input, fast_path.as_slice())
+        }
+    };
+    match scan {
+        StrictScanSpan::NotStrictJson => {
+            let root = parse_json5_text(input).map_err(|_| malformed_json())?;
+            Ok(FastLookup::Resolved(json_type_value(&root, path)?))
+        }
+        StrictScanSpan::Missing => Ok(FastLookup::Resolved(None)),
+        StrictScanSpan::Found(span) => Ok(FastLookup::Resolved(Some(match span.kind {
+            ExtractedKind::Null => "null",
+            ExtractedKind::True => "true",
+            ExtractedKind::False => "false",
+            ExtractedKind::Int => "integer",
+            ExtractedKind::Float => "real",
+            ExtractedKind::String { .. } => "text",
+            ExtractedKind::Array { .. } => "array",
+            ExtractedKind::Object => "object",
+        }))),
+    }
+}
+
+fn try_strict_json_array_length(input: &str, path: Option<&str>) -> Result<FastLookup<usize>> {
+    let scan = match path {
+        None => extract_strict_json_span(input, &[]),
+        Some(path_expr) => {
+            let Some(fast_path) = parse_fast_path(path_expr) else {
+                return Ok(FastLookup::Fallback);
+            };
+            extract_strict_json_span(input, fast_path.as_slice())
+        }
+    };
+    match scan {
+        StrictScanSpan::NotStrictJson => {
+            let root = parse_json5_text(input).map_err(|_| malformed_json())?;
+            Ok(FastLookup::Resolved(json_array_length_value(&root, path)?))
+        }
+        StrictScanSpan::Missing => Ok(FastLookup::Resolved(None)),
+        StrictScanSpan::Found(span) => Ok(FastLookup::Resolved(Some(match span.kind {
+            ExtractedKind::Array { len } => len,
+            _ => 0,
+        }))),
+    }
 }
 
 /// Deserialize JSON5 without letting serde_json turn infinite floats into null.
 struct Json5Value(Value);
-
-impl<'de> serde::Deserialize<'de> for Value {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        // Strict JSON has already passed through the numeric-text rewrite,
-        // including escaping genuine strings that begin with its private tag.
-        deserializer.deserialize_any(JsonValueVisitor::<false>)
-    }
-}
 
 impl<'de> serde::Deserialize<'de> for Json5Value {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer
-            .deserialize_any(JsonValueVisitor::<true>)
-            .map(Self)
+        deserializer.deserialize_any(Json5ValueVisitor).map(Self)
     }
 }
 
-struct JsonValueVisitor<const ESCAPE_STRINGS: bool>;
+struct Json5ValueVisitor;
 
-impl<'de, const ESCAPE_STRINGS: bool> serde::de::DeserializeSeed<'de>
-    for JsonValueVisitor<ESCAPE_STRINGS>
-{
+impl<'de> serde::de::DeserializeSeed<'de> for Json5ValueVisitor {
     type Value = Value;
 
     fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
@@ -2699,11 +3691,11 @@ impl<'de, const ESCAPE_STRINGS: bool> serde::de::DeserializeSeed<'de>
     }
 }
 
-impl<'de, const ESCAPE_STRINGS: bool> serde::de::Visitor<'de> for JsonValueVisitor<ESCAPE_STRINGS> {
+impl<'de> serde::de::Visitor<'de> for Json5ValueVisitor {
     type Value = Value;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a JSON value")
+        formatter.write_str("a JSON5 value")
     }
 
     fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
@@ -2756,22 +3748,14 @@ impl<'de, const ESCAPE_STRINGS: bool> serde::de::Visitor<'de> for JsonValueVisit
     where
         E: serde::de::Error,
     {
-        self.visit_string(value.to_owned())
+        Ok(Value::String(InlineStr::new(value)))
     }
 
     fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(if ESCAPE_STRINGS {
-            json_string_value(value)
-        } else if let Some(raw) = as_number_text(&value)
-            && integer_needs_text(raw)
-        {
-            Value::IntegerText(raw.to_owned())
-        } else {
-            Value::String(value)
-        })
+        Ok(json_string_value(value))
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
@@ -2906,6 +3890,7 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
         Value::Bool(true) => append_jsonb_node(JSONB_TRUE_TYPE, &[], out),
         Value::Bool(false) => append_jsonb_node(JSONB_FALSE_TYPE, &[], out),
         Value::IntegerText(digits) => append_jsonb_node(JSONB_INT_TYPE, digits.as_bytes(), out),
+        Value::FloatText(raw) => append_jsonb_node(JSONB_FLOAT_TYPE, raw.as_bytes(), out),
         Value::HexInteger(integer) => {
             append_jsonb_node(JSONB_INT5_TYPE, integer.token.as_bytes(), out)
         }
@@ -2913,37 +3898,16 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
             // bd-t75hg: SQLite JSONB stores numeric payloads as the ASCII
             // text of the number (RFC-8259 text for INT/FLOAT), never as
             // fixed-width binary — a stock reader decodes binary payloads
-            // as garbage digits. Integers (including u64 beyond i64::MAX,
-            // which stock also keeps INT-typed) use decimal text; floats
-            // use serde's canonical shortest text, which matches stock's
-            // stored bytes whenever the source text was canonical.
+            // as garbage digits.
             if number.is_i64() || number.is_u64() {
                 append_jsonb_node(JSONB_INT_TYPE, number.to_string().as_bytes(), out)
             } else if let Some(float) = number.as_f64().filter(|value| value.is_finite()) {
-                // `{:?}` is Rust's shortest round-trip float text ("1e300",
-                // "-0.0", "0.1"), matching stock's stored bytes for
-                // canonical-form inputs; `Number::to_string` inserts a
-                // non-canonical '+' in exponents ("1e+300").
                 append_jsonb_node(JSONB_FLOAT_TYPE, format!("{float:?}").as_bytes(), out)
             } else {
-                // Unreachable: without `arbitrary_precision`, `Number` never
-                // holds a non-finite value. Non-finite JSON numbers are carried
-                // as tagged `Value::String` and encoded in that arm below
-                // (bd-yalqc). This keeps the match exhaustive.
                 append_jsonb_node(JSONB_FLOAT_TYPE, number.to_string().as_bytes(), out)
             }
         }
-        Value::String(text) => {
-            if let Some(raw) = as_number_text(text) {
-                // A REAL carried as its text (+Inf/-Inf as 9.0e+999 / 9e999, a
-                // constructed 1.0e+300): store that text as a FLOAT payload, as
-                // stock does, so the JSONB value round-trips (GH#212, bd-yalqc,
-                // bd-1nxwh).
-                append_jsonb_node(JSONB_FLOAT_TYPE, raw.as_bytes(), out)
-            } else {
-                append_jsonb_string(json_string_text(text), out)
-            }
-        }
+        Value::String(text) => append_jsonb_string(text, out),
         Value::Array(array) => {
             let mut payload = Vec::new();
             for item in array {
@@ -3090,31 +4054,31 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
             let text = std::str::from_utf8(payload).map_err(|error| {
                 FrankenError::function_error(format!("invalid JSONB float payload: {error}"))
             })?;
-            let normalized = if node_type == JSONB_FLOAT5_TYPE {
-                text.strip_prefix('+').unwrap_or(text)
+            if node_type == JSONB_FLOAT_TYPE {
+                // bd-1nxwh / bd-oahj7: a strict JSONB FLOAT payload stores its
+                // exact ASCII numeric text. Keep it directly as `FloatText`,
+                // matching `parse_json_text` so wire round trips preserve every
+                // digit and exponent spelling without formatting overhead.
+                if !is_strict_json_number(text) && text.parse::<f64>().is_err() {
+                    return Err(FrankenError::function_error(
+                        "invalid JSONB float payload text",
+                    ));
+                }
+                number_text_value(text)
             } else {
-                text
-            };
-            let float = normalized.parse::<f64>().map_err(|error| {
-                FrankenError::function_error(format!("invalid JSONB float payload text: {error}"))
-            })?;
-            if float.is_finite() {
-                // bd-1nxwh: a FLOAT payload is the number's text, which stock
-                // renders as stored (`1.0e+300`, `0.33333333333333332` from a
-                // constructed REAL). Keep that text when Rust's shortest form
-                // would print the value differently.
-                if node_type == JSONB_FLOAT_TYPE && normalized != format!("{float:?}") {
-                    number_text_value(normalized)
-                } else {
+                let normalized = text.strip_prefix('+').unwrap_or(text);
+                let float = normalized.parse::<f64>().map_err(|error| {
+                    FrankenError::function_error(format!(
+                        "invalid JSONB float payload text: {error}"
+                    ))
+                })?;
+                if float.is_finite() {
                     Value::Number(Number::from_f64(float).ok_or_else(|| {
                         FrankenError::function_error("invalid JSONB float payload")
                     })?)
+                } else {
+                    number_text_value(normalized)
                 }
-            } else {
-                // Non-finite payload (e.g. `9e999` +Inf): carry the raw source
-                // text in a tagged string so the JSONB value round-trips through
-                // extract/render (GH#212, bd-yalqc).
-                number_text_value(normalized)
             }
         }
         JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE | JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE => {
@@ -4383,11 +5347,10 @@ fn append_array_path(base: &str, index: usize) -> String {
 fn json_value_column(value: &Value) -> Result<SqliteValue> {
     match value {
         // Canonical writer keeps floats stock-canonical and renders non-finite
-        // numbers (tagged carriers) correctly (GH#212, bd-yalqc).
-        Value::Array(_) | Value::Object(_) => {
-            encode_json_text("json table value encode failed", value)
-                .map(|encoded| SqliteValue::Text(encoded.into()))
-        }
+        // numbers (FloatText) correctly (GH#212, bd-yalqc).
+        Value::Array(_) | Value::Object(_) => Ok(SqliteValue::Text(SmallText::from_string(
+            encode_json_text(value),
+        ))),
         _ => json_to_sqlite_scalar(value),
     }
 }
@@ -4513,6 +5476,7 @@ fn json_type_name(value: &Value) -> &'static str {
         Value::Bool(true) => "true",
         Value::Bool(false) => "false",
         Value::IntegerText(_) | Value::HexInteger(_) => "integer",
+        Value::FloatText(_) => "real",
         Value::Number(number) => {
             if number.is_i64() || number.is_u64() {
                 "integer"
@@ -4520,14 +5484,7 @@ fn json_type_name(value: &Value) -> &'static str {
                 "real"
             }
         }
-        // A tagged number-text carrier is a REAL, not text (GH#212, bd-1nxwh).
-        Value::String(text) => {
-            if as_number_text(text).is_some() {
-                "real"
-            } else {
-                "text"
-            }
-        }
+        Value::String(_) => "text",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
     }
@@ -4545,6 +5502,11 @@ fn json_to_sqlite_scalar(value: &Value) -> Result<SqliteValue> {
             // range. Keep the exact digits until this conversion is requested.
             SqliteValue::Float(raw.parse().expect("validated decimal integer"))
         }
+        Value::FloatText(raw) => {
+            // Exact float text parses to its IEEE-754 value (including ±Inf for
+            // overflowing literals like `9e999`, GH#212, bd-1nxwh).
+            SqliteValue::Float(raw.parse::<f64>().unwrap_or(0.0))
+        }
         Value::Number(number) => {
             if let Some(i) = number.as_i64() {
                 SqliteValue::Integer(i)
@@ -4555,10 +5517,6 @@ fn json_to_sqlite_scalar(value: &Value) -> Result<SqliteValue> {
                     SqliteValue::Float(u as f64)
                 }
             } else {
-                // `as_f64` parses the raw stored text, yielding +Inf/-Inf for a
-                // non-finite literal such as `9e999` (GH#212: json_extract of a
-                // non-finite JSON number reads back as a REAL Inf); fall back to
-                // an explicit parse of the raw text if the accessor declines.
                 let float = number
                     .as_f64()
                     .or_else(|| number.to_string().parse::<f64>().ok())
@@ -4566,23 +5524,11 @@ fn json_to_sqlite_scalar(value: &Value) -> Result<SqliteValue> {
                 SqliteValue::Float(float)
             }
         }
-        Value::String(text) => {
-            if let Some(raw) = as_number_text(text) {
-                // A tagged number-text carrier reads back as the REAL its text
-                // names: ±Inf for a non-finite number (GH#212), the value itself
-                // for a finite one (bd-1nxwh).
-                SqliteValue::Float(raw.parse::<f64>().unwrap_or(0.0))
-            } else {
-                SqliteValue::Text(json_string_text(text).into())
-            }
-        }
+        Value::String(text) => SqliteValue::Text(SmallText::new(text)),
         Value::Array(_) | Value::Object(_) => {
             // Canonical writer (not `serde_json::to_string`): stock-canonical
-            // floats and correct non-finite rendering of tagged carriers
-            // (GH#212). Falls back to `null` on the (unreachable) encode error.
-            let encoded =
-                encode_json_text("json scalar encode", value).unwrap_or_else(|_| "null".to_owned());
-            SqliteValue::Text(encoded.into())
+            // floats and exact FloatText rendering (GH#212).
+            SqliteValue::Text(SmallText::from_string(encode_json_text(value)))
         }
     })
 }
@@ -4597,8 +5543,8 @@ fn float_to_json(f: f64) -> Result<Value> {
     if f.is_infinite() {
         // +-Inf renders as the stock numeric literal `9.0e+999` / `-9.0e+999`
         // (GH#212). `serde_json::Number` cannot hold a non-finite value, so the
-        // constructed literal is carried as a tagged string (bd-yalqc); the
-        // canonical `9.0e+999` form is preserved through render.
+        // constructed literal is carried as `FloatText` (bd-yalqc, bd-oahj7);
+        // the canonical `9.0e+999` form is preserved through render.
         return Ok(number_text_value(if f > 0.0 {
             "9.0e+999"
         } else {
@@ -4610,9 +5556,7 @@ fn float_to_json(f: f64) -> Result<Value> {
     // `1.0e-05`, 1.0/3 is `0.33333333333333332`, 42.333333333333 is
     // `42.333333333333002`, -0.0 is `0.0`. A JSON `Number` renders in Rust's
     // shortest form, which matches that only for an integral value below
-    // 1e15 (`3.0`, `150.0`). Any other REAL is carried as the stock text, as
-    // a non-finite number is, so every renderer, the JSONB encoder, json_type
-    // and json_extract treat it as the REAL it is.
+    // 1e15 (`3.0`, `150.0`). Any other REAL is carried as `FloatText`.
     if f.fract() != 0.0 || f.abs() >= 1e15 || (f == 0.0 && f.is_sign_negative()) {
         return Ok(number_text_value(
             &fsqlite_types::value::format_sqlite_float(f),
@@ -4628,7 +5572,7 @@ fn sqlite_to_json(value: &SqliteValue) -> Result<Value> {
         SqliteValue::Null => Ok(Value::Null),
         SqliteValue::Integer(i) => Ok(Value::Number(Number::from(*i))),
         SqliteValue::Float(f) => float_to_json(*f),
-        SqliteValue::Text(text) => Ok(json_string_value(text.to_string())),
+        SqliteValue::Text(text) => Ok(Value::String(InlineStr::new(text))),
         // Stock `jsonAppendSqlValue`: a JSONB blob is embedded as the JSON
         // value it encodes; any other blob is an error.
         SqliteValue::Blob(bytes) => decode_jsonb_root(bytes)
@@ -4636,19 +5580,19 @@ fn sqlite_to_json(value: &SqliteValue) -> Result<Value> {
     }
 }
 
-fn write_pretty_value(value: &Value, indent: &str, depth: usize, out: &mut String) -> Result<()> {
+fn write_pretty_value(value: &Value, indent: &str, depth: usize, out: &mut String) {
     match value {
         Value::Array(array) => {
             if array.is_empty() {
                 out.push_str("[]");
-                return Ok(());
+                return;
             }
 
             out.push('[');
             out.push('\n');
             for (idx, item) in array.iter().enumerate() {
                 out.push_str(&indent.repeat(depth + 1));
-                write_pretty_value(item, indent, depth + 1, out)?;
+                write_pretty_value(item, indent, depth + 1, out);
                 if idx + 1 < array.len() {
                     out.push(',');
                 }
@@ -4656,26 +5600,20 @@ fn write_pretty_value(value: &Value, indent: &str, depth: usize, out: &mut Strin
             }
             out.push_str(&indent.repeat(depth));
             out.push(']');
-            Ok(())
         }
         Value::Object(object) => {
             if object.is_empty() {
                 out.push_str("{}");
-                return Ok(());
+                return;
             }
 
             out.push('{');
             out.push('\n');
             for (idx, (key, item)) in object.iter().enumerate() {
                 out.push_str(&indent.repeat(depth + 1));
-                let key_quoted = serde_json::to_string(key).map_err(|error| {
-                    FrankenError::function_error(format!(
-                        "json_pretty key-encode failed for `{key}`: {error}"
-                    ))
-                })?;
-                out.push_str(&key_quoted);
+                write_json_escaped_string(key, out);
                 out.push_str(": ");
-                write_pretty_value(item, indent, depth + 1, out)?;
+                write_pretty_value(item, indent, depth + 1, out);
                 if idx + 1 < object.len() {
                     out.push(',');
                 }
@@ -4683,13 +5621,12 @@ fn write_pretty_value(value: &Value, indent: &str, depth: usize, out: &mut Strin
             }
             out.push_str(&indent.repeat(depth));
             out.push('}');
-            Ok(())
         }
         _ => {
             // Scalars pretty-print identically to their minified form; the
             // canonical writer keeps floats stock-canonical and renders
-            // non-finite numbers (tagged carriers) correctly (GH#212, bd-yalqc).
-            write_canonical_json_text(value, out)
+            // FloatText verbatim (GH#212, bd-yalqc).
+            write_canonical_json_text(value, out);
         }
     }
 }
@@ -4856,12 +5793,11 @@ fn apply_array_insert_inner(
 
 fn edit_json_array_insert_with_subtypes(
     name: &str,
-    input: &Value,
+    mut edited: Value,
     args: &[SqliteValue],
     arg_subtypes: &[u32],
     start: usize,
 ) -> Result<Value> {
-    let mut edited = input.clone();
     let mut idx = start;
     while idx + 1 < args.len() {
         if args[idx].is_null() {
@@ -4892,43 +5828,48 @@ fn apply_edit(root: &mut Value, segments: &[PathSegment], new_value: Value, mode
         return;
     }
 
-    let original = root.clone();
     let (parent_segments, last) = segments.split_at(segments.len() - 1);
     let Some(last_segment) = last.first() else {
         return;
     };
+    // Only multi-segment paths can speculatively scaffold intermediate parents,
+    // so single-segment edits (`$.x`, `$[0]`) never need a full-tree clone.
+    let original = if parent_segments.is_empty() {
+        None
+    } else {
+        Some(root.clone())
+    };
     let Some(parent) = resolve_parent_for_edit(root, parent_segments, Some(last_segment), mode)
     else {
-        *root = original;
+        if let Some(original) = original {
+            *root = original;
+        }
         return;
     };
 
     let applied = match (parent, last_segment) {
-        (Value::Object(object), PathSegment::Key(key)) => {
-            let exists = object.contains_key(key.as_ref());
-            match mode {
-                EditMode::Set => {
-                    object.insert(key.to_string(), new_value);
+        (Value::Object(object), PathSegment::Key(key)) => match mode {
+            EditMode::Set => {
+                object.insert(key.as_ref(), new_value);
+                true
+            }
+            EditMode::Insert => {
+                if object.contains_key(key.as_ref()) {
+                    false
+                } else {
+                    object.append(key.as_ref(), new_value);
                     true
                 }
-                EditMode::Insert => {
-                    if exists {
-                        false
-                    } else {
-                        object.insert(key.to_string(), new_value);
-                        true
-                    }
-                }
-                EditMode::Replace => {
-                    if exists {
-                        object.insert(key.to_string(), new_value);
-                        true
-                    } else {
-                        false
-                    }
+            }
+            EditMode::Replace => {
+                if let Some(prior) = object.get_mut(key.as_ref()) {
+                    *prior = new_value;
+                    true
+                } else {
+                    false
                 }
             }
-        }
+        },
         (Value::Array(array), PathSegment::Index(index)) => {
             apply_array_edit(array, *index, new_value, mode)
         }
@@ -4951,7 +5892,7 @@ fn apply_edit(root: &mut Value, segments: &[PathSegment], new_value: Value, mode
         _ => false,
     };
 
-    if !applied {
+    if !applied && let Some(original) = original {
         *root = original;
     }
 }
@@ -5288,37 +6229,30 @@ fn collect_path_args<'a>(
     Ok(out)
 }
 
-fn normalize_arrow_path_arg<'a>(
-    name: &str,
-    value: &'a SqliteValue,
-    index: usize,
-) -> Result<Cow<'a, str>> {
+fn normalize_arrow_path_arg(value: &SqliteValue) -> Cow<'_, str> {
     // Stock's abbreviated paths: an INTEGER N is `$[N]` (`$[#-N]` when
     // negative); any other value is read as text, where `$...` is a full path,
     // `[N]` means `$[N]`, and anything else is an object label.
     let path = match value {
         SqliteValue::Integer(index_value) if *index_value >= 0 => {
-            return Ok(Cow::Owned(format!("$[{index_value}]")));
+            return Cow::Owned(format!("$[{index_value}]"));
         }
         SqliteValue::Integer(index_value) => {
-            return Ok(Cow::Owned(format!("$[#-{}]", index_value.unsigned_abs())));
+            return Cow::Owned(format!("$[#-{}]", index_value.unsigned_abs()));
         }
         SqliteValue::Text(path) => Cow::Borrowed(&**path),
         other => Cow::Owned(other.to_text()),
     };
     if path.starts_with('$') || path.is_empty() {
-        return Ok(path);
+        return path;
     }
     if path.len() >= 3 && path.starts_with('[') && path.ends_with(']') {
-        return Ok(Cow::Owned(format!("${path}")));
+        return Cow::Owned(format!("${path}"));
     }
-    let quoted = serde_json::to_string(path.as_ref()).map_err(|error| {
-        FrankenError::function_error(format!(
-            "{name} argument {} key encoding failed: {error}",
-            index + 1
-        ))
-    })?;
-    Ok(Cow::Owned(format!("$.{quoted}")))
+    let mut quoted = String::with_capacity(path.len() + 4);
+    quoted.push_str("$.");
+    write_json_escaped_string(path.as_ref(), &mut quoted);
+    Cow::Owned(quoted)
 }
 
 fn invoke_json_arrow(name: &str, args: &[SqliteValue], double_arrow: bool) -> Result<SqliteValue> {
@@ -5329,34 +6263,22 @@ fn invoke_json_arrow(name: &str, args: &[SqliteValue], double_arrow: bool) -> Re
         return Ok(SqliteValue::Null);
     }
 
+    let path = normalize_arrow_path_arg(&args[1]);
+    if let SqliteValue::Text(text) = &args[0] {
+        if double_arrow {
+            if let Some((value, _)) = try_strict_json_extract_single(text, path.as_ref())? {
+                return Ok(value);
+            }
+        } else if let Some(value) = try_strict_json_arrow(text, path.as_ref())? {
+            return Ok(value);
+        }
+    }
     let input = json_arg_value(name, args, 0)?;
-    let path = normalize_arrow_path_arg(name, &args[1], 1)?;
     if double_arrow {
         json_extract_value(&input, &[path.as_ref()])
     } else {
         json_arrow_value(&input, path.as_ref())
     }
-}
-
-fn collect_path_value_pairs(
-    name: &str,
-    args: &[SqliteValue],
-    start: usize,
-) -> Result<Vec<(String, SqliteValue)>> {
-    let mut pairs = Vec::with_capacity((args.len().saturating_sub(start)) / 2);
-    let mut idx = start;
-    while idx < args.len() {
-        if idx + 1 >= args.len() {
-            break;
-        }
-        // Stock skips a pair whose PATH is NULL.
-        if !args[idx].is_null() {
-            let path = path_arg(name, args, idx)?.to_owned();
-            pairs.push((path, args[idx + 1].clone()));
-        }
-        idx += 2;
-    }
-    Ok(pairs)
 }
 
 pub struct JsonFunc;
@@ -5379,8 +6301,8 @@ impl ScalarFunction for JsonFunc {
             return Ok(SqliteValue::Text(json(text)?.into()));
         }
         let input = json_arg_value(self.name(), args, 0)?;
-        let encoded = encode_json_text("json serialize failed", &input)?;
-        Ok(SqliteValue::Text(encoded.into()))
+        let encoded = encode_json_text(&input);
+        Ok(SqliteValue::Text(SmallText::from_string(encoded)))
     }
 
     fn num_args(&self) -> i32 {
@@ -5463,6 +6385,25 @@ impl ScalarFunction for JsonTypeFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
+        if let SqliteValue::Text(text) = &args[0] {
+            let fast_path = if args.len() == 2 {
+                if matches!(args[1], SqliteValue::Null) {
+                    None
+                } else {
+                    path_arg(self.name(), args, 1).ok().map(Some)
+                }
+            } else {
+                Some(None)
+            };
+            if let Some(path) = fast_path
+                && let FastLookup::Resolved(kind) = try_strict_json_type(text, path)?
+            {
+                return Ok(match kind {
+                    Some(kind) => SqliteValue::Text(SmallText::new(kind)),
+                    None => SqliteValue::Null,
+                });
+            }
+        }
         let input = json_arg_value(self.name(), args, 0)?;
         let path = if args.len() == 2 {
             if matches!(args[1], SqliteValue::Null) {
@@ -5503,6 +6444,13 @@ impl JsonExtractFunc {
         // SQLite returns NULL when any path argument is NULL.
         if args[1..].iter().any(|a| matches!(a, SqliteValue::Null)) {
             return Ok((SqliteValue::Null, None));
+        }
+        if args.len() == 2
+            && let SqliteValue::Text(text) = &args[0]
+            && let Ok(path) = path_arg(self.name(), args, 1)
+            && let Some(result) = try_strict_json_extract_single(text, path)?
+        {
+            return Ok(result);
         }
         let input = json_arg_value(self.name(), args, 0)?;
         if args.len() == 2 {
@@ -5816,22 +6764,7 @@ pub struct JsonSetFunc;
 
 impl ScalarFunction for JsonSetFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.is_empty() {
-            return Ok(SqliteValue::Null);
-        }
-        check_edit_arity(self.name(), args)?;
-        if matches!(args[0], SqliteValue::Null) {
-            return Ok(SqliteValue::Null);
-        }
-        let input = json_arg_value(self.name(), args, 0)?;
-        let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
-        let pairs = pairs_owned
-            .iter()
-            .map(|(path, value)| (path.as_str(), value.clone()))
-            .collect::<Vec<_>>();
-        let edited = edit_json_paths_value(&input, &pairs, EditMode::Set)?;
-        let encoded = encode_json_text("json edit encode failed", &edited)?;
-        Ok(SqliteValue::Text(encoded.into()))
+        self.invoke_with_arg_subtypes(args, &[])
     }
 
     fn invoke_with_arg_subtypes(
@@ -5849,14 +6782,14 @@ impl ScalarFunction for JsonSetFunc {
         let input = json_arg_value(self.name(), args, 0)?;
         let edited = edit_json_paths_value_with_subtypes(
             self.name(),
-            &input,
+            input,
             args,
             arg_subtypes,
             1,
             EditMode::Set,
         )?;
-        let encoded = encode_json_text("json edit encode failed", &edited)?;
-        Ok(SqliteValue::Text(encoded.into()))
+        let encoded = encode_json_text(&edited);
+        Ok(SqliteValue::Text(SmallText::from_string(encoded)))
     }
 
     fn num_args(&self) -> i32 {
@@ -5916,22 +6849,7 @@ pub struct JsonInsertFunc;
 
 impl ScalarFunction for JsonInsertFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.is_empty() {
-            return Ok(SqliteValue::Null);
-        }
-        check_edit_arity(self.name(), args)?;
-        if matches!(args[0], SqliteValue::Null) {
-            return Ok(SqliteValue::Null);
-        }
-        let input = json_arg_value(self.name(), args, 0)?;
-        let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
-        let pairs = pairs_owned
-            .iter()
-            .map(|(path, value)| (path.as_str(), value.clone()))
-            .collect::<Vec<_>>();
-        let edited = edit_json_paths_value(&input, &pairs, EditMode::Insert)?;
-        let encoded = encode_json_text("json edit encode failed", &edited)?;
-        Ok(SqliteValue::Text(encoded.into()))
+        self.invoke_with_arg_subtypes(args, &[])
     }
 
     fn invoke_with_arg_subtypes(
@@ -5949,14 +6867,14 @@ impl ScalarFunction for JsonInsertFunc {
         let input = json_arg_value(self.name(), args, 0)?;
         let edited = edit_json_paths_value_with_subtypes(
             self.name(),
-            &input,
+            input,
             args,
             arg_subtypes,
             1,
             EditMode::Insert,
         )?;
-        let encoded = encode_json_text("json edit encode failed", &edited)?;
-        Ok(SqliteValue::Text(encoded.into()))
+        let encoded = encode_json_text(&edited);
+        Ok(SqliteValue::Text(SmallText::from_string(encoded)))
     }
 
     fn num_args(&self) -> i32 {
@@ -6016,18 +6934,7 @@ pub struct JsonArrayInsertFunc;
 
 impl ScalarFunction for JsonArrayInsertFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.is_empty() {
-            return Ok(SqliteValue::Null);
-        }
-        check_edit_arity(self.name(), args)?;
-        if matches!(args[0], SqliteValue::Null) {
-            return Ok(SqliteValue::Null);
-        }
-        let input = json_arg_value(self.name(), args, 0)?;
-        let edited = edit_json_array_insert_with_subtypes(self.name(), &input, args, &[], 1)?;
-        Ok(SqliteValue::Text(
-            encode_json_text("json_array_insert encode failed", &edited)?.into(),
-        ))
+        self.invoke_with_arg_subtypes(args, &[])
     }
 
     fn invoke_with_arg_subtypes(
@@ -6044,10 +6951,10 @@ impl ScalarFunction for JsonArrayInsertFunc {
         }
         let input = json_arg_value(self.name(), args, 0)?;
         let edited =
-            edit_json_array_insert_with_subtypes(self.name(), &input, args, arg_subtypes, 1)?;
-        Ok(SqliteValue::Text(
-            encode_json_text("json_array_insert encode failed", &edited)?.into(),
-        ))
+            edit_json_array_insert_with_subtypes(self.name(), input, args, arg_subtypes, 1)?;
+        Ok(SqliteValue::Text(SmallText::from_string(encode_json_text(
+            &edited,
+        ))))
     }
 
     fn num_args(&self) -> i32 {
@@ -6107,22 +7014,7 @@ pub struct JsonReplaceFunc;
 
 impl ScalarFunction for JsonReplaceFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.is_empty() {
-            return Ok(SqliteValue::Null);
-        }
-        check_edit_arity(self.name(), args)?;
-        if matches!(args[0], SqliteValue::Null) {
-            return Ok(SqliteValue::Null);
-        }
-        let input = json_arg_value(self.name(), args, 0)?;
-        let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
-        let pairs = pairs_owned
-            .iter()
-            .map(|(path, value)| (path.as_str(), value.clone()))
-            .collect::<Vec<_>>();
-        let edited = edit_json_paths_value(&input, &pairs, EditMode::Replace)?;
-        let encoded = encode_json_text("json edit encode failed", &edited)?;
-        Ok(SqliteValue::Text(encoded.into()))
+        self.invoke_with_arg_subtypes(args, &[])
     }
 
     fn invoke_with_arg_subtypes(
@@ -6140,14 +7032,14 @@ impl ScalarFunction for JsonReplaceFunc {
         let input = json_arg_value(self.name(), args, 0)?;
         let edited = edit_json_paths_value_with_subtypes(
             self.name(),
-            &input,
+            input,
             args,
             arg_subtypes,
             1,
             EditMode::Replace,
         )?;
-        let encoded = encode_json_text("json edit encode failed", &edited)?;
-        Ok(SqliteValue::Text(encoded.into()))
+        let encoded = encode_json_text(&edited);
+        Ok(SqliteValue::Text(SmallText::from_string(encoded)))
     }
 
     fn num_args(&self) -> i32 {
@@ -6216,7 +7108,7 @@ impl ScalarFunction for JsonRemoveFunc {
         let input = json_arg_value(self.name(), args, 0)?;
         if args.len() == 1 {
             // With just the JSON argument, validate and return minified.
-            let encoded = encode_json_text("json serialize failed", &input)?;
+            let encoded = encode_json_text(&input);
             return Ok(SqliteValue::Text(SmallText::from_string(encoded)));
         }
         // SQLite returns NULL when any path argument is NULL.
@@ -6224,11 +7116,11 @@ impl ScalarFunction for JsonRemoveFunc {
             return Ok(SqliteValue::Null);
         }
         let paths = collect_path_args(self.name(), args, 1)?;
-        let Some(edited) = json_remove_value(&input, &paths)? else {
+        let Some(edited) = json_remove_value(input, &paths)? else {
             return Ok(SqliteValue::Null);
         };
-        let encoded = encode_json_text("json_remove encode failed", &edited)?;
-        Ok(SqliteValue::Text(encoded.into()))
+        let encoded = encode_json_text(&edited);
+        Ok(SqliteValue::Text(SmallText::from_string(encoded)))
     }
 
     fn num_args(&self) -> i32 {
@@ -6300,9 +7192,9 @@ impl ScalarFunction for JsonPatchFunc {
         }
         let input = json_arg_value(self.name(), args, 0)?;
         let patch = json_arg_value(self.name(), args, 1)?;
-        let merged = json_patch_value(&input, &patch);
-        let encoded = encode_json_text("json_patch encode failed", &merged)?;
-        Ok(SqliteValue::Text(encoded.into()))
+        let merged = json_patch_value(input, patch);
+        let encoded = encode_json_text(&merged);
+        Ok(SqliteValue::Text(SmallText::from_string(encoded)))
     }
 
     fn num_args(&self) -> i32 {
@@ -6334,7 +7226,7 @@ impl ScalarFunction for JsonbPatchFunc {
         }
         let input = json_arg_value(self.name(), args, 0)?;
         let patch = json_arg_value(self.name(), args, 1)?;
-        let merged = json_patch_value(&input, &patch);
+        let merged = json_patch_value(input, patch);
         let blob = encode_jsonb_root(&merged)?;
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
@@ -6357,6 +7249,25 @@ impl ScalarFunction for JsonArrayLengthFunc {
         }
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
+        }
+        if let SqliteValue::Text(text) = &args[0] {
+            let fast_path = if args.len() == 2 {
+                if matches!(args[1], SqliteValue::Null) {
+                    None
+                } else {
+                    path_arg(self.name(), args, 1).ok().map(Some)
+                }
+            } else {
+                Some(None)
+            };
+            if let Some(path) = fast_path
+                && let FastLookup::Resolved(len) = try_strict_json_array_length(text, path)?
+            {
+                return Ok(match len {
+                    Some(len) => SqliteValue::Integer(usize_to_i64(self.name(), len)?),
+                    None => SqliteValue::Null,
+                });
+            }
         }
         let input = json_arg_value(self.name(), args, 0)?;
         let path = if args.len() == 2 {
@@ -6440,7 +7351,7 @@ impl ScalarFunction for JsonPrettyFunc {
         } else {
             None
         };
-        let s = json_pretty_value(&input, indent)?;
+        let s = json_pretty_value(&input, indent);
         Ok(SqliteValue::Text(SmallText::from_string(s)))
     }
 
@@ -7648,12 +8559,12 @@ mod tests {
             ("$.a[0]", number_text_value("9e999")),
             ("$.a[1].b", number_text_value("-9e999")),
             ("$.a[1].c", Value::Null),
-            ("$.s", Value::String("Infinity".to_owned())),
+            ("$.s", Value::String(InlineStr::new("Infinity"))),
         ] {
             assert_eq!(resolve_path(&value, path).unwrap(), Some(&expected));
         }
         assert_eq!(
-            encode_json_text("nested JSON5", &value).unwrap(),
+            encode_json_text(&value),
             r#"{"a":[9e999,{"b":-9e999,"c":null}],"s":"Infinity"}"#
         );
     }
@@ -7671,11 +8582,11 @@ mod tests {
         .expect("ordinary JSON5 values keep their representation");
         for (key, expected) in [
             ("Infinity", Value::Number(1_u64.into())),
-            ("NaN", Value::String("NaN".to_owned())),
+            ("NaN", Value::String(InlineStr::new("NaN"))),
             ("u", Value::Number(u64::MAX.into())),
             ("i", Value::Number(i64::MIN.into())),
-            ("v", Value::String("\u{000B}".to_owned())),
-            ("s", Value::String("\\Infinity".to_owned())),
+            ("v", Value::String(InlineStr::new("\u{000B}"))),
+            ("s", Value::String(InlineStr::new("\\Infinity"))),
             ("b", Value::Bool(true)),
             ("n", Value::Null),
             ("a", Value::Array(Vec::new())),
@@ -10828,7 +11739,7 @@ mod tests {
         let dup: Vec<_> = object
             .iter()
             .filter(|(key, _)| key == "dup")
-            .map(|(_, value)| encode_json_text("duplicate", value).unwrap())
+            .map(|(_, value)| encode_json_text(value))
             .collect();
         assert_eq!(dup, ["18446744073709551617", "-0"]);
         for raw in ["+18446744073709551616", "-9223372036854775809", "-0"] {
@@ -11653,7 +12564,7 @@ mod tests {
         text5.push((u8::try_from(payload.len()).unwrap() << 4) | JSONB_TEXT5_TYPE);
         text5.extend_from_slice(payload);
         let decoded = decode_jsonb_root(&text5).expect("TEXT5 decodes");
-        assert_eq!(decoded, Value::String("it's".to_owned()));
+        assert_eq!(decoded, Value::String(InlineStr::new("it's")));
     }
 
     /// bd-t75hg: INT5/FLOAT5 numeric text (JSON5 forms) decodes numerically.
@@ -11673,5 +12584,113 @@ mod tests {
             decode_jsonb_root(&float5).unwrap(),
             Value::Number(Number::from_f64(0.5).unwrap()),
         );
+    }
+
+    /// bd-oahj7: one-pass parser, compact Value/Object layout, FxHashMap large
+    /// object lookup, and zero-allocation streaming single-path extraction edge cases.
+    #[test]
+    fn bd_oahj7_single_pass_parser_and_streaming_extract_invariants() {
+        assert!(
+            std::mem::size_of::<InlineStr>() <= 24,
+            "InlineStr must match String size (24B), got {}",
+            std::mem::size_of::<InlineStr>()
+        );
+        assert!(
+            std::mem::size_of::<Object>() <= 32,
+            "Object must stay compact with boxed index (<=32B), got {}",
+            std::mem::size_of::<Object>()
+        );
+        assert!(
+            std::mem::size_of::<Value>() <= 40,
+            "Value must stay compact (<=40B), got {}",
+            std::mem::size_of::<Value>()
+        );
+
+        // Large object (>= 64 members) exercises FxHashMap index + duplicate keys.
+        let mut members = Vec::new();
+        for i in 0..80 {
+            members.push(format!(r#""key_{i:02}":{i}.50"#));
+        }
+        members.push(r#""key_10":999.00"#.to_owned());
+        members.push(
+            r#""long_heap_key_beyond_22_bytes":"long_heap_value_beyond_22_bytes""#.to_owned(),
+        );
+        let wide_doc = format!("{{{}}}", members.join(","));
+        assert_eq!(json_valid(&wide_doc, None), 1);
+        assert_eq!(
+            json_extract(&wide_doc, &["$.key_10"]).unwrap(),
+            SqliteValue::Float(10.5)
+        );
+        assert_eq!(
+            json_extract(&wide_doc, &["$.key_79"]).unwrap(),
+            SqliteValue::Float(79.5)
+        );
+        assert_eq!(
+            json_extract(&wide_doc, &["$.long_heap_key_beyond_22_bytes"]).unwrap(),
+            SqliteValue::Text(SmallText::new("long_heap_value_beyond_22_bytes"))
+        );
+        let edited = json_set(&wide_doc, &[("$.key_10", SqliteValue::Integer(42))]).unwrap();
+        assert_eq!(
+            json_extract(&edited, &["$.key_10"]).unwrap(),
+            SqliteValue::Integer(42)
+        );
+        assert!(edited.contains(r#""key_79":79.50"#));
+        assert!(edited.contains(r#""key_10":999.00"#));
+
+        // Escaped keys and surrogate pairs in streaming extractor and parser.
+        let escaped_doc = r#"{"\u0061":1.50,"a":2.50,"emoji":"\uD83D\uDE00","arr":[1,2,3]}"#;
+        assert_eq!(json_valid(escaped_doc, None), 1);
+        assert_eq!(
+            json_extract(escaped_doc, &["$.a"]).unwrap(),
+            SqliteValue::Float(1.5)
+        );
+        assert_eq!(
+            json_extract(escaped_doc, &["$.emoji"]).unwrap(),
+            SqliteValue::Text(SmallText::new("😀"))
+        );
+        assert_eq!(json_type(escaped_doc, Some("$.a")).unwrap(), Some("real"));
+        assert_eq!(
+            json_array_length(escaped_doc, Some("$.arr")).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            json_array_length(escaped_doc, Some("$.a")).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            json_array_length(escaped_doc, Some("$.nope")).unwrap(),
+            None
+        );
+
+        // Lone surrogates, unescaped controls, trailing syntax errors MUST fail.
+        for bad in [
+            r#"{"a":"\uD83D"}"#,
+            r#"{"a":"\uDC00"}"#,
+            r#"{"a":"\uD83D\u0041"}"#,
+            "{\"a\":\"line\nbreak\"}",
+            r#"{"x":1, broken}"#,
+            r#"{"x":1} trailing"#,
+            r#"{"x":01}"#,
+            r#"{"x":1.}"#,
+            r#"{"x":.5}"#,
+            r#"{"x":1e}"#,
+        ] {
+            assert_eq!(json_valid(bad, Some(1)), 0, "strict invalid: {bad}");
+        }
+        assert!(json_extract(r#"{"x":1, broken}"#, &["$.x"]).is_err());
+
+        // Malformed JSON must error before bad path error (SQLite error precedence).
+        let err = json_extract("{bad", &["not_a_path"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("malformed JSON"), "got: {err}");
+
+        // Nesting depth boundary: 1000 allowed, 1001 rejected.
+        let deep_ok = format!("{}{}", "[".repeat(1000), "]".repeat(1000));
+        let deep_err = format!("{}{}", "[".repeat(1001), "]".repeat(1001));
+        assert_eq!(json_valid(&deep_ok, Some(1)), 1);
+        assert_eq!(json_valid(&deep_err, Some(1)), 0);
+        assert!(parse_json_text(&deep_ok).is_ok());
+        assert!(parse_json_text(&deep_err).is_err());
     }
 }
