@@ -94,6 +94,107 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-24 - SMALL WIN (landed as dfd2930a8; inside every kill line and every instruction band; instructions only, time a replicated TIE, so its count_star cycles prediction missed): a transaction's read cache hashes a page into hashbrown's tag bits as well as its buckets, so a miss compares the few keys whose tag matches; count_star -7.40M Ir (x12.63 -> x10.89 stock 3.54.1), rowid_lookups_200k -37.4M (x4.934 -> x4.853) (bd-read-miss-path-cost-w8msq, serial read lane rounds 15-16, lever PH v2)
+
+- Target: count_star, as in PH v1's entry below. Of its 7,078 Ir per cold page, 1,123 were hashbrown probing in the two
+  `txn_read_cache` lookups that miss on every page. Under the identity hash every page has hashbrown tag 0.
+- Touched:
+  - `crates/fsqlite-types/src/lib.rs`: new `PageNumberTagHasher` / `PageNumberTagBuildHasher`. The page number is kept
+    in the low 57 bits and a Fibonacci mix fills the top 7. `PageNumberHasher` stays the identity hash.
+  - `crates/fsqlite-pager/src/pager.rs`: `type PageReadCacheMap = HashMap<PageNumber, PageData,
+    PageNumberTagBuildHasher>`, used for `SimpleTransaction::txn_read_cache` and `RetainedMemoryOverlay::pages`
+    (which takes the read cache by `mem::take`). Two field types and two constructors; every write set and MVCC map
+    keeps the identity hash.
+- Keepers, fsqlite-types `tests::page_number_tag_hasher`, against the real `PageNumberBuildHasher`:
+  - the low 57 bits equal the identity hash;
+  - 16 distinct tags in every 16-page window at four starting points;
+  - identical std map and set iteration order through 40,000 random inserts, removes and shrinks;
+  - under 15,000 key comparisons for 7,499 misses against cached pages 2..501 (the identity hash: about 448k).
+  - Mutants: m1 (tag hasher = identity) fails `consecutive_pages_take_distinct_tags` and
+    `misses_against_a_run_of_cached_pages_compare_few_keys`; m2 (a plain multiply) fails
+    `maps_iterate_their_pages_in_identity_hash_order` and `the_hash_is_the_identity_hash_below_its_top_seven_bits`.
+- Prediction (bead, before the build): count_star -6.8M to -7.6M; rowid -28M to -40M; scan_filter_agg and
+  window_row_number -6.5M to -8.5M; bulk within +-0.05%; count_star cycles 0.90-0.97. Kill: count_star under 5.0M;
+  any judged row worse than +0.1% Ir; a replicated LOSE above 1%.
+- Result (one rch job on vmi1227854, -j 1, K=6; parent c966d5040 cargo ELF 79c0263aeebca1ab, its sources equal git;
+  lever 96e01f5cbe0c98cf; stock sqlite3 3.54.1 live; thinkstation1):
+  - Callgrind, all inside their bands:
+    - count_star 53.843M -> 46.444M;
+    - rowid_lookups_200k 2,265.90M -> 2,228.49M;
+    - scan_filter_agg -7.96M; window_row_number -7.96M; join_no_index_5k_x_5k -0.002%.
+  - Judge v2b + count_star (`scratchpad/rl15/judge_run_v2b_cs.sh`): runs r1 valid (2.98), r2 VOID (3.91), r3 valid
+    (2.51).
+    - Instruction minima at or under 1.0000 on every row: count_star 0.8536, rowid 0.9836, memory_script_200k
+      0.9828, delete 0.9928, update 0.9953, bulk_insert_1M_one_txn 0.9988 (PH v1: +0.26%), the scans 0.9924 to
+      0.9994.
+    - Time (recorded under the host's powersave governor; Ir is primary, bd-j0jc0 / bd-gvews): every row-metric a
+      replicated TIE, no replicated LOSE.
+    - count_star cycles 0.928 WIN / 0.992 TIE: the prediction (a WIN) missed.
+- Gate (c966d5040 + ph2.patch, rch):
+  - clippy -D warnings, types and pager, all targets: red only on clippy::too_long_first_doc_paragraph for the two
+    new doc comments; green with the doc-only fix (vmi1152480).
+  - types lib 597 passed (the four keepers among them); pager lib 1,132 passed, 1 failed:
+    `test_deferred_upgrade_busy_when_writer_active`, its 10 ms bound (the bd-gp7t8 class). 5 + 5 sequential reruns:
+    lever 4/5, parent 5/5. 10 + 10 interleaved in one job on hz4 (ELFs 06d74494 lever, 313e3dba parent): 0 and 0
+    failures.
+  - e2e concurrent-writer / MVCC targets: 11 binaries, 84 passed (vmi1227854).
+  - fsqlite crate, 124 targets in 7 batches: fsq1 (lib + 19) 880 passed (vmi1149989); fsq2 36 passed (vmi1227854);
+    fsq3 35 passed, 1 failed: `eq_rowid_bounded_covering_aggregates_avoid_table_reads` at line 558, bd-qrn03's red
+    (on every base from 1cfb9bf40 until its fix 86099995d / 0fc925e13; this base lies between); fsq4 52 passed;
+    fsq5 47 passed; fsq6 37 passed; fsq7 24 passed (fsq3-7 on ovh-a).
+  - Rebased onto e993caac1 (no intervening commit touches the read cache's type, its constructors or the hashers):
+    clippy -D warnings, types and pager, all targets, clean; types lib 597 passed; pager lib 1,157 passed, 0 failed,
+    the timing test among them (ovh-a).
+- What remains on count_star (7,078 -> about 6,100 Ir a page against stock's 568):
+  - the page cache's miss machinery and eviction (about 1,900 a page; page_cache.rs, the point lane's);
+  - the 4 KiB copy-out (about 570);
+  - the VFS read's full Cx::checkpoint (380);
+  - the WAL lookup (342).
+  - Lever SW (a one-worker count through the snapshot reader) is the next cut.
+- Retry / extend condition: another map asked mostly for pages it does not hold, beside a run of pages it does (a
+  page-cache index, a seek cache), may take `PageNumberTagBuildHasher` with its own miss-comparison keeper. A write
+  set or MVCC map may not: there every lookup already ends at its key's bucket (PH v1, bulk +0.26%).
+
+## 2026-11-23 - REJECTED on its regression kill line (bulk_insert_1M_one_txn +18.4M Ir, +0.26%, against +0.1%), with count_star -7.39M (x12.63 -> x10.89 stock 3.54.1) and rowid_lookups_200k -37.4M inside their predictions: `PageNumberHasher` keeps the page number in the hash's low 57 bits and puts a Fibonacci mix in the top 7 (bd-read-miss-path-cost-w8msq, serial read lane round 15, lever PH v1)
+
+- Target: count_star (`SELECT count(*) FROM t`, 1M rows), the worst read ratio.
+  - Callgrind on rl14 P_sm1 (8e3661d94, cargo ELF e13b836ed6e7c205; pager / types / mvcc / btree sources equal main
+    3e52ed08d except pager/encrypt.rs): 53.83M against stock 3.54.1's 4.26M over 7,605 page reads.
+  - Of that, 8.54M (1,123 Ir a page) was hashbrown probing inlined into two `txn_read_cache` lookups that miss on every
+    page: the resident lookup of `SimpleTransaction::get_page` (4.63M) and `cache_transaction_read_page` (3.91M).
+- Cause:
+  - `PageNumberHasher` was the identity hash. hashbrown tags a bucket with the hash's top 7 bits and compares keys only
+    in probed buckets whose tag matches, so every page had tag 0 and every probe compared every full bucket.
+  - The 500-page read cache holds pages 2..501 contiguously in 1,024 buckets. A miss mapping into that run probes
+    about 8 full groups, about 128 key comparisons.
+- Touched (not landed; patch `scratchpad/rl15/ph.patch`, sha256 c5e60ce2d6e96320): `crates/fsqlite-types/src/lib.rs`
+  only. `write_u32` returns `page | (page * 0x9E3779B97F4A7C15 & top-7-bits)`.
+  - The low bits are unchanged, so every map's layout and iteration order is identical.
+  - Keepers: the low 57 bits equal the page; 16 distinct tags in every 16-page window; std map and set iteration
+    order identical to the identity hash through 40,000 random operations; under 15,000 comparisons for 7,499
+    misses against pages 2..501.
+- Prediction (bead, before the build): count_star -6.5M to -8.5M; rowid -30M to -48M; each scan row -4M to -10M;
+  write rows no worse than +0.1%. Kill: count_star under 4.0M; any judged row worse than +0.1% Ir; a replicated LOSE.
+- Result (one rch job on vmi1149989, -j 1, K=6; parent 3e52ed08d cargo ELF 7d2ea5f5031a4faa, its sources equal git;
+  lever e0de95d3fb6a2322; stock sqlite3 3.54.1 live; thinkstation1):
+  - Callgrind instructions, inside every predicted band:
+    - count_star 53.840M -> 46.446M;
+    - rowid_lookups_200k 2,265.89M -> 2,228.49M (x4.934 -> x4.853);
+    - scan_filter_agg -7.96M; window_row_number -7.96M; join_no_index_5k_x_5k -0.006%.
+  - Judge v2b + count_star, two runs, both VOID (null max |z| 4.41, 3.84). Instruction minima over 6 layouts per arm:
+    - bulk_insert_1M_one_txn 6,979.7M -> 6,998.1M, +0.26% on every layout (Q equal to P). LINE 2 CROSSED.
+    - count_star -14.6%, rowid -1.64%, memory_script_200k -1.62%, delete -0.79%, update -0.53%, the scans
+      -0.06% to -0.68%.
+  - Time (indicative only, both runs void):
+    - count_star cycles 0.939 / 0.944 and rowid cycles 0.989 / 0.985, WIN in both runs;
+    - update_10pct_300k cpu 1.082 / 1.088 LOSE at cycles TIE and Ir -0.53%, DS's round-13 pattern on an unrelated
+      lever.
+- Why bulk lost: the mix is about 3 more instructions per hash. A sequential bulk insert's write-set lookups already
+  end at the key's own bucket under the identity hash (a hit compares once, a miss lands on an empty bucket), so
+  every hash pays for tags that save nothing.
+- Retry condition (taken at once as PH v2): the tag hash only on maps that are asked for many pages they do not hold
+  beside a run of pages they do (the transaction read cache). Write sets and MVCC maps keep the identity hash.
+
 ## 2026-11-26 - FIX (landed as 57a7b6c82; a correctness fix measured like a lever, inside its kill lines by exact instruction counts; time cells VOID under the powersave governor): the first attacher's open reclaims EOF holes a concurrent holder left below a peer's growth, gated by a `<db>.fsqlite-holes` marker that such a growth publishes (bd-ioq6x, GH#346, single-writer lane r16/r17)
 
 - Target: GH#346's at-rest leak. A CONCURRENT holder's EOF pages below a peer's committed growth are in no b-tree
