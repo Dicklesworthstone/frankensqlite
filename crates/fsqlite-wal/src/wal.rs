@@ -515,7 +515,7 @@ impl<F: VfsFile> WalFile<F> {
         // Headers of the frames validated below extend the remembered prefix
         // only when it reaches this handle's frame count.
         let mut validated_headers = Vec::new();
-        let record_headers = self.frame_headers.len() == self.frame_count;
+        let header_room = self.remaining_frame_header_slots();
 
         // A checkpoint that restarts the WAL in place leaves the previous
         // generation's frames past this generation's end, so until the new
@@ -606,7 +606,7 @@ impl<F: VfsFile> WalFile<F> {
 
             new_running_checksum = expected;
             new_frame_count += 1;
-            if record_headers {
+            if validated_headers.len() < header_room {
                 validated_headers.push(RecordedFrameHeader::from(&frame_header));
             }
 
@@ -674,17 +674,24 @@ impl<F: VfsFile> WalFile<F> {
         }
     }
 
+    /// Additional headers we can cache without exceeding the cap or leaving
+    /// a hole between the cached prefix and the next appended frame.
+    fn remaining_frame_header_slots(&self) -> usize {
+        if self.frame_headers.len() == self.frame_count {
+            self.frame_header_cap.saturating_sub(self.frame_count)
+        } else {
+            0
+        }
+    }
+
     /// The frame headers in a prepared batch about to be written at the
     /// frame count, exactly as they will be on disk; empty when the
     /// remembered prefix does not reach the frame count.
     fn prepared_batch_headers(&self, prepared_frame_bytes: &[u8]) -> Vec<RecordedFrameHeader> {
-        if self.frame_headers.len() != self.frame_count || self.frame_count >= self.frame_header_cap
-        {
-            return Vec::new();
-        }
-        let frame_size = self.frame_size();
-        let mut headers = Vec::with_capacity(prepared_frame_bytes.len() / frame_size);
-        for frame in prepared_frame_bytes.chunks_exact(frame_size) {
+        let frames = prepared_frame_bytes.chunks_exact(self.frame_size());
+        let count = frames.len().min(self.remaining_frame_header_slots());
+        let mut headers = Vec::with_capacity(count);
+        for frame in frames.take(count) {
             let Ok(header) = WalFrameHeader::from_bytes(&frame[..WAL_FRAME_HEADER_SIZE]) else {
                 break;
             };
@@ -2432,7 +2439,7 @@ impl<F: VfsFile> WalFile<F> {
             let mut running_checksum = self.running_checksum;
             let mut last_commit = None;
             let mut frames_written = 0usize;
-            let record_headers = self.frame_headers.len() == start_frame_index;
+            let header_room = self.remaining_frame_header_slots();
             let mut written_headers = Vec::new();
 
             #[cfg(any(test, feature = "fault-injection"))]
@@ -2459,7 +2466,7 @@ impl<F: VfsFile> WalFile<F> {
                         running_checksum,
                         self.big_endian_checksum,
                     )?;
-                    if record_headers {
+                    if written_headers.len() < header_room {
                         written_headers.push(RecordedFrameHeader {
                             page_number: frame.page_number,
                             db_size: frame.db_size_if_commit,
@@ -5873,6 +5880,35 @@ mod tests {
             reader.read_frame_header(&cx, 0).expect("disk").page_number,
             1
         );
+    }
+
+    #[test]
+    fn prepared_batch_collects_only_headers_that_fit_the_remaining_prefix() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create");
+        let page = sample_page(1);
+        wal.set_recorded_frame_header_cap(2);
+        wal.append_frame(&cx, 1, &page, 1).unwrap();
+        let frames = [
+            frame_ref(2, &page, 0),
+            frame_ref(3, &page, 0),
+            frame_ref(4, &page, 4),
+        ];
+        let (mut bytes, transforms) = prepare_test_frame_bytes(&wal, &frames);
+        let headers = wal.prepared_batch_headers(&bytes);
+        assert_eq!(headers.len(), 1, "only one more header fits before I/O");
+        assert_eq!(headers[0].page_number, 2);
+        wal.append_prepared_frame_bytes(&cx, &mut bytes, &transforms)
+            .unwrap();
+        assert_eq!(wal.frame_count(), 4);
+        assert_eq!(wal.frame_headers.len(), 2);
+        assert_eq!(wal.read_frame_header(&cx, 3).unwrap().db_size, 4);
+
+        // Raising the cap after a gap cannot turn later headers into a prefix.
+        wal.set_recorded_frame_header_cap(8);
+        assert!(wal.prepared_batch_headers(&bytes).is_empty());
     }
 
     #[test]
