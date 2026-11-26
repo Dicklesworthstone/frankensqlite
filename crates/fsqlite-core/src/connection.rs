@@ -100327,6 +100327,10 @@ impl Connection {
                 using_column_projections,
                 registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
             });
+        // bd-k5isc: arm the correlated-EXISTS memo across GROUP BY key,
+        // aggregate FILTER/arg, HAVING, and ORDER BY evaluation. All child
+        // tables and materialized CTEs are read-only for this SELECT.
+        let _exists_memo_guard = self.arm_exists_probe_memo();
         let join_sources: Vec<&TableOrSubquery> = if let SelectCore::Select {
             from: Some(from_clause),
             ..
@@ -100817,20 +100821,13 @@ impl Connection {
                                 eval_group_agg_join_expr(effective, &rows, &col_map)
                             })?
                         } else if expr_has_any_subquery(expr) {
-                            let inlined = self
-                                .inline_subqueries_in_expr_with_using(
-                                    expr,
-                                    representative_row,
-                                    &col_map,
-                                    using_skip,
-                                )
-                                .await?;
-                            self.eval_join_expr_with_using_registry(
-                                &inlined,
+                            self.eval_row_expr_allowing_subqueries_with_using(
+                                expr,
                                 representative_row,
                                 &col_map,
                                 using_skip,
-                            )?
+                            )
+                            .await?
                         } else {
                             self.eval_join_expr_with_using_registry(
                                 expr,
@@ -101262,20 +101259,13 @@ impl Connection {
                                 eval_group_agg_join_expr(effective, &rows, &col_map)
                             })?
                         } else if expr_has_any_subquery(expr) {
-                            let inlined = self
-                                .inline_subqueries_in_expr_with_using(
-                                    expr,
-                                    representative_row,
-                                    &col_map,
-                                    using_skip,
-                                )
-                                .await?;
-                            self.eval_join_expr_with_using_registry(
-                                &inlined,
+                            self.eval_row_expr_allowing_subqueries_with_using(
+                                expr,
                                 representative_row,
                                 &col_map,
                                 using_skip,
-                            )?
+                            )
+                            .await?
                         } else {
                             self.eval_join_expr_with_using_registry(
                                 expr,
@@ -104119,12 +104109,6 @@ impl Connection {
         row: &[SqliteValue],
         col_map: &[(String, String, bool)],
     ) -> Option<Result<SqliteValue>> {
-        // The direct probe reads MemDB rows. In parity-cert file-backed mode
-        // that mirror may be intentionally unhydrated; fall through so the
-        // nested SELECT uses the pager-backed path instead.
-        if !self.join_mem_scan_safe() {
-            return None;
-        }
         // Gate: no CTE, no compounds.
         if subquery.with.is_some() || !subquery.body.compounds.is_empty() {
             return None;
@@ -104161,145 +104145,172 @@ impl Connection {
         if !from.joins.is_empty() {
             return None;
         }
-        let (table_name, inner_binding_name) = match &from.source {
-            TableOrSubquery::Table { name, alias, .. }
-                if name.schema.is_none() && self.local_view_index_for_relation(name).is_none() =>
-            {
-                (&name.name, alias.as_deref().unwrap_or(&name.name))
+        let (table_name, inner_binding_name, qual_name) = match &from.source {
+            TableOrSubquery::Table { name, alias, .. } if name.schema.is_none() => {
+                (&name.name, alias.as_deref().unwrap_or(&name.name), name)
             }
             _ => return None,
         };
-        let table_name_key = table_name.to_ascii_lowercase();
-        // TEMP relations and names participating in TEMP-over-main shadowing
-        // require namespace-aware binding and storage routing. The ordinary
-        // fallback already implements that resolver; this root-page memo does
-        // not, so keep its admission surface to unshadowed MAIN tables.
-        if self.temp_table_names.borrow().contains(&table_name_key)
-            || self
-                .shadowed_main_tables
-                .borrow()
-                .contains_key(&table_name_key)
-        {
-            return None;
-        }
-        let table_entry = self
-            .schema
-            .borrow()
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(table_name))?
-            .clone();
-        // Gate: WHERE clause must exist.
+        // Gate: WHERE clause must exist and decompose into 1..=N AND terms.
         let where_expr = where_clause.as_ref()?;
-        // Decompose WHERE into AND terms.
         let terms = decompose_where_simple(where_expr);
-        // Residual filters need the full metadata-aware evaluator and would
-        // also have to participate in the memo key. Keep this optimized path
-        // to one proven correlated equality.
-        if terms.len() != 1 {
+        if terms.is_empty() {
             return None;
         }
-        let inner_table_names = if table_name.eq_ignore_ascii_case(inner_binding_name) {
-            vec![table_name.as_str()]
+        let inner_table_names_buf = [table_name.as_str(), inner_binding_name];
+        let inner_table_names: &[&str] = if table_name.eq_ignore_ascii_case(inner_binding_name) {
+            &inner_table_names_buf[..1]
         } else {
-            vec![table_name.as_str(), inner_binding_name]
+            &inner_table_names_buf[..2]
         };
-        let probe = extract_correlated_equality(
-            terms[0],
-            &inner_table_names,
-            &table_entry.columns,
-            row,
-            col_map,
-        )?;
-        let outer_value = probe.outer_value;
-        // NULL outer value: EXISTS is false (no row can match NULL = x).
-        if outer_value.is_null() {
-            let truth = if not { true } else { false };
-            return Some(Ok(SqliteValue::Integer(i64::from(truth))));
+
+        let context = current_join_eval_collation_context_snapshot()?;
+        let (root_page, rowid_alias_col_idx, mut resolved) = {
+            let schema = self.schema.borrow();
+            let table_entry = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))?;
+            let is_materialized_temp = self
+                .materialized_temp_root_pages
+                .borrow()
+                .contains(&table_entry.root_page);
+            if !is_materialized_temp {
+                // The direct probe reads MemDB rows. Materialized CTEs live
+                // exclusively in MemDB, so they are always safe to probe even
+                // on file-backed DBs where persistent tables are unhydrated.
+                // Persistent tables still require `join_mem_scan_safe()` and
+                // unshadowed MAIN namespace routing.
+                if !self.join_mem_scan_safe()
+                    || self.local_view_index_for_relation(qual_name).is_some()
+                    || self.table_name_is_virtual(table_name)
+                {
+                    return None;
+                }
+                let table_name_key = table_name.to_ascii_lowercase();
+                if self.temp_table_names.borrow().contains(&table_name_key)
+                    || self
+                        .shadowed_main_tables
+                        .borrow()
+                        .contains_key(&table_name_key)
+                {
+                    return None;
+                }
+            }
+
+            let mut resolved: SmallVec<[(ExistsProbeTermKey, &SqliteValue); 2]> =
+                SmallVec::with_capacity(terms.len());
+            for term in &terms {
+                let probe = extract_correlated_equality(
+                    term,
+                    inner_table_names,
+                    &table_entry.columns,
+                    row,
+                    col_map,
+                )?;
+                let inner_column = table_entry.columns.get(probe.inner_column_index)?;
+                // Virtual generated columns store NULL placeholders in MemDB;
+                // decline so the full evaluator computes them.
+                if inner_column.generated_expr.is_some() {
+                    return None;
+                }
+                let outer_affinity = context.column_affinities.get(probe.outer_index).copied()?;
+                let inner_affinity = affinity_char_to_type(inner_column.affinity);
+                let outer_collation = context
+                    .column_collations
+                    .get(probe.outer_index)
+                    .and_then(Option::as_deref)
+                    .unwrap_or("BINARY");
+                let inner_collation = inner_column.collation.as_deref().unwrap_or("BINARY");
+                let winning_collation = if probe.inner_on_left {
+                    inner_collation
+                } else {
+                    outer_collation
+                };
+                let collation = if winning_collation.eq_ignore_ascii_case("BINARY")
+                    && context.registry.uses_builtin_implementation("BINARY")
+                {
+                    ExistsProbeCollation::Binary
+                } else if winning_collation.eq_ignore_ascii_case("NOCASE")
+                    && context.registry.uses_builtin_implementation("NOCASE")
+                {
+                    ExistsProbeCollation::NoCase
+                } else if winning_collation.eq_ignore_ascii_case("RTRIM")
+                    && context.registry.uses_builtin_implementation("RTRIM")
+                {
+                    ExistsProbeCollation::Rtrim
+                } else {
+                    return None;
+                };
+                // GH#428: when both operands carry an affinity and neither is
+                // numeric, SQLite compares without conversion, so a TEXT column
+                // never coerces a typeless column's integer to text. The inner
+                // side is always a declared table/CTE column; the outer side
+                // counts as declared when it has a non-BLOB affinity or is a
+                // known typeless base column.
+                let outer_declared = outer_affinity != TypeAffinity::Blob
+                    || context.declared_json_keys.contains(&probe.outer_index);
+                let mode = if outer_declared
+                    && matches!(
+                        (inner_affinity, outer_affinity),
+                        (TypeAffinity::Text, TypeAffinity::Blob)
+                            | (TypeAffinity::Blob, TypeAffinity::Text)
+                    ) {
+                    ExistsProbeMode::Raw
+                } else {
+                    exists_probe_mode(inner_affinity, outer_affinity)
+                };
+                resolved.push((
+                    ExistsProbeTermKey {
+                        column_index: probe.inner_column_index,
+                        mode,
+                        collation,
+                    },
+                    probe.outer_value,
+                ));
+            }
+            let rowid_alias_col_idx = if table_entry.without_rowid {
+                None
+            } else {
+                table_entry.columns.iter().position(|column| column.is_ipk)
+            };
+            (table_entry.root_page, rowid_alias_col_idx, resolved)
+        };
+
+        // NULL or NaN in any conjunctive outer operand makes EXISTS false
+        // immediately (no row can match NULL = x or NaN = x).
+        if resolved
+            .iter()
+            .any(|(_, v)| v.is_null() || matches!(v, SqliteValue::Float(f) if f.is_nan()))
+        {
+            return Some(Ok(SqliteValue::Integer(i64::from(not))));
         }
 
-        let col_idx = table_entry
-            .columns
-            .iter()
-            .position(|column| column.name.eq_ignore_ascii_case(&probe.inner_column))?;
-        let inner_column = table_entry.columns.get(col_idx)?;
-        let context = current_join_eval_collation_context_snapshot()?;
-        let outer_affinity = context.column_affinities.get(probe.outer_index).copied()?;
-        let inner_affinity = affinity_char_to_type(inner_column.affinity);
-        let outer_collation = context
-            .column_collations
-            .get(probe.outer_index)
-            .and_then(Option::as_deref)
-            .unwrap_or("BINARY");
-        let inner_collation = inner_column.collation.as_deref().unwrap_or("BINARY");
-        let winning_collation = if probe.inner_on_left {
-            inner_collation
-        } else {
-            outer_collation
-        };
-        let collation = if winning_collation.eq_ignore_ascii_case("BINARY")
-            && context.registry.uses_builtin_implementation("BINARY")
-        {
-            ExistsProbeCollation::Binary
-        } else if winning_collation.eq_ignore_ascii_case("NOCASE")
-            && context.registry.uses_builtin_implementation("NOCASE")
-        {
-            ExistsProbeCollation::NoCase
-        } else if winning_collation.eq_ignore_ascii_case("RTRIM")
-            && context.registry.uses_builtin_implementation("RTRIM")
-        {
-            ExistsProbeCollation::Rtrim
-        } else {
-            return None;
-        };
-        // GH#428: when both operands carry an affinity and neither is numeric,
-        // SQLite compares without conversion, so a TEXT column never coerces a
-        // typeless column's integer to text. The inner side is always a
-        // declared base-table column; the outer side counts as declared when it
-        // has a non-BLOB affinity or is a known typeless base column (a BLOB
-        // entry may otherwise stand for a computed column with no affinity,
-        // where the TEXT side's affinity does apply).
-        let outer_declared = outer_affinity != TypeAffinity::Blob
-            || context.declared_json_keys.contains(&probe.outer_index);
-        let mode = if outer_declared
-            && matches!(
-                (inner_affinity, outer_affinity),
-                (TypeAffinity::Text, TypeAffinity::Blob) | (TypeAffinity::Blob, TypeAffinity::Text)
-            ) {
-            ExistsProbeMode::Raw
-        } else {
-            exists_probe_mode(inner_affinity, outer_affinity)
-        };
+        // Canonicalize multi-term order so `a = x AND b = y` and `b = y AND a = x`
+        // share one memo entry.
+        if resolved.len() > 1 {
+            resolved.sort_unstable_by_key(|(spec, _)| *spec);
+        }
 
         // Probe the MemDB table.
         let db = self.db.borrow();
-        let table = db.get_table(table_entry.root_page)?;
-        let rowid_alias_col_idx = table_entry.columns.iter().position(|column| column.is_ipk);
+        let table = db.get_table(root_page)?;
 
-        // GH#117 fast path: with no inner-only residual filters, EXISTS reduces
-        // to "does the correlated column contain `outer_value`?". During an
-        // armed `execute_join_select` WHERE loop (memo depth > 0), retain the
-        // allocation-free linear scan below until the cumulative number of
-        // child rows it has inspected reaches twice the full child size. This
-        // cost gate preserves early-exit behavior for one or several cheap
-        // probes, while a repeated anti-join (or other late/missing probes)
-        // still promotes to one O(child) value-set build and O(1) membership
-        // checks. At the promotion point, prior linear work already costs at
-        // least two builds, so the extra build cannot create the eager-build
-        // regression this optimization is meant to remove. The value-set
-        // mirrors the admitted comparison mode's precision-preserving
-        // equality, so memoized and linear probes stay identical.
+        // GH#117 / bd-k5isc fast path: with no inner-only residual filters,
+        // EXISTS reduces to membership of the outer value (or composite tuple)
+        // in the child table. During an armed query loop (memo depth > 0), keep
+        // the allocation-free linear scan until cumulative inspected child rows
+        // reach twice the full child size, then build one O(child) value/tuple
+        // set for O(1) lookups shared across both EXISTS and NOT EXISTS probes.
         let memo = self.exists_probe_memo.borrow_mut();
         let memo_key = if memo.depth > 0 {
             let key = ExistsProbeMemoKey {
-                root_page: table_entry.root_page,
-                column_index: col_idx,
-                mode,
-                collation,
+                root_page,
+                terms: resolved.iter().map(|(spec, _)| *spec).collect(),
             };
             if let Some(set) = memo.sets.get(&key) {
                 #[cfg(test)]
                 FSQLITE_EXISTS_PROBE_MEMO_HITS.with(|hits| hits.set(hits.get() + 1));
-                let found = set.contains(&outer_value);
+                let found = set.contains(&resolved);
                 let truth = if not { !found } else { found };
                 return Some(Ok(SqliteValue::Integer(i64::from(truth))));
             }
@@ -104310,19 +104321,33 @@ impl Connection {
                 drop(memo);
                 #[cfg(test)]
                 FSQLITE_EXISTS_PROBE_MEMO_BUILDS.with(|builds| builds.set(builds.get() + 1));
-                let mut set = ExistsValueSet::new(mode, collation);
-                for (rowid, values) in table.iter_rows() {
-                    #[cfg(test)]
-                    FSQLITE_EXISTS_PROBE_MEMO_ROWS_INDEXED.with(|rows| rows.set(rows.get() + 1));
-                    let cell_val = memdb_row_value_with_rowid_alias(
-                        rowid,
-                        values,
-                        col_idx,
-                        rowid_alias_col_idx,
-                    );
-                    set.add(&cell_val);
-                }
-                let found = set.contains(&outer_value);
+                let set = if resolved.len() == 1 {
+                    let spec = resolved[0].0;
+                    let mut single = ExistsValueSet::new(spec.mode, spec.collation);
+                    for (rowid, values) in table.iter_rows() {
+                        #[cfg(test)]
+                        FSQLITE_EXISTS_PROBE_MEMO_ROWS_INDEXED
+                            .with(|rows| rows.set(rows.get() + 1));
+                        let cell_val = memdb_row_value_with_rowid_alias(
+                            rowid,
+                            values,
+                            spec.column_index,
+                            rowid_alias_col_idx,
+                        );
+                        single.add(&cell_val);
+                    }
+                    ExistsProbeSet::Single(single)
+                } else {
+                    let mut tuple_set = ExistsTupleSet::new();
+                    for (rowid, values) in table.iter_rows() {
+                        #[cfg(test)]
+                        FSQLITE_EXISTS_PROBE_MEMO_ROWS_INDEXED
+                            .with(|rows| rows.set(rows.get() + 1));
+                        tuple_set.add_row(rowid, values, rowid_alias_col_idx, &key.terms);
+                    }
+                    ExistsProbeSet::Tuple(tuple_set)
+                };
+                let found = set.contains(&resolved);
                 self.exists_probe_memo.borrow_mut().sets.insert(key, set);
                 let truth = if not { !found } else { found };
                 return Some(Ok(SqliteValue::Integer(i64::from(truth))));
@@ -104330,22 +104355,13 @@ impl Connection {
             drop(memo);
             Some(key)
         } else {
-            // bd-kwaam (frankensqlite#377): outside an armed `execute_join_select`
-            // WHERE loop the value-set memo can never be used, so the path below
-            // degrades to a full linear MemDB scan. In write contexts — the common
-            // depth-0 caller is trigger-WHEN evaluation — that scan runs once per
-            // mutated row against the same table being written, which makes bulk
-            // ingestion guarded by `WHEN EXISTS` validators quadratic (measured:
-            // 3000 guarded inserts 36s vs 3s baseline; stock SQLite seeks). The
-            // nested-statement fallback evaluates the same predicate through the
-            // join executor with no caching and no staleness exposure, so hand
-            // children larger than the threshold to it. Small tables keep the
-            // allocation-free early-exit scan, where it beats statement overhead.
+            // bd-kwaam (frankensqlite#377): outside an armed query loop the
+            // value-set memo can never be used, so decline large tables here so
+            // indexed writes (trigger WHEN guards) can seek instead of scanning.
             if table.row_count() > Self::EXISTS_DIRECT_PROBE_MAX_LINEAR_ROWS {
                 drop(memo);
                 return None;
             }
-
             drop(memo);
             None
         };
@@ -104355,9 +104371,16 @@ impl Connection {
         let mut rows_scanned = 0_usize;
         for (rowid, values) in table.iter_rows() {
             rows_scanned = rows_scanned.saturating_add(1);
-            let cell_val =
-                memdb_row_value_with_rowid_alias(rowid, values, col_idx, rowid_alias_col_idx);
-            if exists_probe_values_equal(&cell_val, &outer_value, mode, collation) {
+            let row_matches = resolved.iter().all(|(spec, outer_value)| {
+                let cell_val = memdb_row_value_with_rowid_alias(
+                    rowid,
+                    values,
+                    spec.column_index,
+                    rowid_alias_col_idx,
+                );
+                exists_probe_values_equal(&cell_val, outer_value, spec.mode, spec.collation)
+            });
+            if row_matches {
                 found = true;
                 break;
             }
@@ -104411,7 +104434,7 @@ impl Connection {
         &self,
         subquery: &'s SelectStatement,
     ) -> Option<(ScanExistsProbePlan, &'s Expr)> {
-        if !self.join_mem_scan_safe() || self.scalar_function_overridden.get() {
+        if self.scalar_function_overridden.get() {
             return None;
         }
         if subquery.with.is_some()
@@ -104462,18 +104485,7 @@ impl Connection {
         else {
             return None;
         };
-        if name.schema.is_some()
-            || index_hint.is_some()
-            || time_travel.is_some()
-            || self.local_view_index_for_relation(name).is_some()
-        {
-            return None;
-        }
-        let table_key = name.name.to_ascii_lowercase();
-        if self.temp_table_names.borrow().contains(&table_key)
-            || self.shadowed_main_tables.borrow().contains_key(&table_key)
-            || self.table_name_is_virtual(&name.name)
-        {
+        if name.schema.is_some() || index_hint.is_some() || time_travel.is_some() {
             return None;
         }
         let (
@@ -104489,8 +104501,23 @@ impl Connection {
                 .iter()
                 .filter(|table| table.name.eq_ignore_ascii_case(&name.name));
             let table = matches.next()?;
-            if matches.next().is_some()
-                || table.without_rowid
+            let is_materialized_temp = self
+                .materialized_temp_root_pages
+                .borrow()
+                .contains(&table.root_page);
+            if !is_materialized_temp {
+                let table_key = name.name.to_ascii_lowercase();
+                if !self.join_mem_scan_safe()
+                    || matches.next().is_some()
+                    || self.local_view_index_for_relation(name).is_some()
+                    || self.temp_table_names.borrow().contains(&table_key)
+                    || self.shadowed_main_tables.borrow().contains_key(&table_key)
+                    || self.table_name_is_virtual(&name.name)
+                {
+                    return None;
+                }
+            }
+            if table.without_rowid
                 || table
                     .columns
                     .iter()
@@ -104899,6 +104926,246 @@ impl Connection {
     /// through every enclosing AND/OR/NOT because polarity flips exactly
     /// where the distinction would become observable. Chains flatten through
     /// `collect_same_binary_op_operands` exactly like the value path, so
+    /// Pure, side-effect-free synchronous twin of [`Self::eval_expr_truthiness`]
+    /// for hot row-evaluation loops (bd-k5isc). Returns `None` whenever any
+    /// reached leaf requires the full async evaluator (scalar subquery, UDF,
+    /// non-direct EXISTS, placeholder, etc.), so falling back never double-runs
+    /// any side effect.
+    fn try_eval_expr_truthiness_sync(
+        &self,
+        expr: &Expr,
+        seeking_true: bool,
+        row: &[SqliteValue],
+        col_map: &[(String, String, bool)],
+    ) -> Option<Result<Option<bool>>> {
+        match expr {
+            Expr::BinaryOp { op, .. } if matches!(op, BinaryOp::And | BinaryOp::Or) => {
+                let mut chain = SmallVec::<[&Expr; 4]>::new();
+                collect_same_binary_op_operands_small(expr, *op, &mut chain);
+                let is_and = matches!(op, BinaryOp::And);
+                if chain
+                    .iter()
+                    .any(|operand| expr_is_constant_absorbing_for(operand, is_and))
+                {
+                    return Some(Ok(Some(!is_and)));
+                }
+                let mut saw_null = false;
+                for operand in &chain {
+                    match self.try_eval_expr_truthiness_sync(operand, seeking_true, row, col_map)? {
+                        Err(err) => return Some(Err(err)),
+                        Ok(None) => {
+                            if is_and == seeking_true {
+                                return Some(Ok(None));
+                            }
+                            saw_null = true;
+                        }
+                        Ok(Some(truthy)) => {
+                            if !truthy && is_and {
+                                return Some(Ok(Some(false)));
+                            }
+                            if truthy && !is_and {
+                                return Some(Ok(Some(true)));
+                            }
+                        }
+                    }
+                }
+                Some(Ok(if saw_null { None } else { Some(is_and) }))
+            }
+            Expr::UnaryOp {
+                op: UnaryOp::Not,
+                expr: inner,
+                ..
+            } => Some(
+                self.try_eval_expr_truthiness_sync(inner, !seeking_true, row, col_map)?
+                    .map(|truth| truth.map(|truthy| !truthy)),
+            ),
+            _ => Some(
+                self.try_eval_expr_with_subqueries_sync(expr, row, col_map)?
+                    .map(|value| {
+                        if value.is_null() {
+                            None
+                        } else {
+                            Some(is_sqlite_truthy(&value))
+                        }
+                    }),
+            ),
+        }
+    }
+
+    /// Pure, side-effect-free synchronous twin of [`Self::eval_expr_with_subqueries`]
+    /// for expressions that evaluate without async I/O or function calls
+    /// (notably searched `CASE` over column comparisons, literal `IN` lists, and
+    /// direct memoized `EXISTS` probes — bd-k5isc). Returns `None` for any
+    /// shape needing the full async path, without performing observable effects.
+    fn try_eval_expr_with_subqueries_sync(
+        &self,
+        expr: &Expr,
+        row: &[SqliteValue],
+        col_map: &[(String, String, bool)],
+    ) -> Option<Result<SqliteValue>> {
+        match expr {
+            Expr::Literal(lit, _) => Some(Ok(literal_to_join_value(lit))),
+            Expr::BoundOuterValue { value, .. } => Some(Ok(value.clone())),
+            Expr::Column(..) => Some(eval_join_expr(expr, row, col_map)),
+            Expr::Exists { subquery, not, .. } => {
+                self.try_direct_exists_probe(subquery, *not, row, col_map)
+            }
+            Expr::Collate { expr: inner, .. } => {
+                self.try_eval_expr_with_subqueries_sync(inner, row, col_map)
+            }
+            Expr::Cast {
+                expr: inner,
+                type_name,
+                ..
+            } => {
+                let val = match self.try_eval_expr_with_subqueries_sync(inner, row, col_map)? {
+                    Ok(v) => v,
+                    Err(err) => return Some(Err(err)),
+                };
+                Some(Ok(apply_cast(val, &type_name.name)))
+            }
+            Expr::IsNull {
+                expr: inner, not, ..
+            } => {
+                let val = match self.try_eval_expr_with_subqueries_sync(inner, row, col_map)? {
+                    Ok(v) => v,
+                    Err(err) => return Some(Err(err)),
+                };
+                let result = if *not { !val.is_null() } else { val.is_null() };
+                Some(Ok(SqliteValue::Integer(i64::from(result))))
+            }
+            Expr::UnaryOp {
+                op, expr: inner, ..
+            } => {
+                let val = match self.try_eval_expr_with_subqueries_sync(inner, row, col_map)? {
+                    Ok(v) => v,
+                    Err(err) => return Some(Err(err)),
+                };
+                Some(Ok(match op {
+                    UnaryOp::Negate => match &val {
+                        SqliteValue::Integer(n) => n
+                            .checked_neg()
+                            .map_or_else(|| SqliteValue::Float(-(*n as f64)), SqliteValue::Integer),
+                        SqliteValue::Float(f) => SqliteValue::Float(-f),
+                        _ => SqliteValue::Null,
+                    },
+                    UnaryOp::Plus => val,
+                    UnaryOp::Not => {
+                        if val.is_null() {
+                            SqliteValue::Null
+                        } else {
+                            SqliteValue::Integer(i64::from(!is_sqlite_truthy(&val)))
+                        }
+                    }
+                    UnaryOp::BitNot => {
+                        if val.is_null() {
+                            SqliteValue::Null
+                        } else {
+                            SqliteValue::Integer(!val.to_integer())
+                        }
+                    }
+                }))
+            }
+            Expr::BinaryOp {
+                left, op, right, ..
+            } => {
+                if let Some(expected) = op.truth_test(right) {
+                    let lv = match self.try_eval_expr_with_subqueries_sync(left, row, col_map)? {
+                        Ok(v) => v,
+                        Err(err) => return Some(Err(err)),
+                    };
+                    return Some(Ok(sqlite_truth_test_result(&lv, expected, *op)));
+                }
+                if matches!(op, BinaryOp::And | BinaryOp::Or)
+                    || matches!(left.as_ref(), Expr::Subquery(..) | Expr::RowValue(..))
+                    || matches!(right.as_ref(), Expr::Subquery(..) | Expr::RowValue(..))
+                {
+                    return None;
+                }
+                let lv = match self.try_eval_expr_with_subqueries_sync(left, row, col_map)? {
+                    Ok(v) => v,
+                    Err(err) => return Some(Err(err)),
+                };
+                let rv = match self.try_eval_expr_with_subqueries_sync(right, row, col_map)? {
+                    Ok(v) => v,
+                    Err(err) => return Some(Err(err)),
+                };
+                Some(Ok(eval_join_binary_op(left, &lv, *op, right, &rv, col_map)))
+            }
+            Expr::In {
+                expr: inner,
+                set: InSet::List(list),
+                not,
+                ..
+            } => {
+                if list.is_empty() {
+                    return Some(Ok(SqliteValue::Integer(i64::from(*not))));
+                }
+                if matches!(inner.as_ref(), Expr::Subquery(..) | Expr::RowValue(..))
+                    || !list.iter().all(|item| matches!(item, Expr::Literal(..)))
+                    || CURRENT_JOIN_EVAL_COLLATION_CONTEXT.with(|stack| stack.borrow().is_empty())
+                {
+                    return None;
+                }
+                let val = match self.try_eval_expr_with_subqueries_sync(inner, row, col_map)? {
+                    Ok(v) => v,
+                    Err(err) => return Some(Err(err)),
+                };
+                if val.is_null() {
+                    return Some(Ok(SqliteValue::Null));
+                }
+                let mut found = false;
+                let mut saw_null = false;
+                for item in list {
+                    let Expr::Literal(lit, _) = item else {
+                        return None;
+                    };
+                    let list_value = literal_to_join_value(lit);
+                    if list_value.is_null() {
+                        saw_null = true;
+                        continue;
+                    }
+                    if compare_join_in_values(inner, &val, None, &list_value, col_map)
+                        == std::cmp::Ordering::Equal
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    Some(Ok(SqliteValue::Integer(i64::from(!*not))))
+                } else if saw_null {
+                    Some(Ok(SqliteValue::Null))
+                } else {
+                    Some(Ok(SqliteValue::Integer(i64::from(*not))))
+                }
+            }
+            Expr::Case {
+                operand: None,
+                whens,
+                else_expr,
+                ..
+            } => {
+                for (when_expr, then_expr) in whens {
+                    let matched =
+                        match self.try_eval_expr_truthiness_sync(when_expr, true, row, col_map)? {
+                            Ok(truth) => truth == Some(true),
+                            Err(err) => return Some(Err(err)),
+                        };
+                    if matched {
+                        return self.try_eval_expr_with_subqueries_sync(then_expr, row, col_map);
+                    }
+                }
+                if let Some(el) = else_expr {
+                    self.try_eval_expr_with_subqueries_sync(el, row, col_map)
+                } else {
+                    Some(Ok(SqliteValue::Null))
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// recursion depth is one async frame per boolean-skeleton alternation,
     /// not per operator: a long homogeneous WHEN chain still costs O(1)
     /// frames per leaf operand.
@@ -108049,6 +108316,9 @@ impl Connection {
         col_map: &[(String, String, bool)],
     ) -> Result<SqliteValue> {
         if expr_has_any_subquery(expr) {
+            if let Some(result) = self.try_eval_expr_with_subqueries_sync(expr, row, col_map) {
+                return result;
+            }
             self.eval_expr_with_subqueries(expr, row, col_map, None)
                 .await
         } else {
@@ -108064,6 +108334,9 @@ impl Connection {
         using_skip: Option<&HashSet<usize>>,
     ) -> Result<SqliteValue> {
         if expr_has_any_subquery(expr) {
+            if let Some(result) = self.try_eval_expr_with_subqueries_sync(expr, row, col_map) {
+                return result;
+            }
             // bd-k5isc: evaluate at the row boundary so CASE can skip unused
             // subqueries. The active JoinEvalCollationContext carries USING
             // projections for both ordinary and correlated column references.
@@ -116994,11 +117267,20 @@ impl Connection {
                             // keep/filter decision on non-erroring rows (both map operand
                             // truth through `is_sqlite_truthy` under the same three-valued
                             // logic). bd-and-or-short-circuit-value-jump-gaps-dkswh.
-                            let keep = lean_future(|| {
-                                self.eval_expr_truthiness(where_expr, true, &row, &col_map, params)
-                            })
-                            .await?
-                            .unwrap_or(false);
+                            let keep = if params.is_none()
+                                && let Some(sync_result) =
+                                    self.try_eval_expr_truthiness_sync(where_expr, true, &row, &col_map)
+                            {
+                                sync_result?.unwrap_or(false)
+                            } else {
+                                lean_future(|| {
+                                    self.eval_expr_truthiness(
+                                        where_expr, true, &row, &col_map, params,
+                                    )
+                                })
+                                .await?
+                                .unwrap_or(false)
+                            };
                             if keep {
                                 filtered.push(row);
                             }
@@ -117185,6 +117467,7 @@ impl Connection {
             })
             .collect();
 
+        let _projection_exists_memo_guard = has_subqueries.then(|| self.arm_exists_probe_memo());
         let mut result: Vec<Row> = Vec::with_capacity(combined.len());
         // bd-w4pr1.12: every projected row has the previous row's width, so
         // reserve exactly that. Growing from empty reserved four values for a
@@ -117253,15 +117536,13 @@ impl Connection {
                         if let Some(slot) = *direct_slot {
                             values.push(row.get(slot).cloned().unwrap_or(SqliteValue::Null));
                         } else if has_subqueries && expr_has_any_subquery(expr) {
-                            let inlined = lean_future(|| {
-                                self.inline_subqueries_in_expr_with_using(
+                            let val = lean_future(|| {
+                                self.eval_row_expr_allowing_subqueries_with_using(
                                     expr, row, &col_map, using_skip,
                                 )
                             })
                             .await?;
-                            values.push(self.eval_join_expr_with_using_registry(
-                                &inlined, row, &col_map, using_skip,
-                            )?);
+                            values.push(val);
                         } else {
                             values.push(self.eval_join_expr_with_using_registry(
                                 expr, row, &col_map, using_skip,
@@ -117272,15 +117553,13 @@ impl Connection {
             }
             for expr in &extra_order_exprs {
                 if has_subqueries && expr_has_any_subquery(expr) {
-                    let inlined = lean_future(|| {
-                        self.inline_subqueries_in_expr_with_using(expr, row, &col_map, using_skip)
+                    let val = lean_future(|| {
+                        self.eval_row_expr_allowing_subqueries_with_using(
+                            expr, row, &col_map, using_skip,
+                        )
                     })
                     .await?;
-                    values.push(
-                        self.eval_join_expr_with_using_registry(
-                            &inlined, row, &col_map, using_skip,
-                        )?,
-                    );
+                    values.push(val);
                 } else {
                     values.push(
                         self.eval_join_expr_with_using_registry(expr, row, &col_map, using_skip)?,
@@ -118222,6 +118501,12 @@ impl Connection {
                     not,
                     span,
                 } => {
+                    if let Some(probe_result) =
+                        self.try_direct_exists_probe(subquery, *not, row, outer_col_map)
+                    {
+                        let value = probe_result?;
+                        return Ok(Expr::Literal(sqlite_value_to_literal(&value), *span));
+                    }
                     let mut sub_clone = subquery.as_ref().clone();
                     self.substitute_outer_refs_for_current_schema(
                         &mut sub_clone,
@@ -144270,14 +144555,15 @@ fn expr_has_external_column_ref_with_locals(
 // B2.2 EXISTS direct-probe helpers
 // ---------------------------------------------------------------------------
 
-/// Decompose a WHERE expression into AND-connected terms.
-fn decompose_where_simple(expr: &Expr) -> Vec<&Expr> {
-    let mut terms = Vec::new();
+/// Decompose a WHERE expression into AND-connected terms without heap
+/// allocation for common 1..=4 term conjunctions.
+fn decompose_where_simple(expr: &Expr) -> SmallVec<[&Expr; 4]> {
+    let mut terms = SmallVec::new();
     decompose_where_simple_inner(expr, &mut terms);
     terms
 }
 
-fn decompose_where_simple_inner<'a>(expr: &'a Expr, terms: &mut Vec<&'a Expr>) {
+fn decompose_where_simple_inner<'a>(expr: &'a Expr, terms: &mut SmallVec<[&'a Expr; 4]>) {
     if let Expr::BinaryOp {
         left,
         op: BinaryOp::And,
@@ -144292,10 +144578,31 @@ fn decompose_where_simple_inner<'a>(expr: &'a Expr, terms: &mut Vec<&'a Expr>) {
     }
 }
 
-struct CorrelatedEqualityProbe {
-    inner_column: String,
+fn collect_same_binary_op_operands_small<'a>(
+    expr: &'a Expr,
+    target_op: BinaryOp,
+    out: &mut SmallVec<[&'a Expr; 4]>,
+) {
+    let mut stack = SmallVec::<[&'a Expr; 8]>::new();
+    stack.push(expr);
+    while let Some(node) = stack.pop() {
+        if let Expr::BinaryOp {
+            left, op, right, ..
+        } = node
+            && *op == target_op
+        {
+            stack.push(right);
+            stack.push(left);
+        } else {
+            out.push(node);
+        }
+    }
+}
+
+struct CorrelatedEqualityProbe<'a> {
+    inner_column_index: usize,
     outer_index: usize,
-    outer_value: SqliteValue,
+    outer_value: &'a SqliteValue,
     inner_on_left: bool,
 }
 
@@ -144303,13 +144610,13 @@ struct CorrelatedEqualityProbe {
 /// and the resolved outer slot. Unqualified outer references are declined:
 /// the inner scope can shadow them, and this fast path must not duplicate the
 /// full resolver's scope rules.
-fn extract_correlated_equality(
+fn extract_correlated_equality<'a>(
     expr: &Expr,
     inner_table_names: &[&str],
     inner_columns: &[ColumnInfo],
-    row: &[SqliteValue],
+    row: &'a [SqliteValue],
     col_map: &[(String, String, bool)],
-) -> Option<CorrelatedEqualityProbe> {
+) -> Option<CorrelatedEqualityProbe<'a>> {
     let Expr::BinaryOp {
         left, op, right, ..
     } = expr
@@ -144343,15 +144650,15 @@ fn extract_correlated_equality(
     )
 }
 
-fn try_correlated_pair(
+fn try_correlated_pair<'a>(
     inner_candidate: &Expr,
     outer_candidate: &Expr,
     inner_table_names: &[&str],
     inner_columns: &[ColumnInfo],
-    row: &[SqliteValue],
+    row: &'a [SqliteValue],
     col_map: &[(String, String, bool)],
     inner_on_left: bool,
-) -> Option<CorrelatedEqualityProbe> {
+) -> Option<CorrelatedEqualityProbe<'a>> {
     let Expr::Column(inner_ref, _) = inner_candidate else {
         return None;
     };
@@ -144359,12 +144666,12 @@ fn try_correlated_pair(
         !inner_table_names
             .iter()
             .any(|name| qualifier.eq_ignore_ascii_case(name))
-    }) || !inner_columns
-        .iter()
-        .any(|column| column.name.eq_ignore_ascii_case(&inner_ref.column))
-    {
+    }) {
         return None;
     }
+    let inner_column_index = inner_columns
+        .iter()
+        .position(|column| column.name.eq_ignore_ascii_case(&inner_ref.column))?;
 
     let Expr::Column(outer_ref, _) = outer_candidate else {
         return None;
@@ -144378,9 +144685,9 @@ fn try_correlated_pair(
     }
     let outer_index =
         find_col_in_map(col_map, Some(outer_qualifier), &outer_ref.column, None).ok()?;
-    let outer_value = row.get(outer_index)?.clone();
+    let outer_value = row.get(outer_index)?;
     Some(CorrelatedEqualityProbe {
-        inner_column: inner_ref.column.to_string(),
+        inner_column_index,
         outer_index,
         outer_value,
         inner_on_left,
@@ -158399,7 +158706,7 @@ struct ExistsProbeMemo {
     /// adaptive build gate; early matches therefore delay or entirely avoid a
     /// full-column value-set build.
     linear_rows_scanned: std::collections::HashMap<ExistsProbeMemoKey, usize>,
-    sets: std::collections::HashMap<ExistsProbeMemoKey, ExistsValueSet>,
+    sets: std::collections::HashMap<ExistsProbeMemoKey, ExistsProbeSet>,
     /// GH#419: scan-probe templates keyed by the `EXISTS` subquery's address,
     /// each validated against the subquery before use.
     scan_templates: std::collections::HashMap<usize, ScanExistsProbeTemplate>,
@@ -158467,22 +158774,27 @@ impl ScanExistsProbeTemplate {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ExistsProbeMode {
     Raw,
     Text,
     Numeric,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ExistsProbeMemoKey {
-    root_page: i32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ExistsProbeTermKey {
     column_index: usize,
     mode: ExistsProbeMode,
     collation: ExistsProbeCollation,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ExistsProbeMemoKey {
+    root_page: i32,
+    terms: SmallVec<[ExistsProbeTermKey; 2]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ExistsProbeCollation {
     Binary,
     NoCase,
@@ -158637,6 +158949,104 @@ impl ExistsValueSet {
             SqliteValue::Text(_) | SqliteValue::Blob(_) => {
                 self.exact.contains(&SqliteValueHashable(canonical))
             }
+        }
+    }
+}
+
+/// Exact canonical equivalence-class key for one column inside a multi-column
+/// [`ExistsTupleSet`]. Matches `exists_probe_values_equal` across INTEGER/REAL
+/// precision-preserving equality, signed zero, NaN/NULL exclusion, and built-in
+/// BINARY/NOCASE/RTRIM collations.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ExistsCanonicalKey {
+    Int(i64),
+    FloatBits(u64),
+    Text(fsqlite_types::SmallText),
+    Blob(Arc<[u8]>),
+}
+
+fn canonical_exists_probe_key(
+    value: &SqliteValue,
+    mode: ExistsProbeMode,
+    collation: ExistsProbeCollation,
+) -> Option<ExistsCanonicalKey> {
+    let canonical = canonical_exists_probe_value(value, mode, collation);
+    match canonical {
+        SqliteValue::Null => None,
+        SqliteValue::Integer(x) => Some(ExistsCanonicalKey::Int(x)),
+        SqliteValue::Float(y) => {
+            if let Some(integer) = exact_i64_for_float(y) {
+                Some(ExistsCanonicalKey::Int(integer))
+            } else if y.is_nan() {
+                None
+            } else {
+                Some(ExistsCanonicalKey::FloatBits(canon_match_f64(y)))
+            }
+        }
+        SqliteValue::Text(text) => Some(ExistsCanonicalKey::Text(text)),
+        SqliteValue::Blob(blob) => Some(ExistsCanonicalKey::Blob(blob)),
+    }
+}
+
+/// Exact multi-column conjunctive equality set for correlated `EXISTS` probes
+/// (`bd-k5isc`). 2-column integer/float tuples stay stack-inline in `SmallVec`.
+struct ExistsTupleSet {
+    tuples: std::collections::HashSet<SmallVec<[ExistsCanonicalKey; 2]>>,
+}
+
+impl ExistsTupleSet {
+    fn new() -> Self {
+        Self {
+            tuples: std::collections::HashSet::new(),
+        }
+    }
+
+    fn add_row(
+        &mut self,
+        rowid: i64,
+        values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+        specs: &[ExistsProbeTermKey],
+    ) {
+        let mut tuple: SmallVec<[ExistsCanonicalKey; 2]> = SmallVec::with_capacity(specs.len());
+        for spec in specs {
+            let cell_val = memdb_row_value_with_rowid_alias(
+                rowid,
+                values,
+                spec.column_index,
+                rowid_alias_col_idx,
+            );
+            let Some(key) = canonical_exists_probe_key(&cell_val, spec.mode, spec.collation) else {
+                return;
+            };
+            tuple.push(key);
+        }
+        self.tuples.insert(tuple);
+    }
+
+    fn contains(&self, resolved: &[(ExistsProbeTermKey, &SqliteValue)]) -> bool {
+        let mut tuple: SmallVec<[ExistsCanonicalKey; 2]> = SmallVec::with_capacity(resolved.len());
+        for (spec, outer_value) in resolved {
+            let Some(key) = canonical_exists_probe_key(outer_value, spec.mode, spec.collation)
+            else {
+                return false;
+            };
+            tuple.push(key);
+        }
+        self.tuples.contains(&tuple)
+    }
+}
+
+enum ExistsProbeSet {
+    Single(ExistsValueSet),
+    Tuple(ExistsTupleSet),
+}
+
+impl ExistsProbeSet {
+    fn contains(&self, resolved: &[(ExistsProbeTermKey, &SqliteValue)]) -> bool {
+        match self {
+            Self::Single(set) => set.contains(resolved[0].1),
+            Self::Tuple(set) => set.contains(resolved),
         }
     }
 }

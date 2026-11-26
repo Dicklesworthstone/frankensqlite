@@ -598,3 +598,497 @@ fn bd_k5isc_case_evaluates_scalar_functions_once_and_skips_unused_cte_probes() {
         conn.close().await.expect("close fsqlite");
     });
 }
+
+const CONTACT_STATS_SCHEMA: &str = "
+    CREATE TABLE agents (id INTEGER PRIMARY KEY, contact_policy TEXT);
+    CREATE TABLE messages (id INTEGER PRIMARY KEY, sender_id INTEGER, created_ts INTEGER NOT NULL);
+    CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL);
+    CREATE TABLE agent_links (
+        id INTEGER PRIMARY KEY,
+        a_agent_id INTEGER,
+        b_agent_id INTEGER,
+        status TEXT,
+        expires_ts INTEGER
+    );
+";
+
+const CONTACT_STATS_NOW: i64 = 1_760_000_000_000_000;
+const CONTACT_STATS_WINDOW_START: i64 = CONTACT_STATS_NOW - 86_400_000_000;
+const CONTACT_STATS_INSIDE: i64 = CONTACT_STATS_NOW - 3_600_000_000;
+const CONTACT_STATS_OUTSIDE: i64 = CONTACT_STATS_NOW - 2 * 86_400_000_000;
+
+fn contact_stats_seed_sql(extra_links: usize) -> String {
+    use std::fmt::Write as _;
+    let mut sql = String::from(CONTACT_STATS_SCHEMA);
+    sql.push_str(
+        "INSERT INTO agents (id, contact_policy) VALUES \
+         (1, 'auto'), (2, 'open'), (3, 'contacts_only'), (4, 'block_all'), \
+         (5, 'contacts_only'), (6, 'contacts_only'), (7, 'contacts_only'), (8, NULL), \
+         (10, 'auto'), (11, 'auto'), (12, 'auto');",
+    );
+    let _ = write!(
+        sql,
+        "INSERT INTO agent_links (id, a_agent_id, b_agent_id, status, expires_ts) VALUES \
+         (1, 10, 3, 'approved', 0), \
+         (2, 5, 11, 'accepted', NULL), \
+         (3, 10, 6, 'pending', 0), \
+         (4, 11, 6, 'approved', {}), \
+         (5, 12, 6, 'approved', {}), \
+         (6, 10, 7, 'rejected', 0);",
+        CONTACT_STATS_NOW - 1_000,
+        CONTACT_STATS_NOW + 1_000_000_000,
+    );
+    for idx in 0..extra_links {
+        let id = 100 + idx;
+        let a = 1_000 + idx;
+        let b = 2_000 + idx;
+        let _ = write!(
+            sql,
+            "INSERT INTO agent_links (id, a_agent_id, b_agent_id, status, expires_ts) \
+             VALUES ({id}, {a}, {b}, 'approved', 0);"
+        );
+    }
+    let _ = write!(
+        sql,
+        "INSERT INTO messages (id, sender_id, created_ts) VALUES \
+         (1, 10, {inside}), (2, 11, {inside}), (3, 12, {inside}), \
+         (4, 3, {inside}), (5, 4, {inside}), (6, 10, {outside}), (7, 11, {inside});\
+         INSERT INTO message_recipients (message_id, agent_id) VALUES \
+         (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7), (1, 8), \
+         (2, 3), (2, 5), (2, 6), \
+         (3, 6), (3, 4), \
+         (4, 3), (5, 4), (6, 3), (7, 1);",
+        inside = CONTACT_STATS_INSIDE,
+        outside = CONTACT_STATS_OUTSIDE,
+    );
+    sql
+}
+
+fn legacy_contact_stats_sql(cte_tag_expr: Option<&str>) -> String {
+    let link_expires_expr = "COALESCE(al.expires_ts, 0)";
+    let message_created_expr = "COALESCE(m.created_ts, 0)";
+    let extra_select = cte_tag_expr
+        .map(|expr| format!(", {expr} AS tag"))
+        .unwrap_or_default();
+    format!(
+        "WITH approved_links AS ( \
+            SELECT a_agent_id AS sender_id, b_agent_id AS recipient_id{extra_select} \
+            FROM agent_links al \
+            WHERE status IN ('approved', 'accepted') \
+              AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now}) \
+            UNION \
+            SELECT b_agent_id AS sender_id, a_agent_id AS recipient_id{extra_select} \
+            FROM agent_links al \
+            WHERE status IN ('approved', 'accepted') \
+              AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now}) \
+         ) \
+         SELECT \
+            mr.agent_id AS agent_id, \
+            SUM(CASE \
+                    WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
+                    WHEN m.sender_id = mr.agent_id THEN 1 \
+                    WHEN recipient.contact_policy = 'contacts_only' AND EXISTS ( \
+                        SELECT 1 FROM approved_links link \
+                        WHERE link.sender_id = m.sender_id \
+                          AND link.recipient_id = mr.agent_id \
+                    ) THEN 1 \
+                    ELSE 0 END) AS respected_count, \
+            SUM(CASE \
+                    WHEN recipient.contact_policy = 'contacts_only' \
+                     AND m.sender_id != mr.agent_id \
+                     AND NOT EXISTS ( \
+                        SELECT 1 FROM approved_links link \
+                        WHERE link.sender_id = m.sender_id \
+                          AND link.recipient_id = mr.agent_id \
+                    ) THEN 1 \
+                    WHEN recipient.contact_policy = 'block_all' \
+                     AND m.sender_id != mr.agent_id \
+                    THEN 1 \
+                    ELSE 0 END) AS violation_count \
+         FROM message_recipients mr \
+         JOIN messages m ON m.id = mr.message_id \
+         JOIN agents recipient ON recipient.id = mr.agent_id \
+         WHERE mr.agent_id IN (1, 2, 3, 4, 5, 6, 7, 8) \
+           AND {message_created_expr} >= {window_start} \
+         GROUP BY mr.agent_id \
+         ORDER BY mr.agent_id",
+        now = CONTACT_STATS_NOW,
+        window_start = CONTACT_STATS_WINDOW_START,
+    )
+}
+
+#[test]
+fn bd_k5isc_legacy_contact_stats_exact_oracle_and_cte_single_eval() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let disk_path = dir.path().join("contact-stats.sqlite3");
+        let disk_path_str = disk_path.to_str().expect("UTF-8 path").to_owned();
+        let seed_sql = contact_stats_seed_sql(80);
+        let query_sql = legacy_contact_stats_sql(None);
+        let counted_sql = legacy_contact_stats_sql(Some("cte_eval_counter(al.id)"));
+
+        let oracle = rusqlite::Connection::open_in_memory().expect("open oracle");
+        oracle.execute_batch(&seed_sql).expect("seed oracle");
+        let expected = sqlite_rows(&oracle, &query_sql).expect("oracle legacy contact stats");
+        assert_eq!(
+            expected,
+            vec![
+                vec!["1", "2", "0"],
+                vec!["2", "1", "0"],
+                vec!["3", "2", "1"],
+                vec!["4", "1", "2"],
+                vec!["5", "1", "1"],
+                vec!["6", "1", "2"],
+                vec!["7", "0", "1"],
+                vec!["8", "0", "0"],
+            ]
+            .into_iter()
+            .map(|r| r.into_iter().map(str::to_owned).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+        );
+
+        for (label, path, reopen) in [
+            ("memory", ":memory:", false),
+            ("file-fresh-write", disk_path_str.as_str(), false),
+            ("file-reopened", disk_path_str.as_str(), true),
+        ] {
+            let conn = Connection::open(path).await.expect("open fsqlite");
+            if !reopen {
+                if path != ":memory:" {
+                    conn.execute("PRAGMA journal_mode=WAL")
+                        .await
+                        .expect("enable WAL");
+                }
+                conn.execute_batch(&seed_sql).await.expect("seed fsqlite");
+            }
+            let direct = frank_rows(&conn, &query_sql)
+                .await
+                .unwrap_or_else(|err| panic!("{label} direct failed: {err}"));
+            assert_eq!(direct, expected, "{label} direct mismatch vs stock 3.54.1");
+
+            let prepared = conn.prepare(&query_sql).await.expect("prepare query");
+            let prepared_rows: Vec<Vec<String>> = prepared
+                .query()
+                .await
+                .unwrap_or_else(|err| panic!("{label} prepared failed: {err}"))
+                .iter()
+                .map(|row| row.values().iter().map(render_frank).collect())
+                .collect();
+            assert_eq!(
+                prepared_rows, expected,
+                "{label} prepared mismatch vs stock 3.54.1"
+            );
+
+            // Prove the UNION CTE body executes ONCE per statement (2 arms x 83 qualifying
+            // rows = 166 UDF calls), never re-evaluated per correlated probe row.
+            let cte_calls = Arc::new(AtomicUsize::new(0));
+            conn.register_nondeterministic_scalar_function(CountingCaseIdentity {
+                name: "cte_eval_counter",
+                calls: Arc::clone(&cte_calls),
+            });
+            let counted = frank_rows(&conn, &counted_sql)
+                .await
+                .unwrap_or_else(|err| panic!("{label} counted failed: {err}"));
+            assert_eq!(counted, expected, "{label} counted mismatch vs stock");
+            assert_eq!(
+                cte_calls.load(Ordering::Relaxed),
+                166,
+                "{label}: CTE body must evaluate once per statement (2 UNION arms x 83 matching rows)"
+            );
+            conn.close().await.expect("close fsqlite");
+        }
+    });
+}
+
+#[test]
+fn bd_k5isc_multi_column_exists_affinity_collation_and_shadowing_oracle() {
+    asupersync::test_utils::run_test(|| async {
+        let setup = "
+            CREATE TABLE outer_rows (
+                id INTEGER PRIMARY KEY,
+                grp INTEGER,
+                policy TEXT,
+                k_int INTEGER,
+                k_txt TEXT,
+                k_nc TEXT COLLATE NOCASE,
+                k_rt TEXT COLLATE RTRIM,
+                k_raw
+            );
+            CREATE TABLE join_dim (
+                id INTEGER PRIMARY KEY,
+                tag TEXT
+            );
+            CREATE TABLE pair_links (
+                id INTEGER PRIMARY KEY,
+                p_int INTEGER,
+                p_txt TEXT,
+                p_nc TEXT COLLATE NOCASE,
+                p_rt TEXT COLLATE RTRIM,
+                p_raw
+            );
+            INSERT INTO join_dim VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e'),(6,'f'),(7,'g'),(8,'h');
+            INSERT INTO outer_rows VALUES
+                (1, 1, 'contacts_only', 1, 'Alpha', 'Alpha', 'pad  ', 1),
+                (2, 1, 'contacts_only', 2, '2',     'BETA',  'pad',   '2'),
+                (3, 1, 'contacts_only', 9007199254740993, 'hi', 'Hi', 'x', 9007199254740993),
+                (4, 2, 'contacts_only', NULL, 'Alpha', 'Alpha', 'pad', NULL),
+                (5, 2, 'contacts_only', 1, NULL, 'Alpha', 'pad', 1),
+                (6, 2, 'open',          999, 'missing', 'missing', 'missing', 999),
+                (7, 3, 'contacts_only', 0, 'zero', 'ZERO', 'z   ', -0.0),
+                (8, 3, 'contacts_only', 5, '5', 'FIVE', 'f', 5);
+            INSERT INTO pair_links VALUES
+                (1, 1, 'Alpha', 'alpha', 'pad', 1),
+                (2, 2, '2',     'beta',  'pad   ', 2),
+                (3, 9007199254740992, 'hi', 'hi', 'x', 9007199254740992.0),
+                (4, 0, 'zero',  'zero',  'z', 0.0),
+                (5, 5, '5',     'five',  'f', '5'),
+                (6, 1, NULL,    'alpha', 'pad', 1),
+                (7, NULL, 'Alpha', 'alpha', 'pad', NULL);
+        ";
+        // Pad pair_links past EXISTS_DIRECT_PROBE_MAX_LINEAR_ROWS (64) to exercise
+        // memo hash-set promotion in both GROUP BY joins and non-grouped joins.
+        let mut full_setup = String::from(setup);
+        for i in 10..95 {
+            use std::fmt::Write as _;
+            let _ = write!(
+                full_setup,
+                "INSERT INTO pair_links VALUES ({i}, {k}, 'pad_{i}', 'pad_{i}', 'pad_{i}', {k});",
+                k = 1000 + i
+            );
+        }
+
+        let queries = [
+            // 2-col integer+text over UNION CTE inside GROUP BY CASE (EXISTS + NOT EXISTS).
+            "WITH links AS (
+                SELECT p_int AS s, p_txt AS r FROM pair_links
+                UNION
+                SELECT p_int + 10000 AS s, p_txt AS r FROM pair_links
+             )
+             SELECT o.grp,
+                    SUM(CASE WHEN o.policy = 'open' THEN 1
+                             WHEN EXISTS (SELECT 1 FROM links l WHERE l.s = o.k_int AND l.r = o.k_txt) THEN 1
+                             ELSE 0 END),
+                    SUM(CASE WHEN o.policy = 'contacts_only'
+                              AND NOT EXISTS (SELECT 1 FROM links l WHERE o.k_int = l.s AND l.r = o.k_txt) THEN 1
+                             ELSE 0 END)
+             FROM outer_rows o JOIN join_dim d ON d.id = o.id
+             GROUP BY o.grp ORDER BY o.grp",
+            // 2-col with NOCASE + RTRIM collations and reversed operand order.
+            "SELECT o.grp,
+                    SUM(CASE WHEN EXISTS (
+                        SELECT 1 FROM pair_links l
+                        WHERE l.p_nc = o.k_nc AND o.k_rt = l.p_rt
+                    ) THEN 1 ELSE 0 END)
+             FROM outer_rows o JOIN join_dim d ON d.id = o.id
+             GROUP BY o.grp ORDER BY o.grp",
+            // GH#428 typeless (BLOB affinity) vs TEXT column must NOT coerce int 2 to '2'.
+            "SELECT o.id,
+                    EXISTS (
+                        SELECT 1 FROM pair_links l
+                        WHERE l.p_raw = o.k_txt AND l.p_int = o.k_int
+                    ),
+                    EXISTS (
+                        SELECT 1 FROM pair_links l
+                        WHERE l.p_raw = o.k_raw AND l.p_int = o.k_int
+                    )
+             FROM outer_rows o JOIN join_dim d ON d.id = o.id
+             ORDER BY o.id",
+            // Duplicate inner column in conjunctive AND: l.p_int = o.k_int AND l.p_int = o.grp.
+            "SELECT o.grp,
+                    SUM(CASE WHEN EXISTS (
+                        SELECT 1 FROM pair_links l
+                        WHERE l.p_int = o.k_int AND l.p_int = o.grp
+                    ) THEN 1 ELSE 0 END)
+             FROM outer_rows o JOIN join_dim d ON d.id = o.id
+             GROUP BY o.grp ORDER BY o.grp",
+            // Precision-preserving int64 vs f64 near 2^53 and -0.0 vs +0.0.
+            "SELECT o.id,
+                    EXISTS (
+                        SELECT 1 FROM pair_links l
+                        WHERE l.p_raw = o.k_raw AND l.p_txt = o.k_txt
+                    )
+             FROM outer_rows o JOIN join_dim d ON d.id = o.id
+             WHERE o.id IN (3, 7, 8)
+             ORDER BY o.id",
+            // CTE shadowing persistent base table name `pair_links`.
+            "WITH pair_links AS (
+                SELECT 1 AS p_int, 'Alpha' AS p_txt
+                UNION
+                SELECT 5 AS p_int, '5' AS p_txt
+             )
+             SELECT o.grp,
+                    SUM(CASE WHEN EXISTS (
+                        SELECT 1 FROM pair_links l
+                        WHERE l.p_int = o.k_int AND l.p_txt = o.k_txt
+                    ) THEN 1 ELSE 0 END)
+             FROM outer_rows o JOIN join_dim d ON d.id = o.id
+             GROUP BY o.grp ORDER BY o.grp",
+            // Non-grouped JOIN WHERE with 2-col correlated EXISTS over CTE.
+            "WITH links AS (SELECT p_int AS s, p_txt AS r FROM pair_links)
+             SELECT o.id FROM outer_rows o JOIN join_dim d ON d.id = o.id
+             WHERE EXISTS (SELECT 1 FROM links l WHERE l.s = o.k_int AND l.r = o.k_txt)
+             ORDER BY o.id",
+        ];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk_path = dir.path().join("multi-col-exists.sqlite3");
+        let disk_path_str = disk_path.to_str().expect("UTF-8 path").to_owned();
+
+        let oracle = rusqlite::Connection::open_in_memory().expect("open oracle");
+        oracle.execute_batch(&full_setup).expect("seed oracle");
+
+        for (label, path, reopen) in [
+            ("memory", ":memory:", false),
+            ("file-fresh", disk_path_str.as_str(), false),
+            ("file-reopened", disk_path_str.as_str(), true),
+        ] {
+            let frank = Connection::open(path).await.expect("open fsqlite");
+            if !reopen {
+                if path != ":memory:" {
+                    frank.execute("PRAGMA journal_mode=WAL").await.unwrap();
+                }
+                frank.execute_batch(&full_setup).await.expect("seed fsqlite");
+            }
+            for sql in queries {
+                let expected = sqlite_rows(&oracle, sql).expect("oracle query");
+                let actual = frank_rows(&frank, sql)
+                    .await
+                    .unwrap_or_else(|err| panic!("{label}: {sql}: {err}"));
+                assert_eq!(actual, expected, "{label} direct mismatch for:\n{sql}");
+
+                let stmt = frank.prepare(sql).await.expect("prepare");
+                let prep_rows: Vec<Vec<String>> = stmt
+                    .query()
+                    .await
+                    .unwrap_or_else(|err| panic!("{label} prepared: {sql}: {err}"))
+                    .iter()
+                    .map(|row| row.values().iter().map(render_frank).collect())
+                    .collect();
+                assert_eq!(prep_rows, expected, "{label} prepared mismatch for:\n{sql}");
+            }
+            frank.close().await.expect("close fsqlite");
+        }
+    });
+}
+
+#[test]
+#[ignore = "manual paired benchmark for bd-k5isc vs stock rusqlite 3.54.1; run with -- --ignored --nocapture"]
+fn bd_k5isc_contact_stats_benchmark_vs_stock_sqlite() {
+    use std::time::Instant;
+
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let frank_path = dir.path().join("frank-bench.sqlite3");
+        let stock_path = dir.path().join("stock-bench.sqlite3");
+        let frank_path_str = frank_path.to_str().expect("UTF-8").to_owned();
+
+        let seed_sql = contact_stats_seed_sql(200);
+        let index_sql = "
+            CREATE INDEX idx_message_recipients_agent ON message_recipients(agent_id);
+            CREATE INDEX idx_message_recipients_agent_message ON message_recipients(agent_id, message_id);
+            CREATE INDEX idx_messages_created_ts ON messages(created_ts);
+        ";
+
+        // Seed FrankenSQLite file-backed WAL DB (9 doublings = 8,192 in-window grouped deliveries,
+        // 4,608 of which hit contacts_only EXISTS + NOT EXISTS over a 406-row UNION CTE).
+        {
+            let frank = Connection::open(&frank_path_str).await.expect("open frank");
+            frank.execute("PRAGMA journal_mode=WAL").await.unwrap();
+            frank.execute_batch(&seed_sql).await.unwrap();
+            frank.execute_batch(index_sql).await.unwrap();
+            frank.execute("BEGIN").await.unwrap();
+            for generation in 0..9 {
+                let offset = 7_i64 << generation;
+                frank
+                    .execute(&format!(
+                        "INSERT INTO messages (id, sender_id, created_ts) \
+                         SELECT id + {offset}, sender_id, created_ts FROM messages WHERE id <= {offset}"
+                    ))
+                    .await
+                    .unwrap();
+                frank
+                    .execute(&format!(
+                        "INSERT INTO message_recipients (message_id, agent_id) \
+                         SELECT message_id + {offset}, agent_id FROM message_recipients WHERE message_id <= {offset}"
+                    ))
+                    .await
+                    .unwrap();
+            }
+            frank.execute("COMMIT").await.unwrap();
+            frank.close().await.unwrap();
+        }
+
+        // Seed stock rusqlite 3.54.1 identically on disk.
+        let oracle = rusqlite::Connection::open(&stock_path).expect("open stock");
+        oracle.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        oracle.execute_batch(&seed_sql).unwrap();
+        oracle.execute_batch(index_sql).unwrap();
+        oracle.execute_batch("BEGIN;").unwrap();
+        for generation in 0..9 {
+            let offset = 7_i64 << generation;
+            oracle
+                .execute(
+                    "INSERT INTO messages (id, sender_id, created_ts) \
+                     SELECT id + ?1, sender_id, created_ts FROM messages WHERE id <= ?1",
+                    [offset],
+                )
+                .unwrap();
+            oracle
+                .execute(
+                    "INSERT INTO message_recipients (message_id, agent_id) \
+                     SELECT message_id + ?1, agent_id FROM message_recipients WHERE message_id <= ?1",
+                    [offset],
+                )
+                .unwrap();
+        }
+        oracle.execute_batch("COMMIT;").unwrap();
+
+        let query_sql = legacy_contact_stats_sql(None);
+        let expected = sqlite_rows(&oracle, &query_sql).expect("stock query");
+
+        // Reopen FrankenSQLite fresh (cold memdb_rows_loaded, real production shape!).
+        let frank = Connection::open(&frank_path_str).await.expect("reopen frank");
+        let actual = frank_rows(&frank, &query_sql).await.expect("frank query");
+        assert_eq!(actual, expected, "benchmark query output mismatch vs stock");
+
+        // Warmup 1 each, then 5 interleaved samples.
+        let _ = sqlite_rows(&oracle, &query_sql).unwrap();
+        let _ = frank_rows(&frank, &query_sql).await.unwrap();
+
+        let mut stock_ms = Vec::with_capacity(5);
+        let mut frank_ms = Vec::with_capacity(5);
+        for i in 0..5 {
+            if i % 2 == 0 {
+                let t0 = Instant::now();
+                let r = frank_rows(&frank, &query_sql).await.unwrap();
+                frank_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(r, expected);
+
+                let t1 = Instant::now();
+                let s = sqlite_rows(&oracle, &query_sql).unwrap();
+                stock_ms.push(t1.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(s, expected);
+            } else {
+                let t1 = Instant::now();
+                let s = sqlite_rows(&oracle, &query_sql).unwrap();
+                stock_ms.push(t1.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(s, expected);
+
+                let t0 = Instant::now();
+                let r = frank_rows(&frank, &query_sql).await.unwrap();
+                frank_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(r, expected);
+            }
+        }
+        stock_ms.sort_by(f64::total_cmp);
+        frank_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "bd-k5isc paired bench (8,192 grouped rows, 4,608 contacts_only EXISTS+NOT EXISTS, 406 CTE rows, reopened file-backed WAL): \
+             stock_3.54.1 median={:.2}ms (all={stock_ms:.2?}) | frankensqlite median={:.2}ms (all={frank_ms:.2?}) | ratio={:.2}x",
+            stock_ms[2],
+            frank_ms[2],
+            frank_ms[2] / stock_ms[2].max(1e-6),
+        );
+        frank.close().await.unwrap();
+    });
+}
