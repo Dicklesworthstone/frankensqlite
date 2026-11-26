@@ -241,12 +241,21 @@ impl Drop for VfsWritePreflight {
 /// Borrowed frame descriptor used for consolidated WAL writes.
 #[derive(Debug, Clone, Copy)]
 pub struct WalAppendFrameRef<'a> {
-    /// Database page number this frame writes.
+    /// Nonzero database page number this frame writes.
     pub page_number: u32,
     /// Page contents for the frame. Must be exactly `page_size` bytes.
     pub page_data: &'a [u8],
     /// Database size in pages for commit frames, or 0 for non-commit frames.
     pub db_size_if_commit: u32,
+}
+
+fn validate_append_page_number(page_number: u32) -> Result<()> {
+    if page_number == 0 {
+        return Err(FrankenError::WalCorrupt {
+            detail: "a WAL frame must address a nonzero database page".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Identity for one WAL generation.
@@ -1435,6 +1444,7 @@ impl<F: VfsFile> WalFile<F> {
             return Err(FrankenError::DatabaseFull);
         }
 
+        validate_append_page_number(page_number)?;
         if page_data.len() != self.page_size {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
@@ -1580,6 +1590,7 @@ impl<F: VfsFile> WalFile<F> {
                     ),
                 });
             }
+            validate_append_page_number(frame.page_number)?;
             if frame.page_data.len() != self.page_size {
                 return Err(FrankenError::WalCorrupt {
                     detail: format!(
@@ -2291,6 +2302,7 @@ impl<F: VfsFile> WalFile<F> {
                         ),
                     });
                 }
+                validate_append_page_number(frame.page_number)?;
                 if frame.page_data.len() != page_size {
                     return Err(FrankenError::WalCorrupt {
                         detail: format!(
@@ -2406,6 +2418,7 @@ impl<F: VfsFile> WalFile<F> {
                     ),
                 });
             }
+            validate_append_page_number(frame.page_number)?;
             if frame.page_data.len() != self.page_size {
                 return Err(FrankenError::WalCorrupt {
                     detail: format!(
@@ -4033,6 +4046,31 @@ mod tests {
         assert_eq!(observed[0], second[0] ^ 1);
     }
 
+    // Write a physical fixture without going through the validating writer.
+    fn write_fixture_frame<F: VfsFile>(
+        wal: &WalFile<F>,
+        cx: &Cx,
+        index: usize,
+        frame: WalAppendFrameRef<'_>,
+        seed: SqliteWalChecksum,
+    ) -> SqliteWalChecksum {
+        let mut bytes = Vec::new();
+        push_wal_frame_bytes(
+            &mut bytes,
+            frame.page_number,
+            frame.db_size_if_commit,
+            wal.header.salts,
+            frame.page_data,
+        );
+        let checksum =
+            write_wal_frame_checksum(&mut bytes, wal.page_size, seed, wal.big_endian_checksum)
+                .unwrap();
+        wal.file()
+            .write(cx, &bytes, wal.frame_offset(index))
+            .unwrap();
+        checksum
+    }
+
     #[test]
     fn test_force_rebuild_stops_at_zero_page_and_discards_only_uncommitted_horizon() {
         let cx = test_cx();
@@ -4045,13 +4083,17 @@ mod tests {
             wal.append_frame(&cx, 1, &page, 1)
                 .expect("committed prefix");
             let marker = wal.last_commit_frame_header();
-            wal.append_frame(
+            write_fixture_frame(
+                &wal,
                 &cx,
-                if zero_page { 0 } else { 2 },
-                &page,
-                if zero_page { 2 } else { 0 },
-            )
-            .expect("construct complete checksum-valid invalid/uncommitted tail");
+                1,
+                frame_ref(
+                    if zero_page { 0 } else { 2 },
+                    &page,
+                    if zero_page { 2 } else { 0 },
+                ),
+                wal.running_checksum(),
+            );
             let size = wal.file().file_size(&cx).unwrap();
             wal.rebuild_state_from_file(&cx)
                 .expect("full recovery scan");
@@ -4075,9 +4117,15 @@ mod tests {
 
         // The rolling checksum is valid through the next commit. A page-zero
         // frame in between still terminates the chain for every replay path.
-        writer.append_frame(&cx, 0, &sample_page(2), 0).unwrap();
-        let damaged_prefix_checksum = writer.running_checksum();
-        writer.append_frame(&cx, 2, &sample_page(3), 2).unwrap();
+        let damaged_prefix_checksum =
+            write_fixture_frame(&writer, &cx, 1, frame_ref(0, &sample_page(2), 0), checksum);
+        write_fixture_frame(
+            &writer,
+            &cx,
+            2,
+            frame_ref(2, &sample_page(3), 2),
+            damaged_prefix_checksum,
+        );
 
         let reopened = WalFile::open(&cx, open_wal_file(&vfs, &cx)).unwrap();
         assert_eq!(reopened.frame_count(), 1);
@@ -4103,6 +4151,36 @@ mod tests {
         ));
         assert_eq!(reader.frame_count(), 1);
         assert_eq!(reader.running_checksum(), checksum);
+    }
+
+    #[test]
+    fn zero_page_appends_fail_before_any_frame_is_written() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create WAL");
+        let page = sample_page(1);
+        let initial_size = wal.file().file_size(&cx).unwrap();
+        assert!(matches!(
+            wal.append_frame(&cx, 0, &page, 1).wait(),
+            Err(FrankenError::WalCorrupt { .. })
+        ));
+        for count in [2, WAL_APPEND_BUFFER_BYTES / wal.frame_size() + 2] {
+            let mut frames = vec![frame_ref(1, &page, 0); count];
+            frames[count - 1] = frame_ref(0, &page, 1);
+            assert!(matches!(
+                wal.prepare_frame_bytes(&frames),
+                Err(FrankenError::WalCorrupt { .. })
+            ));
+            assert!(matches!(
+                wal.append_frames(&cx, &frames).wait(),
+                Err(FrankenError::WalCorrupt { .. })
+            ));
+            assert_eq!(wal.frame_count(), 0);
+            assert_eq!(wal.file().file_size(&cx).unwrap(), initial_size);
+        }
+        wal.append_frame(&cx, 1, &page, 1).unwrap();
+        assert_eq!(wal.frame_count(), 1);
     }
 
     #[test]
