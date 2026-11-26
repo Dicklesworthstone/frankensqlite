@@ -111,6 +111,39 @@ trait QualifiedColumnCatalog {
     /// in TEMP, then MAIN, then each attached database in attach order, as
     /// SQLite does. `None` when there is no such relation.
     fn relation(&self, schema: Option<&str>, name: &str) -> Option<QualifiedColumnRelation>;
+
+    /// Column metadata for a table-valued function (eponymous virtual table in
+    /// MAIN). Defaults to opaque when the catalog has no TVF registry.
+    fn table_function_relation(&self, _name: &str) -> QualifiedColumnRelation {
+        QualifiedColumnRelation::opaque("main", None)
+    }
+
+    /// Validate a function call's existence / arity so walk-order error
+    /// precedence reports an earlier `no such function` ahead of a later
+    /// three-part column error (bd-av6zk).
+    fn validate_function_call(
+        &self,
+        _name: &str,
+        _args: &FunctionArgs,
+        _over: Option<&WindowSpec>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn builtin_schema_column_relation(database: &str) -> QualifiedColumnRelation {
+    QualifiedColumnRelation {
+        database: Some(database.to_owned()),
+        columns: Some(
+            sqlite_master_column_infos()
+                .into_iter()
+                .map(|column| column.name)
+                .collect(),
+        ),
+        rowid_names: vec!["rowid", "_rowid_", "oid"],
+        exposes_true: false,
+        exposes_false: false,
+    }
 }
 
 impl QualifiedColumnCatalog for Connection {
@@ -123,6 +156,12 @@ impl QualifiedColumnCatalog for Connection {
 
     fn relation(&self, schema: Option<&str>, name: &str) -> Option<QualifiedColumnRelation> {
         let Some(schema) = schema else {
+            if canonical_sqlite_temp_schema_name(name).is_some() {
+                return Some(builtin_schema_column_relation("temp"));
+            }
+            if canonical_sqlite_schema_name(name).is_some() {
+                return Some(builtin_schema_column_relation("main"));
+            }
             return self
                 .local_column_relation(name, PragmaSchemaScope::Temp)
                 .or_else(|| self.local_column_relation(name, PragmaSchemaScope::Main))
@@ -141,12 +180,61 @@ impl QualifiedColumnCatalog for Connection {
                 });
         };
         if schema.eq_ignore_ascii_case("main") {
+            if canonical_sqlite_schema_name(name).is_some() {
+                return Some(builtin_schema_column_relation("main"));
+            }
             self.local_column_relation(name, PragmaSchemaScope::Main)
         } else if schema.eq_ignore_ascii_case("temp") {
+            if canonical_sqlite_schema_name(name).is_some()
+                || canonical_sqlite_temp_schema_name(name).is_some()
+            {
+                return Some(builtin_schema_column_relation("temp"));
+            }
             self.local_column_relation(name, PragmaSchemaScope::Temp)
         } else {
+            if self.database_named(schema).is_some()
+                && canonical_sqlite_schema_name(name).is_some()
+            {
+                return Some(builtin_schema_column_relation(&schema.to_ascii_lowercase()));
+            }
             self.attached_column_relation(schema, name)
         }
+    }
+
+    fn table_function_relation(&self, name: &str) -> QualifiedColumnRelation {
+        let columns = self.table_function_result_column_names(name).map(|mut cols| {
+            for hidden in table_function_hidden_columns(name) {
+                if !cols.iter().any(|col| col.eq_ignore_ascii_case(hidden)) {
+                    cols.push((*hidden).to_owned());
+                }
+            }
+            if name.eq_ignore_ascii_case("generate_series") {
+                for hidden in ["start", "stop", "step"] {
+                    if !cols.iter().any(|col| col.eq_ignore_ascii_case(hidden)) {
+                        cols.push(hidden.to_owned());
+                    }
+                }
+            }
+            cols
+        });
+        QualifiedColumnRelation {
+            database: Some("main".to_owned()),
+            columns,
+            rowid_names: vec!["rowid", "_rowid_", "oid"],
+            exposes_true: false,
+            exposes_false: false,
+        }
+    }
+
+    fn validate_function_call(
+        &self,
+        name: &str,
+        args: &FunctionArgs,
+        over: Option<&WindowSpec>,
+    ) -> Result<()> {
+        self.with_fallback_function_registry(|| {
+            validate_function_call_resolution(name, args, over, Span::ZERO)
+        })
     }
 }
 
@@ -223,10 +311,14 @@ impl Connection {
                 .map(|table| QualifiedColumnRelation::table(database, table));
         }
         let index = self.view_index_for_scope(name, scope)?;
-        self.views
-            .borrow()
-            .get(index)
-            .map(|view| QualifiedColumnRelation::opaque(database, view_output_column_names(view)))
+        let view = self.views.borrow().get(index)?.clone();
+        let columns = view_output_column_names(&view).or_else(|| {
+            let resolved = Self::deduplicate_relation_column_names(
+                self.select_result_column_names(&view.query, &[], &mut Vec::new()),
+            );
+            (!resolved.is_empty()).then_some(resolved)
+        });
+        Some(QualifiedColumnRelation::opaque(database, columns))
     }
 
     /// A table or view of the attached database `schema`.
@@ -262,6 +354,11 @@ fn bind_schema_qualified_columns_with(
         return Ok(None);
     }
     if let Some(error) = binder.error.take() {
+        return Err(error);
+    }
+    if binder.saw_later_three_part_error
+        && let Some(error) = binder.earlier_non_three_part_error.take()
+    {
         return Err(error);
     }
     // bd-x4g7x: a `name.*` over several same-named items is rewritten one
@@ -344,10 +441,11 @@ enum TrueFalseLookup {
 }
 
 /// One lexical query scope: its FROM/DML sources plus optional `SELECT`
-/// result-set aliases named `true` or `false` (SQLite's `NC_UEList`).
+/// result-set aliases (SQLite's `NC_UEList`).
 #[derive(Debug, Default)]
 struct BindingScope {
     sources: Vec<BindingSource>,
+    result_aliases: Vec<String>,
     true_alias: Option<Expr>,
     false_alias: Option<Expr>,
     aliases_visible: bool,
@@ -357,10 +455,17 @@ impl BindingScope {
     fn from_sources(sources: Vec<BindingSource>) -> Self {
         Self {
             sources,
+            result_aliases: Vec::new(),
             true_alias: None,
             false_alias: None,
             aliases_visible: false,
         }
+    }
+
+    fn has_result_alias(&self, name: &str) -> bool {
+        self.result_aliases
+            .iter()
+            .any(|alias| alias.eq_ignore_ascii_case(name))
     }
 
     fn alias_for(&self, is_true: bool) -> Option<&Expr> {
@@ -395,6 +500,11 @@ struct QualifiedColumnBinder<'a> {
     true_false_rewrites: usize,
     unresolved_relation: bool,
     error: Option<FrankenError>,
+    /// First bare-column, two-part-missing, or function error seen before any
+    /// binder error (bd-av6zk). Surfaced only when a later three-part error
+    /// would otherwise preempt it out of walk order.
+    earlier_non_three_part_error: Option<FrankenError>,
+    saw_later_three_part_error: bool,
     /// Items that get a synthetic alias: id -> (name, database).
     needs_alias: BTreeMap<usize, (String, String)>,
     /// For each `name.*`, the non-target items of its query addressed as
@@ -409,6 +519,9 @@ struct QualifiedColumnBinder<'a> {
     /// True while walking a `WHERE` clause (so aliased aggregate/window
     /// expressions stay spelled as bare aliases for exact error reporting).
     in_where_clause: bool,
+    /// True while walking an `ON CONFLICT DO UPDATE` clause where `excluded.*`
+    /// is visible.
+    in_upsert_update: bool,
 }
 
 impl<'a> QualifiedColumnBinder<'a> {
@@ -423,12 +536,15 @@ impl<'a> QualifiedColumnBinder<'a> {
             true_false_rewrites: 0,
             unresolved_relation: false,
             error: None,
+            earlier_non_three_part_error: None,
+            saw_later_three_part_error: false,
             needs_alias: BTreeMap::new(),
             table_star_groups: Vec::new(),
             aliases: HashMap::new(),
             taken_names: HashSet::new(),
             returning_scope: None,
             in_where_clause: false,
+            in_upsert_update: false,
         }
     }
 
@@ -439,11 +555,26 @@ impl<'a> QualifiedColumnBinder<'a> {
         self.next_id = 0;
         self.returning_scope = None;
         self.in_where_clause = false;
+        self.in_upsert_update = false;
     }
 
     fn fail(&mut self, error: FrankenError) {
         if self.error.is_none() {
             self.error = Some(error);
+        }
+    }
+
+    fn fail_three_part(&mut self, error: FrankenError) {
+        if self.earlier_non_three_part_error.is_some() {
+            self.saw_later_three_part_error = true;
+            return;
+        }
+        self.fail(error);
+    }
+
+    fn note_non_three_part_error(&mut self, error: FrankenError) {
+        if self.error.is_none() && self.earlier_non_three_part_error.is_none() {
+            self.earlier_non_three_part_error = Some(error);
         }
     }
 
@@ -649,8 +780,10 @@ impl<'a> QualifiedColumnBinder<'a> {
                 // reference sibling `AS` aliases, and their resolved expressions
                 // then seed `NC_UEList` for WHERE / GROUP BY / HAVING / ORDER BY).
                 self.result_columns(columns);
+                let result_aliases = collect_result_aliases(columns);
                 let (true_alias, false_alias) = collect_true_false_result_aliases(columns);
                 if let Some(current) = self.scopes.last_mut() {
+                    current.result_aliases = result_aliases;
                     current.true_alias = true_alias;
                     current.false_alias = false_alias;
                 }
@@ -734,12 +867,15 @@ impl<'a> QualifiedColumnBinder<'a> {
                 where_clause,
             } = &mut upsert.action
             {
+                let prev_upsert = self.in_upsert_update;
+                self.in_upsert_update = true;
                 for assignment in assignments {
                     self.expr(&mut assignment.value);
                 }
                 if let Some(expr) = where_clause {
                     self.expr(expr);
                 }
+                self.in_upsert_update = prev_upsert;
             }
         }
         self.returning(&mut insert.returning);
@@ -864,11 +1000,12 @@ impl<'a> QualifiedColumnBinder<'a> {
                 self.take_name(name);
                 let written_alias = self.apply_alias(id, alias);
                 // Table-valued functions are eponymous virtual tables of MAIN.
+                let relation = self.catalog.table_function_relation(name);
                 scope.push(BindingSource {
                     id,
                     table: Some(name.clone()),
                     alias: written_alias,
-                    relation: QualifiedColumnRelation::opaque("main", None),
+                    relation,
                     coalesced: Vec::new(),
                     is_target: false,
                 });
@@ -1254,6 +1391,7 @@ impl<'a> QualifiedColumnBinder<'a> {
             }
             Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => self.select(subquery),
             Expr::FunctionCall {
+                name,
                 args,
                 order_by,
                 filter,
@@ -1273,6 +1411,12 @@ impl<'a> QualifiedColumnBinder<'a> {
                 }
                 if let Some(over) = over {
                     self.window_spec(over);
+                }
+                if self.pass == BindPass::Bind
+                    && let Err(error) =
+                        self.catalog.validate_function_call(name, args, over.as_ref())
+                {
+                    self.note_non_three_part_error(error);
                 }
             }
             Expr::JsonAccess { expr, path, .. } => {
@@ -1340,6 +1484,11 @@ impl<'a> QualifiedColumnBinder<'a> {
 
     fn column(&mut self, column: &mut ColumnRef) {
         let Some(table) = column.table.clone() else {
+            if self.pass == BindPass::Bind && !self.bare_column_is_known(&column.column) {
+                self.note_non_three_part_error(FrankenError::NoSuchColumn {
+                    name: column.column.to_string(),
+                });
+            }
             return;
         };
         let Some(database) = column.schema.clone() else {
@@ -1353,8 +1502,12 @@ impl<'a> QualifiedColumnBinder<'a> {
                 let name = || format!("{database}.{table}.{}", column.column);
                 match lookup {
                     Lookup::Bound { scope, id } => self.note_shared_name(scope, id),
-                    Lookup::Ambiguous => self.fail(FrankenError::AmbiguousColumn { name: name() }),
-                    Lookup::Missing => self.fail(FrankenError::NoSuchColumn { name: name() }),
+                    Lookup::Ambiguous => {
+                        self.fail_three_part(FrankenError::AmbiguousColumn { name: name() });
+                    }
+                    Lookup::Missing => {
+                        self.fail_three_part(FrankenError::NoSuchColumn { name: name() });
+                    }
                 }
             }
             BindPass::Rewrite => {
@@ -1365,6 +1518,24 @@ impl<'a> QualifiedColumnBinder<'a> {
                 }
             }
         }
+    }
+
+    fn bare_column_is_known(&self, column: &str) -> bool {
+        for scope in self.scopes.iter().rev() {
+            for source in &scope.sources {
+                match source.relation.has_column(column) {
+                    Some(true) | None => return true,
+                    Some(false) => {}
+                }
+                if source.relation.has_rowid_name(column) {
+                    return true;
+                }
+            }
+            if scope.aliases_visible && scope.has_result_alias(column) {
+                return true;
+            }
+        }
+        false
     }
 
     fn two_part(&mut self, column: &mut ColumnRef, table: &str) {
@@ -1386,7 +1557,14 @@ impl<'a> QualifiedColumnBinder<'a> {
                     Lookup::Bound { scope, id } if self.nearest_item_misleads(scope, id, table) => {
                         self.note_shared_name(scope, id);
                     }
-                    Lookup::Bound { .. } | Lookup::Missing => {}
+                    Lookup::Bound { .. } => {}
+                    Lookup::Missing => {
+                        if !(self.in_upsert_update && table.eq_ignore_ascii_case("excluded")) {
+                            self.note_non_three_part_error(FrankenError::NoSuchColumn {
+                                name: format!("{table}.{}", column.column),
+                            });
+                        }
+                    }
                 }
             }
             BindPass::Rewrite => {
@@ -1632,6 +1810,18 @@ fn bare_true_false_under_collate(expr: &mut Expr) -> Option<(&mut Expr, bool, Sp
         }
         _ => None,
     }
+}
+
+fn collect_result_aliases(columns: &[ResultColumn]) -> Vec<String> {
+    columns
+        .iter()
+        .filter_map(|column| match column {
+            ResultColumn::Expr {
+                alias: Some(alias), ..
+            } => Some(alias.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn collect_true_false_result_aliases(columns: &[ResultColumn]) -> (Option<Expr>, Option<Expr>) {

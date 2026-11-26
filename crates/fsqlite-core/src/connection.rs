@@ -88153,6 +88153,15 @@ impl Connection {
             "sqlite_schema_virtual_materialization",
         )?;
         let result = lean_future(|| async {
+            // bd-av6zk: when a query references `temp.sqlite_master` /
+            // `temp.sqlite_schema` (possibly alongside `main.sqlite_master`),
+            // rewrite the TEMP reference to `sqlite_temp_master` /
+            // `sqlite_temp_schema` (preserving any alias or defaulting to the
+            // written table name) and strip `main.` so both catalogs materialize
+            // under distinct names in `self.schema`.
+            let mut normalized_select = select.clone();
+            rewrite_qualified_local_sqlite_schema_tables(&mut normalized_select);
+            let select = &normalized_select;
             let referenced = self.collect_sqlite_schema_references(select);
             if referenced.is_empty() {
                 let statement = Statement::Select(select.clone());
@@ -133444,6 +133453,242 @@ fn join_order_label(select: &SelectStatement) -> String {
                 .collect::<Vec<_>>()
                 .join("->"),
         },
+    }
+}
+
+fn rewrite_qualified_local_sqlite_schema_tables(select: &mut SelectStatement) {
+    if let Some(with) = select.with.as_mut() {
+        for cte in &mut with.ctes {
+            rewrite_qualified_local_sqlite_schema_tables(&mut cte.query);
+        }
+    }
+    rewrite_qualified_local_sqlite_schema_tables_in_core(&mut select.body.select);
+    for (_, core) in &mut select.body.compounds {
+        rewrite_qualified_local_sqlite_schema_tables_in_core(core);
+    }
+    for term in &mut select.order_by {
+        rewrite_qualified_local_sqlite_schema_tables_in_expr(&mut term.expr);
+    }
+    if let Some(limit) = select.limit.as_mut() {
+        rewrite_qualified_local_sqlite_schema_tables_in_expr(&mut limit.limit);
+        if let Some(offset) = limit.offset.as_mut() {
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(offset);
+        }
+    }
+}
+
+fn rewrite_qualified_local_sqlite_schema_tables_in_core(core: &mut SelectCore) {
+    match core {
+        SelectCore::Values(rows) => {
+            for expr in rows.iter_mut().flatten() {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+            }
+        }
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            for column in columns {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+                }
+            }
+            if let Some(from) = from.as_mut() {
+                rewrite_qualified_local_sqlite_schema_tables_in_from(from);
+            }
+            if let Some(expr) = where_clause.as_mut() {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+            }
+            for expr in group_by {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+            }
+            if let Some(expr) = having.as_mut() {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+            }
+            for window in windows {
+                rewrite_qualified_local_sqlite_schema_tables_in_window_spec(&mut window.spec);
+            }
+        }
+    }
+}
+
+fn rewrite_qualified_local_sqlite_schema_tables_in_from(from: &mut FromClause) {
+    rewrite_qualified_local_sqlite_schema_tables_in_source(&mut from.source);
+    for join in &mut from.joins {
+        rewrite_qualified_local_sqlite_schema_tables_in_source(&mut join.table);
+        if let Some(JoinConstraint::On(expr)) = join.constraint.as_mut() {
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+        }
+    }
+}
+
+fn rewrite_qualified_local_sqlite_schema_tables_in_source(source: &mut TableOrSubquery) {
+    match source {
+        TableOrSubquery::Table { name, alias, .. } => {
+            if name
+                .schema
+                .as_deref()
+                .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+            {
+                if let Some(canonical) = canonical_sqlite_schema_name(&name.name) {
+                    if alias.is_none() {
+                        *alias = Some(name.name.clone());
+                    }
+                    name.schema = None;
+                    let target_name = if canonical == "sqlite_schema" {
+                        "sqlite_temp_schema"
+                    } else {
+                        "sqlite_temp_master"
+                    };
+                    target_name.clone_into(&mut name.name);
+                } else if canonical_sqlite_temp_schema_name(&name.name).is_some() {
+                    name.schema = None;
+                }
+            } else if name
+                .schema
+                .as_deref()
+                .is_some_and(|schema| schema.eq_ignore_ascii_case("main"))
+                && canonical_sqlite_schema_name(&name.name).is_some()
+            {
+                name.schema = None;
+            }
+        }
+        TableOrSubquery::Subquery { query, .. } => {
+            rewrite_qualified_local_sqlite_schema_tables(query);
+        }
+        TableOrSubquery::TableFunction { args, .. } => {
+            for arg in args {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(arg);
+            }
+        }
+        TableOrSubquery::ParenJoin(inner) => {
+            rewrite_qualified_local_sqlite_schema_tables_in_from(inner);
+        }
+    }
+}
+
+fn rewrite_qualified_local_sqlite_schema_tables_in_window_spec(spec: &mut WindowSpec) {
+    for expr in &mut spec.partition_by {
+        rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+    }
+    for term in &mut spec.order_by {
+        rewrite_qualified_local_sqlite_schema_tables_in_expr(&mut term.expr);
+    }
+    if let Some(frame) = spec.frame.as_mut() {
+        for bound in std::iter::once(&mut frame.start).chain(frame.end.as_mut()) {
+            if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = bound {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+            }
+        }
+    }
+}
+
+fn rewrite_qualified_local_sqlite_schema_tables_in_expr(expr: &mut Expr) {
+    match expr {
+        Expr::Subquery(subquery, _) | Expr::Exists { subquery, .. } => {
+            rewrite_qualified_local_sqlite_schema_tables(subquery);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(left);
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(right);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => {
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(low);
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(high);
+        }
+        Expr::In { expr, set, .. } => {
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+            match set {
+                InSet::List(items) => {
+                    for item in items {
+                        rewrite_qualified_local_sqlite_schema_tables_in_expr(item);
+                    }
+                }
+                InSet::Subquery(subquery) => {
+                    rewrite_qualified_local_sqlite_schema_tables(subquery);
+                }
+                InSet::Table(_) => {}
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(pattern);
+            if let Some(escape) = escape.as_mut() {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(escape);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand.as_mut() {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(operand);
+            }
+            for (when, then) in whens {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(when);
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(then);
+            }
+            if let Some(else_expr) = else_expr.as_mut() {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(else_expr);
+            }
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if let FunctionArgs::List(items) = args {
+                for arg in items {
+                    rewrite_qualified_local_sqlite_schema_tables_in_expr(arg);
+                }
+            }
+            for term in order_by {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(&mut term.expr);
+            }
+            if let Some(filter) = filter.as_mut() {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(filter);
+            }
+            if let Some(over) = over.as_mut() {
+                rewrite_qualified_local_sqlite_schema_tables_in_window_spec(over);
+            }
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(expr);
+            rewrite_qualified_local_sqlite_schema_tables_in_expr(path);
+        }
+        Expr::RowValue(items, _) => {
+            for item in items {
+                rewrite_qualified_local_sqlite_schema_tables_in_expr(item);
+            }
+        }
+        Expr::Column(..)
+        | Expr::Literal(..)
+        | Expr::Placeholder(..)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Raise { .. } => {}
     }
 }
 
@@ -189726,6 +189971,7 @@ fn validate_join_column_references(
                 using_skip,
             )
             .map(|_| ())
+            .map_err(nested_order_column_error)
         }
         Expr::BinaryOp { left, right, .. } => {
             validate_join_column_references(
