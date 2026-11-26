@@ -2891,3 +2891,344 @@ fn bd_knibh_join3_secidx_30k_live_vs_sqlite() {
         }
     });
 }
+
+/// bd-obpoh: a lookup join whose outer loop seeks an index skips `OpenRead`
+/// and `SeekRowid` on the outer table whenever the outer index (plus its
+/// rowid) covers every outer column read by the statement, and evaluates
+/// outer-only WHERE terms once per outer row rather than inside the inner
+/// loop. Uncovered outer columns, REAL-affinity outer columns, and virtual
+/// generated outer columns fail closed to `SeekRowid`.
+#[test]
+fn bd_obpoh_covering_outer_index_join_oracle() {
+    let has_open_cursor =
+        |ops: &[(i64, String, i64, i64)], cursor: i64| ops.iter().any(|(_, op, p1, _)| op == "OpenRead" && *p1 == cursor);
+    let has_seek_rowid_cursor = |ops: &[(i64, String, i64, i64)], cursor: i64| {
+        ops.iter()
+            .any(|(_, op, p1, _)| op == "SeekRowid" && *p1 == cursor)
+    };
+    let inner_loop_has_comparison = |ops: &[(i64, String, i64, i64)]| {
+        let Some(inner_seek) = ops.iter().rposition(|(_, op, p1, _)| op == "SeekGE" && *p1 == 2)
+        else {
+            return false;
+        };
+        let Some(inner_next) = ops[inner_seek..]
+            .iter()
+            .position(|(_, op, p1, _)| op == "Next" && *p1 == 2)
+            .map(|rel| inner_seek + rel)
+        else {
+            return false;
+        };
+        // Skip the single `Ne` key-termination guard right after `Column 2, 0`.
+        ops[inner_seek..inner_next]
+            .iter()
+            .any(|(_, op, _, _)| op == "Eq" || op == "IfNot")
+    };
+
+    // Unanalyzed `:memory:` with outer `t` written first still covers outer `t`.
+    asupersync::test_utils::run_test(|| async move {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, pad TEXT)",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, tid INTEGER)",
+            "CREATE INDEX t_a ON t(a)",
+            "CREATE INDEX p_tid ON p(tid)",
+            "INSERT INTO t VALUES (1, 5, 'x'), (2, 5, 'y'), (3, 7, 'z')",
+            "INSERT INTO p VALUES (10, 1), (11, 1), (12, 3)",
+        ] {
+            f.execute(sql).await.unwrap();
+            r.execute(sql, []).unwrap();
+        }
+        let sql = "SELECT count(*) FROM t JOIN p ON p.tid = t.id WHERE t.a = 5";
+        assert_agree(&f, &r, sql, &[], &[]).await;
+        let ops = program(&f, sql).await;
+        assert!(
+            !has_open_cursor(&ops, 0)
+                && !has_open_cursor(&ops, 1)
+                && !ops.iter().any(|(_, op, _, _)| op == "SeekRowid"),
+            "unanalyzed :memory: `t JOIN p` must be double-covering: {ops:?}"
+        );
+        f.close().await.unwrap();
+    });
+
+    for (analyzed, file_backed) in [(true, false), (false, true), (true, true)] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let target = if file_backed {
+                dir.path()
+                    .join("bd_obpoh_covering_outer.db")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let f = Connection::open(&target).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+
+            let mut setup = vec![
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, pad TEXT)".to_owned(),
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, tid INTEGER, val INTEGER)".to_owned(),
+                "CREATE INDEX t_a ON t(a)".to_owned(),
+                "CREATE INDEX p_tid ON p(tid)".to_owned(),
+                "CREATE TABLE t2(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, pad TEXT)".to_owned(),
+                "CREATE INDEX t2_a ON t2(a)".to_owned(),
+                "CREATE INDEX t2_ab ON t2(a, b)".to_owned(),
+                "CREATE TABLE small_cov(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)".to_owned(),
+                "CREATE INDEX sc_ab ON small_cov(a, b)".to_owned(),
+                "CREATE TABLE rt(id INTEGER PRIMARY KEY, a INTEGER, r REAL)".to_owned(),
+                "CREATE INDEX rt_r ON rt(r)".to_owned(),
+                "CREATE INDEX rt_ar ON rt(a, r)".to_owned(),
+                "CREATE TABLE vt(id INTEGER PRIMARY KEY, a INTEGER, \
+                 g INTEGER GENERATED ALWAYS AS (a * 10 + id) VIRTUAL)"
+                    .to_owned(),
+                "CREATE INDEX vt_a ON vt(a)".to_owned(),
+                "CREATE TABLE o(id INTEGER PRIMARY KEY, k INTEGER, s TEXT, \
+                 n TEXT COLLATE NOCASE, u, pad TEXT)"
+                    .to_owned(),
+                "CREATE INDEX o_k ON o(k)".to_owned(),
+                "CREATE INDEX o_s ON o(s)".to_owned(),
+                "CREATE INDEX o_n ON o(n)".to_owned(),
+                "CREATE INDEX o_u ON o(u)".to_owned(),
+            ];
+            for i in 1..=200_i64 {
+                setup.push(format!(
+                    "INSERT INTO t VALUES ({i}, {}, {}, 'pad-{i}')",
+                    i % 20,
+                    i % 7
+                ));
+                setup.push(format!(
+                    "INSERT INTO t2 VALUES ({i}, {}, {}, 'pad2-{i}')",
+                    i % 20,
+                    i % 7
+                ));
+            }
+            for i in 1..=400_i64 {
+                // Leave some t rows unmatched for LEFT JOIN / anti-join coverage.
+                let tid = if i % 5 == 0 {
+                    9999
+                } else {
+                    1 + ((i * 3) % 180)
+                };
+                setup.push(format!("INSERT INTO p VALUES ({i}, {tid}, {})", i % 25));
+            }
+            for i in 1..=40_i64 {
+                setup.push(format!(
+                    "INSERT INTO small_cov VALUES ({i}, {}, 's{}')",
+                    i % 5,
+                    i % 3
+                ));
+                setup.push(format!(
+                    "INSERT INTO rt VALUES ({i}, {}, {}.0)",
+                    i % 5,
+                    i % 7
+                ));
+                setup.push(format!("INSERT INTO vt VALUES ({i}, {})", i % 5));
+            }
+            setup.push(
+                "INSERT INTO o VALUES \
+                 (1, 2, '1', 'Abc', 5, 'p1'), \
+                 (2, '2', 'a', 'abc', '5', 'p2'), \
+                 (3, 'x', 1, 'ABC', 5.0, 'p3'), \
+                 (4, NULL, NULL, NULL, NULL, 'p4'), \
+                 (5, 2.5, 'A', 'abd', x'05', 'p5'), \
+                 (6, 7, 'a', 'Abc', 'x', 'p6'), \
+                 (7, 2, '1', 'aBc', 5, 'p7')"
+                    .to_owned(),
+            );
+            for sql in &setup {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            if analyzed {
+                f.execute("ANALYZE").await.unwrap();
+                r.execute_batch("ANALYZE").unwrap();
+            }
+
+            // 1. Exact bd-obpoh target: count(*) over p JOIN t with t.a = 5.
+            //    Both outer (t via t_a) and inner (p via p_tid) are covering:
+            //    no OpenRead on cursor 0 or 1, no SeekRowid at all, and no
+            //    redundant Eq/IfNot inside the inner p_tid loop.
+            let target_sql = "SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5";
+            assert_agree(&f, &r, target_sql, &[], &[]).await;
+            let ops = program(&f, target_sql).await;
+            assert!(
+                !has_open_cursor(&ops, 0),
+                "analyzed={analyzed} file={file_backed} target must skip OpenRead 0: {ops:?}"
+            );
+            assert!(
+                !has_open_cursor(&ops, 1),
+                "analyzed={analyzed} file={file_backed} target must skip OpenRead 1: {ops:?}"
+            );
+            assert!(
+                !ops.iter().any(|(_, op, _, _)| op == "SeekRowid"),
+                "analyzed={analyzed} file={file_backed} target must emit zero SeekRowid: {ops:?}"
+            );
+            assert!(
+                !inner_loop_has_comparison(&ops),
+                "analyzed={analyzed} file={file_backed} target must not re-evaluate outer WHERE inside inner loop: {ops:?}"
+            );
+
+            // 2. Covered outer queries (aggregate, row projection, ORDER BY,
+            //    LIMIT/OFFSET, alias ORDER BY, composite covering preference,
+            //    covered SELECT *, LEFT JOIN, anti-join, LEFT JOIN ON residual).
+            let covered_outer_queries = [
+                "SELECT count(*), sum(t.id), sum(t.a) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5",
+                "SELECT t.id, t.a, p.id FROM p JOIN t ON t.id = p.tid WHERE t.a = 5 ORDER BY t.id, p.id",
+                "SELECT t.id, t.a, p.val FROM t JOIN p ON p.tid = t.id WHERE t.a = 5 AND p.val > 10 ORDER BY t.id, p.id",
+                "SELECT t.rowid, t.a, p.val FROM t JOIN p ON p.tid = t.id WHERE t.a = 5 ORDER BY t.rowid, p.id LIMIT 5 OFFSET 1",
+                "SELECT t.a AS ka, p.val FROM t JOIN p ON p.tid = t.id WHERE t.a = 5 ORDER BY ka, p.val, p.id",
+                // Composite covering index preference: t2_ab(a, b) covers t2.b over t2_a(a).
+                "SELECT count(*), sum(t2.b) FROM p JOIN t2 ON t2.id = p.tid WHERE t2.a = 5",
+                "SELECT t2.id, t2.a, t2.b, p.val FROM t2 JOIN p ON p.tid = t2.id WHERE t2.a = 5 AND t2.b >= 3 ORDER BY t2.id, p.id",
+                // Full-table-covered SELECT * / table.* via sc_ab(a, b) + IPK id.
+                "SELECT * FROM small_cov JOIN p ON p.tid = small_cov.id WHERE small_cov.a = 2 ORDER BY small_cov.id, p.id",
+                "SELECT small_cov.*, p.val FROM small_cov JOIN p ON p.tid = small_cov.id WHERE small_cov.a = 2 ORDER BY small_cov.id, p.id",
+                // Covered LEFT JOIN shapes (matched, unmatched, anti-join, ON residual).
+                "SELECT count(*), count(p.id), sum(t.id) FROM t LEFT JOIN p ON p.tid = t.id WHERE t.a = 5",
+                "SELECT t.id, t.a, p.id FROM t LEFT JOIN p ON p.tid = t.id WHERE t.a = 5 ORDER BY t.id, p.id",
+                "SELECT t.id, t.a FROM t LEFT JOIN p ON p.tid = t.id WHERE t.a = 5 AND p.id IS NULL ORDER BY t.id",
+                "SELECT t2.id, t2.b, p.id FROM t2 LEFT JOIN p ON p.tid = t2.id AND t2.b > 3 WHERE t2.a = 5 ORDER BY t2.id, p.id",
+                "SELECT t2.id, t2.b, p.id FROM t2 LEFT JOIN p ON p.tid = t2.id AND p.val > 12 WHERE t2.a = 5 AND t2.b >= 2 ORDER BY t2.id, p.id",
+            ];
+            for sql in covered_outer_queries {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+                let ops = program(&f, sql).await;
+                assert!(
+                    !has_open_cursor(&ops, 0) && !has_seek_rowid_cursor(&ops, 0),
+                    "analyzed={analyzed} file={file_backed} `{sql}` expected covering outer index (no OpenRead/SeekRowid on cursor 0): {ops:?}"
+                );
+            }
+            // Outer-only WHERE `t2.a = 5 AND t2.b >= 3` must not re-run inside inner p_tid loop.
+            let comp_ops = program(
+                &f,
+                "SELECT count(*), sum(t2.b) FROM p JOIN t2 ON t2.id = p.tid WHERE t2.a = 5 AND t2.b >= 3",
+            )
+            .await;
+            assert!(
+                !inner_loop_has_comparison(&comp_ops),
+                "analyzed={analyzed} composite outer-only WHERE must not re-run inside inner loop: {comp_ops:?}"
+            );
+
+            // 3. Uncovered outer columns + fail-closed guards (payload, SELECT *,
+            //    REAL-affinity column typeof(), virtual generated column, LEFT JOIN
+            //    uncovered, OR across outer+inner).
+            let uncovered_outer_queries = [
+                "SELECT count(*), sum(length(t.pad)) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5",
+                "SELECT t.*, p.id FROM t JOIN p ON p.tid = t.id WHERE t.a = 5 ORDER BY t.id, p.id",
+                "SELECT t.id, t.pad, p.id FROM t LEFT JOIN p ON p.tid = t.id WHERE t.a = 5 ORDER BY t.id, p.id",
+                // REAL-affinity column MUST fail closed so typeof(rt.r) stays 'real'.
+                "SELECT typeof(rt.r), rt.r, p.id FROM rt JOIN p ON p.tid = rt.id WHERE rt.r = 5 ORDER BY rt.id, p.id",
+                "SELECT typeof(rt.r), rt.r, p.id FROM rt JOIN p ON p.tid = rt.id WHERE rt.a = 2 ORDER BY rt.id, p.id",
+                // Virtual generated column MUST fail closed.
+                "SELECT vt.id, vt.g, p.id FROM vt JOIN p ON p.tid = vt.id WHERE vt.a = 2 ORDER BY vt.id, p.id",
+            ];
+            for sql in uncovered_outer_queries {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+                let ops = program(&f, sql).await;
+                assert!(
+                    has_open_cursor(&ops, 0) && has_seek_rowid_cursor(&ops, 0),
+                    "analyzed={analyzed} file={file_backed} `{sql}` must fail closed to table SeekRowid on cursor 0: {ops:?}"
+                );
+            }
+            // OR across outer+inner in LEFT JOIN stays semantically exact.
+            assert_agree(
+                &f,
+                &r,
+                "SELECT t.id, p.id FROM t LEFT JOIN p ON p.tid = t.id WHERE t.a = 5 OR p.val = 1 ORDER BY t.id, p.id",
+                &[],
+                &[],
+            )
+            .await;
+
+            // 4. Cross-type literals, collations, and bound parameters (reusing a
+            //    prepared statement across storage classes) for both covered and
+            //    uncovered outer index joins.
+            let literal_probe_queries = [
+                "SELECT o.id, o.k, p.id FROM o JOIN p ON p.tid = o.id WHERE o.k = 2 ORDER BY o.id, p.id",
+                "SELECT o.id, o.k, p.id FROM o JOIN p ON p.tid = o.id WHERE o.k = '2' ORDER BY o.id, p.id",
+                "SELECT o.id, o.k, p.id FROM o JOIN p ON p.tid = o.id WHERE o.k = 2.0 ORDER BY o.id, p.id",
+                "SELECT o.id, o.k, p.id FROM o JOIN p ON p.tid = o.id WHERE o.k = 2.5 ORDER BY o.id, p.id",
+                "SELECT o.id, o.k, p.id FROM o JOIN p ON p.tid = o.id WHERE o.k = 'x' ORDER BY o.id, p.id",
+                "SELECT o.id, o.s, p.id FROM o JOIN p ON p.tid = o.id WHERE o.s = 1 ORDER BY o.id, p.id",
+                "SELECT o.id, o.s, p.id FROM o JOIN p ON p.tid = o.id WHERE o.s = '1' ORDER BY o.id, p.id",
+                "SELECT o.id, o.n, p.id FROM o JOIN p ON p.tid = o.id WHERE o.n = 'abc' ORDER BY o.id, p.id",
+                "SELECT o.id, o.n, p.id FROM o JOIN p ON p.tid = o.id WHERE o.n = 'ABC' ORDER BY o.id, p.id",
+                "SELECT o.id, o.u, p.id FROM o JOIN p ON p.tid = o.id WHERE o.u = 5 ORDER BY o.id, p.id",
+                "SELECT o.id, o.u, p.id FROM o JOIN p ON p.tid = o.id WHERE o.u = '5' ORDER BY o.id, p.id",
+                "SELECT o.id, o.u, p.id FROM o JOIN p ON p.tid = o.id WHERE o.u = 5.0 ORDER BY o.id, p.id",
+                "SELECT count(*), sum(o.id) FROM o LEFT JOIN p ON p.tid = o.id WHERE o.n = 'aBc'",
+            ];
+            for sql in literal_probe_queries {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+                let ops = program(&f, sql).await;
+                assert!(
+                    !has_open_cursor(&ops, 0) && !has_seek_rowid_cursor(&ops, 0),
+                    "analyzed={analyzed} file={file_backed} `{sql}` expected covering outer index: {ops:?}"
+                );
+            }
+
+            let param_queries = [
+                (
+                    "SELECT o.id, o.k, p.id FROM o JOIN p ON p.tid = o.id WHERE o.k = ?1 ORDER BY o.id, p.id",
+                    true,
+                ),
+                (
+                    "SELECT o.id, o.k, o.pad, p.id FROM o JOIN p ON p.tid = o.id WHERE o.k = ?1 ORDER BY o.id, p.id",
+                    false,
+                ),
+                (
+                    "SELECT o.id, o.u, p.id FROM o LEFT JOIN p ON p.tid = o.id WHERE o.u = ?1 ORDER BY o.id, p.id",
+                    true,
+                ),
+                (
+                    "SELECT count(*), sum(o.id) FROM o JOIN p ON p.tid = o.id WHERE o.n = ?1",
+                    true,
+                ),
+            ];
+            let param_values: Vec<(SqliteValue, rusqlite::types::Value)> = vec![
+                (SqliteValue::Integer(2), rusqlite::types::Value::Integer(2)),
+                (SqliteValue::Text("2".into()), rusqlite::types::Value::Text("2".to_owned())),
+                (SqliteValue::Float(2.0), rusqlite::types::Value::Real(2.0)),
+                (SqliteValue::Float(2.5), rusqlite::types::Value::Real(2.5)),
+                (SqliteValue::Text("x".into()), rusqlite::types::Value::Text("x".to_owned())),
+                (SqliteValue::Integer(5), rusqlite::types::Value::Integer(5)),
+                (SqliteValue::Text("5".into()), rusqlite::types::Value::Text("5".to_owned())),
+                (SqliteValue::Float(5.0), rusqlite::types::Value::Real(5.0)),
+                (SqliteValue::Text("abc".into()), rusqlite::types::Value::Text("abc".to_owned())),
+                (SqliteValue::Text("ABC".into()), rusqlite::types::Value::Text("ABC".to_owned())),
+                (SqliteValue::Blob(vec![5].into()), rusqlite::types::Value::Blob(vec![5])),
+                (SqliteValue::Null, rusqlite::types::Value::Null),
+            ];
+            for (sql, expect_covering) in param_queries {
+                let ops = program(&f, sql).await;
+                assert_eq!(
+                    !has_open_cursor(&ops, 0) && !has_seek_rowid_cursor(&ops, 0),
+                    expect_covering,
+                    "analyzed={analyzed} file={file_backed} `{sql}` covering expectation: {ops:?}"
+                );
+                let prep = f.prepare(sql).await.unwrap();
+                for (fv, rv) in &param_values {
+                    assert_agree(&f, &r, sql, std::slice::from_ref(fv), &[rv]).await;
+                    let pr: Vec<Vec<String>> = prep
+                        .query_with_params(std::slice::from_ref(fv))
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.values().iter().map(tag_f).collect())
+                        .collect();
+                    let dr: Vec<Vec<String>> = f
+                        .query_with_params(sql, std::slice::from_ref(fv))
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.values().iter().map(tag_f).collect())
+                        .collect();
+                    assert_eq!(pr, dr, "prepared vs direct mismatch for `{sql}` with {fv:?}");
+                }
+                drop(prep);
+            }
+
+            f.close().await.unwrap();
+        });
+    }
+}

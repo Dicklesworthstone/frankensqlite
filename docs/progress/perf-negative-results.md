@@ -94,6 +94,20 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-26 - WIN (probe met: 11.60x -> 7.85x stock steady-state Ir, -32.3%, <= 11x probe): a lookup join whose outer index covers all outer reads skips OpenRead + SeekRowid on the outer table and evaluates outer-only WHERE once per outer row (bd-obpoh)
+
+- Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` on the 200,000-row `t` (`t_a(a)`, 200 rows at `a = 5`) / 50,000-row `p` (`p_tid(tid)`) fixture with `ANALYZE`. Previously `emit_outer_loop_start` (`OuterEqualitySeek::Index`) emitted `IdxRowid` + `SeekRowid` into `t` for every outer entry even when the join only read `t.id` and `t.a`, opened unused `left_cursor`/`right_cursor`, and re-evaluated outer-only `WHERE` conjuncts inside the inner loop.
+- Touched:
+  - `crates/fsqlite-vdbe/src/codegen.rs`: `outer_index_covering_columns`, `resolve_outer_equality_seek_terms_preferring` (prefers a covering index, breaking ties by narrowest column count), `OuterLoop::IndexSeek { covering_row }`, `emit_outer_loop_start` (decodes leading key directly into the register image, skips `SeekRowid` when covered), `codegen_single_join_lookup_select` (skips unused `OpenRead`/`Close` on `left_cursor`/`right_cursor`, splits `where_clause` and inner-join `on_residual` into `outer_row_terms` vs `inner_where_terms`/`inner_on_residual`, threads `outer_row: Option<RegisterRow>` through `emit_join_expr`, `emit_join_probe_source`, `emit_join_result_columns`, `emit_join_lookup_match`). REAL-affinity and virtual generated outer columns fail closed to `SeekRowid`.
+  - Keeper: `crates/fsqlite-core/tests/join_aggregate_lookup_oracle.rs::bd_obpoh_covering_outer_index_join_oracle` (covered, composite-preference, uncovered, REAL-affinity `typeof()`, virtual generated, `LEFT JOIN`/anti-join/ON residual, cross-type literals and bound-parameter prepared reuse against live bundled SQLite 3.54.1).
+- Evidence (callgrind Ir, `--profile release-perf` CLI built on `hz3`, parent `b1b1a76df` ELF `ec3bb028b18faf74` vs candidate ELF `4e1d1c66c56a5a60`, live stock `/usr/bin/sqlite3` 3.46.1 ELF `5a910e452929c124` in the same run, steady-state `(11x - 1x)/10` per query, identical stdout on every row):
+  - `target_count_star` (`count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5`): 4,763.5k (11.60x) -> 3,223.6k (7.85x stock 410.6k), -1,539.9k (-32.3%), 23.82k -> 16.12k per outer row.
+  - `covered_sum_tid_ta`: 4,861.3k (10.61x) -> 3,313.9k (7.23x stock 458.3k), -1,547.4k (-31.8%).
+  - `covered_left_join`: 5,050.3k (9.55x) -> 3,417.2k (6.46x stock 528.6k), -1,633.2k (-32.3%).
+  - `covered_rows_ordered`: 5,425.4k (9.56x) -> 3,955.6k (6.97x stock 567.8k), -1,469.8k (-27.1%).
+  - `uncovered_pad_ctrl` (must keep `SeekRowid`): 4,954.2k (8.59x) -> 4,915.9k (8.52x stock 576.8k), -38.3k (-0.8%).
+- Retry / next: remaining ~16.1k Ir/outer row is primarily the inner `p_tid` B-tree seek per outer row (owned by the read/seek lane, `bd-05xlf`), plus a tiny ~15k/query outer-row `Eq` check of the already-enforced `t.a = 5` equality (skipping only worth revisiting if outer row counts scale into tens of thousands and per-seek cost drops first).
+
 ## 2026-11-24 - SMALL WIN (landed as dfd2930a8; inside every kill line and every instruction band; instructions only, time a replicated TIE, so its count_star cycles prediction missed): a transaction's read cache hashes a page into hashbrown's tag bits as well as its buckets, so a miss compares the few keys whose tag matches; count_star -7.40M Ir (x12.63 -> x10.89 stock 3.54.1), rowid_lookups_200k -37.4M (x4.934 -> x4.853) (bd-read-miss-path-cost-w8msq, serial read lane rounds 15-16, lever PH v2)
 
 - Target: count_star, as in PH v1's entry below. Of its 7,078 Ir per cold page, 1,123 were hashbrown probing in the two

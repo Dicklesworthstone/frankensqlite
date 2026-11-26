@@ -12586,7 +12586,8 @@ fn codegen_select_ordered_scan(
             };
             let (seek_loop, scan_body) = if let Some(seek) = eq_seek {
                 let seek_row = b.emit_label();
-                let outer_loop = emit_outer_loop_start(b, Some(seek), cursor, scan_done, None);
+                let outer_loop =
+                    emit_outer_loop_start(b, Some(seek), cursor, scan_done, None, None);
                 b.resolve_label(seek_row);
                 (Some((outer_loop, seek_row)), 0)
             } else {
@@ -13532,6 +13533,7 @@ fn codegen_grouped_inner_join_count_sum_select(
                 plan.left_alias,
                 &plan.join_lookup.probe_source,
                 probe_reg,
+                None,
             );
             let no_match = b.emit_label();
             b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, no_match, P4::None, 0);
@@ -13569,6 +13571,7 @@ fn codegen_grouped_inner_join_count_sum_select(
                 plan.left_alias,
                 &plan.join_lookup.probe_source,
                 probe_reg,
+                None,
             );
             if let Some(affinity) = plan.join_lookup.probe_affinity {
                 // The comparison coerces the key to the indexed column's affinity.
@@ -14846,6 +14849,7 @@ fn join_lookup_column_pair_probe(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_join_probe_source(
     b: &mut ProgramBuilder,
     cursor: i32,
@@ -14853,7 +14857,39 @@ fn emit_join_probe_source(
     table_alias: Option<&str>,
     source: &SortKeySource,
     target_reg: i32,
+    outer_row: Option<RegisterRow>,
 ) {
+    if let Some(row) = outer_row {
+        match source {
+            SortKeySource::Rowid => {
+                let rowid_reg = row
+                    .rowid
+                    .expect("covering outer index row always has a rowid register");
+                b.emit_op(Opcode::SCopy, rowid_reg, target_reg, 0, P4::None, 0);
+                return;
+            }
+            SortKeySource::Column(col_idx) => {
+                if table.columns[*col_idx].is_ipk {
+                    let rowid_reg = row
+                        .rowid
+                        .expect("covering outer index row always has a rowid register");
+                    b.emit_op(Opcode::SCopy, rowid_reg, target_reg, 0, P4::None, 0);
+                } else {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    b.emit_op(
+                        Opcode::SCopy,
+                        row.columns + *col_idx as i32,
+                        target_reg,
+                        0,
+                        P4::None,
+                        0,
+                    );
+                }
+                return;
+            }
+            SortKeySource::Expression(_) => {}
+        }
+    }
     let scan = ScanCtx {
         cursor,
         table,
@@ -14874,8 +14910,8 @@ fn emit_grouped_join_sorter_insert(
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
     let sorter_base = b.alloc_regs(2);
-    emit_join_expr(b, group_key_expr, sorter_base, tables, ctx)?;
-    emit_join_expr(b, sum_arg_expr, sorter_base + 1, tables, ctx)?;
+    emit_join_expr(b, group_key_expr, sorter_base, tables, ctx, None)?;
+    emit_join_expr(b, sum_arg_expr, sorter_base + 1, tables, ctx, None)?;
     let sorter_record = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
@@ -14932,10 +14968,11 @@ fn emit_join_on_residual(
     skip: Label,
     tables: &[(&TableSchema, Option<&str>)],
     ctx: &CodegenContext,
+    outer_row: Option<RegisterRow>,
 ) -> Result<(), CodegenError> {
     for term in residual {
         let cond_reg = b.alloc_reg();
-        emit_join_expr(b, term, cond_reg, tables, ctx)?;
+        emit_join_expr(b, term, cond_reg, tables, ctx, outer_row)?;
         b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip, P4::None, 0);
     }
     Ok(())
@@ -15073,6 +15110,7 @@ fn emit_join_order_key(
     out_col_count: usize,
     tables: &[(&TableSchema, Option<&str>)],
     ctx: &CodegenContext,
+    outer_row: Option<RegisterRow>,
 ) -> Result<(), CodegenError> {
     if let Some(slot) = join_order_output_slot(order_expr, columns, out_col_count, tables)
         .and_then(|slot| i32::try_from(slot).ok())
@@ -15080,7 +15118,7 @@ fn emit_join_order_key(
         b.emit_op(Opcode::SCopy, out_regs + slot, target, 0, P4::None, 0);
         return Ok(());
     }
-    emit_join_expr(b, order_expr, target, tables, ctx)
+    emit_join_expr(b, order_expr, target, tables, ctx, outer_row)
 }
 
 /// A join's LIMIT and OFFSET registers (bd-9gl3w). Without ORDER BY they apply
@@ -15180,6 +15218,7 @@ fn emit_join_output_or_sort(
     sorter: Option<(i32, i32, usize, i32)>,
     order_by: &[OrderingTerm],
     limit: Option<JoinOutputLimit>,
+    outer_row: Option<RegisterRow>,
 ) -> Result<(), CodegenError> {
     let out_col_count = resolve_join_output_count(columns, tables);
     let offset_skip = b.emit_label();
@@ -15188,7 +15227,7 @@ fn emit_join_output_or_sort(
     {
         b.emit_jump_to_label(Opcode::IfPos, offset_reg, 1, offset_skip, P4::None, 0);
     }
-    emit_join_result_columns(b, columns, out_regs, tables, ctx)?;
+    emit_join_result_columns(b, columns, out_regs, tables, ctx, outer_row)?;
     if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
         for (i, term) in order_by.iter().enumerate() {
             let sort_reg = sort_regs + i as i32;
@@ -15201,6 +15240,7 @@ fn emit_join_output_or_sort(
                 out_col_count,
                 tables,
                 ctx,
+                outer_row,
             )?;
         }
         for i in 0..out_col_count {
@@ -15248,6 +15288,7 @@ fn emit_join_aggregate_steps(
     accum_base: i32,
     tables: &[(&TableSchema, Option<&str>)],
     ctx: &CodegenContext,
+    outer_row: Option<RegisterRow>,
 ) -> Result<(), CodegenError> {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for (i, term) in aggregates.iter().enumerate() {
@@ -15255,7 +15296,7 @@ fn emit_join_aggregate_steps(
         let p4 = P4::FuncName(term.name.clone());
         if let Some(arg) = term.arg {
             let arg_reg = b.alloc_reg();
-            emit_join_expr(b, arg, arg_reg, tables, ctx)?;
+            emit_join_expr(b, arg, arg_reg, tables, ctx, outer_row)?;
             b.emit_op(Opcode::AggStep, 0, arg_reg, accum_reg, p4, 1);
         } else {
             b.emit_op(Opcode::AggStep, 0, 0, accum_reg, p4, 0);
@@ -15278,12 +15319,13 @@ fn emit_join_lookup_match(
     aggregates: &[JoinAggregateTerm<'_>],
     accum_base: Option<i32>,
     limit: Option<JoinOutputLimit>,
+    outer_row: Option<RegisterRow>,
 ) -> Result<(), CodegenError> {
     match accum_base {
-        Some(base) => emit_join_aggregate_steps(b, aggregates, base, tables, ctx),
-        None => {
-            emit_join_output_or_sort(b, columns, out_regs, tables, ctx, sorter, order_by, limit)
-        }
+        Some(base) => emit_join_aggregate_steps(b, aggregates, base, tables, ctx, outer_row),
+        None => emit_join_output_or_sort(
+            b, columns, out_regs, tables, ctx, sorter, order_by, limit, outer_row,
+        ),
     }
 }
 
@@ -15527,10 +15569,31 @@ fn resolve_outer_equality_seek_terms<'a>(
     other_table: Option<(&TableSchema, Option<&str>)>,
     required_index: Option<&str>,
 ) -> Option<OuterEqualitySeek<'a>> {
+    resolve_outer_equality_seek_terms_preferring(
+        conjuncts,
+        left_table,
+        left_alias,
+        other_table,
+        required_index,
+        |_| false,
+    )
+}
+
+fn resolve_outer_equality_seek_terms_preferring<'a, F>(
+    conjuncts: Vec<&'a Expr>,
+    left_table: &'a TableSchema,
+    left_alias: Option<&str>,
+    other_table: Option<(&TableSchema, Option<&str>)>,
+    required_index: Option<&str>,
+    prefer_covering: F,
+) -> Option<OuterEqualitySeek<'a>>
+where
+    F: Fn(&IndexSchema) -> bool,
+{
     if left_table.without_rowid {
         return None;
     }
-    let mut index_seek = None;
+    let mut best_index_seek: Option<(OuterEqualitySeek<'a>, bool, usize)> = None;
     for term in conjuncts {
         let Expr::BinaryOp {
             left,
@@ -15563,23 +15626,44 @@ fn resolve_outer_equality_seek_terms<'a>(
                 Some(SortKeySource::Rowid) if required_index.is_none() => {
                     return Some(OuterEqualitySeek::Rowid { probe });
                 }
-                Some(SortKeySource::Column(col_idx)) if index_seek.is_none() => {
-                    index_seek =
-                        outer_index_equality_seek(left_table, col_idx, probe, required_index);
+                Some(SortKeySource::Column(col_idx)) => {
+                    if let Some((candidate, covering, width)) =
+                        outer_index_equality_seek_preferring(
+                            left_table,
+                            col_idx,
+                            probe,
+                            required_index,
+                            &prefer_covering,
+                        )
+                    {
+                        let better = match best_index_seek {
+                            None => true,
+                            Some((_, best_covering, best_width)) => {
+                                covering && (!best_covering || width < best_width)
+                            }
+                        };
+                        if better {
+                            best_index_seek = Some((candidate, covering, width));
+                        }
+                    }
                 }
                 _ => {}
             }
         }
     }
-    index_seek
+    best_index_seek.map(|(seek, _, _)| seek)
 }
 
-fn outer_index_equality_seek<'a>(
+fn outer_index_equality_seek_preferring<'a, F>(
     table: &'a TableSchema,
     col_idx: usize,
     probe: &'a Expr,
     required_index: Option<&str>,
-) -> Option<OuterEqualitySeek<'a>> {
+    prefer_covering: &F,
+) -> Option<(OuterEqualitySeek<'a>, bool, usize)>
+where
+    F: Fn(&IndexSchema) -> bool,
+{
     let column = table.columns.get(col_idx)?;
     let idx_aff = index_key_affinity(column.affinity);
     let probe_affinity = match idx_aff {
@@ -15588,7 +15672,8 @@ fn outer_index_equality_seek<'a>(
         'A' => None,
         _ => return None,
     };
-    table.indexes.iter().find_map(|index| {
+    let mut best: Option<(OuterEqualitySeek<'a>, bool, usize)> = None;
+    for index in &table.indexes {
         let usable = required_index.is_none_or(|name| index.name.eq_ignore_ascii_case(name))
             && index
                 .columns
@@ -15601,12 +15686,234 @@ fn outer_index_equality_seek<'a>(
                 column.collation.as_deref(),
                 index.key_term_collation(0),
             );
-        usable.then_some(OuterEqualitySeek::Index {
-            index,
-            probe,
-            probe_affinity,
-        })
+        if !usable {
+            continue;
+        }
+        let covering = prefer_covering(index);
+        let width = index.columns.len();
+        let better = match best {
+            None => true,
+            Some((_, best_covering, best_width)) => {
+                covering && (!best_covering || width < best_width)
+            }
+        };
+        if better {
+            best = Some((
+                OuterEqualitySeek::Index {
+                    index,
+                    probe,
+                    probe_affinity,
+                },
+                covering,
+                width,
+            ));
+        }
+    }
+    best
+}
+
+/// bd-obpoh: whether `table.columns[col_idx]` can be read directly from an
+/// entry of `index` (or its rowid) without seeking the table row.
+///
+/// REAL-affinity columns fail closed because indexes store integral REAL
+/// values as integers whereas table reads apply RealAffinity (mirroring
+/// `expr_reads_only_index_columns`). Virtual generated columns also fail
+/// closed.
+fn outer_column_covered_by_index(
+    table: &TableSchema,
+    col_idx: usize,
+    index: &IndexSchema,
+) -> bool {
+    table.columns.get(col_idx).is_some_and(|column| {
+        column.is_ipk
+            || (!column.affinity.eq_ignore_ascii_case(&'E')
+                && virtual_generated_column_expr(column, table).is_none()
+                && index_column_position(index, &column.name).is_some())
     })
+}
+
+fn collect_outer_index_reads_in_expr(
+    expr: &Expr,
+    tables: &[(&TableSchema, Option<&str>)],
+    index: &IndexSchema,
+    needed_cols: &mut Vec<usize>,
+) -> bool {
+    match expr {
+        Expr::Column(col_ref, _) => {
+            match resolve_join_column_ref(col_ref.table.as_deref(), &col_ref.column, tables) {
+                Ok(JoinColumnResolution::Column(0, col_idx)) => {
+                    let (left_table, _) = tables[0];
+                    if !outer_column_covered_by_index(left_table, col_idx, index) {
+                        return false;
+                    }
+                    if !left_table.columns[col_idx].is_ipk && !needed_cols.contains(&col_idx) {
+                        needed_cols.push(col_idx);
+                    }
+                    true
+                }
+                Ok(JoinColumnResolution::HiddenRowid(_) | JoinColumnResolution::Column(_, _)) => {
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        Expr::Literal(_, _)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            collect_outer_index_reads_in_expr(left, tables, index, needed_cols)
+                && collect_outer_index_reads_in_expr(right, tables, index, needed_cols)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => {
+            collect_outer_index_reads_in_expr(inner, tables, index, needed_cols)
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_outer_index_reads_in_expr(inner, tables, index, needed_cols)
+                && collect_outer_index_reads_in_expr(low, tables, index, needed_cols)
+                && collect_outer_index_reads_in_expr(high, tables, index, needed_cols)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter: None,
+            over: None,
+            ..
+        } if order_by.is_empty() => match args {
+            FunctionArgs::Star => true,
+            FunctionArgs::List(items) => items
+                .iter()
+                .all(|item| collect_outer_index_reads_in_expr(item, tables, index, needed_cols)),
+        },
+        _ => false,
+    }
+}
+
+fn collect_outer_index_reads_in_sort_key(
+    source: &SortKeySource,
+    left_table: &TableSchema,
+    index: &IndexSchema,
+    needed_cols: &mut Vec<usize>,
+) -> bool {
+    match source {
+        SortKeySource::Rowid => true,
+        SortKeySource::Column(col_idx) => {
+            if !outer_column_covered_by_index(left_table, *col_idx, index) {
+                return false;
+            }
+            if !left_table.columns[*col_idx].is_ipk && !needed_cols.contains(col_idx) {
+                needed_cols.push(*col_idx);
+            }
+            true
+        }
+        SortKeySource::Expression(_) => false,
+    }
+}
+
+/// bd-obpoh: when every outer-table column read by a single-join lookup
+/// statement (outputs, ORDER BY, aggregates, WHERE, ON residual, inner probe
+/// keys) lives in `index` or the rowid, returns the non-IPK outer column
+/// indices to decode from the index entry so the outer loop can skip opening
+/// and seeking the outer table.
+#[allow(clippy::too_many_arguments)]
+fn outer_index_covering_columns(
+    stmt: &SelectStatement,
+    columns: &[ResultColumn],
+    out_col_count: usize,
+    where_clause: Option<&Expr>,
+    tables: &[(&TableSchema, Option<&str>)],
+    plan: &SingleJoinLookupPlan<'_>,
+    aggregates: &[JoinAggregateTerm<'_>],
+    index: &IndexSchema,
+) -> Option<Vec<usize>> {
+    let (left_table, left_alias) = tables[0];
+    if left_table.without_rowid {
+        return None;
+    }
+    let mut needed = Vec::new();
+    if let Some(where_expr) = where_clause
+        && !collect_outer_index_reads_in_expr(where_expr, tables, index, &mut needed)
+    {
+        return None;
+    }
+    for term in &plan.on_residual {
+        if !collect_outer_index_reads_in_expr(term, tables, index, &mut needed) {
+            return None;
+        }
+    }
+    if let Some(probe_expr) = plan.probe_expr {
+        if !collect_outer_index_reads_in_expr(probe_expr, tables, index, &mut needed) {
+            return None;
+        }
+    } else if !collect_outer_index_reads_in_sort_key(
+        &plan.probe_source,
+        left_table,
+        index,
+        &mut needed,
+    ) {
+        return None;
+    }
+    for (source, _) in &plan.extra_keys {
+        if !collect_outer_index_reads_in_sort_key(source, left_table, index, &mut needed) {
+            return None;
+        }
+    }
+    if !aggregates.is_empty() {
+        for term in aggregates {
+            if let Some(arg) = term.arg
+                && !collect_outer_index_reads_in_expr(arg, tables, index, &mut needed)
+            {
+                return None;
+            }
+        }
+    } else {
+        for col in columns {
+            match col {
+                ResultColumn::Star => {
+                    for (col_idx, column) in left_table.columns.iter().enumerate() {
+                        if !outer_column_covered_by_index(left_table, col_idx, index) {
+                            return None;
+                        }
+                        if !column.is_ipk && !needed.contains(&col_idx) {
+                            needed.push(col_idx);
+                        }
+                    }
+                }
+                ResultColumn::TableStar(table_name) => {
+                    if join_qualifier_matches(Some(&table_name.name), left_table, left_alias) {
+                        for (col_idx, column) in left_table.columns.iter().enumerate() {
+                            if !outer_column_covered_by_index(left_table, col_idx, index) {
+                                return None;
+                            }
+                            if !column.is_ipk && !needed.contains(&col_idx) {
+                                needed.push(col_idx);
+                            }
+                        }
+                    }
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    if !collect_outer_index_reads_in_expr(expr, tables, index, &mut needed) {
+                        return None;
+                    }
+                }
+            }
+        }
+        for term in &stmt.order_by {
+            if join_order_output_slot(&term.expr, columns, out_col_count, tables).is_none()
+                && !collect_outer_index_reads_in_expr(&term.expr, tables, index, &mut needed)
+            {
+                return None;
+            }
+        }
+    }
+    Some(needed)
 }
 
 /// How the outer loop emitted by [`emit_outer_loop_start`] advances.
@@ -15620,18 +15927,31 @@ enum OuterLoop {
         idx_cursor: i32,
         idx_row: crate::Label,
         idx_advance: crate::Label,
+        covering_row: Option<RegisterRow>,
     },
+}
+
+impl OuterLoop {
+    const fn covering_row(&self) -> Option<RegisterRow> {
+        match self {
+            Self::IndexSeek { covering_row, .. } => *covering_row,
+            Self::Scan | Self::RowidSeek => None,
+        }
+    }
 }
 
 /// Open the outer loop of a single-join lookup: position `left_cursor` on its
 /// first row (through `seek` when there is one) and fall through to the loop
-/// body; `done` ends the loop.
+/// body; `done` ends the loop. When `covering_outer` is `Some`, an index seek
+/// populates a register row image from the index entry (and its rowid) and
+/// skips `SeekRowid` into `left_cursor`.
 fn emit_outer_loop_start(
     b: &mut ProgramBuilder,
     seek: Option<&OuterEqualitySeek<'_>>,
     left_cursor: i32,
     done: crate::Label,
     scan_floor: Option<(i64, bool)>,
+    covering_outer: Option<(&TableSchema, &[usize])>,
 ) -> OuterLoop {
     match seek {
         None => {
@@ -15719,8 +16039,20 @@ fn emit_outer_loop_start(
                 P4::None,
                 0,
             );
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let covering_image = covering_outer.map(|(table, needed_cols)| {
+                let image = b.alloc_regs(table.columns.len() as i32);
+                (table, needed_cols, image)
+            });
             b.resolve_label(idx_row);
-            let key_reg = b.alloc_reg();
+            let leading_col_idx = covering_image.and_then(|(table, _, _)| {
+                index.columns.first().and_then(|name| table.column_index(name))
+            });
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let key_reg = match (covering_image, leading_col_idx) {
+                (Some((_, _, image)), Some(col_idx)) => image + col_idx as i32,
+                _ => b.alloc_reg(),
+            };
             b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
             b.emit_jump_to_label(
                 Opcode::Ne,
@@ -15732,11 +16064,42 @@ fn emit_outer_loop_start(
             );
             let rowid_reg = b.alloc_reg();
             b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::SeekRowid, left_cursor, rowid_reg, idx_advance, P4::None, 0);
+            let covering_row = if let Some((table, needed_cols, image)) = covering_image {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                for &col_idx in needed_cols {
+                    if Some(col_idx) == leading_col_idx {
+                        continue;
+                    }
+                    if let Some(position) =
+                        index_column_position(index, &table.columns[col_idx].name)
+                    {
+                        b.emit_op(
+                            Opcode::Column,
+                            idx_cursor,
+                            position as i32,
+                            image + col_idx as i32,
+                            P4::None,
+                            0,
+                        );
+                    }
+                }
+                Some(RegisterRow::with_rowid(image, rowid_reg))
+            } else {
+                b.emit_jump_to_label(
+                    Opcode::SeekRowid,
+                    left_cursor,
+                    rowid_reg,
+                    idx_advance,
+                    P4::None,
+                    0,
+                );
+                None
+            };
             OuterLoop::IndexSeek {
                 idx_cursor,
                 idx_row,
                 idx_advance,
+                covering_row,
             }
         }
     }
@@ -15760,6 +16123,7 @@ fn emit_outer_loop_advance(
             idx_cursor,
             idx_row,
             idx_advance,
+            ..
         } => {
             b.resolve_label(*idx_advance);
             b.emit_jump_to_label(Opcode::Next, *idx_cursor, 0, *idx_row, P4::None, 0);
@@ -15823,6 +16187,7 @@ fn emit_join_autoindex(
         right_alias,
         &SortKeySource::Column(column),
         entry,
+        None,
     );
     b.emit_jump_to_label(Opcode::IsNull, entry, 0, next_row, P4::None, 0);
     b.emit_op(Opcode::Rowid, right_cursor, entry + 1, 0, P4::None, 0);
@@ -15892,24 +16257,71 @@ fn codegen_single_join_lookup_select(
                 .is_some_and(|arg| expr_references_scan(arg, right_table, right_alias))
         });
 
+    // An inner join's ON terms the lookup does not consume filter the outer
+    // row as WHERE terms do, so they can seek it too. That covers a join
+    // written as `FROM t, u WHERE u.k = t.id AND t.a = 5`, whose whole WHERE
+    // is its join condition. Prefer an outer index that covers every outer
+    // column the statement reads (bd-obpoh).
+    let outer_seek = resolve_outer_equality_seek_terms_preferring(
+        join_outer_filter_terms(where_clause, plan),
+        left_table,
+        left_alias,
+        Some((right_table, right_alias)),
+        None,
+        |index| {
+            outer_index_covering_columns(
+                stmt,
+                columns,
+                out_col_count,
+                where_clause,
+                &tables,
+                plan,
+                aggregates,
+                index,
+            )
+            .is_some()
+        },
+    );
+    let outer_covering_cols = match outer_seek {
+        Some(OuterEqualitySeek::Index { index, .. }) => outer_index_covering_columns(
+            stmt,
+            columns,
+            out_col_count,
+            where_clause,
+            &tables,
+            plan,
+            aggregates,
+            index,
+        ),
+        _ => None,
+    };
+    let open_left_table = outer_covering_cols.is_none();
+    let open_right_table = seek_right_row
+        || !matches!(plan.lookup_target, SingleJoinLookupTarget::Index(_))
+        || matches!(plan.join_kind, fsqlite_ast::JoinKind::Left);
+
     let left_cursor = 0_i32;
     let right_cursor = 1_i32;
-    b.emit_op(
-        Opcode::OpenRead,
-        left_cursor,
-        left_table.root_page,
-        0,
-        P4::Table(left_table.name.clone()),
-        0,
-    );
-    b.emit_op(
-        Opcode::OpenRead,
-        right_cursor,
-        right_table.root_page,
-        0,
-        P4::Table(right_table.name.clone()),
-        0,
-    );
+    if open_left_table {
+        b.emit_op(
+            Opcode::OpenRead,
+            left_cursor,
+            left_table.root_page,
+            0,
+            P4::Table(left_table.name.clone()),
+            0,
+        );
+    }
+    if open_right_table {
+        b.emit_op(
+            Opcode::OpenRead,
+            right_cursor,
+            right_table.root_page,
+            0,
+            P4::Table(right_table.name.clone()),
+            0,
+        );
+    }
     let index_cursor = match &plan.lookup_target {
         SingleJoinLookupTarget::Index(index) => {
             let cursor = 2_i32;
@@ -16041,27 +16453,32 @@ fn codegen_single_join_lookup_select(
     };
 
     let next_left_label = b.emit_label();
-    // An inner join's ON terms the lookup does not consume filter the outer
-    // row as WHERE terms do, so they can seek it too. That covers a join
-    // written as `FROM t, u WHERE u.k = t.id AND t.a = 5`, whose whole WHERE
-    // is its join condition.
-    let outer_seek = resolve_outer_equality_seek_terms(
-        join_outer_filter_terms(where_clause, plan),
-        left_table,
-        left_alias,
-        Some((right_table, right_alias)),
-        None,
-    );
-    // bd-w4pr1.13.16: a WHERE term that reads only the outer table decides the
-    // outer row before the lookup. A row that fails it produces no output
-    // whether or not the join matches (a LEFT JOIN's null-extended row carries
-    // the same outer values), so its lookup is skipped. For an inner join the
-    // same holds for an ON term the lookup did not consume. The terms are
-    // tested again with the whole WHERE after the lookup, as before.
-    let mut conjuncts = Vec::new();
+    // bd-w4pr1.13.16 / bd-obpoh: a WHERE term that reads only the outer table
+    // decides the outer row once before the inner lookup. A row that fails it
+    // produces no output whether or not the join matches (a LEFT JOIN's
+    // null-extended row carries the same outer values), so its lookup is
+    // skipped and the inner loop only needs WHERE conjuncts that reference the
+    // inner table. For an inner join the same holds for ON residual terms that
+    // read only the outer table.
+    let mut where_conjuncts = Vec::new();
     if let Some(where_expr) = where_clause {
-        collect_conjunctive_terms(where_expr, &mut conjuncts);
+        collect_conjunctive_terms(where_expr, &mut where_conjuncts);
     }
+    let inner_where_terms: Vec<&Expr> = where_conjuncts
+        .iter()
+        .copied()
+        .filter(|term| expr_references_scan(term, right_table, right_alias))
+        .collect();
+    let inner_on_residual: Vec<&Expr> = if matches!(plan.join_kind, fsqlite_ast::JoinKind::Inner) {
+        plan.on_residual
+            .iter()
+            .copied()
+            .filter(|term| expr_references_scan(term, right_table, right_alias))
+            .collect()
+    } else {
+        plan.on_residual.clone()
+    };
+    let mut conjuncts = where_conjuncts;
     if matches!(plan.join_kind, fsqlite_ast::JoinKind::Inner) {
         conjuncts.extend(plan.on_residual.iter().copied());
     }
@@ -16100,7 +16517,9 @@ fn codegen_single_join_lookup_select(
         left_cursor,
         done_label,
         scan_floor,
+        outer_covering_cols.as_deref().map(|cols| (left_table, cols)),
     );
+    let outer_row = outer_loop.covering_row();
     b.resolve_label(next_left_label);
     let outer_row_rejected = b.emit_label();
     for term in outer_row_terms {
@@ -16115,7 +16534,7 @@ fn codegen_single_join_lookup_select(
             outer_row_rejected
         };
         let cond_reg = b.alloc_reg();
-        emit_join_expr(b, term, cond_reg, &tables, ctx)?;
+        emit_join_expr(b, term, cond_reg, &tables, ctx, outer_row)?;
         b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, failed, P4::None, 0);
     }
     let left_join_match_reg = if matches!(plan.join_kind, fsqlite_ast::JoinKind::Left) {
@@ -16130,7 +16549,7 @@ fn codegen_single_join_lookup_select(
         SingleJoinLookupTarget::Rowid => {
             let probe_reg = b.alloc_reg();
             if let Some(key) = plan.probe_expr {
-                emit_join_expr(b, key, probe_reg, &tables, ctx)?;
+                emit_join_expr(b, key, probe_reg, &tables, ctx, outer_row)?;
             } else {
                 emit_join_probe_source(
                     b,
@@ -16139,6 +16558,7 @@ fn codegen_single_join_lookup_select(
                     left_alias,
                     &plan.probe_source,
                     probe_reg,
+                    outer_row,
                 );
             }
             let no_match = b.emit_label();
@@ -16155,14 +16575,14 @@ fn codegen_single_join_lookup_select(
                 P4::None,
                 0,
             );
-            emit_join_on_residual(b, &plan.on_residual, no_match, &tables, ctx)?;
+            emit_join_on_residual(b, &inner_on_residual, no_match, &tables, ctx, outer_row)?;
             if let Some(match_reg) = left_join_match_reg {
                 b.emit_op(Opcode::Integer, 1, match_reg, 0, P4::None, 0);
             }
             let matched_skip = b.emit_label();
-            if let Some(where_expr) = where_clause {
+            for term in &inner_where_terms {
                 let cond_reg = b.alloc_reg();
-                emit_join_expr(b, where_expr, cond_reg, &tables, ctx)?;
+                emit_join_expr(b, term, cond_reg, &tables, ctx, outer_row)?;
                 b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, matched_skip, P4::None, 0);
             }
             emit_join_lookup_match(
@@ -16176,6 +16596,7 @@ fn codegen_single_join_lookup_select(
                 aggregates,
                 accum_base,
                 limit,
+                outer_row,
             )?;
             b.resolve_label(matched_skip);
             b.resolve_label(no_match);
@@ -16195,7 +16616,7 @@ fn codegen_single_join_lookup_select(
             let probe_reg = probe_base;
             let comparison_p4 = lookup_term_comparison_p4(&plan.lookup_target, 0);
             if let Some(key) = plan.probe_expr {
-                emit_join_expr(b, key, probe_reg, &tables, ctx)?;
+                emit_join_expr(b, key, probe_reg, &tables, ctx, outer_row)?;
             } else {
                 emit_join_probe_source(
                     b,
@@ -16204,6 +16625,7 @@ fn codegen_single_join_lookup_select(
                     left_alias,
                     &plan.probe_source,
                     probe_reg,
+                    outer_row,
                 );
             }
             if let Some(affinity) = plan.probe_affinity {
@@ -16226,7 +16648,15 @@ fn codegen_single_join_lookup_select(
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             for (offset, (source, affinity)) in plan.extra_keys.iter().enumerate() {
                 let key_reg = probe_base + 1 + offset as i32;
-                emit_join_probe_source(b, left_cursor, left_table, left_alias, source, key_reg);
+                emit_join_probe_source(
+                    b,
+                    left_cursor,
+                    left_table,
+                    left_alias,
+                    source,
+                    key_reg,
+                    outer_row,
+                );
                 if let Some(affinity) = affinity {
                     b.emit_op(
                         Opcode::Affinity,
@@ -16274,13 +16704,13 @@ fn codegen_single_join_lookup_select(
                         0,
                     );
                 }
-                emit_join_on_residual(b, &plan.on_residual, advance, &tables, ctx)?;
+                emit_join_on_residual(b, &inner_on_residual, advance, &tables, ctx, outer_row)?;
                 if let Some(match_reg) = left_join_match_reg {
                     b.emit_op(Opcode::Integer, 1, match_reg, 0, P4::None, 0);
                 }
-                if let Some(where_expr) = where_clause {
+                for term in &inner_where_terms {
                     let cond_reg = b.alloc_reg();
-                    emit_join_expr(b, where_expr, cond_reg, &tables, ctx)?;
+                    emit_join_expr(b, term, cond_reg, &tables, ctx, outer_row)?;
                     b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, advance, P4::None, 0);
                 }
                 emit_join_lookup_match(
@@ -16294,6 +16724,7 @@ fn codegen_single_join_lookup_select(
                     aggregates,
                     accum_base,
                     limit,
+                    outer_row,
                 )
             };
             let idx_loop_top = b.current_addr();
@@ -16398,9 +16829,9 @@ fn codegen_single_join_lookup_select(
             0,
         );
         b.emit_op(Opcode::NullRow, right_cursor, 0, 0, P4::None, 0);
-        if let Some(where_expr) = where_clause {
+        for term in &inner_where_terms {
             let cond_reg = b.alloc_reg();
-            emit_join_expr(b, where_expr, cond_reg, &tables, ctx)?;
+            emit_join_expr(b, term, cond_reg, &tables, ctx, outer_row)?;
             b.emit_jump_to_label(
                 Opcode::IfNot,
                 cond_reg,
@@ -16421,6 +16852,7 @@ fn codegen_single_join_lookup_select(
             aggregates,
             accum_base,
             limit,
+            outer_row,
         )?;
         b.resolve_label(skip_left_join_null_row);
     }
@@ -16472,8 +16904,12 @@ fn codegen_single_join_lookup_select(
     if let Some(idx_cursor) = index_cursor {
         b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     }
-    b.emit_op(Opcode::Close, right_cursor, 0, 0, P4::None, 0);
-    b.emit_op(Opcode::Close, left_cursor, 0, 0, P4::None, 0);
+    if open_right_table {
+        b.emit_op(Opcode::Close, right_cursor, 0, 0, P4::None, 0);
+    }
+    if open_left_table {
+        b.emit_op(Opcode::Close, left_cursor, 0, 0, P4::None, 0);
+    }
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
     Ok(())
@@ -17334,7 +17770,7 @@ fn codegen_multi_join_lookup_select(
     if !skip_driver_where {
         for &term in &where_at_table[0] {
             let cond_reg = b.alloc_reg();
-            emit_join_expr(b, term, cond_reg, &all_tables, ctx)?;
+            emit_join_expr(b, term, cond_reg, &all_tables, ctx, None)?;
             b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, outer_advance_label, P4::None, 0);
         }
     }
@@ -17403,12 +17839,19 @@ fn codegen_multi_join_lookup_select(
                         P4::None,
                         0,
                     );
-                    emit_join_on_residual(b, &step.on_residual, after_search_label, &all_tables, ctx)?;
+                    emit_join_on_residual(
+                        b,
+                        &step.on_residual,
+                        after_search_label,
+                        &all_tables,
+                        ctx,
+                        None,
+                    )?;
                     final_where_placeholder_base = b.current_anon_placeholder();
                     b.emit_op(Opcode::Integer, 1, left_matched_reg, 0, P4::None, 0);
                     for &term in table_where_terms {
                         let cond_reg = b.alloc_reg();
-                        emit_join_expr(b, term, cond_reg, &all_tables, ctx)?;
+                        emit_join_expr(b, term, cond_reg, &all_tables, ctx, None)?;
                         b.emit_jump_to_label(
                             Opcode::IfNot,
                             cond_reg,
@@ -17429,6 +17872,7 @@ fn codegen_multi_join_lookup_select(
                         aggregates,
                         accum_base,
                         limit,
+                        None,
                     )?;
                 }
                 SingleJoinLookupTarget::Index(index) => {
@@ -17500,12 +17944,19 @@ fn codegen_multi_join_lookup_select(
                             0,
                         );
                     }
-                    emit_join_on_residual(b, &step.on_residual, match_advance, &all_tables, ctx)?;
+                    emit_join_on_residual(
+                        b,
+                        &step.on_residual,
+                        match_advance,
+                        &all_tables,
+                        ctx,
+                        None,
+                    )?;
                     final_where_placeholder_base = b.current_anon_placeholder();
                     b.emit_op(Opcode::Integer, 1, left_matched_reg, 0, P4::None, 0);
                     for &term in table_where_terms {
                         let cond_reg = b.alloc_reg();
-                        emit_join_expr(b, term, cond_reg, &all_tables, ctx)?;
+                        emit_join_expr(b, term, cond_reg, &all_tables, ctx, None)?;
                         b.emit_jump_to_label(
                             Opcode::IfNot,
                             cond_reg,
@@ -17526,6 +17977,7 @@ fn codegen_multi_join_lookup_select(
                         aggregates,
                         accum_base,
                         limit,
+                        None,
                     )?;
                     if !step.is_unique_lookup {
                         b.resolve_label(match_advance);
@@ -17549,7 +18001,7 @@ fn codegen_multi_join_lookup_select(
             b.set_next_anon_placeholder(final_where_placeholder_base);
             for &term in table_where_terms {
                 let cond_reg = b.alloc_reg();
-                emit_join_expr(b, term, cond_reg, &all_tables, ctx)?;
+                emit_join_expr(b, term, cond_reg, &all_tables, ctx, None)?;
                 b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, current_advance, P4::None, 0);
             }
             emit_join_lookup_match(
@@ -17563,6 +18015,7 @@ fn codegen_multi_join_lookup_select(
                 aggregates,
                 accum_base,
                 limit,
+                None,
             )?;
             continue;
         }
@@ -17588,10 +18041,17 @@ fn codegen_multi_join_lookup_select(
                     P4::None,
                     0,
                 );
-                emit_join_on_residual(b, &step.on_residual, current_advance, &all_tables, ctx)?;
+                emit_join_on_residual(
+                    b,
+                    &step.on_residual,
+                    current_advance,
+                    &all_tables,
+                    ctx,
+                    None,
+                )?;
                 for &term in table_where_terms {
                     let cond_reg = b.alloc_reg();
-                    emit_join_expr(b, term, cond_reg, &all_tables, ctx)?;
+                    emit_join_expr(b, term, cond_reg, &all_tables, ctx, None)?;
                     b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, current_advance, P4::None, 0);
                 }
             }
@@ -17664,10 +18124,10 @@ fn codegen_multi_join_lookup_select(
                         0,
                     );
                 }
-                emit_join_on_residual(b, &step.on_residual, step_advance, &all_tables, ctx)?;
+                emit_join_on_residual(b, &step.on_residual, step_advance, &all_tables, ctx, None)?;
                 for &term in table_where_terms {
                     let cond_reg = b.alloc_reg();
-                    emit_join_expr(b, term, cond_reg, &all_tables, ctx)?;
+                    emit_join_expr(b, term, cond_reg, &all_tables, ctx, None)?;
                     b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, step_advance, P4::None, 0);
                 }
             }
@@ -17686,6 +18146,7 @@ fn codegen_multi_join_lookup_select(
             aggregates,
             accum_base,
             limit,
+            None,
         )?;
     }
 
@@ -18053,7 +18514,7 @@ fn codegen_join_select(
     for (_, _, _, on_expr) in &join_tables {
         if let Some(expr) = on_expr {
             let cond_reg = b.alloc_regs(1);
-            emit_join_expr(b, expr, cond_reg, &all_tables, ctx)?;
+            emit_join_expr(b, expr, cond_reg, &all_tables, ctx, None)?;
             b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
         }
     }
@@ -18062,7 +18523,7 @@ fn codegen_join_select(
     }
     if let Some(where_expr) = where_clause {
         let cond_reg = b.alloc_regs(1);
-        emit_join_expr(b, where_expr, cond_reg, &all_tables, ctx)?;
+        emit_join_expr(b, where_expr, cond_reg, &all_tables, ctx, None)?;
         b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
     }
 
@@ -18076,6 +18537,7 @@ fn codegen_join_select(
         sorter,
         &stmt.order_by,
         limit,
+        None,
     )?;
 
     // Close nested loops (inner to outer).
@@ -18099,7 +18561,7 @@ fn codegen_join_select(
         b.emit_op(Opcode::NullRow, right_cursors[0], 0, 0, P4::None, 0);
         if let Some(where_expr) = where_clause {
             let cond_reg = b.alloc_regs(1);
-            emit_join_expr(b, where_expr, cond_reg, &all_tables, ctx)?;
+            emit_join_expr(b, where_expr, cond_reg, &all_tables, ctx, None)?;
             b.emit_jump_to_label(
                 Opcode::IfNot,
                 cond_reg,
@@ -18118,6 +18580,7 @@ fn codegen_join_select(
             sorter,
             &stmt.order_by,
             limit,
+            None,
         )?;
         b.resolve_label(skip_left_join_null_row);
     }
@@ -18183,16 +18646,43 @@ fn emit_join_expr(
     target: i32,
     tables: &[(&TableSchema, Option<&str>)],
     _ctx: &CodegenContext,
+    outer_row: Option<RegisterRow>,
 ) -> Result<(), CodegenError> {
     match expr {
         Expr::Column(col_ref, _) => {
             match resolve_join_column_ref(col_ref.table.as_deref(), &col_ref.column, tables)? {
                 JoinColumnResolution::HiddenRowid(cursor) => {
-                    b.emit_op(Opcode::Rowid, cursor, target, 0, P4::None, 0);
+                    if cursor == 0
+                        && let Some(row) = outer_row
+                        && let Some(rowid_reg) = row.rowid
+                    {
+                        b.emit_op(Opcode::SCopy, rowid_reg, target, 0, P4::None, 0);
+                    } else {
+                        b.emit_op(Opcode::Rowid, cursor, target, 0, P4::None, 0);
+                    }
                 }
                 JoinColumnResolution::Column(cursor, col_idx) => {
                     let (table, table_alias) = tables[cursor as usize];
-                    if table.columns[col_idx].is_ipk {
+                    if cursor == 0
+                        && let Some(row) = outer_row
+                    {
+                        if table.columns[col_idx].is_ipk {
+                            let rowid_reg = row
+                                .rowid
+                                .expect("covering outer index row always has a rowid register");
+                            b.emit_op(Opcode::SCopy, rowid_reg, target, 0, P4::None, 0);
+                        } else {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                            b.emit_op(
+                                Opcode::SCopy,
+                                row.columns + col_idx as i32,
+                                target,
+                                0,
+                                P4::None,
+                                0,
+                            );
+                        }
+                    } else if table.columns[col_idx].is_ipk {
                         // bd-ghiey: an INTEGER PRIMARY KEY is stored as the
                         // b-tree rowid, not in the record, so read it via Rowid
                         // (mirroring single-table `emit_table_column_read`). The
@@ -18306,8 +18796,8 @@ fn emit_join_expr(
             use fsqlite_ast::BinaryOp;
             let left_reg = b.alloc_regs(1);
             let right_reg = b.alloc_regs(1);
-            emit_join_expr(b, left, left_reg, tables, _ctx)?;
-            emit_join_expr(b, right, right_reg, tables, _ctx)?;
+            emit_join_expr(b, left, left_reg, tables, _ctx, outer_row)?;
+            emit_join_expr(b, right, right_reg, tables, _ctx, outer_row)?;
             let comparison_collation = join_comparison_collation_name(left, right, tables)
                 .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
             let comparison_p5 = 0x20 | join_comparison_affinity_p5(left, right, tables);
@@ -18416,7 +18906,7 @@ fn emit_join_expr(
             expr: inner, not, ..
         } => {
             let inner_reg = b.alloc_regs(1);
-            emit_join_expr(b, inner, inner_reg, tables, _ctx)?;
+            emit_join_expr(b, inner, inner_reg, tables, _ctx, outer_row)?;
             let skip = b.emit_label();
             // IS NULL: result is 1 when inner is null, 0 otherwise.
             // IS NOT NULL: result is 0 when inner is null, 1 otherwise.
@@ -18437,7 +18927,7 @@ fn emit_join_expr(
             span,
         } => {
             let comparisons = between_as_comparisons(operand, low, high, *not, *span);
-            emit_join_expr(b, &comparisons, target, tables, _ctx)
+            emit_join_expr(b, &comparisons, target, tables, _ctx, outer_row)
         }
         // A plain scalar call: its arguments, then one PureFunc, as the
         // single-table emitter compiles it. Reached only for an aggregate
@@ -18457,7 +18947,7 @@ fn emit_join_expr(
             let nargs = u16::try_from(arg_list.len()).map_err(|_| unsupported())?;
             let arg_base = b.alloc_regs(i32::from(nargs));
             for (arg_reg, arg) in (arg_base..).zip(arg_list) {
-                emit_join_expr(b, arg, arg_reg, tables, _ctx)?;
+                emit_join_expr(b, arg, arg_reg, tables, _ctx, outer_row)?;
             }
             b.emit_op(
                 Opcode::PureFunc,
@@ -18688,6 +19178,7 @@ fn emit_join_result_columns(
     out_regs: i32,
     tables: &[(&TableSchema, Option<&str>)],
     ctx: &CodegenContext,
+    outer_row: Option<RegisterRow>,
 ) -> Result<(), CodegenError> {
     let mut reg_offset = 0;
     for col in columns {
@@ -18702,7 +19193,25 @@ fn emit_join_result_columns(
                         // Expr-path note in `emit_join_expr`), so a `SELECT *`
                         // over a TEMP/shadowed table in a join projects the id
                         // instead of NULL.
-                        if column.is_ipk {
+                        if cursor_idx == 0
+                            && let Some(row) = outer_row
+                        {
+                            if column.is_ipk {
+                                let rowid_reg = row
+                                    .rowid
+                                    .expect("covering outer index row always has a rowid register");
+                                b.emit_op(Opcode::SCopy, rowid_reg, dst, 0, P4::None, 0);
+                            } else {
+                                b.emit_op(
+                                    Opcode::SCopy,
+                                    row.columns + col_idx as i32,
+                                    dst,
+                                    0,
+                                    P4::None,
+                                    0,
+                                );
+                            }
+                        } else if column.is_ipk {
                             b.emit_op(Opcode::Rowid, cursor_idx as i32, dst, 0, P4::None, 0);
                         } else {
                             b.emit_op(
@@ -18725,7 +19234,25 @@ fn emit_join_result_columns(
                         matched = true;
                         for (col_idx, column) in table.columns.iter().enumerate() {
                             let dst = out_regs + reg_offset;
-                            if column.is_ipk {
+                            if cursor_idx == 0
+                                && let Some(row) = outer_row
+                            {
+                                if column.is_ipk {
+                                    let rowid_reg = row.rowid.expect(
+                                        "covering outer index row always has a rowid register",
+                                    );
+                                    b.emit_op(Opcode::SCopy, rowid_reg, dst, 0, P4::None, 0);
+                                } else {
+                                    b.emit_op(
+                                        Opcode::SCopy,
+                                        row.columns + col_idx as i32,
+                                        dst,
+                                        0,
+                                        P4::None,
+                                        0,
+                                    );
+                                }
+                            } else if column.is_ipk {
                                 b.emit_op(Opcode::Rowid, cursor_idx as i32, dst, 0, P4::None, 0);
                             } else {
                                 b.emit_op(
@@ -18748,7 +19275,7 @@ fn emit_join_result_columns(
             }
             ResultColumn::Expr { expr, .. } => {
                 let dst = out_regs + reg_offset;
-                emit_join_expr(b, expr, dst, tables, ctx)?;
+                emit_join_expr(b, expr, dst, tables, ctx, outer_row)?;
                 reg_offset += 1;
             }
         }
