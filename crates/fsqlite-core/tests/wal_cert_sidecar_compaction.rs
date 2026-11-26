@@ -3,12 +3,19 @@
 //! bd-reality-check-1022-llk6g.32: `-wal-cert` gained one certificate record
 //! per WAL commit and nothing ever removed one, so it grew forever. A WAL
 //! reset (new salts, a new generation) makes every older record unreadable,
-//! and the first append of the new generation now truncates them away.
+//! and the first append of the new generation now compacts them away.
+//!
+//! Since c9c513a65 (bd-5eult) that compaction keeps one record of the reset
+//! generation: it truncates the sidecar, writes the reset generation's newest
+//! complete record back at offset 0 as a continuity anchor, then appends its
+//! own record. A COMMIT that waited across the reset matches that anchor
+//! against the tail it captured (bd-kcua5 re-pinned these keepers to it).
 //!
 //! The keepers check the three things that compaction must not break:
-//! the sidecar stays bounded by the current generation's commits, every
-//! crash image of the unsynced truncate-then-append reopens with all rows,
-//! and a reader in another process never sees a truncate as corruption.
+//! the sidecar stays bounded by one anchor plus the current generation's
+//! commits, every crash image of the unsynced truncate, anchor write and
+//! append reopens with all rows, and a reader in another process never sees
+//! a compaction as corruption.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -59,6 +66,36 @@ fn certificate_records(bytes: &[u8]) -> usize {
     records
 }
 
+/// The newest record of a sidecar whose tail is a complete record.
+fn newest_record(bytes: &[u8]) -> &[u8] {
+    assert!(bytes.len() >= 4, "sidecar has no length footer");
+    let footer: [u8; 4] = bytes[bytes.len() - 4..].try_into().expect("4-byte footer");
+    let len = usize::try_from(u32::from_le_bytes(footer)).expect("record length fits usize");
+    assert!(
+        len > 4 && len <= bytes.len(),
+        "invalid newest record length {len} in a {}-byte sidecar",
+        bytes.len()
+    );
+    &bytes[bytes.len() - len..]
+}
+
+/// `sidecar` is exactly `prefix` followed by one complete new record.
+fn assert_prefix_then_one_record(context: &str, sidecar: &[u8], prefix: &[u8]) {
+    assert!(
+        sidecar.len() > prefix.len() && sidecar.starts_with(prefix),
+        "{context}: the sidecar ({} bytes) must keep the expected {}-byte prefix byte for byte \
+         and append to it",
+        sidecar.len(),
+        prefix.len()
+    );
+    let appended = &sidecar[prefix.len()..];
+    assert_eq!(
+        newest_record(appended).len(),
+        appended.len(),
+        "{context}: exactly one complete record follows the kept prefix"
+    );
+}
+
 /// Run a TRUNCATE checkpoint and report whether it completed.
 async fn truncate_checkpoint(conn: &Connection) -> bool {
     let rows = conn
@@ -90,13 +127,15 @@ fn wal_cert_sidecar_stays_bounded_across_checkpoint_resets() {
                     .expect("autocommit insert");
             }
             let records = certificate_records(&read_sidecar(&db));
-            // Cycle 0 also holds the CREATE TABLE commit.
+            // Cycle 0 also holds the CREATE TABLE commit; every later cycle
+            // holds the reset generation's anchor (c9c513a65) instead.
             assert!(
                 records > 0
                     && records
                         <= usize::try_from(COMMITS_PER_GENERATION + 1).expect("fits usize"),
                 "cycle {cycle}: -wal-cert holds {records} records after {rows} inserts; \
-                 only the current generation's {COMMITS_PER_GENERATION} commits may remain"
+                 only one prior-generation anchor and the current generation's \
+                 {COMMITS_PER_GENERATION} commits may remain"
             );
             assert!(
                 truncate_checkpoint(&conn).await,
@@ -108,25 +147,111 @@ fn wal_cert_sidecar_stays_bounded_across_checkpoint_resets() {
     });
 }
 
+/// The first append of a new generation makes three unsynced changes, in
+/// order (c9c513a65): T, truncate the sidecar to 0; A, write the anchor (the
+/// reset generation's newest complete record) at offset 0; N, append the new
+/// record after it. A crash image may hold any subset of them, and a write
+/// may stop part-way. When the truncate is lost, the old size survives and a
+/// write lands over the old bytes.
 #[derive(Debug, Clone, Copy)]
 enum CompactionCrash {
-    /// Both the truncate and the new record reached the disk.
+    /// T, A and N: `[anchor, record]`.
     Intact,
-    /// Neither did: the sidecar still holds only the reset generation.
+    /// None: the sidecar still holds only the reset generation.
     NothingPersisted,
-    /// The truncate did, the new record did not.
+    /// T alone: an empty sidecar.
     TruncateOnly,
-    /// The new record landed over the old bytes but the old size survived,
-    /// so the tail is still the reset generation's last record.
+    /// T and part of A: a torn anchor.
+    TornAnchor,
+    /// T and A, not N (a crash between the anchor and the record):
+    /// `[anchor]`.
+    AnchorOnly,
+    /// T, A and part of N: `[anchor, torn record]`.
+    TornRecord,
+    /// T and N, not A: the record past a zero-filled hole where the anchor
+    /// belongs.
+    RecordWithoutAnchor,
+    /// A alone: the anchor over the old head, the old tail intact.
+    AnchorOverOldHead,
+    /// A and N, not T: both over the old bytes, the old tail intact.
     RecordOverOldTail,
+    /// N alone: the record over the old bytes, the old tail intact.
+    RecordOverOldBytes,
 }
 
-fn crash_image(
-    source_dir: &Path,
-    image_dir: &Path,
-    before_compaction: &[u8],
-    crash: CompactionCrash,
-) -> PathBuf {
+const COMPACTION_CRASHES: [CompactionCrash; 10] = [
+    CompactionCrash::Intact,
+    CompactionCrash::NothingPersisted,
+    CompactionCrash::TruncateOnly,
+    CompactionCrash::TornAnchor,
+    CompactionCrash::AnchorOnly,
+    CompactionCrash::TornRecord,
+    CompactionCrash::RecordWithoutAnchor,
+    CompactionCrash::AnchorOverOldHead,
+    CompactionCrash::RecordOverOldTail,
+    CompactionCrash::RecordOverOldBytes,
+];
+
+/// `bytes` written at `offset` over `base`, keeping `base`'s length when
+/// it is longer: a write whose truncate was lost.
+fn overlay(base: &[u8], offset: usize, bytes: &[u8]) -> Vec<u8> {
+    let mut image = base.to_vec();
+    let end = offset + bytes.len();
+    assert!(end <= image.len(), "the old sidecar outlasts the write");
+    image[offset..end].copy_from_slice(bytes);
+    image
+}
+
+/// The crash image's sidecar. `after` is the live `[anchor, record]`.
+fn crash_sidecar(before_compaction: &[u8], after: &[u8], crash: CompactionCrash) -> Vec<u8> {
+    let anchor = newest_record(before_compaction);
+    assert!(
+        after.starts_with(anchor),
+        "the compaction leaves the anchor at offset 0"
+    );
+    let record = &after[anchor.len()..];
+    match crash {
+        CompactionCrash::Intact => after.to_vec(),
+        CompactionCrash::NothingPersisted => before_compaction.to_vec(),
+        CompactionCrash::TruncateOnly => Vec::new(),
+        CompactionCrash::TornAnchor => anchor[..anchor.len() / 2].to_vec(),
+        CompactionCrash::AnchorOnly => anchor.to_vec(),
+        CompactionCrash::TornRecord => [anchor, &record[..record.len() / 2]].concat(),
+        CompactionCrash::RecordWithoutAnchor => {
+            let mut image = vec![0_u8; anchor.len()];
+            image.extend_from_slice(record);
+            image
+        }
+        CompactionCrash::AnchorOverOldHead => overlay(before_compaction, 0, anchor),
+        CompactionCrash::RecordOverOldTail => overlay(before_compaction, 0, after),
+        CompactionCrash::RecordOverOldBytes => overlay(before_compaction, anchor.len(), record),
+    }
+}
+
+/// What the reopened image's sidecar must start with once its next commit
+/// appended one record. The append repairs a torn suffix to its last
+/// complete record (truncating a reset generation's tail away), compacts a
+/// reset-generation tail to the anchor, and appends to a current-generation
+/// tail; so no image keeps more than one record of the reset generation.
+fn kept_prefix(image: &[u8], anchor: &[u8], crash: CompactionCrash) -> Vec<u8> {
+    match crash {
+        // The tail is the current generation's record.
+        CompactionCrash::Intact | CompactionCrash::RecordWithoutAnchor => image.to_vec(),
+        // The tail is the reset generation's newest record: the anchor.
+        CompactionCrash::NothingPersisted
+        | CompactionCrash::AnchorOnly
+        | CompactionCrash::AnchorOverOldHead
+        | CompactionCrash::RecordOverOldTail
+        | CompactionCrash::RecordOverOldBytes => anchor.to_vec(),
+        // Nothing complete, or only a reset-generation record under a torn
+        // suffix: the repair truncates to empty.
+        CompactionCrash::TruncateOnly
+        | CompactionCrash::TornAnchor
+        | CompactionCrash::TornRecord => Vec::new(),
+    }
+}
+
+fn crash_image(source_dir: &Path, image_dir: &Path, sidecar: &[u8]) -> PathBuf {
     std::fs::create_dir_all(image_dir).expect("create crash image dir");
     for suffix in ["", "-wal", "-wal-fec", "-wal-cert-head"] {
         let from = source_dir.join(format!("live.db{suffix}"));
@@ -135,23 +260,20 @@ fn crash_image(
                 .expect("copy live file into crash image");
         }
     }
-    let after = read_sidecar(&source_dir.join("live.db"));
-    let sidecar = match crash {
-        CompactionCrash::Intact => after,
-        CompactionCrash::NothingPersisted => before_compaction.to_vec(),
-        CompactionCrash::TruncateOnly => Vec::new(),
-        CompactionCrash::RecordOverOldTail => {
-            assert!(
-                before_compaction.len() > after.len(),
-                "the reset generation left more than one record"
-            );
-            let mut image = before_compaction.to_vec();
-            image[..after.len()].copy_from_slice(&after);
-            image
-        }
-    };
     std::fs::write(image_dir.join("live.db-wal-cert"), sidecar).expect("write sidecar image");
     image_dir.join("live.db")
+}
+
+async fn assert_integrity_ok(conn: &Connection, context: &str) {
+    let check = conn
+        .query("PRAGMA integrity_check;")
+        .await
+        .unwrap_or_else(|e| panic!("{context}: integrity_check: {e}"));
+    assert!(
+        matches!(&check[0].values()[0], SqliteValue::Text(s) if s.as_ref() == "ok"),
+        "{context}: integrity_check returned {:?}",
+        check[0].values()
+    );
 }
 
 #[test]
@@ -181,25 +303,31 @@ fn every_crash_image_of_the_compaction_reopens_with_all_rows() {
             certificate_records(&before_compaction) > 1,
             "the reset generation's records are still on disk before the next append"
         );
-        // The first commit of the new generation compacts the sidecar.
+        // The first commit of the new generation compacts the sidecar to the
+        // anchor plus its own record. bd-kcua5: this pin was `1` (the whole
+        // reset generation dropped, d2a752116) until c9c513a65 (bd-5eult)
+        // kept the reset generation's newest complete record as the anchor.
         conn.execute("INSERT INTO t(v) VALUES ('first-of-new-generation');")
             .await
             .expect("first insert after the reset");
         let rows = COMMITS_PER_GENERATION + 1;
-        assert_eq!(certificate_records(&read_sidecar(&db)), 1);
+        let after = read_sidecar(&db);
+        let anchor = newest_record(&before_compaction).to_vec();
+        assert_eq!(
+            certificate_records(&after),
+            2,
+            "one anchor and the new generation's first record"
+        );
+        assert_prefix_then_one_record("compaction", &after, &anchor);
+        assert_ne!(
+            newest_record(&after),
+            anchor.as_slice(),
+            "the new generation's record is not a copy of the anchor"
+        );
 
-        for crash in [
-            CompactionCrash::Intact,
-            CompactionCrash::NothingPersisted,
-            CompactionCrash::TruncateOnly,
-            CompactionCrash::RecordOverOldTail,
-        ] {
-            let image = crash_image(
-                &live,
-                &dir.path().join(format!("{crash:?}")),
-                &before_compaction,
-                crash,
-            );
+        for crash in COMPACTION_CRASHES {
+            let sidecar = crash_sidecar(&before_compaction, &after, crash);
+            let image = crash_image(&live, &dir.path().join(format!("{crash:?}")), &sidecar);
             let reopened = Connection::open(image.to_str().expect("utf-8 path"))
                 .await
                 .unwrap_or_else(|e| panic!("{crash:?}: reopen crash image: {e}"));
@@ -208,25 +336,45 @@ fn every_crash_image_of_the_compaction_reopens_with_all_rows() {
                 rows,
                 "{crash:?}: every FULL-acknowledged row must survive"
             );
-            let check = reopened
-                .query("PRAGMA integrity_check;")
-                .await
-                .unwrap_or_else(|e| panic!("{crash:?}: integrity_check: {e}"));
-            assert!(
-                matches!(&check[0].values()[0], SqliteValue::Text(s) if s.as_ref() == "ok"),
-                "{crash:?}: integrity_check returned {:?}",
-                check[0].values()
-            );
+            assert_integrity_ok(&reopened, &format!("{crash:?}")).await;
             reopened
                 .execute("INSERT INTO t(v) VALUES ('after-reopen');")
                 .await
                 .unwrap_or_else(|e| panic!("{crash:?}: write after reopen: {e}"));
             assert_eq!(scalar(&reopened, "SELECT count(*) FROM t;").await, rows + 1);
-            let records = certificate_records(&read_sidecar(&image));
-            assert!(
-                (1..=2).contains(&records),
-                "{crash:?}: only current-generation records may remain, found {records}"
+            // At most one reset-generation record (the anchor) survives the
+            // next append, and it is the reset generation's newest one.
+            assert_prefix_then_one_record(
+                &format!("{crash:?}: the write after reopen"),
+                &read_sidecar(&image),
+                &kept_prefix(&sidecar, &anchor, crash),
             );
+
+            // The next reset's first append compacts whatever the image left
+            // (a hole included) to that generation's newest record plus one.
+            assert!(
+                truncate_checkpoint(&reopened).await,
+                "{crash:?}: TRUNCATE checkpoint after reopen"
+            );
+            let before_next = read_sidecar(&image);
+            let next_anchor = newest_record(&before_next).to_vec();
+            reopened
+                .execute("INSERT INTO t(v) VALUES ('after-next-reset');")
+                .await
+                .unwrap_or_else(|e| panic!("{crash:?}: write after the next reset: {e}"));
+            let next = read_sidecar(&image);
+            assert_eq!(
+                certificate_records(&next),
+                2,
+                "{crash:?}: the next generation's first append leaves one anchor plus its record"
+            );
+            assert_prefix_then_one_record(
+                &format!("{crash:?}: the next reset's compaction"),
+                &next,
+                &next_anchor,
+            );
+            assert_eq!(scalar(&reopened, "SELECT count(*) FROM t;").await, rows + 2);
+            assert_integrity_ok(&reopened, &format!("{crash:?}: after the next reset")).await;
             reopened
                 .close()
                 .await
@@ -236,7 +384,7 @@ fn every_crash_image_of_the_compaction_reopens_with_all_rows() {
             let count: i64 = stock
                 .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
                 .expect("stock count");
-            assert_eq!(count, rows + 1, "{crash:?}: stock row count");
+            assert_eq!(count, rows + 2, "{crash:?}: stock row count");
             let integrity: String = stock
                 .query_row("PRAGMA integrity_check", [], |row| row.get(0))
                 .expect("stock integrity_check");
