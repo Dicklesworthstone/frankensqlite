@@ -17043,6 +17043,10 @@ impl Drop for StatementLookasideGrowthGuard<'_> {
 struct MemFallbackRejectionOverrideGuard<'a> {
     conn: &'a Connection,
     previous_reject: bool,
+    // Field drops after `Drop::drop` restores `reject_mem_fallback`, so
+    // `reject_mem_fallback == false` is never observed without suppression
+    // when the caller had fallback rejection enabled (bd-yk032, bd-rv46n).
+    _hydration_suppression: Option<MemdbRowHydrationSuppression<'a>>,
 }
 
 impl Drop for MemFallbackRejectionOverrideGuard<'_> {
@@ -28349,10 +28353,21 @@ impl Connection {
                  first_failure_diag={first_failure_diag}"
             )));
         }
+        // bd-yk032 / bd-rv46n: temporarily disabling mem-fallback rejection for
+        // internal materialized tables (CTEs, views, sqlite_schema, attached
+        // temp snapshots) exists only so VDBE/fallback paths can read those
+        // synthetic MemDatabase roots; persistent tables remain authoritative
+        // on the pager/active_txn. Do not let this temporary policy flip trick
+        // `refresh_memdb_from_active_txn_if_dirty` or `reload_memdb_from_pager`
+        // into eagerly re-hydrating every row of every untouched table.
+        let hydration_suppression = (previous_reject
+            || self.memdb_row_hydration_suppressed.get() > 0)
+            .then(|| self.suppress_memdb_row_hydration());
         self.set_reject_mem_fallback(false);
         Ok(MemFallbackRejectionOverrideGuard {
             conn: self,
             previous_reject,
+            _hydration_suppression: hydration_suppression,
         })
     }
 
@@ -112080,19 +112095,13 @@ impl Connection {
         let inlined_not_materialized = inline_not_materialized_ctes(select);
         let select = inlined_not_materialized.as_ref().unwrap_or(select);
 
-        // bd-yk032: disabling mem-fallback rejection for CTE materialization
-        // exists only so VDBE/fallback paths can read CTE roots from MemDB;
-        // persistent tables are read directly from the pager/active_txn. Do
-        // not let the temporary policy flip re-hydrate the whole MemDatabase
-        // image (O(database) per WITH after any write).
-        let suppress_hydration = *self.reject_mem_fallback.borrow()
-            || self.memdb_row_hydration_suppressed.get() > 0
-            || self.cte_statement_reads_only_own_ctes(CteConsumer::Select(select));
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "select",
             "with_clause_materialization",
         )?;
-        let _hydration_suppression = suppress_hydration.then(|| self.suppress_memdb_row_hydration());
+        let _hydration_suppression = self
+            .cte_statement_reads_only_own_ctes(CteConsumer::Select(select))
+            .then(|| self.suppress_memdb_row_hydration());
         match self
             .execute_recursive_cte_direct_sum_consumer(select, params)
             .await
@@ -113705,13 +113714,10 @@ impl Connection {
             return Ok(rows);
         }
 
-        let suppress_hydration =
-            *self.reject_mem_fallback.borrow() || self.memdb_row_hydration_suppressed.get() > 0;
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "delete",
             "with_clause_materialization",
         )?;
-        let _hydration_suppression = suppress_hydration.then(|| self.suppress_memdb_row_hydration());
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
         self.materialize_with_clause(delete.with.as_ref(), params, &mut temp_tables.tables, None)
             .await?;
@@ -113800,13 +113806,10 @@ impl Connection {
             };
         }
 
-        let suppress_hydration =
-            *self.reject_mem_fallback.borrow() || self.memdb_row_hydration_suppressed.get() > 0;
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "update",
             "with_clause_materialization",
         )?;
-        let _hydration_suppression = suppress_hydration.then(|| self.suppress_memdb_row_hydration());
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
         self.materialize_with_clause(update.with.as_ref(), params, &mut temp_tables.tables, None)
             .await?;
@@ -113896,16 +113899,15 @@ impl Connection {
             };
         }
 
-        let suppress_hydration = *self.reject_mem_fallback.borrow()
-            || self.memdb_row_hydration_suppressed.get() > 0
-            || self.cte_statement_reads_only_own_ctes(CteConsumer::Insert(insert));
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "insert",
             "with_clause_materialization",
         )?;
         // Dynamic roots must not reuse programs from another WITH scope.
         let _compiled_cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
-        let _hydration_suppression = suppress_hydration.then(|| self.suppress_memdb_row_hydration());
+        let _hydration_suppression = self
+            .cte_statement_reads_only_own_ctes(CteConsumer::Insert(insert))
+            .then(|| self.suppress_memdb_row_hydration());
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
         self.materialize_with_clause(insert.with.as_ref(), params, &mut temp_tables.tables, None)
             .await?;
@@ -114082,13 +114084,10 @@ impl Connection {
         with: Option<&fsqlite_ast::WithClause>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<MaterializedTempTable>> {
-        let suppress_hydration =
-            *self.reject_mem_fallback.borrow() || self.memdb_row_hydration_suppressed.get() > 0;
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "statement",
             "with_clause_materialization",
         )?;
-        let _hydration_suppression = suppress_hydration.then(|| self.suppress_memdb_row_hydration());
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
         self.materialize_with_clause(with, params, &mut temp_tables.tables, None)
             .await?;
@@ -122045,7 +122044,14 @@ impl Connection {
     /// process.
     #[must_use]
     pub fn memdb_row_hydration_count(&self) -> u64 {
-        self.memdb_row_hydration_count.get()
+        let attached = self
+            .attached_connections
+            .borrow()
+            .values()
+            .fold(0_u64, |acc, conn| {
+                acc.wrapping_add(conn.memdb_row_hydration_count())
+            });
+        self.memdb_row_hydration_count.get().wrapping_add(attached)
     }
 
     /// bd-qteu2: record that one user-table row was hydrated into the

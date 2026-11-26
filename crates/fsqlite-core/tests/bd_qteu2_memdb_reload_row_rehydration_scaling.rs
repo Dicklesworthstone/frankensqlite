@@ -266,3 +266,407 @@ fn fk_child_insert_is_correct_under_lazy_hydration() {
         );
     });
 }
+
+#[derive(Clone, Copy, Debug)]
+enum Rv46nBackend {
+    Memory,
+    FileDelete,
+    FileWal,
+}
+
+impl Rv46nBackend {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Memory => ":memory:",
+            Self::FileDelete => "file-delete",
+            Self::FileWal => "file-wal",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Rv46nDml {
+    UpdateSubquery,
+    UpdateFromReturning,
+    DeleteSubquery,
+    DeleteExistsReturning,
+}
+
+impl Rv46nDml {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::UpdateSubquery => "with-update-subquery",
+            Self::UpdateFromReturning => "with-update-from-returning",
+            Self::DeleteSubquery => "with-delete-subquery",
+            Self::DeleteExistsReturning => "with-delete-exists-returning",
+        }
+    }
+}
+
+fn stock_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let cols = stmt.column_count();
+    stmt.query_map([], |row| {
+        let mut out = Vec::with_capacity(cols);
+        for i in 0..cols {
+            let v = match row.get_ref_unwrap(i) {
+                rusqlite::types::ValueRef::Null => "NULL".to_owned(),
+                rusqlite::types::ValueRef::Integer(n) => format!("I:{n}"),
+                rusqlite::types::ValueRef::Real(f) => format!("R:{f:?}"),
+                rusqlite::types::ValueRef::Text(b) => {
+                    format!("T:{}", String::from_utf8_lossy(b))
+                }
+                rusqlite::types::ValueRef::Blob(b) => format!("B:{b:?}"),
+            };
+            out.push(v);
+        }
+        Ok(out)
+    })
+    .unwrap()
+    .map(|r| r.unwrap())
+    .collect()
+}
+
+fn frank_rows_fmt(rows: &[fsqlite_core::connection::Row]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|row| {
+            row.values()
+                .iter()
+                .map(|v| match v {
+                    SqliteValue::Null => "NULL".to_owned(),
+                    SqliteValue::Integer(n) => format!("I:{n}"),
+                    SqliteValue::Float(f) => format!("R:{f:?}"),
+                    SqliteValue::Text(s) => format!("T:{s}"),
+                    SqliteValue::Blob(b) => format!("B:{b:?}"),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// bd-rv46n: run a WITH ... UPDATE or WITH ... DELETE over `INGEST_ROWS` rows
+/// on a target table with BEFORE and AFTER triggers whose WHEN clauses query a
+/// VIEW over `sink` and whose bodies write to `sink`, alongside `STABLE_TABLES`
+/// untouched tables. Returns `(hydrated_delta, returning_rows, main_rows, sink_rows)`
+/// and verifies parity against live bundled rusqlite (3.54.1).
+async fn run_rv46n_with_dml_scaling_case(
+    backend: Rv46nBackend,
+    dml: Rv46nDml,
+    stable_rows_each: usize,
+) -> u64 {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let frank = match backend {
+        Rv46nBackend::Memory => Connection::open(":memory:").await.unwrap(),
+        Rv46nBackend::FileDelete | Rv46nBackend::FileWal => {
+            Connection::open(temp.path().to_str().unwrap())
+                .await
+                .unwrap()
+        }
+    };
+    let stock = rusqlite::Connection::open_in_memory().unwrap();
+    if matches!(backend, Rv46nBackend::FileWal) {
+        frank.execute("PRAGMA journal_mode=WAL;").await.unwrap();
+    }
+
+    let mut ddl = String::new();
+    for t in 0..STABLE_TABLES {
+        ddl.push_str(&format!(
+            "CREATE TABLE stable_{t}(id INTEGER PRIMARY KEY, a TEXT, b TEXT);"
+        ));
+    }
+    ddl.push_str("CREATE TABLE main(id INTEGER PRIMARY KEY, v TEXT);");
+    ddl.push_str("CREATE TABLE src(id INTEGER PRIMARY KEY, v TEXT);");
+    ddl.push_str("CREATE TABLE sink(id INTEGER PRIMARY KEY, msg TEXT);");
+    ddl.push_str("CREATE VIEW sink_v AS SELECT count(*) AS n FROM sink;");
+    ddl.push_str(
+        "CREATE TRIGGER main_bu BEFORE UPDATE ON main \
+         WHEN (SELECT n FROM sink_v) >= 0 \
+         BEGIN INSERT INTO sink(msg) VALUES ('bu:' || OLD.id || ':' || OLD.v || '->' || NEW.v); END;\
+         CREATE TRIGGER main_au AFTER UPDATE ON main \
+         WHEN (SELECT count(*) FROM sink) >= 0 \
+         BEGIN INSERT INTO sink(msg) VALUES ('au:' || NEW.id || ':' || NEW.v); END;\
+         CREATE TRIGGER main_bd BEFORE DELETE ON main \
+         WHEN (SELECT n FROM sink_v) >= 0 \
+         BEGIN INSERT INTO sink(msg) VALUES ('bd:' || OLD.id || ':' || OLD.v); END;\
+         CREATE TRIGGER main_ad AFTER DELETE ON main \
+         WHEN (SELECT count(*) FROM sink) >= 0 \
+         BEGIN INSERT INTO sink(msg) VALUES ('ad:' || OLD.id || ':' || OLD.v); END;",
+    );
+    frank.execute_batch(&ddl).await.unwrap();
+    stock.execute_batch(&ddl).unwrap();
+
+    for t in 0..STABLE_TABLES {
+        let mut batch = String::from("BEGIN;");
+        for r in 0..stable_rows_each {
+            batch.push_str(&format!(
+                "INSERT INTO stable_{t}(a, b) VALUES ('a{r}', 'b{r}');"
+            ));
+        }
+        batch.push_str("COMMIT;");
+        frank.execute_batch(&batch).await.unwrap();
+        stock.execute_batch(&batch).unwrap();
+    }
+
+    let mut seed = String::from("BEGIN;");
+    for i in 1..=INGEST_ROWS {
+        seed.push_str(&format!(
+            "INSERT INTO main(id, v) VALUES ({i}, 'orig-{i}');\
+             INSERT INTO src(id, v) VALUES ({i}, 'next-{i}');"
+        ));
+    }
+    seed.push_str("COMMIT;");
+    frank.execute_batch(&seed).await.unwrap();
+    stock.execute_batch(&seed).unwrap();
+
+    let stmt_sql = match dml {
+        Rv46nDml::UpdateSubquery => {
+            "WITH c(k, v) AS (SELECT id, v FROM src) \
+             UPDATE main SET v = (SELECT v FROM c WHERE c.k = main.id) \
+             WHERE id IN (SELECT k FROM c)"
+        }
+        Rv46nDml::UpdateFromReturning => {
+            "WITH c(k, v) AS (SELECT id, v FROM src) \
+             UPDATE main SET v = c.v || '-from' FROM c \
+             WHERE main.id = c.k \
+             RETURNING main.id, main.v"
+        }
+        Rv46nDml::DeleteSubquery => {
+            "WITH c(k) AS (SELECT id FROM src) \
+             DELETE FROM main WHERE id IN (SELECT k FROM c)"
+        }
+        Rv46nDml::DeleteExistsReturning => {
+            "WITH c(k) AS (SELECT id FROM src) \
+             DELETE FROM main WHERE EXISTS (SELECT 1 FROM c WHERE c.k = main.id) \
+             RETURNING id, v"
+        }
+    };
+
+    let before = frank.memdb_row_hydration_count();
+    frank.execute("BEGIN;").await.unwrap();
+    stock.execute_batch("BEGIN;").unwrap();
+    let (frank_ret, stock_ret) = match dml {
+        Rv46nDml::UpdateSubquery | Rv46nDml::DeleteSubquery => {
+            let f_changed = frank.execute(stmt_sql).await.unwrap();
+            let s_changed = stock.execute(stmt_sql, []).unwrap();
+            assert_eq!(
+                f_changed,
+                s_changed,
+                "bd-rv46n change count mismatch ({}, {})",
+                backend.label(),
+                dml.label()
+            );
+            (Vec::new(), Vec::new())
+        }
+        Rv46nDml::UpdateFromReturning | Rv46nDml::DeleteExistsReturning => {
+            let f_rows = frank_rows_fmt(&frank.query(stmt_sql).await.unwrap());
+            let s_rows = stock_rows(&stock, stmt_sql);
+            (f_rows, s_rows)
+        }
+    };
+    frank.execute("COMMIT;").await.unwrap();
+    stock.execute_batch("COMMIT;").unwrap();
+    let delta = frank.memdb_row_hydration_count() - before;
+
+    assert_eq!(
+        frank_ret,
+        stock_ret,
+        "bd-rv46n RETURNING mismatch ({}, {})",
+        backend.label(),
+        dml.label()
+    );
+    for check_sql in [
+        "SELECT id, v FROM main ORDER BY id",
+        "SELECT id, msg FROM sink ORDER BY id",
+        "SELECT count(*) FROM stable_0",
+    ] {
+        let f_rows = frank_rows_fmt(&frank.query(check_sql).await.unwrap());
+        let s_rows = stock_rows(&stock, check_sql);
+        assert_eq!(
+            f_rows,
+            s_rows,
+            "bd-rv46n post-state mismatch ({}, {}, `{check_sql}`)",
+            backend.label(),
+            dml.label()
+        );
+    }
+
+    delta
+}
+
+/// bd-rv46n: WITH ... UPDATE holding the internal mem-fallback override across
+/// BEFORE/AFTER UPDATE triggers (including a trigger WHEN reading a VIEW over
+/// another table) must not re-hydrate untouched stable tables on each affected
+/// row — across `:memory:`, file-backed DELETE, and file-backed WAL.
+#[test]
+fn with_update_trigger_replay_does_not_rehydrate_untouched_rows_per_affected_row() {
+    asupersync::test_utils::run_test(|| async {
+        for backend in [
+            Rv46nBackend::Memory,
+            Rv46nBackend::FileDelete,
+            Rv46nBackend::FileWal,
+        ] {
+            for dml in [Rv46nDml::UpdateSubquery, Rv46nDml::UpdateFromReturning] {
+                let small = run_rv46n_with_dml_scaling_case(backend, dml, SMALL_STABLE_ROWS).await;
+                let large = run_rv46n_with_dml_scaling_case(backend, dml, LARGE_STABLE_ROWS).await;
+                eprintln!(
+                    "bd-rv46n receipt [{}/{}]: small={small} large={large}",
+                    backend.label(),
+                    dml.label()
+                );
+                assert_eq!(
+                    small,
+                    0,
+                    "bd-rv46n [{}/{}]: WITH UPDATE hydrated rows on small stable set",
+                    backend.label(),
+                    dml.label()
+                );
+                assert_eq!(
+                    large,
+                    0,
+                    "bd-rv46n [{}/{}]: WITH UPDATE hydrated rows on large stable set",
+                    backend.label(),
+                    dml.label()
+                );
+            }
+        }
+    });
+}
+
+/// bd-rv46n: WITH ... DELETE holding the internal mem-fallback override across
+/// BEFORE/AFTER DELETE triggers (including a trigger WHEN reading a VIEW over
+/// another table) must not re-hydrate untouched stable tables on each affected
+/// row — across `:memory:`, file-backed DELETE, and file-backed WAL.
+#[test]
+fn with_delete_trigger_replay_does_not_rehydrate_untouched_rows_per_affected_row() {
+    asupersync::test_utils::run_test(|| async {
+        for backend in [
+            Rv46nBackend::Memory,
+            Rv46nBackend::FileDelete,
+            Rv46nBackend::FileWal,
+        ] {
+            for dml in [Rv46nDml::DeleteSubquery, Rv46nDml::DeleteExistsReturning] {
+                let small = run_rv46n_with_dml_scaling_case(backend, dml, SMALL_STABLE_ROWS).await;
+                let large = run_rv46n_with_dml_scaling_case(backend, dml, LARGE_STABLE_ROWS).await;
+                eprintln!(
+                    "bd-rv46n receipt [{}/{}]: small={small} large={large}",
+                    backend.label(),
+                    dml.label()
+                );
+                assert_eq!(
+                    small,
+                    0,
+                    "bd-rv46n [{}/{}]: WITH DELETE hydrated rows on small stable set",
+                    backend.label(),
+                    dml.label()
+                );
+                assert_eq!(
+                    large,
+                    0,
+                    "bd-rv46n [{}/{}]: WITH DELETE hydrated rows on large stable set",
+                    backend.label(),
+                    dml.label()
+                );
+            }
+        }
+    });
+}
+
+/// bd-rv46n: ATTACHed-database WITH ... UPDATE and WITH ... DELETE with
+/// triggers, plus CTE names that shadow a table written by the trigger body,
+/// match stock 3.54.1 without hydrating untouched tables.
+#[test]
+fn with_update_and_delete_shadowed_and_attached_match_stock_with_zero_hydration() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let att_path = dir.path().join("att.db");
+        let main_str = main_path.to_str().unwrap();
+        let att_str = att_path.to_str().unwrap();
+
+        let frank = Connection::open(main_str).await.unwrap();
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let stock_att_path = dir.path().join("stock_att.db");
+        let stock_att_str = stock_att_path.to_str().unwrap();
+
+        frank
+            .execute(&format!("ATTACH DATABASE '{att_str}' AS att;"))
+            .await
+            .unwrap();
+        stock
+            .execute_batch(&format!("ATTACH DATABASE '{stock_att_str}' AS att;"))
+            .unwrap();
+
+        let setup = "\
+            CREATE TABLE untouched(id INTEGER PRIMARY KEY, pad TEXT);\
+            CREATE TABLE target(id INTEGER PRIMARY KEY, v TEXT);\
+            CREATE TABLE sink(id INTEGER PRIMARY KEY, msg TEXT);\
+            CREATE TRIGGER t_bu BEFORE UPDATE ON target WHEN (SELECT count(*) FROM sink) >= 0 \
+            BEGIN INSERT INTO sink(msg) VALUES ('u:' || OLD.id || ':' || NEW.v); END;\
+            CREATE TRIGGER t_bd BEFORE DELETE ON target WHEN (SELECT count(*) FROM sink) >= 0 \
+            BEGIN INSERT INTO sink(msg) VALUES ('d:' || OLD.id || ':' || OLD.v); END;\
+            CREATE TABLE att.untouched(id INTEGER PRIMARY KEY, pad TEXT);\
+            CREATE TABLE att.target(id INTEGER PRIMARY KEY, v TEXT);\
+            CREATE TABLE att.sink(id INTEGER PRIMARY KEY, msg TEXT);\
+            CREATE TRIGGER att.at_bu BEFORE UPDATE ON target WHEN (SELECT count(*) FROM sink) >= 0 \
+            BEGIN INSERT INTO sink(msg) VALUES ('au:' || OLD.id || ':' || NEW.v); END;\
+            CREATE TRIGGER att.at_bd BEFORE DELETE ON target WHEN (SELECT count(*) FROM sink) >= 0 \
+            BEGIN INSERT INTO sink(msg) VALUES ('ad:' || OLD.id || ':' || OLD.v); END;";
+        frank.execute_batch(setup).await.unwrap();
+        stock.execute_batch(setup).unwrap();
+
+        let mut seed = String::from("BEGIN;");
+        for i in 1..=300 {
+            seed.push_str(&format!(
+                "INSERT INTO untouched(id, pad) VALUES ({i}, 'pad-{i}');\
+                 INSERT INTO att.untouched(id, pad) VALUES ({i}, 'apad-{i}');"
+            ));
+        }
+        for i in 1..=25 {
+            seed.push_str(&format!(
+                "INSERT INTO target(id, v) VALUES ({i}, 'v{i}');\
+                 INSERT INTO att.target(id, v) VALUES ({i}, 'av{i}');"
+            ));
+        }
+        seed.push_str("COMMIT;");
+        frank.execute_batch(&seed).await.unwrap();
+        stock.execute_batch(&seed).unwrap();
+
+        let before = frank.memdb_row_hydration_count();
+        for sql in [
+            // CTE shadows trigger target `sink`: trigger must write real `sink`.
+            "WITH sink(k, nv) AS (SELECT id, 's-' || id FROM target WHERE id <= 15) \
+             UPDATE target SET v = (SELECT nv FROM sink WHERE sink.k = target.id) \
+             WHERE id IN (SELECT k FROM sink)",
+            "WITH sink(k) AS (SELECT id FROM target WHERE id <= 10) \
+             DELETE FROM target WHERE id IN (SELECT k FROM sink)",
+            // ATTACHed target with triggers + untouched rows.
+            "WITH c(k, nv) AS (SELECT id, 'as-' || id FROM att.target WHERE id <= 15) \
+             UPDATE att.target SET v = (SELECT nv FROM c WHERE c.k = att.target.id) \
+             WHERE id IN (SELECT k FROM c)",
+            "WITH c(k) AS (SELECT id FROM att.target WHERE id <= 10) \
+             DELETE FROM att.target WHERE id IN (SELECT k FROM c)",
+        ] {
+            let f_changed = frank.execute(sql).await.unwrap();
+            let s_changed = stock.execute(sql, []).unwrap();
+            assert_eq!(f_changed, s_changed, "change count mismatch for `{sql}`");
+        }
+        let delta = frank.memdb_row_hydration_count() - before;
+        assert_eq!(
+            delta, 0,
+            "bd-rv46n: shadowed + ATTACHed WITH UPDATE/DELETE must hydrate 0 rows"
+        );
+
+        for check_sql in [
+            "SELECT id, v FROM target ORDER BY id",
+            "SELECT id, msg FROM sink ORDER BY id",
+            "SELECT id, v FROM att.target ORDER BY id",
+            "SELECT id, msg FROM att.sink ORDER BY id",
+            "SELECT count(*) FROM untouched",
+            "SELECT count(*) FROM att.untouched",
+        ] {
+            let f_rows = frank_rows_fmt(&frank.query(check_sql).await.unwrap());
+            let s_rows = stock_rows(&stock, check_sql);
+            assert_eq!(f_rows, s_rows, "post-state mismatch for `{check_sql}`");
+        }
+    });
+}
