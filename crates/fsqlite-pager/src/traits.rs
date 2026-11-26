@@ -445,28 +445,42 @@ pub trait WalBackend: Send + Sync {
     /// reused, for [`Self::certificate_sidecar_unchanged_since_capture`].
     ///
     /// Every fsqlite commit appends its record to the sidecar before it
-    /// appends a WAL frame, and the first append of a new WAL generation
-    /// truncates the sidecar first. So a sidecar found unchanged later proves
-    /// that no fsqlite commit happened in between, in any WAL generation. A
-    /// stock SQLite commit or checkpoint never touches the sidecar. This
-    /// assumes every fsqlite writer of the file writes certificate records.
+    /// appends a WAL frame. The first append of a new WAL generation compacts
+    /// the sidecar to its newest complete prior-generation record before
+    /// appending current-generation records (bd-5eult). That retained record
+    /// can anchor the later continuity proof. A stock SQLite commit or
+    /// checkpoint never touches the sidecar. This assumes every fsqlite
+    /// writer of the file writes certificate records.
     ///
     /// An absent sidecar is captured as absent (every fsqlite commit creates
-    /// it, and nothing removes it) and an empty one as empty. `false` means
-    /// there is nothing usable to capture (no sidecar facility, or a tail
-    /// that is not one complete current-version record), and the proof is
-    /// then unavailable. A new capture replaces an older one.
+    /// it, and nothing removes it). An empty sidecar can be captured, but
+    /// cannot prove cross-reset continuity: a failed compaction can erase an
+    /// intervening commit and return the same file to length zero. `false`
+    /// means there is no usable capture (no sidecar facility, or an invalid
+    /// nonempty tail). A new capture replaces an older one.
     fn capture_certificate_sidecar_horizon<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, bool> {
         Box::pin(async { Ok(false) })
     }
 
     /// bd-reality-check-1022-llk6g.5.7: consume the capture of
     /// [`Self::capture_certificate_sidecar_horizon`] and answer whether the
-    /// sidecar is still the captured file, with the captured length and last
-    /// record, and that record does not cover a commit of `generation` that
-    /// ends past WAL frame `horizon` (a commit in flight at the capture, whose
-    /// frames could have landed after the horizon). `false` whenever any of
-    /// that cannot be shown, including when there is no capture.
+    /// sidecar proves continuity across a WAL reset. The sidecar must still
+    /// be the captured file, and the captured complete record must not cover
+    /// a commit of `generation` ending past WAL frame `horizon` (a commit
+    /// in flight whose frames could have landed after the horizon).
+    ///
+    /// An unchanged complete tail and length suffice. After a generation
+    /// change, an exact byte-for-byte copy of the captured record at offset
+    /// zero also suffices when every following record is complete and belongs
+    /// to the current WAL generation. An absent capture is sufficient only
+    /// while the sidecar remains absent; an empty capture or lost anchor is
+    /// never sufficient. Return `false` whenever the proof is unavailable.
+    ///
+    /// The caller holds the external writer gate while checking this proof.
+    /// Success permits subsequent page conflict validation; it does not
+    /// prove that no writes occurred. The caller must still reject candidate
+    /// pages written anywhere in the current generation (even if their bytes
+    /// match) and compare main-file pages against their snapshot baselines.
     fn certificate_sidecar_unchanged_since_capture<'a>(
         &'a mut self,
         _cx: &'a Cx,
