@@ -536,15 +536,16 @@ pub async fn open_with_flags_with_env(
             env.set_readonly_shm(resolved.readonly_shm);
             open_read_only_connection_with_env(path, env).await
         }
-        // bd-tv006: stock honours `readonly_shm=1` on a read-write connection
-        // too. Its unix VFS opens the `-shm` read-only whatever the
+        // bd-tv006 / bd-cf0be: stock honours `readonly_shm=1` on a read-write
+        // connection too. Its unix VFS opens the `-shm` read-only whatever the
         // connection's mode, so over a WAL database it reads (through a
         // private index when no peer is attached), every write answers
         // SQLITE_READONLY and nothing is written; a missing `-shm` answers
         // SQLITE_CANTOPEN. A rollback-journal database never maps the `-shm`
-        // and reads and writes as usual (3.54.1, pinned live). The WAL case is
-        // therefore served by a read-only connection, whose writes answer
-        // `ReadOnly` as stock's do.
+        // and reads and writes as usual — UNLESS another connection later
+        // switches that database to WAL mode, in which case `readonly_shm=1`
+        // must still bind the connection (bd-cf0be). Carry `readonly_shm` into
+        // the rollback-journal open too so runtime WAL adoption honours it.
         OpenDisposition::WriteExisting | OpenDisposition::WriteCreate
             if resolved.readonly_shm && opens_in_wal_mode(path) =>
         {
@@ -553,13 +554,19 @@ pub async fn open_with_flags_with_env(
             open_read_only_connection_with_env(path, env).await
         }
         OpenDisposition::WriteExisting => {
+            let mut env = env;
+            env.set_readonly_shm(resolved.readonly_shm);
             if path == ":memory:" {
                 Connection::open_with_env(path, env).await
             } else {
                 Connection::open_existing_with_env(path, env).await
             }
         }
-        OpenDisposition::WriteCreate => Connection::open_with_env(path, env).await,
+        OpenDisposition::WriteCreate => {
+            let mut env = env;
+            env.set_readonly_shm(resolved.readonly_shm);
+            Connection::open_with_env(path, env).await
+        }
     }
 }
 

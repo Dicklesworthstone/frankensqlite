@@ -9214,6 +9214,10 @@ pub(crate) struct PagerInner<F: VfsFile> {
     freelist_repair_dropped: u32,
     /// Current journal mode (rollback journal vs WAL).
     journal_mode: JournalMode,
+    /// bd-cf0be: true when the last main-file header probe observed WAL format
+    /// bytes (`write_version == 2 || read_version == 2`) while this pager was
+    /// still in rollback-journal mode. Cleared once WAL mode is adopted.
+    disk_header_requests_wal: bool,
     /// Post-commit rollback-journal cleanup strategy (bd-sw2k5). Selects the
     /// `PRAGMA journal_mode` behavior among the non-WAL modes (delete /
     /// truncate / persist); a per-connection setting, not published state.
@@ -9586,6 +9590,7 @@ struct VisibleCommitProbe {
     wal_generation: Option<WalGenerationIdentity>,
     wal_visible_commit_count: u64,
     native_db_size: Option<u32>,
+    disk_header_requests_wal: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11177,34 +11182,38 @@ impl<F: VfsFile> PagerInner<F> {
             && wal_generation.is_some()
             && self.committed_wal_generation == wal_generation
             && !self.image_replaced_by_peer();
-        let (base_commit_seq, raw_base_change_counter) = if cached_wal_base_is_current {
-            (previous_base_commit_seq, self.committed_db_change_counter)
-        } else {
-            let base_header_bytes = self.read_database_file_header_bytes(cx, file_size).await?;
-            let raw_base_change_counter = if self.journal_mode == JournalMode::Wal {
-                // A stock bootstrap stub (schema format / encoding 0) parses,
-                // so its change counter is read like any stale main header.
-                DatabaseHeader::from_bytes(&base_header_bytes)
-                    .map_err(|error| {
-                        error.to_franken_error("invalid database-file header during WAL refresh")
-                    })?
-                    .change_counter
+        let (base_commit_seq, raw_base_change_counter, disk_header_requests_wal) =
+            if cached_wal_base_is_current {
+                (
+                    previous_base_commit_seq,
+                    self.committed_db_change_counter,
+                    false,
+                )
             } else {
-                DatabaseHeader::from_bytes(&base_header_bytes)
-                    .map_err(|error| {
-                        error.to_franken_error("invalid database header during pager refresh")
-                    })?
-                    .change_counter
-            };
-            let previous_raw_change_counter =
-                u32::try_from(previous_db_change_counter).map_err(|_| {
-                    FrankenError::internal("cached database change counter did not fit u32")
+                let base_header_bytes = self.read_database_file_header_bytes(cx, file_size).await?;
+                let base_header = DatabaseHeader::from_bytes(&base_header_bytes).map_err(|error| {
+                    error.to_franken_error(if self.journal_mode == JournalMode::Wal {
+                        "invalid database-file header during WAL refresh"
+                    } else {
+                        "invalid database header during pager refresh"
+                    })
                 })?;
-            let base_commit_seq = previous_base_commit_seq.saturating_add(u64::from(
-                raw_base_change_counter.wrapping_sub(previous_raw_change_counter),
-            ));
-            (base_commit_seq, u64::from(raw_base_change_counter))
-        };
+                let raw_base_change_counter = base_header.change_counter;
+                let disk_header_requests_wal = self.journal_mode != JournalMode::Wal
+                    && (base_header.write_version == 2 || base_header.read_version == 2);
+                let previous_raw_change_counter =
+                    u32::try_from(previous_db_change_counter).map_err(|_| {
+                        FrankenError::internal("cached database change counter did not fit u32")
+                    })?;
+                let base_commit_seq = previous_base_commit_seq.saturating_add(u64::from(
+                    raw_base_change_counter.wrapping_sub(previous_raw_change_counter),
+                ));
+                (
+                    base_commit_seq,
+                    u64::from(raw_base_change_counter),
+                    disk_header_requests_wal,
+                )
+            };
         // A parallel WAL group may collapse multiple logical commits behind a
         // single physical marker. A current-generation certificate can widen
         // that count only when it was bound above to this exact pinned read
@@ -11244,6 +11253,7 @@ impl<F: VfsFile> PagerInner<F> {
             wal_generation,
             wal_visible_commit_count,
             native_db_size,
+            disk_header_requests_wal,
         })
     }
 
@@ -11362,6 +11372,7 @@ impl<F: VfsFile> PagerInner<F> {
     ) -> Result<CommittedStateRefresh> {
         let image_replaced = self.image_replaced_by_peer();
         let probe = self.probe_visible_commit_seq(cx, wal_backend, native_reader_prepared).await?;
+        self.disk_header_requests_wal = probe.disk_header_requests_wal;
         // GH#399: a WAL generation change — a peer process's RESTART/TRUNCATE
         // checkpoint, or a stock SQLite close that deleted the WAL — invalidates
         // every "no committed frame => provable hole" judgement this pager could
@@ -17685,8 +17696,10 @@ where
                     }
                 }
                 inner.journal_mode = mode;
-                self.cache.evict(PageNumber::ONE);
-                self.published.publish_remove_page(
+                inner.disk_header_requests_wal = false;
+                inner.committed_metadata_needs_refresh = true;
+                self.cache.clear();
+                self.published.publish_clear_if(
                     cx,
                     PublishedPagerUpdate {
                         visible_commit_seq: inner.commit_seq,
@@ -17695,7 +17708,7 @@ where
                         freelist_count: inner.freelist.len(),
                         checkpoint_active: inner.checkpoint_active,
                     },
-                    PageNumber::ONE,
+                    true,
                 );
                 let mut snapshot = self
                     .committed_snapshot
@@ -18349,6 +18362,42 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .access_mode
             == PagerAccessMode::ReadOnlyShm
+    }
+
+    /// bd-cf0be: whether the last main-file header probe observed WAL format
+    /// bytes (`write_version == 2 || read_version == 2`) while this pager was
+    /// still in rollback-journal mode.
+    #[must_use]
+    pub fn disk_header_requests_wal(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .disk_header_requests_wal
+    }
+
+    /// bd-cf0be: downgrade a quiescent rollback-journal pager (writable or
+    /// read-only) opened with `readonly_shm=1` to `ReadOnlyShm` once another
+    /// connection has switched the database to WAL mode.
+    pub fn downgrade_to_readonly_shm(&self) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        if inner.active_transactions > 0 || inner.writer_active || inner.checkpoint_active {
+            return Err(FrankenError::Busy);
+        }
+        inner.access_mode = match inner.access_mode {
+            PagerAccessMode::Writable
+            | PagerAccessMode::ReadOnly
+            | PagerAccessMode::ReadOnlyShm => PagerAccessMode::ReadOnlyShm,
+            PagerAccessMode::Immutable => PagerAccessMode::Immutable,
+            PagerAccessMode::ReadOnlyWithWalIndexRecovery => {
+                return Err(FrankenError::internal(
+                    "readonly_shm=1 cannot downgrade a WAL-index-recovery pager",
+                ));
+            }
+        };
+        Ok(())
     }
 
     /// Map the separate MVCC companion through the admitted main-file handle.
@@ -22643,6 +22692,7 @@ where
                     &group_commit_queue.disowned_pages_generation,
                 )),
                 journal_mode: initial_journal_mode,
+                disk_header_requests_wal: false,
                 rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
                 rollback_journal_recovery_state: RollbackJournalRecoveryState::Clean,
@@ -23175,6 +23225,7 @@ where
                     &group_commit_queue.disowned_pages_generation,
                 )),
                 journal_mode: JournalMode::Delete,
+                disk_header_requests_wal: false,
                 rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
                 access_mode: if immutable {

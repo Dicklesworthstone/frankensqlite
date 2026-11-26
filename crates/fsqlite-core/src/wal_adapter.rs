@@ -1980,13 +1980,23 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         use fsqlite_wal::wal_index::{WAL_INDEX_VERSION, WalIndexHdr};
 
         let wal_header = self.wal.header();
+        // bd-cf0be: a header-less (0-byte) WAL has no frames and no WAL header;
+        // stock SQLite's `walIndexRecover` publishes an unindexed empty header
+        // (`szPage = 0, mxFrame = 0, aSalt = [0, 0]`, GH#431).
+        let unindexed_empty = self.wal.is_headerless() && self.wal.frame_count() == 0;
         let mut target = WalIndexHdr {
             i_version: WAL_INDEX_VERSION,
             unused: 0,
             i_change: 0,
             is_init: 1,
-            big_end_cksum: u8::from(wal_header.big_endian_checksum()),
-            sz_page: if wal_header.page_size == 65_536 {
+            big_end_cksum: if unindexed_empty {
+                0
+            } else {
+                u8::from(wal_header.big_endian_checksum())
+            },
+            sz_page: if unindexed_empty {
+                0
+            } else if wal_header.page_size == 65_536 {
                 1
             } else {
                 u16::try_from(wal_header.page_size).map_err(|_| FrankenError::DatabaseFull)?
@@ -1994,7 +2004,11 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             mx_frame: u32::try_from(self.wal.frame_count()).map_err(|_| FrankenError::DatabaseFull)?,
             n_page: 0,
             a_frame_cksum: [0, 0],
-            a_salt: [wal_header.salts.salt1, wal_header.salts.salt2],
+            a_salt: if unindexed_empty {
+                [0, 0]
+            } else {
+                [wal_header.salts.salt1, wal_header.salts.salt2]
+            },
             a_cksum: [0, 0],
         };
         let terminal = if let Some((index, marker)) = self.wal.last_commit_frame_header() {

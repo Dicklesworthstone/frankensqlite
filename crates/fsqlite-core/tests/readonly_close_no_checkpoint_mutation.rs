@@ -376,12 +376,31 @@ fn strict_readonly_reads_checkpointed_wal_database_without_usable_sidecar() {
             assert!(matches!(error, fsqlite_error::FrankenError::ReadOnly), "{kind}: {error}");
             reader.close().await.unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), main_before, "{kind}: main bytes unchanged");
+            let shm_path = std::path::PathBuf::from(format!("{db_str}-shm"));
             if let Some(bytes) = &sidecar {
                 assert_eq!(&std::fs::read(&wal_path).unwrap(), bytes, "{kind}: WAL bytes unchanged");
+                assert!(!shm_path.exists(), "{kind}: SHM must not be created");
             } else {
-                assert!(!wal_path.exists(), "missing WAL must not be created");
+                // bd-cf0be: a read-only first attacher on a cleanly closed WAL
+                // database (no -wal, no -shm) in a writable directory creates an
+                // empty 0-byte -wal and a 32 KiB initialized empty -shm, as
+                // stock SQLite 3.54.1 does.
+                assert_eq!(
+                    std::fs::read(&wal_path).expect("missing: read-only first attacher creates empty -wal"),
+                    Vec::<u8>::new(),
+                    "{kind}: created -wal must be empty"
+                );
+                let shm_bytes = std::fs::read(&shm_path)
+                    .expect("missing: read-only first attacher creates -shm");
+                assert_eq!(shm_bytes.len(), 32 * 1024, "{kind}: -shm must be one 32 KiB region");
+                let (hdr, _) = fsqlite_wal::wal_index::parse_shm_header(&shm_bytes)
+                    .expect("parse -shm header")
+                    .unwrap_or_else(|| panic!("{kind}: -shm must carry a valid initialized header"));
+                assert!(
+                    hdr.is_unindexed_empty(),
+                    "{kind}: -shm header must be stock's unindexed empty header: {hdr:?}"
+                );
             }
-            assert!(!std::path::Path::new(&format!("{db_str}-shm")).exists(), "{kind}: SHM must not be created");
         }
     });
 }

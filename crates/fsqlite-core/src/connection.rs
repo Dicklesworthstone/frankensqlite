@@ -5748,6 +5748,42 @@ impl PagerBackend {
         }
     }
 
+    fn reads_shm_readonly(&self) -> bool {
+        match self {
+            Self::Memory(p) => p.reads_shm_readonly(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.reads_shm_readonly(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.reads_shm_readonly(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.reads_shm_readonly(),
+        }
+    }
+
+    fn disk_header_requests_wal(&self) -> bool {
+        match self {
+            Self::Memory(p) => p.disk_header_requests_wal(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.disk_header_requests_wal(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.disk_header_requests_wal(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.disk_header_requests_wal(),
+        }
+    }
+
+    fn downgrade_to_readonly_shm(&self) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.downgrade_to_readonly_shm(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.downgrade_to_readonly_shm(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.downgrade_to_readonly_shm(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.downgrade_to_readonly_shm(),
+        }
+    }
+
     async fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
         match self {
             Self::Memory(p) => p.set_journal_mode(cx, mode).await,
@@ -5833,6 +5869,7 @@ impl PagerBackend {
         cx: &Cx,
         db_path: &str,
         allow_readonly: bool,
+        force_readonly_shm: bool,
     ) -> Result<bool> {
         self.validate_namespace_binding()?;
         let wal_path = wal_path_for_db_path(db_path);
@@ -5845,23 +5882,48 @@ impl PagerBackend {
                     cx,
                     &wal_path,
                     allow_readonly,
+                    force_readonly_shm,
                 )
                 .await
             }
             #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => {
                 let vfs = IoUringVfs::new();
-                install_existing_wal_backend_with_vfs(p, vfs, cx, &wal_path, allow_readonly).await
+                install_existing_wal_backend_with_vfs(
+                    p,
+                    vfs,
+                    cx,
+                    &wal_path,
+                    allow_readonly,
+                    force_readonly_shm,
+                )
+                .await
             }
             #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => {
                 let vfs = UnixVfs::new();
-                install_existing_wal_backend_with_vfs(p, vfs, cx, &wal_path, allow_readonly).await
+                install_existing_wal_backend_with_vfs(
+                    p,
+                    vfs,
+                    cx,
+                    &wal_path,
+                    allow_readonly,
+                    force_readonly_shm,
+                )
+                .await
             }
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
-                install_existing_wal_backend_with_vfs(p, vfs, cx, &wal_path, allow_readonly).await
+                install_existing_wal_backend_with_vfs(
+                    p,
+                    vfs,
+                    cx,
+                    &wal_path,
+                    allow_readonly,
+                    force_readonly_shm,
+                )
+                .await
             }
         }
     }
@@ -5871,7 +5933,17 @@ impl PagerBackend {
         cx: &Cx,
         db_path: &str,
     ) -> Result<bool> {
-        self.install_existing_wal_backend_with_mode(cx, db_path, true)
+        self.install_existing_wal_backend_with_mode(cx, db_path, true, false)
+            .await
+    }
+
+    async fn install_existing_wal_backend_allow_readonly_with_shm_mode(
+        &self,
+        cx: &Cx,
+        db_path: &str,
+        force_readonly_shm: bool,
+    ) -> Result<bool> {
+        self.install_existing_wal_backend_with_mode(cx, db_path, true, force_readonly_shm)
             .await
     }
 
@@ -6682,13 +6754,57 @@ async fn install_existing_wal_backend_with_vfs<V>(
     cx: &Cx,
     wal_path: &Path,
     allow_readonly: bool,
+    force_readonly_shm: bool,
 ) -> Result<bool>
 where
     V: Vfs + Send + Sync + 'static,
     V::File: Send + Sync + 'static,
 {
+    let readonly_shm = allow_readonly && (pager.reads_shm_readonly() || force_readonly_shm);
     if !vfs.access(cx, wal_path, AccessFlags::EXISTS)? {
-        return Ok(false);
+        if !allow_readonly {
+            return Ok(false);
+        }
+        // bd-cf0be: a cleanly closed WAL database has header bytes 18/19 == 2
+        // and neither `-wal` nor `-shm`.
+        // - Under `readonly_shm=1`, stock refuses with SQLITE_CANTOPEN when
+        //   `-shm` is missing (never creating `-shm`).
+        // - Otherwise, under the bd-tv006 first-attacher condition (no live
+        //   peer and writable directory / `-shm`), stock creates an empty
+        //   0-byte `-wal` and builds the 32 KiB empty `-shm` index.
+        let private_index =
+            read_only_shm_needs_private_index(&vfs, cx, wal_path, readonly_shm)?;
+        if private_index
+            || readonly_shm
+            || !read_only_open_is_first_attacher(&vfs, cx, wal_path)?
+        {
+            return Ok(false);
+        }
+        pager
+            .quiesce_pending_group_commit_finalization()
+            .await
+            .inspect_err(|error| {
+                if matches!(error, FrankenError::BusyRecovery) {
+                    tracing::warn!(
+                        target: "fsqlite.core.readonly_wal_install",
+                        stage = "quiesce",
+                        "read-only WAL admission refused pending recovery"
+                    );
+                }
+            })?;
+        pager.rebuild_wal_index_as_first_attacher()?;
+        let create_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let Ok((mut file, _)) = vfs.open(cx, Some(wal_path), create_flags) else {
+            return Ok(false);
+        };
+        if file.file_size(cx)? < u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
+            let wal = WalFile::open_headerless(file, pager.page_size().get());
+            install_opened_wal_backend_bare(pager, cx, wal, false)?;
+            return Ok(true);
+        }
+        // A racing peer created and populated `-wal` before our CREATE open;
+        // close this handle and fall through to the existing-WAL path below.
+        let _ = file.close(cx);
     }
 
     // A read-only install (schema-only / existing-only open) can run right
@@ -6718,7 +6834,6 @@ where
     // table (unix.rs). All subsequent connections that clone this fd via the
     // fast path inherit the read-only fd and fail with EBADF on WAL writes
     // (pwrite on a read-only fd returns EBADF on Linux).
-    let readonly_shm = allow_readonly && pager.reads_shm_readonly();
     let private_index =
         allow_readonly && read_only_shm_needs_private_index(&vfs, cx, wal_path, readonly_shm)?;
     // bd-tv006: before the backend (and its index source) is installed.
@@ -16497,6 +16612,10 @@ pub struct Connection {
     /// `MemDatabase` must never run on their behalf. See
     /// `defer_memdb_row_hydration`.
     schema_only_open: bool,
+    /// bd-cf0be: `readonly_shm=1` URI option preserved on the connection even
+    /// when opened against a rollback-journal database, so a later external
+    /// switch to WAL mode still binds `-shm` read-only and refuses writes.
+    readonly_shm: bool,
     /// #368 defect 3: when set, the schema reload keeps the bare (empty) FTS5
     /// vtab instance and does NOT read/validate its `%_data` shadow structure,
     /// so a database whose FTS5 shadow is corrupt (e.g. "structure segment
@@ -18487,6 +18606,7 @@ impl Connection {
             #[cfg(feature = "ext-fts5")]
             allow_lazy_contentless_fts5: true,
             schema_only_open: true,
+            readonly_shm: env.readonly_shm(),
             defer_fts5_hydration,
             skip_statement_memdb_refresh: Cell::new(false),
             reject_mem_fallback_strict: RefCell::new(false),
@@ -18710,6 +18830,9 @@ impl Connection {
             && PagerBackend::database_file_is_read_only(&path, &bootstrap_cx)
         {
             // Stock's SQLITE_OPEN_READWRITE falls back to read-only too.
+            if env.readonly_shm() {
+                return Box::pin(Self::open_schema_only_with_env(path, env)).await;
+            }
             return Box::pin(Self::open_schema_only_with_wal_index_recovery_and_env(
                 path, env,
             ))
@@ -19179,6 +19302,7 @@ impl Connection {
             #[cfg(feature = "ext-fts5")]
             allow_lazy_contentless_fts5: true,
             schema_only_open: false,
+            readonly_shm: env.readonly_shm(),
             defer_fts5_hydration: false,
             skip_statement_memdb_refresh: Cell::new(false),
             // Strict fallback rejection is opt-in for certifying runs.
@@ -30675,6 +30799,16 @@ impl Connection {
             } else {
                 self.pager.refresh_published_snapshot(cx).await?
             };
+            let snapshot = if self.pager.journal_mode() == JournalMode::Delete
+                && !self.pager.is_immutable()
+                && !self.in_transaction.get()
+                && (self.readonly_shm || self.pager.is_readonly())
+                && self.pager.disk_header_requests_wal()
+            {
+                boxed_future(|| self.adopt_external_wal_mode_if_needed(cx, snapshot)).await?
+            } else {
+                snapshot
+            };
             BoundPagerPublication {
                 snapshot,
                 read_retry_count: self.pager.published_read_retry_count(),
@@ -30699,11 +30833,77 @@ impl Connection {
         Ok(publication)
     }
 
+    /// bd-cf0be: catch up an idle rollback-journal connection when another
+    /// connection switched the database file header to WAL mode (`(2, 2)`).
+    async fn adopt_external_wal_mode_if_needed(
+        &self,
+        cx: &Cx,
+        snapshot: PagerPublishedSnapshot,
+    ) -> Result<PagerPublishedSnapshot> {
+        if self.pager.is_memory()
+            || self.pager.is_immutable()
+            || self.pager.journal_mode() != JournalMode::Delete
+            || self.in_transaction.get()
+            || !self.pager.disk_header_requests_wal()
+        {
+            return Ok(snapshot);
+        }
+        if !self.readonly_shm && !self.pager.is_readonly() {
+            return Ok(snapshot);
+        }
+
+        let force_readonly_shm = self.readonly_shm || self.pager.reads_shm_readonly();
+        let installed = self
+            .pager
+            .install_existing_wal_backend_allow_readonly_with_shm_mode(
+                cx,
+                &self.path,
+                force_readonly_shm,
+            )
+            .await?;
+        if self.readonly_shm {
+            self.pager.downgrade_to_readonly_shm()?;
+        }
+        if installed {
+            self.pager.set_journal_mode(cx, JournalMode::Wal).await?;
+        }
+        "wal".clone_into(&mut self.pragma_state.borrow_mut().journal_mode);
+        self.cached_autocommit_publication.set(None);
+        self.cached_autocommit_publication_epoch.set(0);
+        self.cached_autocommit_publication_cookie.set(0);
+        *self.memdb_visible_commit_seq.borrow_mut() = CommitSeq::ZERO;
+        self.pager.refresh_published_snapshot(cx).await
+    }
+
+    /// bd-cf0be: before a write guard runs on a writable `readonly_shm=1`
+    /// rollback-journal connection, probe whether a peer switched the database
+    /// to WAL mode so writes refuse with `ReadOnly` / `CannotOpen` as stock
+    /// does even without an intervening `SELECT`.
+    async fn sync_external_wal_switch_if_needed(&self, cx: &Cx) -> Result<()> {
+        if !self.readonly_shm
+            || self.pager.is_readonly()
+            || self.pager.is_memory()
+            || self.pager.is_immutable()
+            || self.pager.journal_mode() != JournalMode::Delete
+            || self.in_transaction.get()
+        {
+            return Ok(());
+        }
+        let snapshot = self.pager.refresh_published_snapshot(cx).await?;
+        let _ = self
+            .adopt_external_wal_mode_if_needed(cx, snapshot)
+            .await?;
+        Ok(())
+    }
+
     fn cached_autocommit_publication(
         &self,
         scenario_id: &'static str,
     ) -> Option<BoundPagerPublication> {
-        if scenario_id != "autocommit_begin" || self.pager.is_memory() {
+        if scenario_id != "autocommit_begin"
+            || self.pager.is_memory()
+            || (self.readonly_shm && self.pager.journal_mode() == JournalMode::Delete)
+        {
             return None;
         }
 
@@ -34634,6 +34834,14 @@ impl Connection {
             // database from a read-only main and the read-only FTS5
             // `integrity-check` (a syntactically-INSERT read) exception, both of
             // which stock permits on a `mode=ro` main.
+            if self.readonly_shm
+                && !self.pager.is_readonly()
+                && (stmt.precompiled_dml().is_some()
+                    || stmt.prepared_update_delete_fast_path().is_some())
+            {
+                let op_cx = self.op_cx()?;
+                boxed_future(|| self.sync_external_wal_switch_if_needed(&op_cx)).await?;
+            }
             if self.pager.is_readonly()
                 && (stmt.precompiled_dml().is_some()
                     || stmt.prepared_update_delete_fast_path().is_some())
@@ -45712,8 +45920,7 @@ impl Connection {
         // which permits `ATTACH`/reads of attached schemas on a `mode=ro` main.
         // (Writability of the attached schema is governed by how the attached
         // connection itself is opened, handled in the ATTACH branch below.)
-        if self.pager.is_readonly()
-            && !self.statement_is_read_only_fts5_integrity_check(statement)
+        let statement_writes_main = !self.statement_is_read_only_fts5_integrity_check(statement)
             && (matches!(
                 statement,
                 Statement::Insert(_)
@@ -45733,8 +45940,11 @@ impl Connection {
             // VACUUM INTO only READS the source and writes a NEW target file —
             // stock SQLite permits it on a read-only / mode=ro source.
             // bd-n7ypv / GH#342.
-            || matches!(statement, Statement::Vacuum(v) if v.into.is_none()))
-        {
+            || matches!(statement, Statement::Vacuum(v) if v.into.is_none()));
+        if statement_writes_main && self.readonly_shm && !self.pager.is_readonly() {
+            boxed_future(|| self.sync_external_wal_switch_if_needed(cx)).await?;
+        }
+        if self.pager.is_readonly() && statement_writes_main {
             return Err(FrankenError::ReadOnly);
         }
         if !matches!(statement, Statement::Select(_) | Statement::Pragma(_)) {

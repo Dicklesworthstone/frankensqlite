@@ -146,6 +146,7 @@ fn unwritable_database_file_opens_read_only_like_stock() {
                     &image,
                     &root.path().join(format!("{shape}-{opener}-stock")),
                 );
+                let stock_wal = PathBuf::from(format!("{}-wal", stock_path.display()));
                 let stock = rusqlite::Connection::open(&stock_path)
                     .unwrap_or_else(|error| panic!("{case}: stock open failed: {error}"));
                 let stock_rows: i64 = stock
@@ -153,6 +154,7 @@ fn unwritable_database_file_opens_read_only_like_stock() {
                     .unwrap_or_else(|error| panic!("{case}: stock read failed: {error}"));
                 let stock_write = stock.execute("INSERT INTO t(v) VALUES ('d')", []);
                 drop(stock);
+                let stock_wal_after = read_bytes(&stock_wal);
                 assert_eq!(stock_rows, ROWS, "{case}: stock sees the committed rows");
                 assert!(
                     !unprivileged || stock_write.is_err(),
@@ -215,10 +217,21 @@ fn unwritable_database_file_opens_read_only_like_stock() {
                         main_before,
                         "{case}: main bytes unchanged"
                     );
+                    if wal_before.is_some() {
+                        assert_eq!(
+                            read_bytes(&frank_wal),
+                            wal_before,
+                            "{case}: existing WAL bytes unchanged"
+                        );
+                    }
+                    // bd-cf0be: on a cleanly closed WAL database (`wal_checkpointed`)
+                    // in a writable directory, stock's read-only first attacher
+                    // creates a 0-byte `-wal` (and `-shm`), so compare against
+                    // live stock's resulting WAL bytes across every shape.
                     assert_eq!(
                         read_bytes(&frank_wal),
-                        wal_before,
-                        "{case}: WAL bytes unchanged"
+                        stock_wal_after,
+                        "{case}: WAL sidecar matches stock"
                     );
                 }
             }

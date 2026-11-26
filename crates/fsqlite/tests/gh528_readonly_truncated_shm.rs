@@ -1277,3 +1277,782 @@ fn bd_tv006_readonly_shm_refusals_and_writes_match_stock() {
         drop(writer);
     });
 }
+
+/// A cleanly closed WAL-mode database holding rows 1..=ROWS, with header bytes
+/// 18/19 == 2 and neither `-wal` nor `-shm` present on disk.
+fn clean_wal_fixture(dir: &Path) -> PathBuf {
+    let db = dir.join("clean-wal.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL);",
+    )
+    .unwrap();
+    for (id, v) in expected_rows() {
+        conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![id, v])
+            .unwrap();
+    }
+    drop(conn);
+    assert!(
+        !sidecar(&db, "-wal").exists() && !sidecar(&db, "-shm").exists(),
+        "cleanly closed WAL fixture must have no -wal or -shm"
+    );
+    let header = std::fs::read(&db).unwrap();
+    assert_eq!(
+        &header[18..20],
+        &[2, 2],
+        "cleanly closed WAL fixture must have WAL format bytes in header"
+    );
+    db
+}
+
+fn copy_single_db(source: &Path, to: &Path) -> PathBuf {
+    std::fs::create_dir_all(to).unwrap();
+    let db = to.join("copy.db");
+    std::fs::copy(source, &db).unwrap();
+    db
+}
+
+fn file_sizes(files: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, usize> {
+    files.iter().map(|(k, v)| (k.clone(), v.len())).collect()
+}
+
+/// Only the SQLite database family suffixes (`""`, `"-wal"`, `"-shm"`),
+/// excluding FrankenSQLite's internal namespace lock sidecars (`-fsqlite-ns-*`)
+/// created by writable opens.
+fn sqlite_file_sizes(files: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, usize> {
+    files
+        .iter()
+        .filter(|(k, _)| matches!(k.as_str(), "" | "-wal" | "-shm"))
+        .map(|(k, v)| (k.clone(), v.len()))
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanWalShape {
+    /// Plain `mode=ro` on a cleanly closed WAL db (no `-wal`, no `-shm`):
+    /// stock creates an empty `-wal` (0 bytes) and a 32 KiB `-shm`.
+    ModeRoAlone,
+    /// Negative: a live peer is attached first, so `-wal` and `-shm` exist and
+    /// the dead-man switch is held. `mode=ro` creates and rewrites nothing.
+    ModeRoWithPeer,
+    /// `mode=ro&readonly_shm=1` on a cleanly closed WAL db (no `-wal`, no
+    /// `-shm`): stock refuses with `SQLITE_CANTOPEN` and creates nothing.
+    RoShmModeRoAlone,
+    /// Read-write `readonly_shm=1` on a cleanly closed WAL db (no `-wal`, no
+    /// `-shm`): stock refuses with `SQLITE_CANTOPEN` and creates nothing.
+    RoShmReadWriteAlone,
+    /// Negative: a live peer is attached first, so `-wal` and `-shm` exist.
+    /// `mode=ro&readonly_shm=1` reads every row and writes nothing.
+    RoShmWithPeer,
+}
+
+/// bd-cf0be shapes 1 & 2 (plus live-peer negatives): read-only and
+/// `readonly_shm=1` opens of a cleanly closed WAL database (no `-wal`, no
+/// `-shm`), compared with a live stock 3.54.1 child process on its own copy.
+#[test]
+fn bd_cf0be_clean_wal_readonly_sidecar_and_readonly_shm_parity() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = clean_wal_fixture(dir.path());
+        let mut all_failures = Vec::new();
+        for shape in [
+            CleanWalShape::ModeRoAlone,
+            CleanWalShape::ModeRoWithPeer,
+            CleanWalShape::RoShmModeRoAlone,
+            CleanWalShape::RoShmReadWriteAlone,
+            CleanWalShape::RoShmWithPeer,
+        ] {
+            let context = format!("{shape:?}");
+            let stock_db =
+                copy_single_db(&source, &dir.path().join(format!("cf0be-{shape:?}-stock")));
+            let frank_db =
+                copy_single_db(&source, &dir.path().join(format!("cf0be-{shape:?}-frank")));
+
+            let mut peers = Vec::new();
+            if matches!(
+                shape,
+                CleanWalShape::ModeRoWithPeer | CleanWalShape::RoShmWithPeer
+            ) {
+                peers.push(StockHolder::attach(&stock_db));
+                peers.push(StockHolder::attach(&frank_db));
+            }
+
+            let stock_before = family(&stock_db);
+            let frank_before = family(&frank_db);
+            assert_eq!(
+                file_sizes(&frank_before),
+                file_sizes(&stock_before),
+                "{context}: identical starting file sizes"
+            );
+
+            let (stock, frank): (ReadThenWrite, ReadThenWrite) = match shape {
+                CleanWalShape::ModeRoAlone | CleanWalShape::ModeRoWithPeer => (
+                    stock_read(&stock_db, "mode=ro").map(|rows| (rows, None)),
+                    frank_read(&frank_db, "mode=ro")
+                        .await
+                        .map(|rows| (rows, None)),
+                ),
+                CleanWalShape::RoShmModeRoAlone | CleanWalShape::RoShmWithPeer => (
+                    stock_read(&stock_db, "mode=ro&readonly_shm=1").map(|rows| (rows, None)),
+                    frank_read(&frank_db, "mode=ro&readonly_shm=1")
+                        .await
+                        .map(|rows| (rows, None)),
+                ),
+                CleanWalShape::RoShmReadWriteAlone => (
+                    stock_read_then_write(&stock_db, "readonly_shm=1")
+                        .map(|(rows, insert)| (rows, Some(insert))),
+                    frank_read_then_write(&frank_db, "readonly_shm=1")
+                        .await
+                        .map(|(rows, insert)| (rows, Some(insert))),
+                ),
+            };
+
+            let stock_after = family(&stock_db);
+            let frank_after = family(&frank_db);
+            eprintln!(
+                "event=bd_cf0be_clean_wal shape={shape:?} stock_res={:?} frank_res={:?} \
+                 stock_before={:?} stock_after={:?} frank_before={:?} frank_after={:?}",
+                stock
+                    .as_ref()
+                    .map(|(rows, insert)| (rows.len(), insert.clone())),
+                frank
+                    .as_ref()
+                    .map(|(rows, insert)| (rows.len(), insert.clone())),
+                file_sizes(&stock_before),
+                file_sizes(&stock_after),
+                file_sizes(&frank_before),
+                file_sizes(&frank_after),
+            );
+
+            let mut failures = Vec::new();
+            match shape {
+                CleanWalShape::ModeRoAlone => {
+                    assert_eq!(
+                        stock,
+                        Ok((expected_rows(), None)),
+                        "{context}: stock reads every row"
+                    );
+                    assert_eq!(
+                        file_sizes(&stock_after),
+                        BTreeMap::from([
+                            (String::new(), stock_before[""].len()),
+                            ("-wal".to_owned(), 0),
+                            ("-shm".to_owned(), SHM_REGION),
+                        ]),
+                        "{context}: stock creates empty -wal and 32 KiB -shm"
+                    );
+                    if frank != Ok((expected_rows(), None)) {
+                        failures.push(format!("{context}: fsqlite rows={frank:?}"));
+                    }
+                    if file_sizes(&frank_after) != file_sizes(&stock_after) {
+                        failures.push(format!(
+                            "{context}: file sizes frank={:?} != stock={:?}",
+                            file_sizes(&frank_after),
+                            file_sizes(&stock_after)
+                        ));
+                    } else {
+                        if frank_after[""] != stock_before[""] {
+                            failures.push(format!("{context}: main database file changed"));
+                        }
+                        if rebuilt_index(&frank_after["-shm"], &format!("{context} fsqlite"))
+                            != rebuilt_index(&stock_after["-shm"], &format!("{context} stock"))
+                        {
+                            failures.push(format!("{context}: rebuilt -shm differs from stock"));
+                        }
+                    }
+                }
+                CleanWalShape::ModeRoWithPeer | CleanWalShape::RoShmWithPeer => {
+                    assert_eq!(
+                        stock,
+                        Ok((expected_rows(), None)),
+                        "{context}: stock reads every row with live peer"
+                    );
+                    assert_eq!(
+                        stock_after, stock_before,
+                        "{context}: stock creates and rewrites nothing with live peer"
+                    );
+                    if frank != Ok((expected_rows(), None)) {
+                        failures.push(format!("{context}: fsqlite rows={frank:?}"));
+                    }
+                    if frank_after != frank_before {
+                        failures.push(format!(
+                            "{context}: fsqlite modified files with live peer: before={:?} after={:?}",
+                            file_sizes(&frank_before),
+                            file_sizes(&frank_after)
+                        ));
+                    }
+                }
+                CleanWalShape::RoShmModeRoAlone | CleanWalShape::RoShmReadWriteAlone => {
+                    let stock_err = stock
+                        .as_ref()
+                        .err()
+                        .unwrap_or_else(|| panic!("{context}: stock must refuse, read {stock:?}"));
+                    assert!(
+                        stock_err.starts_with("unable to open database file"),
+                        "{context}: stock answers SQLITE_CANTOPEN, got {stock_err}"
+                    );
+                    // Stock's `sqlite3WalOpen` creates a 0-byte `-wal` before
+                    // `unixOpenSharedMemory` fails with SQLITE_CANTOPEN on the
+                    // missing `-shm`; neither engine creates `-shm` or alters
+                    // the main file, and fsqlite creates nothing at all.
+                    assert_eq!(
+                        file_sizes(&stock_after),
+                        BTreeMap::from([
+                            (String::new(), stock_before[""].len()),
+                            ("-wal".to_owned(), 0),
+                        ]),
+                        "{context}: stock creates no -shm on CANTOPEN"
+                    );
+                    assert_eq!(
+                        stock_after[""], stock_before[""],
+                        "{context}: stock leaves main file unchanged"
+                    );
+                    match &frank {
+                        Err(err) if err.starts_with("unable to open database file") => {}
+                        other => failures.push(format!(
+                            "{context}: fsqlite expected SQLITE_CANTOPEN, got {other:?}"
+                        )),
+                    }
+                    if frank_after != frank_before {
+                        failures.push(format!(
+                            "{context}: fsqlite modified files on CANTOPEN: before={:?} after={:?}",
+                            file_sizes(&frank_before),
+                            file_sizes(&frank_after)
+                        ));
+                    }
+                }
+            }
+
+            drop(peers);
+            all_failures.extend(failures);
+        }
+        assert!(
+            all_failures.is_empty(),
+            "bd-cf0be clean WAL parity failures:\n{}",
+            all_failures.join("\n")
+        );
+    });
+}
+
+const SWITCH_STOCK_CHILD_TEST: &str = "bd_cf0be_stock_switch_child";
+const SWITCH_STOCK_DB_ENV: &str = "FSQLITE_BD_CF0BE_SWITCH_DB";
+const SWITCH_STOCK_QUERY_ENV: &str = "FSQLITE_BD_CF0BE_SWITCH_QUERY";
+const SWITCH_STOCK_WRITE_ENV: &str = "FSQLITE_BD_CF0BE_SWITCH_WRITE";
+const SWITCH_PEER_CHILD_TEST: &str = "bd_cf0be_wal_switcher_peer_child";
+const SWITCH_PEER_DB_ENV: &str = "FSQLITE_BD_CF0BE_PEER_DB";
+const SWITCH_PEER_KEEP_OPEN_ENV: &str = "FSQLITE_BD_CF0BE_PEER_KEEP_OPEN";
+
+fn switched_peer_row() -> (i64, String) {
+    (ROWS + 1, "switched-wal".to_owned())
+}
+
+fn post_switch_write_row() -> (i64, String) {
+    (ROWS + 2, "post-switch-write".to_owned())
+}
+
+/// Child: switches a rollback-journal database to WAL mode and inserts
+/// [`switched_peer_row`]. When `FSQLITE_BD_CF0BE_PEER_KEEP_OPEN` is set, stays
+/// attached until `<db>.peer-release` appears; otherwise closes cleanly so no
+/// `-wal`/`-shm` remain on disk.
+#[test]
+fn bd_cf0be_wal_switcher_peer_child() {
+    let Some(db) = std::env::var_os(SWITCH_PEER_DB_ENV) else {
+        return;
+    };
+    let db = PathBuf::from(db);
+    let keep_open = std::env::var_os(SWITCH_PEER_KEEP_OPEN_ENV).is_some();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode.to_ascii_lowercase(), "wal", "switcher entered WAL");
+    let (id, v) = switched_peer_row();
+    conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![id, v])
+        .unwrap();
+    if keep_open {
+        std::fs::write(sidecar(&db, ".peer-ready"), b"").unwrap();
+        let started = std::time::Instant::now();
+        while !sidecar(&db, ".peer-release").exists() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(120),
+                "wal switcher peer was never released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(conn);
+    } else {
+        drop(conn);
+        std::fs::write(sidecar(&db, ".peer-ready"), b"").unwrap();
+    }
+}
+
+struct WalSwitcherPeer {
+    child: Option<std::process::Child>,
+    db: PathBuf,
+    keep_open: bool,
+}
+
+impl WalSwitcherPeer {
+    fn run(db: &Path, keep_open: bool) -> Self {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            SWITCH_PEER_CHILD_TEST,
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(SWITCH_PEER_DB_ENV, db)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        if keep_open {
+            cmd.env(SWITCH_PEER_KEEP_OPEN_ENV, "1");
+        }
+        let child = cmd.spawn().expect("spawn wal switcher peer");
+        let mut peer = Self {
+            child: Some(child),
+            db: db.to_path_buf(),
+            keep_open,
+        };
+        let started = std::time::Instant::now();
+        while !sidecar(db, ".peer-ready").exists() {
+            let exited = peer
+                .child
+                .as_mut()
+                .expect("peer spawned")
+                .try_wait()
+                .expect("peer status");
+            if let Some(status) = exited {
+                assert!(
+                    status.success() && sidecar(db, ".peer-ready").exists(),
+                    "wal switcher peer exited early: {status:?}"
+                );
+                peer.child = None;
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "wal switcher peer never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if !keep_open && let Some(mut child) = peer.child.take() {
+            let status = child.wait().expect("wait for clean-close switcher");
+            assert!(status.success(), "clean-close switcher failed: {status:?}");
+        }
+        peer
+    }
+}
+
+impl Drop for WalSwitcherPeer {
+    fn drop(&mut self) {
+        if self.keep_open {
+            let _ = std::fs::write(sidecar(&self.db, ".peer-release"), b"");
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Child: opens a rollback-journal db with `readonly_shm=1`, performs an
+/// initial read, signals `.opened`, waits for `.go` (after a peer switches the
+/// db to WAL), then runs a second `SELECT` and (if `write`) an `INSERT`.
+#[test]
+fn bd_cf0be_stock_switch_child() {
+    let (Some(db), Some(query)) = (
+        std::env::var_os(SWITCH_STOCK_DB_ENV),
+        std::env::var_os(SWITCH_STOCK_QUERY_ENV),
+    ) else {
+        return;
+    };
+    let db = PathBuf::from(db);
+    let write = std::env::var_os(SWITCH_STOCK_WRITE_ENV).is_some();
+    let uri = format!("file:{}?{}", db.to_str().unwrap(), query.to_str().unwrap());
+    let access = if write {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+    } else {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+    };
+    let conn =
+        rusqlite::Connection::open_with_flags(&uri, access | rusqlite::OpenFlags::SQLITE_OPEN_URI)
+            .expect("stock switch child open");
+    let initial: Rows = conn
+        .prepare("SELECT id, v FROM t ORDER BY id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Rows>>()
+        .unwrap();
+    assert_eq!(initial, expected_rows(), "initial rollback read");
+    std::fs::write(sidecar(&db, ".opened"), b"").unwrap();
+    let started = std::time::Instant::now();
+    while !sidecar(&db, ".go").exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(120),
+            "stock switch child never received .go"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let after_read: rusqlite::Result<Rows> = (|| {
+        conn.prepare("SELECT id, v FROM t ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect()
+    })();
+    match after_read {
+        Ok(rows) => {
+            for (id, v) in rows {
+                println!("{STOCK_WITNESS}row {id} {v}");
+            }
+            if write {
+                let (id, v) = post_switch_write_row();
+                match conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![id, v]) {
+                    Ok(_) => println!("{STOCK_WITNESS}write ok"),
+                    Err(error) => println!("{STOCK_WITNESS}write error {error}"),
+                }
+            }
+            println!("{STOCK_WITNESS}ok");
+        }
+        Err(error) => {
+            println!("{STOCK_WITNESS}read error {error}");
+            if write {
+                let (id, v) = post_switch_write_row();
+                match conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![id, v]) {
+                    Ok(_) => println!("{STOCK_WITNESS}write ok"),
+                    Err(werr) => println!("{STOCK_WITNESS}write error {werr}"),
+                }
+            }
+            println!("{STOCK_WITNESS}done");
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PostSwitchOutcome {
+    read: Result<Rows, String>,
+    write: Option<Result<(), String>>,
+}
+
+type FamilyFiles = BTreeMap<String, Vec<u8>>;
+type SwitchArmResult = (PostSwitchOutcome, FamilyFiles, FamilyFiles);
+
+fn run_stock_switch_arm(db: &Path, query: &str, write: bool, keep_open: bool) -> SwitchArmResult {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        SWITCH_STOCK_CHILD_TEST,
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(SWITCH_STOCK_DB_ENV, db)
+    .env(SWITCH_STOCK_QUERY_ENV, query)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    if write {
+        cmd.env(SWITCH_STOCK_WRITE_ENV, "1");
+    }
+    let mut child = cmd.spawn().expect("spawn stock switch child");
+    let started = std::time::Instant::now();
+    while !sidecar(db, ".opened").exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "stock switch child exited before .opened"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "stock switch child never wrote .opened"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let peer = WalSwitcherPeer::run(db, keep_open);
+    let before = family(db);
+    std::fs::write(sidecar(db, ".go"), b"").unwrap();
+    let output = child.wait_with_output().expect("wait stock switch child");
+    assert!(
+        output.status.success(),
+        "stock switch child failed: {output:?}"
+    );
+    let after = family(db);
+    drop(peer);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut rows = Vec::new();
+    let mut read_err = None;
+    let mut write_res = None;
+    for line in stdout.lines() {
+        let Some((_, witness)) = line.split_once(STOCK_WITNESS) else {
+            continue;
+        };
+        if let Some(row) = witness.strip_prefix("row ") {
+            let (id, v) = row.split_once(' ').unwrap();
+            rows.push((id.parse().unwrap(), v.to_owned()));
+        } else if let Some(err) = witness.strip_prefix("read error ") {
+            read_err = Some(err.to_owned());
+        } else if witness == "write ok" {
+            write_res = Some(Ok(()));
+        } else if let Some(err) = witness.strip_prefix("write error ") {
+            write_res = Some(Err(err.to_owned()));
+        }
+    }
+    let read = match read_err {
+        Some(err) => Err(err),
+        None => Ok(rows),
+    };
+    (
+        PostSwitchOutcome {
+            read,
+            write: write_res,
+        },
+        before,
+        after,
+    )
+}
+
+async fn run_frank_switch_arm(
+    db: &Path,
+    query: &str,
+    write: bool,
+    keep_open: bool,
+) -> SwitchArmResult {
+    let uri = format!("file:{}?{query}", db.to_str().unwrap());
+    let access = if write {
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    };
+    let conn = open_with_flags(&uri, access | OpenFlags::SQLITE_OPEN_URI)
+        .await
+        .expect("frank switch arm open");
+    assert_eq!(
+        frank_rows(&conn, "initial rollback read").await,
+        expected_rows(),
+        "initial fsqlite rollback read"
+    );
+    let peer = WalSwitcherPeer::run(db, keep_open);
+    let before = family(db);
+    let read = conn
+        .query("SELECT id, v FROM t ORDER BY id")
+        .await
+        .map_err(|error| error.to_string())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| match row.values() {
+                    [SqliteValue::Integer(id), SqliteValue::Text(v)] => (*id, v.to_string()),
+                    other => panic!("unexpected row {other:?}"),
+                })
+                .collect()
+        });
+    let write_res = if write {
+        let (id, v) = post_switch_write_row();
+        Some(
+            conn.execute(&format!("INSERT INTO t VALUES ({id}, '{v}')"))
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+        )
+    } else {
+        None
+    };
+    let _ = conn.close().await;
+    let after = family(db);
+    drop(peer);
+    (
+        PostSwitchOutcome {
+            read,
+            write: write_res,
+        },
+        before,
+        after,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwitchToWalShape {
+    /// `mode=ro&readonly_shm=1` opened on rollback db; peer switches to WAL and
+    /// stays open (`-wal` and `-shm` exist).
+    RoWithOpenPeer,
+    /// Read-write `readonly_shm=1` opened on rollback db; peer switches to WAL
+    /// and stays open (`-wal` and `-shm` exist).
+    RwWithOpenPeer,
+    /// `mode=ro&readonly_shm=1` opened on rollback db; peer switches to WAL and
+    /// closes cleanly (no `-wal`, no `-shm`).
+    RoAfterCleanClose,
+    /// Read-write `readonly_shm=1` opened on rollback db; peer switches to WAL
+    /// and closes cleanly (no `-wal`, no `-shm`).
+    RwAfterCleanClose,
+}
+
+/// bd-cf0be shape 3: a `readonly_shm=1` rollback-journal connection whose
+/// database is switched to WAL by another connection, pinned against live stock
+/// 3.54.1 in the same run.
+#[test]
+fn bd_cf0be_readonly_shm_rollback_switched_to_wal_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rollback = rollback_fixture(dir.path());
+        let mut all_failures = Vec::new();
+        for shape in [
+            SwitchToWalShape::RoWithOpenPeer,
+            SwitchToWalShape::RwWithOpenPeer,
+            SwitchToWalShape::RoAfterCleanClose,
+            SwitchToWalShape::RwAfterCleanClose,
+        ] {
+            let context = format!("{shape:?}");
+            let (query, write, keep_open) = match shape {
+                SwitchToWalShape::RoWithOpenPeer => ("mode=ro&readonly_shm=1", false, true),
+                SwitchToWalShape::RwWithOpenPeer => ("readonly_shm=1", true, true),
+                SwitchToWalShape::RoAfterCleanClose => ("mode=ro&readonly_shm=1", false, false),
+                SwitchToWalShape::RwAfterCleanClose => ("readonly_shm=1", true, false),
+            };
+            let stock_db = copy_single_db(
+                &rollback,
+                &dir.path().join(format!("cf0be-sw-{shape:?}-stock")),
+            );
+            let frank_db = copy_single_db(
+                &rollback,
+                &dir.path().join(format!("cf0be-sw-{shape:?}-frank")),
+            );
+            let (stock, stock_before, stock_after) =
+                run_stock_switch_arm(&stock_db, query, write, keep_open);
+            let (frank, frank_before, frank_after) =
+                run_frank_switch_arm(&frank_db, query, write, keep_open).await;
+            eprintln!(
+                "event=bd_cf0be_switch_to_wal shape={shape:?} \
+                 stock_read={:?} stock_write={:?} frank_read={:?} frank_write={:?} \
+                 stock_before={:?} stock_after={:?} frank_before={:?} frank_after={:?}",
+                stock.read.as_ref().map(Vec::len),
+                stock.write,
+                frank.read.as_ref().map(Vec::len),
+                frank.write,
+                file_sizes(&stock_before),
+                file_sizes(&stock_after),
+                file_sizes(&frank_before),
+                file_sizes(&frank_after),
+            );
+            if frank.read.is_ok() != stock.read.is_ok() {
+                all_failures.push(format!(
+                    "{context}: read ok/err mismatch stock={:?} frank={:?}",
+                    stock.read.as_ref().map(Vec::len),
+                    frank.read.as_ref().map(Vec::len)
+                ));
+            } else {
+                match (&stock.read, &frank.read) {
+                    (Ok(s_rows), Ok(f_rows)) if f_rows != s_rows => {
+                        all_failures.push(format!(
+                            "{context}: post-switch rows mismatch stock_len={} frank_len={}",
+                            s_rows.len(),
+                            f_rows.len()
+                        ));
+                    }
+                    (Err(s_err), Err(f_err)) => {
+                        let s_prefix = s_err.split(':').next().unwrap_or(s_err);
+                        if !f_err.starts_with(s_prefix) {
+                            all_failures.push(format!(
+                                "{context}: read error mismatch stock={s_err:?} frank={f_err:?}"
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if frank.write.as_ref().map(Result::is_ok) != stock.write.as_ref().map(Result::is_ok) {
+                all_failures.push(format!(
+                    "{context}: write ok/err mismatch stock={:?} frank={:?}",
+                    stock.write, frank.write
+                ));
+            } else if let (Some(Err(s_err)), Some(Err(f_err))) = (&stock.write, &frank.write) {
+                let s_prefix = s_err.split(':').next().unwrap_or(s_err);
+                if !f_err.starts_with(s_prefix) {
+                    all_failures.push(format!(
+                        "{context}: write error mismatch stock={s_err:?} frank={f_err:?}"
+                    ));
+                }
+            }
+            let stock_sqlite_after = sqlite_file_sizes(&stock_after);
+            let frank_sqlite_after = sqlite_file_sizes(&frank_after);
+            if stock.read.is_err() {
+                // On CANTOPEN (cleanly closed WAL with no -shm), stock's
+                // sqlite3WalOpen leaves a 0-byte -wal without creating -shm;
+                // fsqlite refuses cleanly without creating -wal or -shm.
+                assert!(
+                    !stock_sqlite_after.contains_key("-shm"),
+                    "{context}: stock must not create -shm on CANTOPEN"
+                );
+                if frank_after != frank_before {
+                    all_failures.push(format!(
+                        "{context}: fsqlite modified files on CANTOPEN: before={:?} after={:?}",
+                        file_sizes(&frank_before),
+                        file_sizes(&frank_after)
+                    ));
+                }
+            } else {
+                if frank_sqlite_after != stock_sqlite_after {
+                    all_failures.push(format!(
+                        "{context}: sqlite file sizes mismatch stock={stock_sqlite_after:?} frank={frank_sqlite_after:?}"
+                    ));
+                }
+                if stock_after == stock_before && frank_after != frank_before {
+                    all_failures.push(format!(
+                        "{context}: fsqlite modified files where stock wrote nothing"
+                    ));
+                }
+            }
+        }
+        // Also verify immediate write without an intervening post-switch SELECT
+        // on a read-write `readonly_shm=1` rollback connection.
+        for (label, keep_open, expected_prefix) in [
+            (
+                "ImmediateWritePeerOpen",
+                true,
+                "attempt to write a readonly database",
+            ),
+            (
+                "ImmediateWritePeerClosedClean",
+                false,
+                "unable to open database file",
+            ),
+        ] {
+            let db = copy_single_db(&rollback, &dir.path().join(format!("cf0be-sw-{label}")));
+            let uri = format!("file:{}?readonly_shm=1", db.to_str().unwrap());
+            let conn = open_with_flags(
+                &uri,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+            )
+            .await
+            .expect("open immediate-write arm");
+            assert_eq!(
+                frank_rows(&conn, label).await,
+                expected_rows(),
+                "{label}: initial rollback read"
+            );
+            let peer = WalSwitcherPeer::run(&db, keep_open);
+            let before = family(&db);
+            let (id, v) = post_switch_write_row();
+            let write_res = conn
+                .execute(&format!("INSERT INTO t VALUES ({id}, '{v}')"))
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let _ = conn.close().await;
+            let after = family(&db);
+            drop(peer);
+            match &write_res {
+                Err(err) if err.starts_with(expected_prefix) => {}
+                other => all_failures.push(format!(
+                    "{label}: expected error starting with {expected_prefix:?}, got {other:?}"
+                )),
+            }
+            if after != before {
+                all_failures.push(format!(
+                    "{label}: immediate post-switch write modified files: before={:?} after={:?}",
+                    file_sizes(&before),
+                    file_sizes(&after)
+                ));
+            }
+        }
+        assert!(
+            all_failures.is_empty(),
+            "bd-cf0be rollback->WAL switch parity failures:\n{}",
+            all_failures.join("\n")
+        );
+    });
+}
