@@ -215,6 +215,51 @@ impl std::hash::Hasher for PageNumberHasher {
 /// BuildHasher for `PageNumberHasher`.
 pub type PageNumberBuildHasher = std::hash::BuildHasherDefault<PageNumberHasher>;
 
+/// Hasher for `PageNumber` keys of a transaction's read cache.
+///
+/// For a map that is asked for many pages it does not hold, next to a run of
+/// pages it does: a transaction's read cache is asked for every page a scan
+/// reads once it is full (bd-read-miss-path-cost-w8msq).
+///
+/// The hash is the page number itself in its low 57 bits, with a
+/// multiplicative (Fibonacci) mix of the page number in its top 7 bits.
+/// hashbrown, the table behind `std::collections::HashMap`, places a key by
+/// the hash's low bits and tags its bucket with the top 7 bits; a lookup then
+/// compares keys only in the probed buckets whose tag matches. The identity
+/// hash of [`PageNumberHasher`] gives every page the tag 0, so a lookup there
+/// compares the key of every full bucket it probes: a page missing from a
+/// 500-page run of cached pages cost about 500 instructions. The low bits are
+/// the identity hash's, so a map places, and iterates, its pages exactly as
+/// it would with [`PageNumberHasher`]. The mix costs a multiply per hash,
+/// which maps whose lookups mostly end at their first bucket (the write sets
+/// of sequential inserts) do not repay; those keep [`PageNumberHasher`]. A
+/// 32-bit target takes bucket and tag from the low 32 bits, where this is the
+/// identity hash.
+#[derive(Default)]
+pub struct PageNumberTagHasher(u64);
+
+/// The top 7 bits of a [`PageNumberTagHasher`] hash: hashbrown's tag.
+const PAGE_NUMBER_HASH_TAG_BITS: u64 = !(u64::MAX >> 7);
+
+impl std::hash::Hasher for PageNumberTagHasher {
+    fn write(&mut self, _: &[u8]) {
+        // As for PageNumberHasher: PageNumber hashes through write_u32.
+        debug_assert!(false, "PageNumberTagHasher only supports write_u32");
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        let page = u64::from(n);
+        self.0 = page | (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) & PAGE_NUMBER_HASH_TAG_BITS);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// BuildHasher for [`PageNumberTagHasher`].
+pub type PageNumberTagBuildHasher = std::hash::BuildHasherDefault<PageNumberTagHasher>;
+
 /// GF(256) addition (`+`) for bytes (XOR).
 #[must_use]
 pub const fn gf256_add_byte(lhs: u8, rhs: u8) -> u8 {
@@ -2510,6 +2555,185 @@ mod tests {
     fn page_number_zero_is_invalid() {
         assert!(PageNumber::new(0).is_none());
         assert!(PageNumber::try_from(0u32).is_err());
+    }
+
+    /// bd-read-miss-path-cost-w8msq: [`PageNumberTagHasher`] keeps hashbrown's
+    /// bucket bits (the low bits) equal to [`PageNumberHasher`]'s identity hash
+    /// and mixes the tag bits (the top 7).
+    mod page_number_tag_hasher {
+        use crate::{PageNumber, PageNumberBuildHasher, PageNumberTagBuildHasher};
+        use std::cell::Cell;
+        use std::collections::{HashMap, HashSet};
+        use std::hash::{BuildHasher, Hash, Hasher};
+
+        fn page(raw: u32) -> PageNumber {
+            PageNumber::new(raw).expect("nonzero page number")
+        }
+
+        fn tag_hash(raw: u32) -> u64 {
+            PageNumberTagBuildHasher::default().hash_one(page(raw))
+        }
+
+        fn tag(raw: u32) -> u64 {
+            tag_hash(raw) >> 57
+        }
+
+        #[test]
+        fn the_hash_is_the_identity_hash_below_its_top_seven_bits() {
+            let pages = (1..=70_000)
+                .chain((0..64).map(|shift| 1_u32 << (shift % 32)))
+                .chain([0x8000_0001, 3_000_000_019, u32::MAX - 1]);
+            for raw in pages {
+                let identity = PageNumberBuildHasher::default().hash_one(page(raw));
+                assert_eq!(identity, u64::from(raw), "identity hash of page {raw}");
+                assert_eq!(tag_hash(raw) & (u64::MAX >> 7), identity, "page {raw}");
+            }
+        }
+
+        #[test]
+        fn consecutive_pages_take_distinct_tags() {
+            // One hashbrown probe group is 16 buckets. The identity hash gives
+            // every page below 2^57 the tag 0.
+            for start in [1_u32, 4_097, 0x8000_0000, u32::MAX - 5_000] {
+                let tags: Vec<u64> = (start..start + 4_096).map(tag).collect();
+                let distinct: HashSet<u64> = tags.iter().copied().collect();
+                assert_eq!(
+                    distinct.len(),
+                    128,
+                    "pages from {start}: {} tags",
+                    distinct.len()
+                );
+                for (offset, group) in tags.windows(16).enumerate() {
+                    let distinct: HashSet<u64> = group.iter().copied().collect();
+                    assert_eq!(
+                        distinct.len(),
+                        16,
+                        "pages from {}",
+                        u64::from(start) + offset as u64
+                    );
+                }
+            }
+        }
+
+        /// A map's bucket layout follows the hash's low bits alone, so a map
+        /// with the tag hasher must iterate its pages exactly as one with the
+        /// identity hasher does through any history of inserts, removals and
+        /// resizes.
+        #[test]
+        fn maps_iterate_their_pages_in_identity_hash_order() {
+            let mut ours: HashMap<PageNumber, u32, PageNumberTagBuildHasher> = HashMap::default();
+            let mut reference: HashMap<PageNumber, u32, PageNumberBuildHasher> = HashMap::default();
+            let mut our_set: HashSet<PageNumber, PageNumberTagBuildHasher> = HashSet::default();
+            let mut reference_set: HashSet<PageNumber, PageNumberBuildHasher> = HashSet::default();
+            let mut state = 0x2545_F491_4F6C_DD1D_u64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut run = 1_u32;
+            let mut compared = 0;
+            for step in 0..40_000_u32 {
+                let draw = next();
+                let raw = match draw % 8 {
+                    0..=2 => {
+                        run = run % 9_000 + 1;
+                        run
+                    }
+                    3 | 4 => (draw >> 32) as u32 % 5_000 + 1,
+                    5 => ((draw >> 32) as u32).clamp(1, u32::MAX - 1),
+                    _ => 0,
+                };
+                if raw == 0 {
+                    // Remove a page the maps hold, chosen by the reference.
+                    let victim = reference
+                        .keys()
+                        .nth((draw >> 40) as usize % reference.len().max(1))
+                        .copied();
+                    if let Some(victim) = victim {
+                        assert_eq!(ours.remove(&victim), reference.remove(&victim));
+                        assert_eq!(our_set.remove(&victim), reference_set.remove(&victim));
+                    }
+                } else {
+                    assert_eq!(
+                        ours.insert(page(raw), step),
+                        reference.insert(page(raw), step)
+                    );
+                    assert_eq!(our_set.insert(page(raw)), reference_set.insert(page(raw)));
+                }
+                if step % 4_000 == 3_999 {
+                    ours.shrink_to_fit();
+                    reference.shrink_to_fit();
+                }
+                if step % 401 == 0 || step == 39_999 {
+                    let a: Vec<(PageNumber, u32)> = ours.iter().map(|(k, v)| (*k, *v)).collect();
+                    let b: Vec<(PageNumber, u32)> =
+                        reference.iter().map(|(k, v)| (*k, *v)).collect();
+                    assert_eq!(a, b, "map order at step {step}");
+                    let a: Vec<PageNumber> = our_set.iter().copied().collect();
+                    let b: Vec<PageNumber> = reference_set.iter().copied().collect();
+                    assert_eq!(a, b, "set order at step {step}");
+                    compared += 1;
+                }
+            }
+            assert!(
+                compared > 90 && reference.len() > 1_000,
+                "{compared} {}",
+                reference.len()
+            );
+        }
+
+        thread_local! {
+            static KEY_COMPARISONS: Cell<u64> = const { Cell::new(0) };
+        }
+
+        /// A page key that hashes as `PageNumber` does and counts its equality
+        /// comparisons.
+        #[derive(Clone, Copy, Eq)]
+        struct CountedPage(PageNumber);
+
+        impl PartialEq for CountedPage {
+            fn eq(&self, other: &Self) -> bool {
+                KEY_COMPARISONS.with(|count| count.set(count.get() + 1));
+                self.0 == other.0
+            }
+        }
+
+        impl Hash for CountedPage {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.0.hash(state);
+            }
+        }
+
+        /// The shape that cost a cold page read about 1,100 instructions: a
+        /// transaction read cache holding pages 2..=501 (the default budget),
+        /// asked for every later page of a scan. The identity hash compares
+        /// about 128 keys for each page that maps into the cached run.
+        #[test]
+        fn misses_against_a_run_of_cached_pages_compare_few_keys() {
+            let mut cache: HashSet<CountedPage, PageNumberTagBuildHasher> = HashSet::default();
+            for raw in 2..=501 {
+                cache.insert(CountedPage(page(raw)));
+            }
+            KEY_COMPARISONS.with(|count| count.set(0));
+            let found = (502..=8_000)
+                .filter(|&raw| cache.contains(&CountedPage(page(raw))))
+                .count();
+            let compared = KEY_COMPARISONS.with(Cell::get);
+            assert_eq!(found, 0);
+            assert!(
+                compared < 15_000,
+                "{compared} key comparisons for 7,499 misses"
+            );
+            KEY_COMPARISONS.with(|count| count.set(0));
+            assert!((2..=501).all(|raw| cache.contains(&CountedPage(page(raw)))));
+            let compared = KEY_COMPARISONS.with(Cell::get);
+            assert!(
+                (500..1_000).contains(&compared),
+                "{compared} key comparisons for 500 hits"
+            );
+        }
     }
 
     #[test]

@@ -25,8 +25,8 @@ use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::{
     AutoVacuumMode, BTreePageHeader, CommitSeq, DATABASE_HEADER_MAGIC, DATABASE_HEADER_SIZE,
     DatabaseHeader, FRANKENSQLITE_SQLITE_VERSION_NUMBER, LockLevel, PageData, PageNumber,
-    PageNumberBuildHasher, PageSize, PtrMapEntry, PtrMapType, SecureDeleteMode, is_ptrmap_page,
-    ptrmap_entry_offset, ptrmap_page_for,
+    PageNumberBuildHasher, PageNumberTagBuildHasher, PageSize, PtrMapEntry, PtrMapType,
+    SecureDeleteMode, is_ptrmap_page, ptrmap_entry_offset, ptrmap_page_for,
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_vfs::{
@@ -96,6 +96,16 @@ fn atomic_u64_checked_update(
 /// shift+mask.
 type PagePageMap<V> = HashMap<PageNumber, V, PageNumberBuildHasher>;
 type PagePageSet = HashSet<PageNumber, PageNumberBuildHasher>;
+
+/// A transaction's read cache.
+///
+/// It is asked for every page a scan reads, most of them absent once the
+/// cache is full, beside a run of the pages it holds.
+/// `PageNumberTagBuildHasher` places and iterates its pages as the identity
+/// hash does, but gives each one its own tag, so a miss compares the few keys
+/// whose tag matches instead of every full bucket it probes
+/// (bd-read-miss-path-cost-w8msq).
+type PageReadCacheMap = HashMap<PageNumber, PageData, PageNumberTagBuildHasher>;
 
 use fsqlite_wal::{
     ConsolidationPhase, FrameSubmission, GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig,
@@ -10441,7 +10451,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
 /// The bitmap selects committed images; current speculative writes are never moved.
 struct RetainedMemoryOverlay {
     page_nos: BTreeSet<PageNumber>,
-    pages: PagePageMap<PageData>,
+    pages: PageReadCacheMap,
     committed_db_size: u32,
 }
 
@@ -17254,7 +17264,7 @@ where
                     page_lease: Vec::new(),
                     memory_db_bump_alloc,
                     rolled_back_pages: HashSet::new(),
-                    txn_read_cache: RefCell::new(PagePageMap::default()),
+                    txn_read_cache: RefCell::new(PageReadCacheMap::default()),
                     txn_read_cache_page_budget: self.transaction_read_cache_page_budget(),
                     txn_read_cache_incomplete: Cell::new(false),
                     retained_memory_overlay_dirty_pages: BTreeSet::new(),
@@ -17517,7 +17527,7 @@ where
                 page_lease: Vec::new(),
                 memory_db_bump_alloc,
                 rolled_back_pages: HashSet::new(),
-                txn_read_cache: RefCell::new(PagePageMap::default()),
+                txn_read_cache: RefCell::new(PageReadCacheMap::default()),
                 txn_read_cache_page_budget: self.transaction_read_cache_page_budget(),
                 txn_read_cache_incomplete: Cell::new(false),
                 retained_memory_overlay_dirty_pages: BTreeSet::new(),
@@ -25054,7 +25064,7 @@ where
     /// shared latest-image sources (GH #129). Also avoids repeated inner.lock()
     /// acquisition for hot pages. Optional read admission is bounded separately
     /// from authoritative retained commits; see the overlay contract below.
-    txn_read_cache: RefCell<PagePageMap<PageData>>,
+    txn_read_cache: RefCell<PageReadCacheMap>,
     /// Optional read-image bound captured at each logical transaction boundary.
     /// PRAGMA cache_size changes apply to the next snapshot, so resizing cannot
     /// silently evict an existing snapshot's retained images or reopen its guard.
