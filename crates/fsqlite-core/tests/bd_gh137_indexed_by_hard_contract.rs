@@ -259,3 +259,331 @@ fn gh137_sub4_param_lowering() {
         );
     });
 }
+
+fn render_fsqlite_val(value: &SqliteValue) -> String {
+    match value {
+        SqliteValue::Null => "NULL".to_owned(),
+        SqliteValue::Integer(n) => n.to_string(),
+        SqliteValue::Float(f) => format!("{f:?}"),
+        SqliteValue::Text(s) => format!("'{s}'"),
+        SqliteValue::Blob(b) => format!("x{b:02x?}"),
+    }
+}
+
+fn render_stock_val(value: &rusqlite::types::Value) -> String {
+    match value {
+        rusqlite::types::Value::Null => "NULL".to_owned(),
+        rusqlite::types::Value::Integer(n) => n.to_string(),
+        rusqlite::types::Value::Real(f) => format!("{f:?}"),
+        rusqlite::types::Value::Text(s) => format!("'{s}'"),
+        rusqlite::types::Value::Blob(b) => format!("x{b:02x?}"),
+    }
+}
+
+fn stock_query_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let ncols = stmt.column_count();
+    let mut rows = Vec::new();
+    let mut cursor = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = cursor.next().map_err(|e| e.to_string())? {
+        rows.push(
+            (0..ncols)
+                .map(|i| render_stock_val(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                .collect(),
+        );
+    }
+    Ok(rows)
+}
+
+async fn fsqlite_query_rows(
+    conn: &Connection,
+    sql: &str,
+    prepared: bool,
+) -> Result<Vec<Vec<String>>, String> {
+    let rows = if prepared {
+        let stmt = conn.prepare(sql).await.map_err(|e| e.to_string())?;
+        stmt.query().await.map_err(|e| e.to_string())?
+    } else {
+        conn.query(sql).await.map_err(|e| e.to_string())?
+    };
+    Ok(rows
+        .iter()
+        .map(|row| row.values().iter().map(render_fsqlite_val).collect())
+        .collect())
+}
+
+/// bd-aj9v4: `INDEXED BY` a covering index on an aggregate must seek only the
+/// constrained range of that covering index without table lookups, matching
+/// live bundled SQLite 3.54.1 across `:memory:` and file-backed x direct and
+/// prepared, while preserving `NOT INDEXED`, DESC scan order, and partial-index
+/// refusal contracts.
+#[test]
+fn bd_aj9v4_indexed_by_covering_aggregates_match_stock_and_seek() {
+    let setup: &[&str] = &[
+        "CREATE TABLE s(id INTEGER PRIMARY KEY, g INTEGER, h INTEGER, val INTEGER, pad TEXT)",
+        "INSERT INTO s VALUES \
+            (1, NULL, 10, 5, 'n1'), \
+            (2, NULL, 20, NULL, 'n2'), \
+            (3, 1, 100, 10, 'a'), \
+            (4, 1, 200, 25, 'b'), \
+            (5, 2, 100, 30, 'c'), \
+            (6, 2, 300, NULL, 'd'), \
+            (7, 3, 150, 40, 'e'), \
+            (8, 3, 250, 55, 'f'), \
+            (9, 4, 100, 70, 'g'), \
+            (10, 5, 500, 90, 'h')",
+        "CREATE INDEX s_g ON s(g)",
+        "CREATE INDEX s_gh ON s(g, h)",
+        "CREATE INDEX s_gv ON s(g, val)",
+        "CREATE INDEX s_gv_desc ON s(g DESC, val DESC)",
+        "CREATE INDEX s_partial ON s(g, val) WHERE g >= 3",
+        // Overflow-order table to verify DESC forced-index scan order stays intact.
+        "CREATE TABLE ord_t(id INTEGER PRIMARY KEY, k INTEGER, x INTEGER)",
+        "CREATE INDEX ord_k_desc ON ord_t(k DESC)",
+        "INSERT INTO ord_t VALUES (1, 3, 9223372036854775807), (2, 1, 1), (3, 2, -1)",
+    ];
+
+    let covering_seek_cases: &[(&str, &str)] = &[
+        (
+            "range_covering_gv",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE g BETWEEN 2 AND 4",
+        ),
+        (
+            "eq_covering_gv",
+            "SELECT count(*), sum(val), min(val), max(val) FROM s INDEXED BY s_gv WHERE g = 3",
+        ),
+        (
+            "eq_empty_covering_gv",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE g = 999",
+        ),
+        (
+            "composite_prefix_range_gv",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE g = 3 AND val BETWEEN 35 AND 60",
+        ),
+        (
+            "in_list_covering_gv",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE g IN (1, 3, 5)",
+        ),
+        (
+            "prefix_residual_covering_gv",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE g = 3 AND val % 2 = 0",
+        ),
+        (
+            "count_star_eq_gv",
+            "SELECT count(*) FROM s INDEXED BY s_gv WHERE g = 2",
+        ),
+        (
+            "count_star_is_null_gv",
+            "SELECT count(*) FROM s INDEXED BY s_gv WHERE g IS NULL",
+        ),
+        (
+            "count_star_is_not_null_gv",
+            "SELECT count(*) FROM s INDEXED BY s_gv WHERE g IS NOT NULL",
+        ),
+        (
+            "minmax_prefix_gv",
+            "SELECT max(val) FROM s INDEXED BY s_gv WHERE g = 3",
+        ),
+        (
+            "groupby_range_covering_gv",
+            "SELECT g, count(*), sum(val) FROM s INDEXED BY s_gv WHERE g BETWEEN 1 AND 4 GROUP BY g",
+        ),
+        (
+            "groupby_eq_covering_gv",
+            "SELECT g, count(*), sum(val) FROM s INDEXED BY s_gv WHERE g = 3 GROUP BY g",
+        ),
+    ];
+
+    let extra_parity_cases: &[(&str, &str)] = &[
+        (
+            "unseekable_where_covering_gv",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE val > 35",
+        ),
+        (
+            "non_covering_forced_gh",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gh WHERE g BETWEEN 2 AND 4",
+        ),
+        (
+            "not_indexed_negative",
+            "SELECT count(*), sum(val) FROM s NOT INDEXED WHERE g BETWEEN 2 AND 4",
+        ),
+        (
+            "count_star_no_where_gv",
+            "SELECT count(*) FROM s INDEXED BY s_gv",
+        ),
+        (
+            "count_star_no_where_not_indexed",
+            "SELECT count(*) FROM s NOT INDEXED",
+        ),
+        (
+            "groupby_no_where_gv",
+            "SELECT g, count(*), sum(val) FROM s INDEXED BY s_gv GROUP BY g",
+        ),
+        (
+            "desc_forced_index_range",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gv_desc WHERE g BETWEEN 2 AND 4",
+        ),
+        (
+            "desc_forced_index_overflow_order",
+            "SELECT sum(x) FROM ord_t INDEXED BY ord_k_desc",
+        ),
+        (
+            "partial_forced_index_covered",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_partial WHERE g >= 3",
+        ),
+    ];
+
+    let stock = rusqlite::Connection::open_in_memory().unwrap();
+    for stmt in setup {
+        stock.execute(stmt, []).unwrap();
+    }
+    let expected_covering: Vec<(&str, &str, Vec<Vec<String>>)> = covering_seek_cases
+        .iter()
+        .map(|&(name, sql)| (name, sql, stock_query_rows(&stock, sql).unwrap()))
+        .collect();
+    let expected_extra: Vec<(&str, &str, Vec<Vec<String>>)> = extra_parity_cases
+        .iter()
+        .map(|&(name, sql)| (name, sql, stock_query_rows(&stock, sql).unwrap()))
+        .collect();
+    assert!(
+        stock_query_rows(
+            &stock,
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_partial WHERE g = 1"
+        )
+        .is_err(),
+        "stock must reject unusable forced partial index"
+    );
+
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = if file_backed {
+                    dir.path()
+                        .join("bd_aj9v4.db")
+                        .to_str()
+                        .unwrap()
+                        .to_owned()
+                } else {
+                    ":memory:".to_owned()
+                };
+                let conn = Connection::open(&path).await.unwrap();
+                for stmt in setup {
+                    conn.execute(stmt).await.unwrap();
+                }
+
+                for (name, sql, expected) in &expected_covering {
+                    let got = fsqlite_query_rows(&conn, sql, prepared).await.unwrap();
+                    assert_eq!(
+                        &got, expected,
+                        "covering case={name} file_backed={file_backed} prepared={prepared}\nsql: {sql}"
+                    );
+                }
+                for (name, sql, expected) in &expected_extra {
+                    let got = fsqlite_query_rows(&conn, sql, prepared).await.unwrap();
+                    assert_eq!(
+                        &got, expected,
+                        "extra case={name} file_backed={file_backed} prepared={prepared}\nsql: {sql}"
+                    );
+                }
+
+                // Bound parameter parity on INDEXED BY covering aggregate.
+                let bound = conn
+                    .query_with_params(
+                        "SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE g = ?1",
+                        &[SqliteValue::Integer(3)],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(bound[0].values()[0], SqliteValue::Integer(2));
+                assert_eq!(bound[0].values()[1], SqliteValue::Integer(95));
+
+                // Unusable forced partial index must still error.
+                assert!(
+                    fsqlite_query_rows(
+                        &conn,
+                        "SELECT count(*), sum(val) FROM s INDEXED BY s_partial WHERE g = 1",
+                        prepared,
+                    )
+                    .await
+                    .is_err(),
+                    "unusable forced partial index must error (file_backed={file_backed} prepared={prepared})"
+                );
+
+                // Opcode & EQP verification (once per DB backing).
+                if !prepared {
+                    for (name, sql) in covering_seek_cases {
+                        let explain_rows = conn.query(&format!("EXPLAIN {sql}")).await.unwrap();
+                        let ops: Vec<(String, String)> = explain_rows
+                            .iter()
+                            .map(|r| {
+                                (
+                                    render_fsqlite_val(&r.values()[1]),
+                                    render_fsqlite_val(&r.values()[5]),
+                                )
+                            })
+                            .collect();
+                        assert!(
+                            ops.iter().any(|(op, p4)| op == "'OpenRead'" && p4 == "'s_gv'"),
+                            "case={name}: expected OpenRead on s_gv, got {ops:?}"
+                        );
+                        assert!(
+                            !ops.iter().any(|(op, p4)| op == "'OpenRead'" && p4 == "'s'"),
+                            "case={name}: expected covering s_gv with no table OpenRead, got {ops:?}"
+                        );
+                        assert!(
+                            !ops.iter().any(|(op, _)| op == "'SeekRowid'"),
+                            "case={name}: expected no SeekRowid, got {ops:?}"
+                        );
+                    }
+
+                    // EXPLAIN QUERY PLAN matches covering SEARCH on s_gv.
+                    let eqp_range = conn
+                        .query(
+                            "EXPLAIN QUERY PLAN SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE g BETWEEN 2 AND 4",
+                        )
+                        .await
+                        .unwrap();
+                    let eqp_text: Vec<String> = eqp_range
+                        .iter()
+                        .map(|r| render_fsqlite_val(&r.values()[3]))
+                        .collect();
+                    assert!(
+                        eqp_text
+                            .iter()
+                            .any(|d| d.contains("SEARCH s USING COVERING INDEX s_gv")),
+                        "expected COVERING INDEX s_gv in EQP, got {eqp_text:?}"
+                    );
+
+                    // Unseekable covering WHERE avoids table OpenRead and SeekRowid.
+                    let explain_full_cover = conn
+                        .query("EXPLAIN SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE val > 35")
+                        .await
+                        .unwrap();
+                    assert!(
+                        !explain_full_cover
+                            .iter()
+                            .any(|r| render_fsqlite_val(&r.values()[1]) == "'SeekRowid'"),
+                        "unseekable covering WHERE on INDEXED BY s_gv should avoid SeekRowid"
+                    );
+
+                    // NOT INDEXED negative control opens table, never any index.
+                    let explain_not_indexed = conn
+                        .query("EXPLAIN SELECT count(*), sum(val) FROM s NOT INDEXED WHERE g BETWEEN 2 AND 4")
+                        .await
+                        .unwrap();
+                    assert!(
+                        !explain_not_indexed.iter().any(|r| {
+                            render_fsqlite_val(&r.values()[1]) == "'OpenRead'"
+                                && matches!(
+                                    render_fsqlite_val(&r.values()[5]).as_str(),
+                                    "'s_g'" | "'s_gh'" | "'s_gv'" | "'s_gv_desc'" | "'s_partial'"
+                                )
+                        }),
+                        "NOT INDEXED must never open a secondary index"
+                    );
+                }
+            }
+        }
+    });
+}

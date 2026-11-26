@@ -3604,55 +3604,91 @@ pub fn codegen_select(
         // degrades to Rewind/Next over the whole table. Yield to `codegen_select_aggregate`, which drives
         // AggStep from an index seek (`index_eq_seek` / `index_in_seek`). Every other COUNT(*) shape keeps
         // its specialized fast path.
-        && !(aggregate_index_eq_seek_allowed(from_index_hint)
-            && (aggregate_index_eq_seek_target(where_clause.as_deref(), table, table_alias).is_some()
-                || index_integer_in_list_residual_target(where_clause.as_deref(), table, table_alias)
+        // bd-aj9v4: a forced `INDEXED BY <idx>` with a WHERE must route through
+        // `count_star_index_range_target` / `codegen_select_aggregate` so it seeks
+        // or walks the forced index (covering when possible) instead of taking
+        // `codegen_select_count_star`'s unindexed table scan.
+        && !(where_clause.is_some()
+            && matches!(from_index_hint, Some(fsqlite_ast::IndexHint::IndexedBy(_))))
+        && {
+            let seek_constraint = aggregate_index_seek_constraint(from_index_hint);
+            !seek_constraint.allows_index_seek() || {
+                let required_index = seek_constraint.required_index();
+                !(aggregate_index_eq_seek_target(
+                    where_clause.as_deref(),
+                    table,
+                    table_alias,
+                    required_index,
+                )
+                .is_some()
+                    || index_integer_in_list_residual_target(
+                        where_clause.as_deref(),
+                        table,
+                        table_alias,
+                        required_index,
+                    )
                     .is_some()
-                || index_const_in_list_residual_target(
-                    where_clause.as_deref(),
-                    table,
-                    table_alias,
-                    schema,
-                )
-                .is_some()
-                || aggregate_index_range_seek_target(
-                    where_clause.as_deref(),
-                    table,
-                    table_alias,
-                    schema,
-                )
-                .is_some()
-                || aggregate_index_is_null_target(where_clause.as_deref(), table, table_alias)
+                    || index_const_in_list_residual_target(
+                        where_clause.as_deref(),
+                        table,
+                        table_alias,
+                        schema,
+                        required_index,
+                    )
                     .is_some()
-                // bd-2fb53: and `col IS NOT NULL`, counted from the index's pages.
-                || count_star_index_range_target(
-                    where_clause.as_deref(),
-                    table,
-                    table_alias,
-                    schema,
-                )
-                .is_some()
-                || composite_index_prefix_range_target(
-                    where_clause.as_deref(),
-                    table,
-                    table_alias,
-                    schema,
-                    None,
-                    None,
-                )
-                .is_some()
-                // bd-79p0a: a bound key yields too; `codegen_select_aggregate` takes it last.
-                || aggregate_index_prefix_residual_target(
-                    where_clause.as_deref(),
-                    table,
-                    table_alias,
-                    schema,
-                    PrefixIndexShape::AnyPrefix,
-                    PrefixProbe::LiteralOrNumberedParameter,
-                )
-                .is_some()
-                || extract_rowid_range_residual_target(where_clause.as_deref(), table, table_alias)
-                    .is_some_and(|(_, has_residual)| has_residual)));
+                    || aggregate_index_range_seek_target(
+                        where_clause.as_deref(),
+                        table,
+                        table_alias,
+                        schema,
+                        required_index,
+                    )
+                    .is_some()
+                    || aggregate_index_is_null_target(
+                        where_clause.as_deref(),
+                        table,
+                        table_alias,
+                        required_index,
+                    )
+                    .is_some()
+                    // bd-2fb53: and `col IS NOT NULL`, counted from the index's pages.
+                    || count_star_index_range_target(
+                        where_clause.as_deref(),
+                        table,
+                        table_alias,
+                        schema,
+                        required_index,
+                    )
+                    .is_some()
+                    || composite_index_prefix_range_target(
+                        where_clause.as_deref(),
+                        table,
+                        table_alias,
+                        schema,
+                        required_index,
+                        None,
+                    )
+                    .is_some()
+                    // bd-79p0a: a bound key yields too; `codegen_select_aggregate` takes it last.
+                    || aggregate_index_prefix_residual_target(
+                        where_clause.as_deref(),
+                        table,
+                        table_alias,
+                        schema,
+                        PrefixIndexShape::AnyPrefix,
+                        PrefixProbe::LiteralOrNumberedParameter,
+                        required_index,
+                    )
+                    .is_some()
+                    || (required_index.is_none()
+                        && extract_rowid_range_residual_target(
+                            where_clause.as_deref(),
+                            table,
+                            table_alias,
+                        )
+                        .is_some_and(|(_, has_residual)| has_residual)))
+            }
+        };
 
     // Check for aggregate columns FIRST, before rowid/index seek optimizations.
     // Most aggregates still require a full scan + AggStep/AggFinal path. Plain
@@ -3830,6 +3866,7 @@ pub fn codegen_select(
             schema,
             PrefixIndexShape::SingleColumn,
             PrefixProbe::Literal,
+            None,
         )
         .filter(|(_idx, prefix)| prefix.len() == 1)
         .map(|(idx, prefix)| (idx, prefix[0]))
@@ -3864,6 +3901,7 @@ pub fn codegen_select(
                 schema,
                 PrefixIndexShape::SingleColumn,
                 PrefixProbe::Literal,
+                None,
             )?;
             (prefix.len() == 1).then(|| (idx, prefix[0], bounds))
         })
@@ -3933,10 +3971,11 @@ pub fn codegen_select(
                 table,
                 table_alias,
                 schema,
+                None,
             )
             .is_none())
     {
-        index_integer_in_list_residual_target(where_clause.as_deref(), table, table_alias)
+        index_integer_in_list_residual_target(where_clause.as_deref(), table, table_alias, None)
             .map(|(idx, ints, has_residual)| {
                 (
                     idx,
@@ -3959,7 +3998,13 @@ pub fn codegen_select(
         && rowid_in_const.is_none()
         && index_in.is_none()
     {
-        index_const_in_list_residual_target(where_clause.as_deref(), table, table_alias, schema)
+        index_const_in_list_residual_target(
+            where_clause.as_deref(),
+            table,
+            table_alias,
+            schema,
+            None,
+        )
     } else {
         None
     };
@@ -5444,7 +5489,7 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
-            aggregate_index_eq_seek_allowed(from_index_hint),
+            from_index_hint,
             stmt.order_by.len(),
         )
     } else if is_simple_count_star(columns)
@@ -5455,9 +5500,14 @@ pub fn codegen_select(
         && having.is_none()
         && from_clause.joins.is_empty()
         && time_travel.is_none()
-        && aggregate_index_eq_seek_allowed(from_index_hint)
-        && let Some((index, range)) =
-            count_star_index_range_target(where_clause.as_deref(), table, table_alias, schema)
+        && aggregate_index_seek_constraint(from_index_hint).allows_index_seek()
+        && let Some((index, range)) = count_star_index_range_target(
+            where_clause.as_deref(),
+            table,
+            table_alias,
+            schema,
+            aggregate_index_seek_constraint(from_index_hint).required_index(),
+        )
     {
         // --- bd-2fb53: COUNT(*) over an index range, IS NULL or IS NOT NULL ---
         codegen_select_count_star_index_range(b, table, index, &range, out_regs, done_label, end_label);
@@ -5488,7 +5538,6 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
-            aggregate_index_eq_seek_allowed(from_index_hint),
             from_index_hint,
         )
     } else if !stmt.order_by.is_empty() {
@@ -7384,6 +7433,7 @@ fn codegen_select_index_in_subquery_scan(
                 probe_source.where_clause,
                 probe_source.table,
                 probe_source.table_alias,
+                None,
             )
         })
         .flatten();
@@ -7893,7 +7943,7 @@ fn or_index_union_terms<'t, 'e>(
     }
     terms
         .into_iter()
-        .map(|term| index_equality_prefix_target(Some(term), table, table_alias))
+        .map(|term| index_equality_prefix_target(Some(term), table, table_alias, None))
         .collect()
 }
 
@@ -9789,12 +9839,20 @@ fn codegen_select_count_star(
         // available — index B-trees have smaller rows and fewer pages.
         // Uses the SAME cursor ID as the table would, so the rest of the
         // program shape (Count, Close, Halt) is identical.
-        let cheapest_index = table
-            .indexes
-            .iter()
-            .filter(|idx| idx.where_clause.is_none())
-            .filter(|idx| !idx.columns.is_empty())
-            .min_by_key(|idx| idx.columns.len());
+        let cheapest_index = match index_hint {
+            Some(fsqlite_ast::IndexHint::NotIndexed) => None,
+            Some(fsqlite_ast::IndexHint::IndexedBy(name)) => table.indexes.iter().find(|idx| {
+                idx.where_clause.is_none()
+                    && !idx.columns.is_empty()
+                    && idx.name.eq_ignore_ascii_case(name)
+            }),
+            None => table
+                .indexes
+                .iter()
+                .filter(|idx| idx.where_clause.is_none())
+                .filter(|idx| !idx.columns.is_empty())
+                .min_by_key(|idx| idx.columns.len()),
+        };
 
         if let Some(idx) = cheapest_index {
             b.emit_op(
@@ -19443,29 +19501,47 @@ fn find_minmax_leading_index<'t>(
     table: &'t TableSchema,
     col_name: &str,
     collation: Option<&str>,
+    required_index: Option<&str>,
 ) -> Option<(&'t IndexSchema, bool)> {
-    table
-        .single_column_index_for_column_with_collation(col_name, collation)
-        .map(|idx| (idx, false))
-        .or_else(|| {
-            if collation.is_some_and(|c| !c.eq_ignore_ascii_case("BINARY")) || table.without_rowid {
-                return None;
-            }
-            table.indexes.iter().find_map(|idx| {
-                let leads = idx.supports_direct_column_lookup()
+    let single_col = if table.without_rowid {
+        None
+    } else {
+        table
+            .indexes
+            .iter()
+            .find(|idx| {
+                index_matches_required(idx, required_index)
+                    && idx.supports_direct_column_lookup()
+                    && idx.columns.len() == 1
+                    && !idx.key_term_descending(0)
                     && idx
                         .columns
                         .first()
                         .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
-                    && idx
-                        .key_term_collation(0)
-                        .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
-                // Composite leading (any direction), or a single-column DESC index (single-column ASC
-                // is handled above).
-                let usable = leads && (idx.key_term_count() >= 2 || idx.key_term_descending(0));
-                usable.then(|| (idx, idx.key_term_descending(0)))
+                    && direct_lookup_index_collation_matches_join(idx, collation)
             })
+            .map(|idx| (idx, false))
+    };
+    single_col.or_else(|| {
+        if collation.is_some_and(|c| !c.eq_ignore_ascii_case("BINARY")) || table.without_rowid {
+            return None;
+        }
+        table.indexes.iter().find_map(|idx| {
+            let leads = index_matches_required(idx, required_index)
+                && idx.supports_direct_column_lookup()
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+                && idx
+                    .key_term_collation(0)
+                    .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
+            // Composite leading (any direction), or a single-column DESC index (single-column ASC
+            // is handled above).
+            let usable = leads && (idx.key_term_count() >= 2 || idx.key_term_descending(0));
+            usable.then(|| (idx, idx.key_term_descending(0)))
         })
+    })
 }
 
 /// The single-column ASC BINARY-collation index a `SELECT COUNT(DISTINCT col) FROM t` (no
@@ -19489,6 +19565,7 @@ fn count_distinct_index_walk_plan(
     agg_columns: &[AggColumn],
     columns: &[ResultColumn],
     table: &TableSchema,
+    required_index: Option<&str>,
 ) -> Option<CountDistinctIndexWalk> {
     let [agg] = agg_columns else {
         return None;
@@ -19527,7 +19604,8 @@ fn count_distinct_index_walk_plan(
         .indexes
         .iter()
         .filter(|idx| {
-            idx.supports_direct_column_lookup()
+            index_matches_required(idx, required_index)
+                && idx.supports_direct_column_lookup()
                 && idx.key_term_count() >= 1
                 && !idx.key_term_descending(0)
                 && idx
@@ -19589,6 +19667,7 @@ fn minmax_where_is_redundant_not_null(
 fn minmax_index_seek_plan(
     agg_columns: &[AggColumn],
     table: &TableSchema,
+    required_index: Option<&str>,
 ) -> Option<MinMaxIndexSeek> {
     let [agg] = agg_columns else {
         return None;
@@ -19614,7 +19693,8 @@ fn minmax_index_seek_plan(
         _ => return None,
     };
     let col_name = table.columns.get(agg.arg_col_index?)?.name.as_str();
-    let (idx, descending) = find_minmax_leading_index(table, col_name, agg.collation.as_deref())?;
+    let (idx, descending) =
+        find_minmax_leading_index(table, col_name, agg.collation.as_deref(), required_index)?;
     Some(MinMaxIndexSeek {
         is_max,
         index_name: idx.name.clone(),
@@ -19642,7 +19722,11 @@ struct MinMaxPairSeek {
 /// multi/extra; no scalar wrapper — kept simple), requires the same column and matching collation, and
 /// reuses [`find_minmax_leading_index`]. Byte-identical: each end feeds its own accumulator exactly as
 /// the single-seek path would.
-fn minmax_pair_seek_plan(agg_columns: &[AggColumn], table: &TableSchema) -> Option<MinMaxPairSeek> {
+fn minmax_pair_seek_plan(
+    agg_columns: &[AggColumn],
+    table: &TableSchema,
+    required_index: Option<&str>,
+) -> Option<MinMaxPairSeek> {
     let [a0, a1] = agg_columns else {
         return None;
     };
@@ -19675,7 +19759,8 @@ fn minmax_pair_seek_plan(agg_columns: &[AggColumn], table: &TableSchema) -> Opti
         return None;
     }
     let col_name = table.columns.get(col)?.name.as_str();
-    let (idx, descending) = find_minmax_leading_index(table, col_name, a0.collation.as_deref())?;
+    let (idx, descending) =
+        find_minmax_leading_index(table, col_name, a0.collation.as_deref(), required_index)?;
     Some(MinMaxPairSeek {
         min_out_col,
         max_out_col,
@@ -19757,6 +19842,7 @@ fn minmax_range_seek_plan(
     table: &TableSchema,
     table_alias: Option<&str>,
     where_clause: Option<&Expr>,
+    required_index: Option<&str>,
 ) -> Option<MinMaxRangeSeek> {
     use fsqlite_ast::BinaryOp::{Ge, Gt, Le, Lt};
     let [agg] = agg_columns else {
@@ -19795,8 +19881,20 @@ fn minmax_range_seek_plan(
         (true, Le) => Opcode::SeekLE,  // MAX col <= c → last entry <= c
         _ => return None,              // unnatural pairing → global extremum, different shape
     };
-    let idx =
-        table.single_column_index_for_column_with_collation(&col.name, agg.collation.as_deref())?;
+    if table.without_rowid {
+        return None;
+    }
+    let idx = table.indexes.iter().find(|idx| {
+        index_matches_required(idx, required_index)
+            && idx.supports_direct_column_lookup()
+            && idx.columns.len() == 1
+            && !idx.key_term_descending(0)
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&col.name))
+            && direct_lookup_index_collation_matches_join(idx, agg.collation.as_deref())
+    })?;
     Some(MinMaxRangeSeek {
         index_name: idx.name.clone(),
         index_root: idx.root_page,
@@ -19927,6 +20025,7 @@ fn minmax_prefix_seek_plan<'e>(
     table: &TableSchema,
     table_alias: Option<&str>,
     where_clause: Option<&'e Expr>,
+    required_index: Option<&str>,
 ) -> Option<MinMaxPrefixSeek<'e>> {
     let [agg] = agg_columns else {
         return None;
@@ -19979,7 +20078,8 @@ fn minmax_prefix_seek_plan<'e>(
     }
     let where_expr = where_clause?;
     let idx = table.indexes.iter().find(|idx| {
-        idx.supports_direct_column_lookup()
+        index_matches_required(idx, required_index)
+            && idx.supports_direct_column_lookup()
             && !idx.key_term_descending(0)
             && idx
                 .columns
@@ -22324,19 +22424,54 @@ fn emit_aggregate_accumulate_body(
 ///
 /// Shared by [`codegen_select_aggregate`] and by the `simple_count_star`
 /// suppression in [`codegen_select`], so the two cannot drift apart.
-/// Whether an explicit `INDEXED BY` / `NOT INDEXED` hint permits the aggregate
-/// index seek.
-///
-/// `NOT INDEXED` must force the scan, and `INDEXED BY <name>` names an index the
-/// seek does not consult, so both decline. Only an unhinted FROM source may seek.
-fn aggregate_index_eq_seek_allowed(index_hint: Option<&fsqlite_ast::IndexHint>) -> bool {
-    index_hint.is_none()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AggregateIndexSeekConstraint<'a> {
+    Any,
+    Required(&'a str),
+    Forbidden,
+}
+
+impl<'a> AggregateIndexSeekConstraint<'a> {
+    const fn allows_index_seek(self) -> bool {
+        !matches!(self, Self::Forbidden)
+    }
+
+    const fn required_index(self) -> Option<&'a str> {
+        match self {
+            Self::Required(name) => Some(name),
+            Self::Any | Self::Forbidden => None,
+        }
+    }
+}
+
+/// Resolve a FROM `INDEXED BY` / `NOT INDEXED` hint into an aggregate index-seek
+/// constraint (bd-aj9v4):
+/// - `None` -> `Any` (unrestricted: any qualifying index may seek).
+/// - `Some(IndexHint::IndexedBy(name))` -> `Required(name)` (restrict all
+///   index-seek candidates to the named index; never bypass it via another index
+///   or rowid seek).
+/// - `Some(IndexHint::NotIndexed)` -> `Forbidden` (decline all secondary-index seeks).
+fn aggregate_index_seek_constraint(
+    index_hint: Option<&fsqlite_ast::IndexHint>,
+) -> AggregateIndexSeekConstraint<'_> {
+    match index_hint {
+        None => AggregateIndexSeekConstraint::Any,
+        Some(fsqlite_ast::IndexHint::IndexedBy(name)) => {
+            AggregateIndexSeekConstraint::Required(name.as_str())
+        }
+        Some(fsqlite_ast::IndexHint::NotIndexed) => AggregateIndexSeekConstraint::Forbidden,
+    }
+}
+
+fn index_matches_required(index: &IndexSchema, required_index: Option<&str>) -> bool {
+    required_index.is_none_or(|name| index.name.eq_ignore_ascii_case(name))
 }
 
 fn aggregate_index_eq_seek_target<'t, 'e>(
     where_clause: Option<&'e Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
+    required_index: Option<&str>,
 ) -> Option<(&'t IndexSchema, Vec<&'e Expr>)> {
     // The seek walks the block pinned by an equality PREFIX of an ASC-leading index (`WHERE a=?` on
     // `(a,b)`, or `WHERE a=? AND b=?` on `(a,b)`). A partial `[prefix..]` probe anchors at the first
@@ -22352,7 +22487,10 @@ fn aggregate_index_eq_seek_target<'t, 'e>(
     let mut conjuncts = Vec::new();
     collect_conjunctive_terms(where_expr, &mut conjuncts);
     for index in &table.indexes {
-        if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
+        if !index_matches_required(index, required_index)
+            || index.key_term_descending(0)
+            || !index.supports_direct_column_lookup()
+        {
             continue;
         }
         let prefix = extract_index_equality_prefix_exprs(index, table, table_alias, where_clause);
@@ -22378,6 +22516,7 @@ fn index_equality_prefix_target<'t, 'e>(
     where_clause: Option<&'e Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
+    required_index: Option<&str>,
 ) -> Option<IndexEqualityPrefix<'t, 'e>> {
     if table.without_rowid {
         return None;
@@ -22387,7 +22526,10 @@ fn index_equality_prefix_target<'t, 'e>(
     collect_conjunctive_terms(where_expr, &mut conjuncts);
     let mut best: Option<IndexEqualityPrefix<'t, 'e>> = None;
     for index in &table.indexes {
-        if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
+        if !index_matches_required(index, required_index)
+            || index.key_term_descending(0)
+            || !index.supports_direct_column_lookup()
+        {
             continue;
         }
         let mut values = Vec::new();
@@ -22453,6 +22595,7 @@ fn index_integer_in_list_target<'t>(
     where_clause: Option<&Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
+    required_index: Option<&str>,
 ) -> Option<(&'t IndexSchema, Vec<i64>)> {
     // The seeks this feeds probe `[value, i64::MIN]` and read the row through
     // `IdxRowid`; a WITHOUT ROWID entry has no rowid after its key (bd-aoukl).
@@ -22475,7 +22618,8 @@ fn index_integer_in_list_target<'t>(
     // *composite* `(col, …)` index that shadows a usable single-column one listed after it — filtering
     // that result would then decline even though a single-column index exists. Search all indexes.
     if let Some(idx) = table.indexes.iter().find(|idx| {
-        idx.supports_direct_column_lookup()
+        index_matches_required(idx, required_index)
+            && idx.supports_direct_column_lookup()
             && idx.key_term_count() == 1
             && !idx.key_term_descending(0)
             && idx
@@ -22492,7 +22636,8 @@ fn index_integer_in_list_target<'t>(
     // probes with a 1-field PREFIX `[value]`: SeekGE anchors at the first `a=value` entry regardless of
     // the trailing column (including NULL), and the Column-0 run stop is unchanged.
     let idx = table.indexes.iter().find(|idx| {
-        idx.supports_direct_column_lookup()
+        index_matches_required(idx, required_index)
+            && idx.supports_direct_column_lookup()
             && idx.key_term_count() > 1
             && !idx.key_term_descending(0)
             && idx
@@ -23327,6 +23472,7 @@ fn index_const_in_list_target<'t, 'a>(
     term: &'a Expr,
     table: &'t TableSchema,
     table_alias: Option<&str>,
+    required_index: Option<&str>,
 ) -> Option<(&'t IndexSchema, Vec<&'a Expr>, char)> {
     if table.without_rowid {
         return None;
@@ -23334,7 +23480,8 @@ fn index_const_in_list_target<'t, 'a>(
     let is_binary = |collation: Option<&str>| collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
     let (col_name, values, affinity) = const_in_list_members(term, table, table_alias)?;
     let usable = |idx: &&IndexSchema| {
-        idx.supports_direct_column_lookup()
+        index_matches_required(idx, required_index)
+            && idx.supports_direct_column_lookup()
             && !idx.key_term_descending(0)
             && is_binary(idx.key_term_collation(0))
             && idx
@@ -23441,6 +23588,7 @@ fn index_const_in_list_composite_target<'t, 'a>(
     table: &'t TableSchema,
     table_alias: Option<&str>,
     schema: &[TableSchema],
+    required_index: Option<&str>,
 ) -> Option<IndexConstInList<'t, 'a>> {
     let where_expr = where_clause?;
     // The probe emits the equalities before the IN members, so an anonymous
@@ -23467,7 +23615,10 @@ fn index_const_in_list_composite_target<'t, 'a>(
             continue;
         };
         for index in &table.indexes {
-            if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
+            if !index_matches_required(index, required_index)
+                || index.key_term_descending(0)
+                || !index.supports_direct_column_lookup()
+            {
                 continue;
             }
             let key_terms = index.key_term_count().min(index.columns.len());
@@ -23619,15 +23770,20 @@ fn index_const_in_list_residual_target<'t, 'a>(
     table: &'t TableSchema,
     table_alias: Option<&str>,
     schema: &[TableSchema],
+    required_index: Option<&str>,
 ) -> Option<IndexConstInList<'t, 'a>> {
-    if let Some(target) =
-        index_const_in_list_composite_target(where_clause, table, table_alias, schema)
-    {
+    if let Some(target) = index_const_in_list_composite_target(
+        where_clause,
+        table,
+        table_alias,
+        schema,
+        required_index,
+    ) {
         return Some(target);
     }
     let where_expr = where_clause?;
     if let Some((index, values, affinity)) =
-        index_const_in_list_target(where_expr, table, table_alias)
+        index_const_in_list_target(where_expr, table, table_alias, required_index)
     {
         return Some(IndexConstInList {
             index,
@@ -23648,7 +23804,8 @@ fn index_const_in_list_residual_target<'t, 'a>(
     }
     let mut anon_offset = 0_u32;
     for term in conjuncts {
-        if let Some((index, values, affinity)) = index_const_in_list_target(term, table, table_alias)
+        if let Some((index, values, affinity)) =
+            index_const_in_list_target(term, table, table_alias, required_index)
         {
             return Some(IndexConstInList {
                 index,
@@ -23674,8 +23831,11 @@ fn index_integer_in_list_residual_target<'t>(
     where_clause: Option<&Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
+    required_index: Option<&str>,
 ) -> Option<(&'t IndexSchema, Vec<i64>, bool)> {
-    if let Some((idx, ints)) = index_integer_in_list_target(where_clause, table, table_alias) {
+    if let Some((idx, ints)) =
+        index_integer_in_list_target(where_clause, table, table_alias, required_index)
+    {
         return Some((idx, ints, false));
     }
     let where_expr = where_clause?;
@@ -23685,7 +23845,9 @@ fn index_integer_in_list_residual_target<'t>(
         return None;
     }
     for term in &conjuncts {
-        if let Some((idx, ints)) = index_integer_in_list_target(Some(term), table, table_alias) {
+        if let Some((idx, ints)) =
+            index_integer_in_list_target(Some(term), table, table_alias, required_index)
+        {
             return Some((idx, ints, true));
         }
     }
@@ -23710,6 +23872,7 @@ fn aggregate_index_is_null_target<'t>(
     where_clause: Option<&Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
+    required_index: Option<&str>,
 ) -> Option<&'t IndexSchema> {
     let Some(Expr::IsNull {
         expr, not: false, ..
@@ -23722,7 +23885,8 @@ fn aggregate_index_is_null_target<'t>(
     }
     let col_name = column_name(expr, table, table_alias)?;
     let leads = |idx: &&IndexSchema| {
-        idx.supports_direct_column_lookup()
+        index_matches_required(idx, required_index)
+            && idx.supports_direct_column_lookup()
             && !idx.key_term_descending(0)
             && idx
                 .columns
@@ -23783,14 +23947,17 @@ fn count_star_index_range_target<'t, 'e>(
     table: &'t TableSchema,
     table_alias: Option<&str>,
     schema: &[TableSchema],
+    required_index: Option<&str>,
 ) -> Option<(&'t IndexSchema, CountIndexRange<'e>)> {
     if !table.without_rowid
         && let Some((index, members)) =
-            index_integer_in_list_target(where_clause, table, table_alias)
+            index_integer_in_list_target(where_clause, table, table_alias, required_index)
     {
         return Some((index, CountIndexRange::Members(members)));
     }
-    if let Some((index, values)) = aggregate_index_eq_seek_target(where_clause, table, table_alias) {
+    if let Some((index, values)) =
+        aggregate_index_eq_seek_target(where_clause, table, table_alias, required_index)
+    {
         let mut planned = Vec::with_capacity(values.len());
         let mut all_exact = true;
         for (pos, value) in values.into_iter().enumerate() {
@@ -23830,6 +23997,7 @@ fn count_star_index_range_target<'t, 'e>(
             schema,
             PrefixIndexShape::FullKey,
             PrefixProbe::Literal,
+            required_index,
         )
         && index.where_clause.is_none()
         && index_prefix_rowid_bounds_cover_where(
@@ -23866,11 +24034,13 @@ fn count_star_index_range_target<'t, 'e>(
         ));
     }
     if let Some((index, range, false)) =
-        aggregate_index_range_seek_target(where_clause, table, table_alias, schema)
+        aggregate_index_range_seek_target(where_clause, table, table_alias, schema, required_index)
     {
         return Some((index, CountIndexRange::Range(range)));
     }
-    if let Some(index) = aggregate_index_is_null_target(where_clause, table, table_alias) {
+    if let Some(index) =
+        aggregate_index_is_null_target(where_clause, table, table_alias, required_index)
+    {
         return Some((index, CountIndexRange::Nulls));
     }
     let Some(Expr::IsNull {
@@ -23887,7 +24057,8 @@ fn count_star_index_range_target<'t, 'e>(
         .indexes
         .iter()
         .filter(|idx| {
-            idx.supports_direct_column_lookup()
+            index_matches_required(idx, required_index)
+                && idx.supports_direct_column_lookup()
                 && !idx.key_term_descending(0)
                 && idx
                     .columns
@@ -24120,6 +24291,7 @@ fn aggregate_index_range_seek_target<'t, 'e>(
     table: &'t TableSchema,
     table_alias: Option<&str>,
     schema: &[TableSchema],
+    required_index: Option<&str>,
 ) -> Option<(&'t IndexSchema, ColumnRangeTarget<'e>, bool)> {
     if table.without_rowid {
         return None;
@@ -24136,7 +24308,8 @@ fn aggregate_index_range_seek_target<'t, 'e>(
         // composite `(a, …)` index is declared before `idx_a` (bd-agg-range-shadowed-index — the same
         // shadowing fixed for the IN-list seek). Searching all indexes finds the single-column one.
         if let Some(idx) = table.indexes.iter().find(|idx| {
-            idx.supports_direct_column_lookup()
+            index_matches_required(idx, required_index)
+                && idx.supports_direct_column_lookup()
                 && idx.key_term_count() == 1
                 && !idx.key_term_descending(0)
                 && idx
@@ -24163,13 +24336,12 @@ fn aggregate_index_range_seek_target<'t, 'e>(
     let candidates = table
         .indexes
         .iter()
-        .filter(|index| covers_where(index))
-        .chain(
-            table
-                .indexes
-                .iter()
-                .filter(|index| index.key_term_count() == 1 && !covers_where(index)),
-        );
+        .filter(|index| index_matches_required(index, required_index) && covers_where(index))
+        .chain(table.indexes.iter().filter(|index| {
+            index_matches_required(index, required_index)
+                && index.key_term_count() == 1
+                && !covers_where(index)
+        }));
     for index in candidates {
         if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
             continue;
@@ -24269,6 +24441,7 @@ fn aggregate_index_prefix_residual_target<'t, 'e>(
     schema: &[TableSchema],
     shape: PrefixIndexShape,
     probe: PrefixProbe,
+    required_index: Option<&str>,
 ) -> Option<(&'t IndexSchema, Vec<&'e Expr>)> {
     let where_expr = where_clause?;
     if table.without_rowid
@@ -24280,7 +24453,8 @@ fn aggregate_index_prefix_residual_target<'t, 'e>(
     let mut conjuncts = Vec::new();
     collect_conjunctive_terms(where_expr, &mut conjuncts);
     for index in &table.indexes {
-        if index.key_term_descending(0)
+        if !index_matches_required(index, required_index)
+            || index.key_term_descending(0)
             || index.columns.is_empty()
             || index.columns.len() != index.key_term_count()
             || (shape == PrefixIndexShape::SingleColumn && index.key_term_count() != 1)
@@ -25351,22 +25525,28 @@ fn codegen_select_aggregate(
     out_col_count: i32,
     done_label: crate::Label,
     end_label: crate::Label,
-    allow_index_seek: bool,
-    // #137 sub-2: the query's FROM index hint. A forced `INDEXED BY <idx>` makes
-    // the aggregate scan the index in STORED order (so order-sensitive aggregates
-    // like SUM's transient overflow match stock) instead of the rowid-order table
-    // scan. `allow_index_seek` is false for a forced hint (it gates the eq-SEEK
-    // fast paths), so the forced index-ORDERED full scan is enabled from this hint
-    // directly, orthogonally to `allow_index_seek`.
+    // bd-aj9v4 / #137 sub-2: the query's FROM index hint. `INDEXED BY <idx>`
+    // restricts every index-seek path below to `<idx>` (so covering seeks over
+    // constrained ranges run without walking the whole index or looking up rows),
+    // disables rowid/table-only shortcuts, and falls back to an ordered walk of
+    // `<idx>` (covering when the WHERE reads only index columns) only when no
+    // constrained seek on `<idx>` matches. `NOT INDEXED` declines every index seek.
     from_index_hint: Option<&fsqlite_ast::IndexHint>,
 ) -> Result<(), CodegenError> {
+    let index_seek_constraint = aggregate_index_seek_constraint(from_index_hint);
+    let allow_index_seek = index_seek_constraint.allows_index_seek();
+    let required_index = index_seek_constraint.required_index();
+    let forced_indexed_by = matches!(from_index_hint, Some(fsqlite_ast::IndexHint::IndexedBy(_)));
+    let allow_rowid_seek = from_index_hint.is_none();
+
     // Resolve SELECT-list aliases referenced from HAVING (e.g.
     // `SELECT SUM(qty) AS total_qty ... HAVING total_qty > 100`).
     let rewritten_having = having.map(|h| rewrite_having_select_aliases(h, columns, table));
     let having = rewritten_having.as_ref();
     let limit_is_output_neutral = single_group_aggregate_limit_is_output_neutral(limit_clause);
 
-    if where_clause.is_none()
+    if !forced_indexed_by
+        && where_clause.is_none()
         && having.is_none()
         && limit_is_output_neutral
         && let Some(plan) = simple_count_star_plus_sum_plan(columns, table, table_alias)
@@ -25386,7 +25566,8 @@ fn codegen_select_aggregate(
     // The accumulate/finalize/wrapper machinery is reused verbatim so the
     // produced result is bit-identical to the full-scan path; only the row that
     // feeds AggStep changes (the single extremum row instead of every row).
-    if where_clause.is_none()
+    if !forced_indexed_by
+        && where_clause.is_none()
         && having.is_none()
         && limit_is_output_neutral
         && let Some(seek) = minmax_rowid_seek_plan(&agg_columns)
@@ -25417,7 +25598,7 @@ fn codegen_select_aggregate(
         && minmax_no_effective_where
         && having.is_none()
         && limit_is_output_neutral
-        && let Some(seek) = minmax_index_seek_plan(&agg_columns, table)
+        && let Some(seek) = minmax_index_seek_plan(&agg_columns, table, required_index)
     {
         return codegen_select_minmax_index_seek(
             b,
@@ -25439,7 +25620,8 @@ fn codegen_select_aggregate(
         && where_clause.is_none()
         && having.is_none()
         && limit_is_output_neutral
-        && let Some(walk) = count_distinct_index_walk_plan(&agg_columns, columns, table)
+        && let Some(walk) =
+            count_distinct_index_walk_plan(&agg_columns, columns, table, required_index)
     {
         codegen_select_count_distinct_index_walk(
             b,
@@ -25459,7 +25641,7 @@ fn codegen_select_aggregate(
         && minmax_no_effective_where
         && having.is_none()
         && limit_is_output_neutral
-        && let Some(seek) = minmax_pair_seek_plan(&agg_columns, table)
+        && let Some(seek) = minmax_pair_seek_plan(&agg_columns, table, required_index)
     {
         return codegen_select_minmax_pair_seek(
             b,
@@ -25479,7 +25661,8 @@ fn codegen_select_aggregate(
     if allow_index_seek
         && having.is_none()
         && limit_is_output_neutral
-        && let Some(seek) = minmax_prefix_seek_plan(&agg_columns, table, table_alias, where_clause)
+        && let Some(seek) =
+            minmax_prefix_seek_plan(&agg_columns, table, table_alias, where_clause, required_index)
     {
         return codegen_select_minmax_prefix_seek(
             b,
@@ -25498,7 +25681,8 @@ fn codegen_select_aggregate(
     if allow_index_seek
         && having.is_none()
         && limit_is_output_neutral
-        && let Some(seek) = minmax_range_seek_plan(&agg_columns, table, table_alias, where_clause)
+        && let Some(seek) =
+            minmax_range_seek_plan(&agg_columns, table, table_alias, where_clause, required_index)
     {
         return codegen_select_minmax_range_seek(
             b,
@@ -25514,7 +25698,7 @@ fn codegen_select_aggregate(
 
     // Rowid analogue: `SELECT MIN(id) WHERE id >[=] c` / `MAX(id) WHERE id <[=] c` seeks the table
     // b-tree (one seek) instead of scanning the range. bd-minmax-rowid-range-seek.
-    if allow_index_seek
+    if allow_rowid_seek
         && having.is_none()
         && limit_is_output_neutral
         && let Some((seek_op, bound)) =
@@ -25624,7 +25808,26 @@ fn codegen_select_aggregate(
     // row, and stock visits the rows in the same ascending key order a seek
     // does; the rowid-order scan this gate used to force returned another row.
     let index_eq_seek = if allow_index_seek && having.is_none() {
-        aggregate_index_eq_seek_target(where_clause, table, table_alias)
+        aggregate_index_eq_seek_target(where_clause, table, table_alias, required_index).filter(
+            |(idx_schema, prefix_exprs)| {
+                // Under `INDEXED BY <idx>`, admit equality seek only when every
+                // pinned term is exact after affinity coercion so misses finalize
+                // directly instead of falling through to a table scan.
+                required_index.is_none()
+                    || prefix_exprs.iter().enumerate().all(|(i, expr)| {
+                        index_eq_term_probe_plan(
+                            table,
+                            table_alias,
+                            schema,
+                            idx_schema,
+                            i,
+                            expr,
+                            where_clause,
+                        )
+                        .exact_after_coercion
+                    })
+            },
+        )
     } else {
         None
     };
@@ -25644,7 +25847,7 @@ fn codegen_select_aggregate(
     //     COUNT=0 / SUM=NULL the empty scan would produce.
     // Mutually exclusive with `index_eq_seek`: the INTEGER PRIMARY KEY is the table
     // b-tree key, not a secondary index, so `extract_column_eq_target` never matches it.
-    let rowid_eq_seek = if allow_index_seek && having.is_none() && index_eq_seek.is_none() {
+    let rowid_eq_seek = if allow_rowid_seek && having.is_none() && index_eq_seek.is_none() {
         // bd-agg-rowid-eq-coerced: accept any simple constant (placeholder / real /
         // text as well as an integer literal), not just an integer literal.
         // `extract_rowid_target_expr` already requires `is_simple_constant`; the
@@ -25667,7 +25870,7 @@ fn codegen_select_aggregate(
     // `resolved_rowid_range_comparison`), so the aggregate inherits its affinity/collation
     // correctness; only the per-row action changes (accumulate vs `ResultRow`). Ascending
     // only — aggregates impose no order.
-    let rowid_range_seek = if allow_index_seek
+    let rowid_range_seek = if allow_rowid_seek
         && having.is_none()
         && index_eq_seek.is_none()
         && rowid_eq_seek.is_none()
@@ -25687,9 +25890,16 @@ fn codegen_select_aggregate(
         && index_eq_seek.is_none()
         && rowid_eq_seek.is_none()
         && rowid_range_seek.is_none()
-        && index_const_in_list_composite_target(where_clause, table, table_alias, schema).is_none()
+        && index_const_in_list_composite_target(
+            where_clause,
+            table,
+            table_alias,
+            schema,
+            required_index,
+        )
+        .is_none()
     {
-        index_integer_in_list_residual_target(where_clause, table, table_alias)
+        index_integer_in_list_residual_target(where_clause, table, table_alias, required_index)
     } else {
         None
     };
@@ -25704,7 +25914,13 @@ fn codegen_select_aggregate(
         && rowid_range_seek.is_none()
         && index_in_seek.is_none()
     {
-        index_const_in_list_residual_target(where_clause, table, table_alias, schema)
+        index_const_in_list_residual_target(
+            where_clause,
+            table,
+            table_alias,
+            schema,
+            required_index,
+        )
     } else {
         None
     };
@@ -25723,16 +25939,18 @@ fn codegen_select_aggregate(
         && index_in_seek.is_none()
         && index_const_in_seek.is_none()
     {
-        aggregate_index_range_seek_target(where_clause, table, table_alias, schema)
+        aggregate_index_range_seek_target(where_clause, table, table_alias, schema, required_index)
             .map(|(index, range, has_residual)| (index, range, has_residual, false))
             .or_else(|| {
-                aggregate_index_is_null_target(where_clause, table, table_alias).map(|index| {
-                    let nulls = ColumnRangeTarget {
-                        lower: None,
-                        upper: None,
-                    };
-                    (index, nulls, false, true)
-                })
+                aggregate_index_is_null_target(where_clause, table, table_alias, required_index).map(
+                    |index| {
+                        let nulls = ColumnRangeTarget {
+                            lower: None,
+                            upper: None,
+                        };
+                        (index, nulls, false, true)
+                    },
+                )
             })
     } else {
         None
@@ -25759,7 +25977,7 @@ fn codegen_select_aggregate(
             table,
             table_alias,
             schema,
-            None,
+            required_index,
             Some(&covers),
         )
     } else {
@@ -25787,6 +26005,7 @@ fn codegen_select_aggregate(
             schema,
             PrefixIndexShape::AnyPrefix,
             PrefixProbe::Literal,
+            required_index,
         )
     } else {
         None
@@ -25798,7 +26017,7 @@ fn codegen_select_aggregate(
     // existing seek gate changes — a rowid IN is mutually exclusive with every shape above. Integer
     // literals only (SeekRowid coerces via to_integer()); sorted+deduped so each row accumulates once; an
     // all-miss leaves the accumulators Null (the empty-scan result).
-    let rowid_in_seek = if allow_index_seek
+    let rowid_in_seek = if allow_rowid_seek
         && having.is_none()
         && index_eq_seek.is_none()
         && rowid_eq_seek.is_none()
@@ -25819,7 +26038,7 @@ fn codegen_select_aggregate(
     // row and re-applying the residual before AggStep. `extract_rowid_eq_residual_target` returns the const
     // only when `rowid = const` is a conjunct alongside others (the bare eq is served by rowid_eq_seek).
     // Integer literal only; gated after every other seek so no existing gate changes.
-    let rowid_eq_residual_seek = if allow_index_seek
+    let rowid_eq_residual_seek = if allow_rowid_seek
         && having.is_none()
         && index_eq_seek.is_none()
         && rowid_eq_seek.is_none()
@@ -25864,6 +26083,7 @@ fn codegen_select_aggregate(
             schema,
             PrefixIndexShape::AnyPrefix,
             PrefixProbe::LiteralOrNumberedParameter,
+            required_index,
         )
     } else {
         index_prefix_residual_seek
@@ -25887,6 +26107,7 @@ fn codegen_select_aggregate(
             schema,
             PrefixIndexShape::FullKey,
             PrefixProbe::Literal,
+            required_index,
         )?;
         Some((idx, prefix, bounds))
     });
@@ -25900,8 +26121,12 @@ fn codegen_select_aggregate(
         .filter(|_| index_prefix_rowid_bounded.is_none())
         .and_then(|(range, _)| {
             let bounds = IndexEqRowidBounds::from_range(range)?;
-            let (idx, values, has_residual) =
-                index_integer_in_list_residual_target(where_clause, table, table_alias)?;
+            let (idx, values, has_residual) = index_integer_in_list_residual_target(
+                where_clause,
+                table,
+                table_alias,
+                required_index,
+            )?;
             (idx.key_term_count() == 1).then_some((idx, values, has_residual, bounds))
         });
     let rowid_range_seek = rowid_range_seek.filter(|_| {
@@ -25920,14 +26145,11 @@ fn codegen_select_aggregate(
     let where_placeholder_base = b.current_anon_placeholder();
     let mut skip_scan = false;
 
-    // #137 sub-2: a forced `INDEXED BY <idx>` on an aggregate must scan the forced
-    // index in its STORED order, not the rowid-order table scan. Resolve the forced
-    // index (a plain, non-partial direct-lookup index — an unusable partial forced
-    // index already errors at prepare per sub-1). NOT gated on `allow_index_seek`
-    // (false for a forced hint). Covering only when no residual WHERE and no bare
-    // output column and every aggregate reads from the index entry; otherwise the
-    // table row is fetched (rowid seek, or a WITHOUT ROWID PK-suffix seek per
-    // sub-4) and any residual WHERE is re-applied per row.
+    // #137 sub-2 / bd-aj9v4: fallback full walk of a forced `INDEXED BY <idx>`
+    // in its STORED order when none of the constrained seeks above matched
+    // `<idx>`. Covering whenever all aggregates and any WHERE clause read only
+    // columns stored in `<idx>` (using `emit_index_entry_where_filter` so no
+    // table lookup is emitted).
     let forced_index_ordered =
         if let Some(fsqlite_ast::IndexHint::IndexedBy(name)) = from_index_hint {
             table
@@ -25936,112 +26158,26 @@ fn codegen_select_aggregate(
                 .find(|idx| idx.name.eq_ignore_ascii_case(name))
                 .filter(|idx| idx.supports_direct_column_lookup())
                 .map(|forced_idx| {
-                    let covering = where_clause.is_none()
+                    let where_from_index = !table.without_rowid
+                        && where_clause.is_some_and(|where_expr| {
+                            expr_reads_only_index_columns(
+                                where_expr,
+                                table,
+                                table_alias,
+                                forced_idx,
+                                false,
+                            )
+                        });
+                    let covering = (where_clause.is_none() || where_from_index)
                         && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
                         && aggregate_seek_is_covering(&agg_columns, forced_idx, table);
-                    (forced_idx, covering)
+                    (forced_idx, covering, where_from_index)
                 })
         } else {
             None
         };
 
-    if let Some((forced_idx, covering)) = forced_index_ordered {
-        // Index-ordered full scan feeding the shared accumulate/finalize. Forward
-        // Rewind/Next = stored order (ascending for an ASC index, descending for a
-        // DESC index), matching stock's forced-index plan.
-        let idx_cursor = 1_i32;
-        if !covering {
-            b.emit_op(
-                Opcode::OpenRead,
-                cursor,
-                table.root_page,
-                0,
-                P4::Table(table.name.clone()),
-                0,
-            );
-        }
-        b.emit_op(
-            Opcode::OpenRead,
-            idx_cursor,
-            forced_idx.root_page,
-            0,
-            P4::Index(forced_idx.name.clone()),
-            0,
-        );
-        // Empty index -> finalize with still-Null accumulators (COUNT=0 / SUM=NULL).
-        b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
-        let idx_loop_top = b.current_addr();
-        let idx_skip_label = b.emit_label();
-        if !covering {
-            if table.without_rowid {
-                // WITHOUT ROWID: the index entry carries a PK suffix, not a rowid;
-                // seek the table b-tree by the PK columns (sub-4).
-                let pk_indices = without_rowid_pk_indices(table)?;
-                emit_without_rowid_index_to_table_seek(
-                    b,
-                    table,
-                    cursor,
-                    idx_cursor,
-                    forced_idx,
-                    &pk_indices,
-                    idx_skip_label,
-                );
-            } else {
-                let rowid_reg = b.alloc_reg();
-                b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-                b.emit_jump_to_label(
-                    Opcode::SeekRowid,
-                    cursor,
-                    rowid_reg,
-                    idx_skip_label,
-                    P4::None,
-                    0,
-                );
-            }
-            // Re-apply the whole WHERE per row (the forced full index scan enforces
-            // no predicate). Reset the anon-placeholder base so a bound `?` in the
-            // residual is numbered once, matching the non-index path.
-            if let Some(where_expr) = where_clause {
-                b.set_next_anon_placeholder(where_placeholder_base);
-                emit_where_filter(
-                    b,
-                    where_expr,
-                    cursor,
-                    table,
-                    table_alias,
-                    schema,
-                    idx_skip_label,
-                );
-            }
-        }
-        if covering {
-            emit_aggregate_accumulate_body_covering(
-                b,
-                idx_cursor,
-                forced_idx,
-                table,
-                &agg_columns,
-                accum_base,
-            );
-        } else {
-            emit_aggregate_accumulate_body(
-                b,
-                cursor,
-                table,
-                table_alias,
-                schema,
-                &agg_columns,
-                accum_base,
-                bare_capture,
-            );
-        }
-        b.resolve_label(idx_skip_label);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let idx_loop_body = idx_loop_top as i32;
-        b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
-        skip_scan = true;
-    } else if let Some((idx_schema, prefix_exprs)) = index_eq_seek {
+    if let Some((idx_schema, prefix_exprs)) = index_eq_seek {
         let idx_cursor = 1_i32;
         let duplicate_run_done = b.emit_label();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -26209,6 +26345,7 @@ fn codegen_select_aggregate(
         if exact_seek {
             // Exact seek: 0 matches is authoritative → finalize directly (accumulators still Null).
             b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+            skip_scan = true;
         } else {
             b.emit_jump_to_label(
                 Opcode::If,
@@ -26909,11 +27046,12 @@ fn codegen_select_aggregate(
     } else if let Some((idx_schema, prefix_exprs, rowid_bounds)) = index_prefix_residual_seek {
         // bd-agg-leading-eq-residual: seek the storage-class-exact equality-prefix block, then apply
         // the full WHERE per row so the residual predicate is enforced (no dropped-predicate bug),
-        // and accumulate. bd-qrn03: when the prefix and exact rowid bounds enforce every conjunct,
-        // covering aggregates read only the index; all other shapes retain the table filter.
+        // and accumulate. bd-qrn03 / bd-aj9v4: when the prefix and exact rowid bounds enforce every
+        // conjunct, or when the residual WHERE reads only columns stored in `idx_schema`, evaluate
+        // the filter from the index entry and read covering aggregates without touching the table.
         // bd-z3a05: `rowid_bounds` is set only when the prefix pins every key column, so the
         // next record field is the rowid and the block is in rowid order.
-        let covering = rowid_bounds.is_some_and(|bounds| {
+        let bounds_cover_where = rowid_bounds.is_some_and(|bounds| {
             index_prefix_rowid_bounds_cover_where(
                 where_clause,
                 table,
@@ -26922,7 +27060,13 @@ fn codegen_select_aggregate(
                 &prefix_exprs,
                 bounds,
             )
-        }) && aggregate_seek_is_covering(&agg_columns, idx_schema, table);
+        });
+        let residual_from_index = !bounds_cover_where
+            && where_clause.is_some_and(|where_expr| {
+                expr_reads_only_index_columns(where_expr, table, table_alias, idx_schema, false)
+            });
+        let covering = (bounds_cover_where || residual_from_index)
+            && aggregate_seek_is_covering(&agg_columns, idx_schema, table);
         let idx_cursor = 1_i32;
         let duplicate_run_done = b.emit_label();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -27046,7 +27190,7 @@ fn codegen_select_aggregate(
 
         let skip_label = b.emit_label();
         let rowid_reg = b.alloc_reg();
-        if !covering || rowid_ceiling_reg.is_some() {
+        if !covering || rowid_ceiling_reg.is_some() || residual_from_index {
             b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
         }
         // bd-z3a05: the block is in rowid order, so once an entry's rowid
@@ -27063,6 +27207,20 @@ fn codegen_select_aggregate(
                 duplicate_run_done,
                 P4::None,
                 0,
+            );
+        }
+        if residual_from_index && let Some(where_expr) = where_clause {
+            emit_index_entry_where_filter(
+                b,
+                where_expr,
+                idx_cursor,
+                rowid_reg,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                idx_schema,
+                skip_label,
             );
         }
         if covering {
@@ -27084,7 +27242,7 @@ fn codegen_select_aggregate(
                 0,
             );
             // The prefix is redundant, but other conjuncts may require the table row.
-            if let Some(where_expr) = where_clause {
+            if !residual_from_index && let Some(where_expr) = where_clause {
                 emit_where_filter(
                     b,
                     where_expr,
@@ -27212,6 +27370,125 @@ fn codegen_select_aggregate(
             accum_base,
             bare_capture,
         );
+        skip_scan = true;
+    }
+
+    if !skip_scan
+        && let Some((forced_idx, covering, where_from_index)) = forced_index_ordered
+    {
+        // #137 sub-2 / bd-aj9v4: fallback full walk of a forced `INDEXED BY`
+        // index in its STORED order when no constrained seek matched.
+        let idx_cursor = 1_i32;
+        if !covering {
+            b.emit_op(
+                Opcode::OpenRead,
+                cursor,
+                table.root_page,
+                0,
+                P4::Table(table.name.clone()),
+                0,
+            );
+        }
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            forced_idx.root_page,
+            0,
+            P4::Index(forced_idx.name.clone()),
+            0,
+        );
+        // Empty index -> finalize with still-Null accumulators (COUNT=0 / SUM=NULL).
+        b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
+        let idx_loop_top = b.current_addr();
+        let idx_skip_label = b.emit_label();
+        let rowid_reg = (!table.without_rowid && (where_from_index || !covering)).then(|| {
+            let reg = b.alloc_reg();
+            b.emit_op(Opcode::IdxRowid, idx_cursor, reg, 0, P4::None, 0);
+            reg
+        });
+        if where_from_index
+            && let (Some(where_expr), Some(rowid_reg)) = (where_clause, rowid_reg)
+        {
+            b.set_next_anon_placeholder(where_placeholder_base);
+            emit_index_entry_where_filter(
+                b,
+                where_expr,
+                idx_cursor,
+                rowid_reg,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                forced_idx,
+                idx_skip_label,
+            );
+        }
+        if !covering {
+            if table.without_rowid {
+                // WITHOUT ROWID: the index entry carries a PK suffix, not a rowid;
+                // seek the table b-tree by the PK columns (sub-4).
+                let pk_indices = without_rowid_pk_indices(table)?;
+                emit_without_rowid_index_to_table_seek(
+                    b,
+                    table,
+                    cursor,
+                    idx_cursor,
+                    forced_idx,
+                    &pk_indices,
+                    idx_skip_label,
+                );
+            } else if let Some(rowid_reg) = rowid_reg {
+                b.emit_jump_to_label(
+                    Opcode::SeekRowid,
+                    cursor,
+                    rowid_reg,
+                    idx_skip_label,
+                    P4::None,
+                    0,
+                );
+            }
+            // Re-apply the whole WHERE per row when not already evaluated from
+            // the index entry. Reset the anon-placeholder base so a bound `?`
+            // in the residual is numbered once, matching the non-index path.
+            if !where_from_index && let Some(where_expr) = where_clause {
+                b.set_next_anon_placeholder(where_placeholder_base);
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    idx_skip_label,
+                );
+            }
+        }
+        if covering {
+            emit_aggregate_accumulate_body_covering(
+                b,
+                idx_cursor,
+                forced_idx,
+                table,
+                &agg_columns,
+                accum_base,
+            );
+        } else {
+            emit_aggregate_accumulate_body(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                &agg_columns,
+                accum_base,
+                bare_capture,
+            );
+        }
+        b.resolve_label(idx_skip_label);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let idx_loop_body = idx_loop_top as i32;
+        b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
         skip_scan = true;
     }
 
@@ -29395,12 +29672,17 @@ fn codegen_select_group_by_aggregate(
     out_col_count: i32,
     done_label: crate::Label,
     end_label: crate::Label,
-    allow_index_seek: bool,
+    from_index_hint: Option<&fsqlite_ast::IndexHint>,
     // The ORDER BY's length. It is an ASC prefix of the GROUP BY keys (the
     // only shape routed here), so the keys past it may come out in any order:
     // they may stream in a DESC index key's order, as stock emits them.
     order_by_len: usize,
 ) -> Result<(), CodegenError> {
+    let index_seek_constraint = aggregate_index_seek_constraint(from_index_hint);
+    let allow_index_seek = index_seek_constraint.allows_index_seek();
+    let required_index = index_seek_constraint.required_index();
+    let forced_indexed_by = matches!(from_index_hint, Some(fsqlite_ast::IndexHint::IndexedBy(_)));
+
     // Resolve SELECT-list aliases referenced from HAVING (e.g.
     // `SELECT product_id, SUM(qty) AS total_qty ... HAVING total_qty >= 10`)
     // and lower any valid row-value comparisons produced by alias expansion.
@@ -29416,7 +29698,8 @@ fn codegen_select_group_by_aggregate(
     };
     let having = rewritten_having.as_ref();
 
-    if where_clause.is_none()
+    if !forced_indexed_by
+        && where_clause.is_none()
         && having.is_none()
         && limit_clause.is_none()
         && let Some(plan) =
@@ -29574,15 +29857,29 @@ fn codegen_select_group_by_aggregate(
     // bd-hyoms: an IN probe pinning at least as many key terms (`a = 5 AND
     // b IN (1, 2)` on `(a, b)`) visits fewer rows than the equality prefix.
     let composite_in_width = allow_index_seek
-        .then(|| index_const_in_list_composite_target(where_clause, table, table_alias, schema))
+        .then(|| {
+            index_const_in_list_composite_target(
+                where_clause,
+                table,
+                table_alias,
+                schema,
+                required_index,
+            )
+        })
         .flatten()
         .map_or(0, |target| target.width());
     let index_eq_seek = allow_index_seek
-        .then(|| index_equality_prefix_target(where_clause, table, table_alias))
+        .then(|| index_equality_prefix_target(where_clause, table, table_alias, required_index))
         .flatten()
         .filter(|target| target.values.len() > composite_in_width);
     let index_in_seek = if allow_index_seek && !table.without_rowid && index_eq_seek.is_none() {
-        index_const_in_list_residual_target(where_clause, table, table_alias, schema)
+        index_const_in_list_residual_target(
+            where_clause,
+            table,
+            table_alias,
+            schema,
+            required_index,
+        )
     } else {
         None
     };
@@ -29687,7 +29984,10 @@ fn codegen_select_group_by_aggregate(
         let ranges: Vec<(&IndexSchema, KeyRange<'_>)> = table
             .indexes
             .iter()
-            .filter(|index| index.supports_direct_column_lookup())
+            .filter(|index| {
+                index_matches_required(index, required_index)
+                    && index.supports_direct_column_lookup()
+            })
             .filter_map(|index| {
                 ordered_scan_key_bounds(where_clause, table, table_alias, index, 0)
                     .map(|range| (index, range))
@@ -29704,6 +30004,7 @@ fn codegen_select_group_by_aggregate(
     // With no seek, an index whose order groups the keys can still feed the
     // grouping, read whole in order: it pays when the index covers the query
     // (no table read at all) or a LIMIT ends the walk after its last group.
+    // Under `INDEXED BY`, prefer walking the forced index when it groups in order.
     // The whole WHERE filters each row.
     let index_walk_input = if allow_index_seek
         && !table.without_rowid
@@ -29713,12 +30014,15 @@ fn codegen_select_group_by_aggregate(
     {
         let walkable = || {
             table.indexes.iter().filter(|index| {
-                index.supports_direct_column_lookup() && groups_in_index_order(index, 0)
+                index_matches_required(index, required_index)
+                    && index.supports_direct_column_lookup()
+                    && groups_in_index_order(index, 0)
             })
         };
         walkable()
             .find(|index| where_clause.is_none() && covers_grouping(index))
             .or_else(|| limit_clause.and_then(|_| walkable().next()))
+            .or_else(|| required_index.and_then(|_| walkable().next()))
     } else {
         None
     };
@@ -29753,7 +30057,8 @@ fn codegen_select_group_by_aggregate(
             Some(SortKeySource::Rowid)
         ),
     };
-    let groups_in_rowid_order = index_eq_seek.is_none()
+    let groups_in_rowid_order = !forced_indexed_by
+        && index_eq_seek.is_none()
         && index_in_seek.is_none()
         && index_range_input.is_none()
         && index_walk_input.is_none()
@@ -45143,6 +45448,7 @@ fn composite_index_prefix_range_target<'a>(
         // `a=? AND b<range`). Mirrors the single-column range planner's usability test verbatim, so we
         // never decline into a full table scan when the single-column index is unusable (desc/collation).
         if range_pos == 0
+            && required_index.is_none()
             && table.indexes.iter().any(|other| {
                 other.supports_direct_column_lookup()
                     && other.key_term_count() == 1
@@ -54672,7 +54978,7 @@ mod tests {
             right: Box::new(two.clone()),
             span: Span::ZERO,
         };
-        let (idx, targets) = aggregate_index_eq_seek_target(Some(&indexed_eq), &table, None)
+        let (idx, targets) = aggregate_index_eq_seek_target(Some(&indexed_eq), &table, None, None)
             .expect("indexed column equality must select the index seek");
         assert_eq!(idx.name, "idx_t_k");
         assert_eq!(targets.len(), 1);
@@ -54685,7 +54991,7 @@ mod tests {
             right: Box::new(two.clone()),
             span: Span::ZERO,
         };
-        assert!(aggregate_index_eq_seek_target(Some(&unindexed_eq), &table, None).is_none());
+        assert!(aggregate_index_eq_seek_target(Some(&unindexed_eq), &table, None, None).is_none());
 
         // Rowid / INTEGER PRIMARY KEY has no secondary index: no seek here.
         let rowid_eq = Expr::BinaryOp {
@@ -54694,10 +55000,10 @@ mod tests {
             right: Box::new(two.clone()),
             span: Span::ZERO,
         };
-        assert!(aggregate_index_eq_seek_target(Some(&rowid_eq), &table, None).is_none());
+        assert!(aggregate_index_eq_seek_target(Some(&rowid_eq), &table, None, None).is_none());
 
         // No WHERE clause at all: no seek.
-        assert!(aggregate_index_eq_seek_target(None, &table, None).is_none());
+        assert!(aggregate_index_eq_seek_target(None, &table, None, None).is_none());
 
         // Non-equality predicate: no seek.
         let range = Expr::BinaryOp {
@@ -54706,7 +55012,7 @@ mod tests {
             right: Box::new(two),
             span: Span::ZERO,
         };
-        assert!(aggregate_index_eq_seek_target(Some(&range), &table, None).is_none());
+        assert!(aggregate_index_eq_seek_target(Some(&range), &table, None, None).is_none());
     }
 
     #[test]
@@ -54714,7 +55020,7 @@ mod tests {
         let table = bd_2dgf5_table();
         // Detection: `k IN (1, 2) AND v = 3` — an IN-list CONJUNCT plus a residual.
         let e = parse_sql_expr("k IN (1, 2) AND v = 3").expect("parse");
-        let r = index_integer_in_list_residual_target(Some(&e), &table, None);
+        let r = index_integer_in_list_residual_target(Some(&e), &table, None, None);
         assert!(r.is_some(), "IN-list + residual must be detected");
         let (idx, ints, has_residual) = r.unwrap();
         assert_eq!(idx.name, "idx_t_k");
@@ -54723,7 +55029,7 @@ mod tests {
         // Residual-free still reported (has_residual = false).
         let e2 = parse_sql_expr("k IN (1, 2)").expect("parse");
         assert_eq!(
-            index_integer_in_list_residual_target(Some(&e2), &table, None).map(|(_, _, h)| h),
+            index_integer_in_list_residual_target(Some(&e2), &table, None, None).map(|(_, _, h)| h),
             Some(false)
         );
         // Routing: COUNT(*) with an IN-list + residual must reach the seek (SeekGE in the program).
@@ -64330,6 +64636,7 @@ mod tests {
                     std::slice::from_ref(&table),
                     PrefixIndexShape::AnyPrefix,
                     PrefixProbe::Literal,
+                    None,
                 )
                 .is_some()
             };
@@ -64388,6 +64695,7 @@ mod tests {
                 std::slice::from_ref(&function_table),
                 PrefixIndexShape::AnyPrefix,
                 PrefixProbe::Literal,
+                None,
             )
             .is_some(),
             "fixture must exercise the partial-index equality-prefix residual heuristic"
@@ -64421,6 +64729,7 @@ mod tests {
                     std::slice::from_ref(&function_table),
                     PrefixIndexShape::AnyPrefix,
                     PrefixProbe::Literal,
+                    None,
                 )
                 .is_none(),
                 "a scalar replacement must keep the function-bearing partial index \
@@ -64443,6 +64752,7 @@ mod tests {
                     std::slice::from_ref(&plain_table),
                     PrefixIndexShape::AnyPrefix,
                     PrefixProbe::Literal,
+                    None,
                 )
                 .is_some(),
                 "the function-free partial index must remain eligible for the residual heuristic"
@@ -69778,15 +70088,16 @@ mod tests {
             "fixture must exercise the rowid MIN/MAX leaf seek"
         );
         assert!(
-            minmax_index_seek_plan(&index_agg, &table).is_some(),
+            minmax_index_seek_plan(&index_agg, &table, None).is_some(),
             "fixture must exercise the secondary-index MIN/MAX leaf seek"
         );
         assert!(
-            minmax_pair_seek_plan(&pair_agg, &table).is_some(),
+            minmax_pair_seek_plan(&pair_agg, &table, None).is_some(),
             "fixture must exercise the paired MIN/MAX leaf seek"
         );
         assert!(
-            minmax_range_seek_plan(&range_agg, &table, None, fixture_where(&range_stmt)).is_some(),
+            minmax_range_seek_plan(&range_agg, &table, None, fixture_where(&range_stmt), None)
+                .is_some(),
             "fixture must exercise the bounded secondary-index MIN/MAX leaf seek"
         );
         assert!(
@@ -69800,13 +70111,24 @@ mod tests {
             "fixture must exercise the bounded rowid MIN/MAX leaf seek"
         );
         assert!(
-            minmax_prefix_seek_plan(&prefix_agg, prefix_table, None, fixture_where(&prefix_stmt),)
-                .is_some(),
+            minmax_prefix_seek_plan(
+                &prefix_agg,
+                prefix_table,
+                None,
+                fixture_where(&prefix_stmt),
+                None,
+            )
+            .is_some(),
             "fixture must exercise the composite-prefix MIN/MAX leaf seek"
         );
         assert!(
-            count_distinct_index_walk_plan(&distinct_agg, fixture_columns(&distinct_stmt), &table,)
-                .is_some(),
+            count_distinct_index_walk_plan(
+                &distinct_agg,
+                fixture_columns(&distinct_stmt),
+                &table,
+                None,
+            )
+            .is_some(),
             "fixture must exercise the COUNT(DISTINCT) index walk"
         );
 
@@ -69820,16 +70142,22 @@ mod tests {
                     "custom max/1 must decline the rowid leaf seek"
                 );
                 assert!(
-                    minmax_index_seek_plan(&index_agg, &table).is_none(),
+                    minmax_index_seek_plan(&index_agg, &table, None).is_none(),
                     "custom max/1 must decline the secondary-index leaf seek"
                 );
                 assert!(
-                    minmax_pair_seek_plan(&pair_agg, &table).is_none(),
+                    minmax_pair_seek_plan(&pair_agg, &table, None).is_none(),
                     "custom max/1 must decline the MIN/MAX pair seek"
                 );
                 assert!(
-                    minmax_range_seek_plan(&range_agg, &table, None, fixture_where(&range_stmt),)
-                        .is_none(),
+                    minmax_range_seek_plan(
+                        &range_agg,
+                        &table,
+                        None,
+                        fixture_where(&range_stmt),
+                        None,
+                    )
+                    .is_none(),
                     "custom max/1 must decline the bounded secondary-index leaf seek"
                 );
                 assert!(
@@ -69848,6 +70176,7 @@ mod tests {
                         prefix_table,
                         None,
                         fixture_where(&prefix_stmt),
+                        None,
                     )
                     .is_none(),
                     "custom max/1 must decline the composite-prefix leaf seek"
@@ -69865,6 +70194,7 @@ mod tests {
                         &distinct_agg,
                         fixture_columns(&distinct_stmt),
                         &table,
+                        None,
                     )
                     .is_none(),
                     "custom count/1 must decline COUNT(DISTINCT) index-walk algebra"
@@ -74592,6 +74922,137 @@ mod tests {
             open_read.p2, 2,
             "bd-wwqen.1: COUNT(*) with no indexes should open table (root=2), got root={}",
             open_read.p2
+        );
+    }
+
+    #[test]
+    fn bd_aj9v4_indexed_by_covering_aggregate_seeks_without_table_lookup() {
+        let typed = |name: &str, affinity: char, is_ipk: bool, ty: &str| {
+            let mut col = ColumnInfo::basic(name, affinity, is_ipk);
+            col.type_name = Some(ty.to_owned());
+            col
+        };
+        let table = TableSchema {
+            name: "s".to_owned(),
+            root_page: 2,
+            columns: vec![
+                typed("id", 'D', true, "INTEGER"),
+                typed("g", 'D', false, "INTEGER"),
+                typed("h", 'D', false, "INTEGER"),
+                typed("val", 'D', false, "INTEGER"),
+            ],
+            indexes: vec![
+                IndexSchema {
+                    name: "s_g".to_owned(),
+                    root_page: 3,
+                    columns: vec!["g".to_owned()],
+                    key_expressions: vec!["g".to_owned()],
+                    key_sort_directions: Vec::new(),
+                    where_clause: None,
+                    is_unique: false,
+                    key_collations: Vec::new(),
+                    conflict_action: None,
+                },
+                IndexSchema {
+                    name: "s_gh".to_owned(),
+                    root_page: 4,
+                    columns: vec!["g".to_owned(), "h".to_owned()],
+                    key_expressions: vec!["g".to_owned(), "h".to_owned()],
+                    key_sort_directions: Vec::new(),
+                    where_clause: None,
+                    is_unique: false,
+                    key_collations: Vec::new(),
+                    conflict_action: None,
+                },
+                IndexSchema {
+                    name: "s_gv".to_owned(),
+                    root_page: 5,
+                    columns: vec!["g".to_owned(), "val".to_owned()],
+                    key_expressions: vec!["g".to_owned(), "val".to_owned()],
+                    key_sort_directions: Vec::new(),
+                    where_clause: None,
+                    is_unique: false,
+                    key_collations: Vec::new(),
+                    conflict_action: None,
+                },
+            ],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+        let schema = vec![table];
+        let compile = |sql: &str| {
+            let stmt = select_sql(sql);
+            let mut b = ProgramBuilder::new();
+            codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+            b.finish().unwrap().ops().to_vec()
+        };
+
+        for sql in [
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE g BETWEEN 100 AND 199",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE g = 100",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE g = 100 AND val BETWEEN 10 AND 50",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE g IN (10, 20, 30)",
+            "SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE g = 100 AND val % 2 = 0",
+            "SELECT count(*) FROM s INDEXED BY s_gv WHERE g = 100",
+            "SELECT g, count(*), sum(val) FROM s INDEXED BY s_gv WHERE g BETWEEN 100 AND 199 GROUP BY g",
+        ] {
+            let ops = compile(sql);
+            assert!(
+                ops.iter()
+                    .any(|op| op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Index(n) if n == "s_gv")),
+                "expected OpenRead on s_gv for: {sql}"
+            );
+            assert!(
+                !ops.iter()
+                    .any(|op| op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Table(_))),
+                "expected covering s_gv (no table OpenRead) for: {sql}"
+            );
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+                "expected no SeekRowid table lookup for: {sql}"
+            );
+            assert!(
+                ops.iter()
+                    .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT)),
+                "expected range/equality seek opcode on s_gv for: {sql}"
+            );
+        }
+
+        // Unseekable WHERE over covering columns still avoids table OpenRead / SeekRowid.
+        let full_cover = compile("SELECT count(*), sum(val) FROM s INDEXED BY s_gv WHERE val > 900");
+        assert!(
+            full_cover
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Index(n) if n == "s_gv"))
+        );
+        assert!(
+            !full_cover
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Table(_)))
+        );
+        assert!(!full_cover.iter().any(|op| op.opcode == Opcode::SeekRowid));
+
+        // Forced non-covering index seeks s_gh (not whole index) and looks up table rows.
+        let non_cover =
+            compile("SELECT count(*), sum(val) FROM s INDEXED BY s_gh WHERE g BETWEEN 100 AND 199");
+        assert!(
+            non_cover
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Index(n) if n == "s_gh"))
+        );
+        assert!(non_cover.iter().any(|op| op.opcode == Opcode::SeekGE));
+        assert!(non_cover.iter().any(|op| op.opcode == Opcode::SeekRowid));
+
+        // Negative control: NOT INDEXED must never open any secondary index.
+        let not_indexed =
+            compile("SELECT count(*), sum(val) FROM s NOT INDEXED WHERE g BETWEEN 100 AND 199");
+        assert!(
+            !not_indexed
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Index(_)))
         );
     }
 }
