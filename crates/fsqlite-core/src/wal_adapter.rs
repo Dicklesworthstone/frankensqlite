@@ -4304,9 +4304,9 @@ where
     /// Holding the descriptor is safe: the read is `READONLY` (no lock), the
     /// certificate is only ever appended/truncated *in place* (never
     /// unlinked+recreated), so re-reading `file_size` each call observes peer
-    /// appends live — including the truncate-to-empty that the first append
-    /// of a new WAL generation performs to drop the prior generation's
-    /// records. [`Self::replace_inner`] (and `checkpoint`) still invalidate
+    /// appends live — including the compaction that the first append of a
+    /// new WAL generation performs to retain one prior-generation anchor.
+    /// [`Self::replace_inner`] (and `checkpoint`) still invalidate
     /// this cache at a generation change. A stale cross-generation read is
     /// additionally caught by the callers' `record.wal_generation` check
     /// (fail-closed). Any read anomaly drops the descriptor, forcing a fresh
@@ -5585,6 +5585,72 @@ where
         }))
     }
 
+    /// Prove that compaction preserved the captured complete tail and that
+    /// every later certificate is still represented by the current WAL.
+    /// The caller holds the external writer gate, so the sidecar cannot
+    /// change during this scan. Current-generation page conflicts remain
+    /// the responsibility of `conflicts_after_generation_change`.
+    async fn certificate_sidecar_proves_continuity(
+        file: &V::File,
+        cx: &Cx,
+        captured: &ObservedCertificateHorizon,
+        snapshot_generation: WalGenerationIdentity,
+        current_generation: WalGenerationIdentity,
+    ) -> Result<bool> {
+        let Some((captured_record, _)) = &captured.last else {
+            // Truncate-before-rewrite can return the same file to length
+            // zero after an intervening commit. An empty capture provides
+            // no anchor with which to distinguish that lost history.
+            return Ok(false);
+        };
+        let Some(current) = Self::read_certificate_sidecar_horizon(file, cx).await? else {
+            return Ok(false);
+        };
+        if current.identity != captured.identity {
+            return Ok(false);
+        }
+        if current.same_as(captured) {
+            return Ok(true);
+        }
+        if current_generation == snapshot_generation {
+            return Ok(false);
+        }
+
+        // Walk exact footer boundaries backwards, without retaining the
+        // whole sidecar. The oldest record must be byte-identical to the
+        // captured tail; every intervening record must belong to the WAL
+        // generation whose frames the subsequent conflict check can see.
+        let mut record_end = current.len;
+        while record_end != 0 {
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let Some((record_start, record)) =
+                Self::read_certificate_record_ending_at(file, cx, record_end).await?
+            else {
+                return Ok(false);
+            };
+            if record_start == 0 {
+                let record_len =
+                    usize::try_from(record_end).map_err(|_| FrankenError::WalCorrupt {
+                        detail: "parallel WAL certificate continuity anchor exceeds usize".to_owned(),
+                    })?;
+                let anchor = Self::read_certificate_sidecar_exact(
+                    file,
+                    cx,
+                    0,
+                    record_len,
+                    "continuity anchor",
+                )
+                .await?;
+                return Ok(anchor.as_slice() == captured_record.as_slice());
+            }
+            if record.wal_generation != current_generation {
+                return Ok(false);
+            }
+            record_end = record_start;
+        }
+        Ok(false)
+    }
+
     async fn read_certificate_record_ending_at(
         file: &V::File,
         cx: &Cx,
@@ -5692,13 +5758,9 @@ where
         Ok(0)
     }
 
-    /// The newest record — and so, in generation-ordered appends, every
-    /// record — belongs to a WAL generation a checkpoint has since reset.
-    /// Readers already treat that tail as absent, so drop it before the
-    /// first append of `generation`: the sidecar then holds at most one
-    /// generation instead of every commit since the database was created
-    /// (bd-reality-check-1022-llk6g.32). Unsynced like every append; the
-    /// crash ordering is the one `discard_legacy_certificate_sidecar` gives.
+    /// A prior generation with a torn suffix cannot provide an exact
+    /// continuity anchor. Discard it before appending to the current
+    /// generation; a waiter that captured the old tail must then retry.
     fn discard_prior_generation_certificate_sidecar(
         file: &mut V::File,
         cx: &Cx,
@@ -5715,9 +5777,44 @@ where
         Ok(0)
     }
 
+    /// Keep only the newest complete record from the reset generation. A
+    /// waiter that released its WAL read claim can match these exact bytes
+    /// against its captured tail (bd-5eult), while the sidecar stays bounded
+    /// to one prior record plus the current generation's records.
+    ///
+    /// Truncate before rewriting so a partial write cannot leave the new
+    /// head underneath a stale tail. Like an append, this is unsynced: a
+    /// crash may lose or tear the anchor, in which case continuity cannot be
+    /// proved. Neither a missing nor an empty anchor proves absence of an
+    /// intervening commit. A single-record sidecar already has this shape.
+    async fn retain_prior_generation_certificate_sidecar(
+        file: &mut V::File,
+        cx: &Cx,
+        file_size: u64,
+        generation: WalGenerationIdentity,
+        newest_record: &[u8],
+    ) -> Result<u64> {
+        let retained_len =
+            u64::try_from(newest_record.len()).expect("bounded certificate length fits u64");
+        if file_size == retained_len {
+            return Ok(retained_len);
+        }
+        tracing::debug!(
+            target: "fsqlite::wal::durability_combiner",
+            file_size,
+            retained_len,
+            checkpoint_seq = generation.checkpoint_seq,
+            "retaining the newest prior-generation certificate as a continuity anchor"
+        );
+        file.truncate(cx, 0)?;
+        file.write(cx, newest_record, 0).await?;
+        Ok(retained_len)
+    }
+
     /// Return a safe append boundary for a record of `generation`, repairing
-    /// exactly one validated torn suffix in place and dropping a sidecar whose
-    /// tail belongs to a prior generation.
+    /// exactly one validated torn suffix in place. A complete prior-generation
+    /// tail is retained as one continuity anchor; a torn prior-generation
+    /// suffix is discarded conservatively.
     ///
     /// The caller must hold the database's external writer or maintenance
     /// gate for the whole scan/truncate/append sequence. Keeping this helper
@@ -5775,9 +5872,10 @@ where
                     match decode_durable_certificate_record(&bytes, "append-boundary record") {
                         Ok(record) => {
                             if record.wal_generation != generation {
-                                return Self::discard_prior_generation_certificate_sidecar(
-                                    file, cx, file_size, generation,
-                                );
+                                return Self::retain_prior_generation_certificate_sidecar(
+                                    file, cx, file_size, generation, &bytes,
+                                )
+                                .await;
                             }
                             return Ok(file_size);
                         }
@@ -7087,25 +7185,31 @@ where
             let in_flight = captured.last.as_ref().is_some_and(|(_, record)| {
                 record.wal_generation == generation && record.wal_frame_end > horizon
             });
-            let current = if in_flight {
-                None
+            let continuous = if in_flight {
+                false
             } else {
                 match self.open_certificate_sidecar_for_horizon(cx) {
                     Ok(Some(mut current)) => {
-                        let observed = Self::read_certificate_sidecar_horizon(&current, cx).await;
+                        let proof = Self::certificate_sidecar_proves_continuity(
+                            &current,
+                            cx,
+                            &captured,
+                            generation,
+                            self.inner.inner().generation_identity(),
+                        )
+                        .await;
                         let cleanup_cx = cx.create_child();
                         let _cleanup_mask = cleanup_cx.masked();
                         let _ = current.close(&cleanup_cx);
-                        observed.ok().flatten()
+                        proof.unwrap_or(false)
                     }
-                    Ok(None) | Err(_) => None,
+                    Ok(None) | Err(_) => false,
                 }
             };
-            let unchanged = current.is_some_and(|observed| observed.same_as(&captured));
             let cleanup_cx = cx.create_child();
             let _cleanup_mask = cleanup_cx.masked();
             let _ = file.close(&cleanup_cx);
-            Ok(unchanged)
+            Ok(continuous)
         })
     }
 
@@ -11048,10 +11152,361 @@ mod tests {
             .certificate
     }
 
+    fn publish_continuity_fixture_page(
+        backend: &mut PathRefreshingWalBackend<MemoryVfs>,
+        cx: &Cx,
+        commit_seq: u64,
+        page_number: u32,
+        page: &[u8],
+    ) {
+        let frame = u64::try_from(backend.inner.frame_count()).expect("frame count fits u64") + 1;
+        let mut certificate = sample_certificate(commit_seq, commit_seq, vec![1]);
+        certificate.db_size_pages = 3;
+        certificate.wal_frame_payload_digest = test_frame_payload_digest(page_number, page, 3);
+        certificate.certificate_crc32c = certificate.computed_crc32c();
+        backend
+            .persist_parallel_wal_commit_certificate(cx, &certificate, frame, frame)
+            .expect("persist the certificate before its frame");
+        backend
+            .append_frame(cx, page_number, page, 3)
+            .expect("append the certified frame");
+        backend.sync(cx).expect("publish the certified frame");
+    }
+
+    fn reset_continuity_fixture(backend: &mut PathRefreshingWalBackend<MemoryVfs>, cx: &Cx) {
+        let previous_generation = backend.inner.inner().generation_identity();
+        let mut writer = MockCheckpointPageWriter;
+        let result = backend
+            .checkpoint(cx, CheckpointMode::Truncate, &mut writer, 0, None)
+            .expect("reset the fixture WAL");
+        assert!(result.wal_was_reset);
+        assert_ne!(
+            backend.inner.inner().generation_identity(),
+            previous_generation
+        );
+    }
+
+    fn newest_continuity_fixture_record(
+        backend: &PathRefreshingWalBackend<MemoryVfs>,
+        cx: &Cx,
+    ) -> Vec<u8> {
+        let mut file = backend
+            .open_certificate_sidecar_for_horizon(cx)
+            .expect("open the current sidecar")
+            .expect("the fixture has a sidecar");
+        let observed =
+            PathRefreshingWalBackend::<MemoryVfs>::read_certificate_sidecar_horizon(&file, cx)
+                .expect("read the current tail")
+                .expect("the current tail has an identity");
+        file.close(cx).expect("close the current-tail reader");
+        observed.last.expect("the current tail is complete").0
+    }
+
+    fn certificate_continuity_fixture(
+        vfs: &MemoryVfs,
+        cx: &Cx,
+    ) -> (
+        PathRefreshingWalBackend<MemoryVfs>,
+        TransactionConflictSnapshot,
+        Vec<u8>,
+    ) {
+        let mut page_one =
+            sqlite_page_one(u16::try_from(PAGE_SIZE).expect("test page size fits u16"));
+        page_one[28..32].copy_from_slice(&3_u32.to_be_bytes());
+        let page_two = sample_page(0x22);
+        write_main_db_pages(
+            vfs,
+            cx,
+            &[page_one.clone(), page_two.clone(), sample_page(0x33)],
+        );
+        let mut backend = make_path_refreshing_backend(vfs, cx);
+        publish_continuity_fixture_page(&mut backend, cx, 1, 1, &page_one);
+        backend
+            .begin_transaction(cx)
+            .expect("pin the original generation");
+        let pinned = backend
+            .pinned_read_snapshot()
+            .expect("pinned original snapshot");
+        let snapshot = TransactionConflictSnapshot {
+            generation: pinned.generation,
+            last_commit_frame: pinned.last_commit_frame,
+            commit_count: pinned.commit_count,
+            snapshot_db_size: 3,
+        };
+        assert!(
+            backend
+                .capture_certificate_sidecar_horizon(cx)
+                .expect("capture the certificate")
+        );
+        (backend, snapshot, page_two)
+    }
+
+    #[test]
+    fn bd_5eult_retained_anchor_admits_disjoint_current_generation_commit() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, page_two) = certificate_continuity_fixture(&vfs, &cx);
+        let anchor = read_certificate_sidecar(&vfs, &cx);
+        reset_continuity_fixture(&mut backend, &cx);
+        let peer_page = sample_page(0x77);
+        publish_continuity_fixture_page(&mut backend, &cx, 2, 3, &peer_page);
+        assert!(
+            read_certificate_sidecar(&vfs, &cx).starts_with(&anchor),
+            "the first append must preserve the captured complete record"
+        );
+        assert!(
+            backend
+                .certificate_sidecar_unchanged_since_capture(&cx, snapshot.generation, 1)
+                .expect("prove cross-reset certificate continuity")
+        );
+        assert!(
+            backend.certificate_sidecar_capture.is_none(),
+            "the proof consumes its capture"
+        );
+        assert!(
+            backend
+                .conflicting_pages_since_snapshot(
+                    &cx,
+                    snapshot,
+                    &[2],
+                    &[conflict_baseline(2, &page_two)],
+                )
+                .expect("validate the untouched candidate page")
+                .is_empty()
+        );
+        assert_eq!(
+            backend.read_page(&cx, 3).expect("read the peer commit"),
+            Some(peer_page)
+        );
+    }
+
+    #[test]
+    fn bd_5eult_retained_anchor_does_not_hide_identical_page_write() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, page_two) = certificate_continuity_fixture(&vfs, &cx);
+        reset_continuity_fixture(&mut backend, &cx);
+        publish_continuity_fixture_page(&mut backend, &cx, 2, 2, &page_two);
+        assert!(
+            backend
+                .certificate_sidecar_unchanged_since_capture(&cx, snapshot.generation, 1)
+                .expect("the certificate proof admits only the generation history")
+        );
+        assert_eq!(
+            backend
+                .conflicting_pages_since_snapshot(
+                    &cx,
+                    snapshot,
+                    &[2],
+                    &[conflict_baseline(2, &page_two)],
+                )
+                .expect("retain the structural-write conflict"),
+            vec![2],
+            "a current-generation frame conflicts even when its payload is unchanged"
+        );
+    }
+
+    #[test]
+    fn bd_5eult_refuses_commits_hidden_in_original_or_intermediate_generation() {
+        for intermediate_generation in [false, true] {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let (mut backend, snapshot, _) = certificate_continuity_fixture(&vfs, &cx);
+            if intermediate_generation {
+                reset_continuity_fixture(&mut backend, &cx);
+            }
+            publish_continuity_fixture_page(&mut backend, &cx, 2, 3, &sample_page(0x55));
+            reset_continuity_fixture(&mut backend, &cx);
+            publish_continuity_fixture_page(&mut backend, &cx, 3, 3, &sample_page(0x66));
+            assert!(
+                !backend
+                    .certificate_sidecar_unchanged_since_capture(&cx, snapshot.generation, 1)
+                    .expect("refuse a reset-away fsqlite commit"),
+                "intermediate_generation={intermediate_generation}"
+            );
+        }
+    }
+
+    #[test]
+    fn bd_5eult_refuses_captured_certificate_ahead_of_snapshot_horizon() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, _) = certificate_continuity_fixture(&vfs, &cx);
+        let mut in_flight = sample_certificate(2, 2, vec![1]);
+        in_flight.db_size_pages = 3;
+        in_flight.wal_frame_payload_digest = test_frame_payload_digest(3, &sample_page(0x55), 3);
+        in_flight.certificate_crc32c = in_flight.computed_crc32c();
+        backend
+            .persist_parallel_wal_commit_certificate(&cx, &in_flight, 2, 2)
+            .expect("publish an in-flight certificate before its frames");
+        assert!(
+            backend
+                .capture_certificate_sidecar_horizon(&cx)
+                .expect("capture the in-flight tail")
+        );
+        reset_continuity_fixture(&mut backend, &cx);
+        publish_continuity_fixture_page(&mut backend, &cx, 3, 3, &sample_page(0x66));
+        assert!(
+            !backend
+                .certificate_sidecar_unchanged_since_capture(&cx, snapshot.generation, 1)
+                .expect("an in-flight original-generation commit invalidates the proof")
+        );
+    }
+
+    #[test]
+    fn bd_5eult_refuses_empty_capture_after_compaction_erases_history() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, _) = certificate_continuity_fixture(&vfs, &cx);
+        replace_certificate_sidecar(&vfs, &cx, &[]);
+        assert!(
+            backend
+                .capture_certificate_sidecar_horizon(&cx)
+                .expect("capture an empty sidecar")
+        );
+        publish_continuity_fixture_page(&mut backend, &cx, 2, 3, &sample_page(0x55));
+        reset_continuity_fixture(&mut backend, &cx);
+        // A crash after truncate(0), before the retained head's write, leaves
+        // the same identity and length that were captured. They prove no
+        // continuity: the intervening fsqlite commit has disappeared.
+        replace_certificate_sidecar(&vfs, &cx, &[]);
+        assert!(
+            !backend
+                .certificate_sidecar_unchanged_since_capture(&cx, snapshot.generation, 1)
+                .expect("an empty cross-reset capture cannot prove continuity")
+        );
+    }
+
+    #[test]
+    fn bd_5eult_refuses_absent_capture_with_only_current_generation_records() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut backend = make_path_refreshing_backend(&vfs, &cx);
+        backend
+            .append_frame(&cx, 1, &sample_page(0x11), 3)
+            .expect("stock-like original commit");
+        backend
+            .sync(&cx)
+            .expect("publish the original commit without a certificate");
+        let generation = backend.inner.inner().generation_identity();
+        assert!(
+            backend
+                .capture_certificate_sidecar_horizon(&cx)
+                .expect("capture an absent sidecar")
+        );
+        publish_continuity_fixture_page(&mut backend, &cx, 1, 3, &sample_page(0x55));
+        reset_continuity_fixture(&mut backend, &cx);
+        replace_certificate_sidecar(&vfs, &cx, &[]);
+        publish_continuity_fixture_page(&mut backend, &cx, 2, 3, &sample_page(0x66));
+        assert!(
+            !backend
+                .certificate_sidecar_unchanged_since_capture(&cx, generation, 1)
+                .expect("current-generation records alone cannot account for erased history")
+        );
+    }
+
+    #[test]
+    fn bd_5eult_refuses_missing_torn_or_corrupt_anchor() {
+        for damage in ["missing", "torn", "corrupt"] {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let (mut backend, snapshot, _) = certificate_continuity_fixture(&vfs, &cx);
+            let mut anchor = read_certificate_sidecar(&vfs, &cx);
+            reset_continuity_fixture(&mut backend, &cx);
+            publish_continuity_fixture_page(&mut backend, &cx, 2, 3, &sample_page(0x55));
+            let current = newest_continuity_fixture_record(&backend, &cx);
+            match damage {
+                "missing" => anchor.clear(),
+                "torn" => anchor.truncate(anchor.len() / 2),
+                "corrupt" => anchor[20] ^= 1,
+                _ => unreachable!(),
+            }
+            anchor.extend_from_slice(&current);
+            replace_certificate_sidecar(&vfs, &cx, &anchor);
+            assert!(
+                !backend
+                    .certificate_sidecar_unchanged_since_capture(&cx, snapshot.generation, 1)
+                    .expect("damaged continuity proof must fail closed"),
+                "damage={damage}"
+            );
+        }
+    }
+
+    #[test]
+    fn bd_5eult_refuses_changed_tail_without_generation_change() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, _) = certificate_continuity_fixture(&vfs, &cx);
+        publish_continuity_fixture_page(&mut backend, &cx, 2, 3, &sample_page(0x55));
+        assert!(
+            !backend
+                .certificate_sidecar_unchanged_since_capture(&cx, snapshot.generation, 1)
+                .expect("the cross-reset extension cannot certify an unchanged generation")
+        );
+    }
+
+    #[test]
+    fn bd_5eult_refuses_replaced_sidecar_with_identical_anchor() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, _) = certificate_continuity_fixture(&vfs, &cx);
+        reset_continuity_fixture(&mut backend, &cx);
+        publish_continuity_fixture_page(&mut backend, &cx, 2, 3, &sample_page(0x55));
+        let bytes = read_certificate_sidecar(&vfs, &cx);
+        // This is an in-memory VFS namespace replacement; the captured
+        // descriptor stays open on the old object throughout the proof.
+        vfs.delete(&cx, Path::new(CERTIFICATE_PATH), false)
+            .expect("unlink the memory sidecar while its old descriptor is held");
+        replace_certificate_sidecar(&vfs, &cx, &bytes);
+        assert!(
+            !backend
+                .certificate_sidecar_unchanged_since_capture(&cx, snapshot.generation, 1)
+                .expect("identical bytes on a different file do not prove continuity")
+        );
+    }
+
+    #[test]
+    fn bd_5eult_refuses_old_generation_record_between_anchor_and_current_tail() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, _) = certificate_continuity_fixture(&vfs, &cx);
+        publish_continuity_fixture_page(&mut backend, &cx, 2, 3, &sample_page(0x55));
+        let mut uncompacted_history = read_certificate_sidecar(&vfs, &cx);
+        reset_continuity_fixture(&mut backend, &cx);
+        publish_continuity_fixture_page(&mut backend, &cx, 3, 3, &sample_page(0x66));
+        let current = newest_continuity_fixture_record(&backend, &cx);
+        uncompacted_history.extend_from_slice(&current);
+        replace_certificate_sidecar(&vfs, &cx, &uncompacted_history);
+        assert!(
+            !backend
+                .certificate_sidecar_unchanged_since_capture(&cx, snapshot.generation, 1)
+                .expect("every record after the anchor must belong to the current generation")
+        );
+    }
+
+    #[test]
+    fn bd_5eult_unchanged_complete_capture_still_proves_continuity() {
+        for reset in [false, true] {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let (mut backend, snapshot, _) = certificate_continuity_fixture(&vfs, &cx);
+            if reset {
+                reset_continuity_fixture(&mut backend, &cx);
+            }
+            assert!(
+                backend
+                    .certificate_sidecar_unchanged_since_capture(&cx, snapshot.generation, 1)
+                    .expect("the unchanged complete anchor remains sufficient"),
+                "reset={reset}"
+            );
+        }
+    }
+
     /// bd-reality-check-1022-llk6g.32: `-wal-cert` kept every certificate
     /// since the database was created, because nothing removed the records a
     /// WAL reset had made unreadable. The first append of a reset generation
-    /// now drops them, so the sidecar holds one generation at most.
+    /// now retains only the newest prior record as a continuity anchor
+    /// (bd-5eult), followed by the current generation's records.
     #[test]
     fn first_append_after_wal_reset_compacts_prior_generation_certificates() {
         const COMMITS_PER_GENERATION: usize = 4;
@@ -11060,6 +11515,7 @@ mod tests {
         let mut backend = make_path_refreshing_backend(&vfs, &cx);
         let combiner = fsqlite_wal::ParallelWalDurabilityCombiner::default();
         let mut batch_id = 0;
+        let mut prior_anchor = Vec::new();
         for cycle in 0..3 {
             let mut record_len = 0;
             let mut latest = None;
@@ -11069,23 +11525,30 @@ mod tests {
                     publish_certified_commit(&mut backend, &cx, &combiner, batch_id);
                 if commit == 0 {
                     let sidecar = read_certificate_sidecar(&vfs, &cx);
-                    let record = ParallelWalDurableCertificateRecord::from_bytes(&sidecar)
-                        .expect("a generation's first append leaves exactly one record");
+                    assert!(
+                        sidecar.starts_with(&prior_anchor),
+                        "cycle {cycle}: retain the exact newest prior-generation record"
+                    );
+                    let current_record = &sidecar[prior_anchor.len()..];
+                    let record = ParallelWalDurableCertificateRecord::from_bytes(current_record)
+                        .expect("one current-generation record follows the retained anchor");
                     assert_eq!(
                         record.wal_generation,
                         backend.inner.inner().generation_identity()
                     );
                     assert_eq!(record.certificate, certificate);
-                    record_len = sidecar.len();
+                    record_len = current_record.len();
                 }
                 latest = Some(certificate);
             }
-            let sidecar_len = read_certificate_sidecar(&vfs, &cx).len();
+            let sidecar = read_certificate_sidecar(&vfs, &cx);
+            let sidecar_len = sidecar.len();
             assert_eq!(
                 sidecar_len,
-                COMMITS_PER_GENERATION * record_len,
-                "cycle {cycle}: only the current generation's records remain"
+                prior_anchor.len() + COMMITS_PER_GENERATION * record_len,
+                "cycle {cycle}: only one prior anchor and the current generation remain"
             );
+            prior_anchor = sidecar[sidecar_len - record_len..].to_vec();
             assert_eq!(
                 backend
                     .latest_authorized_parallel_wal_commit_certificate(&cx)
@@ -11104,8 +11567,8 @@ mod tests {
                 )
                 .expect("truncate checkpoint resets the WAL generation");
             assert!(checkpoint.wal_was_reset);
-            // Readers already treat the old records as absent; they stay on
-            // disk until the new generation's first append replaces them.
+            // Old records stay on disk until the new generation's first
+            // append compacts them to the newest complete anchor.
             assert_eq!(read_certificate_sidecar(&vfs, &cx).len(), sidecar_len);
         }
     }
