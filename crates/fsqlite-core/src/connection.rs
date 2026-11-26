@@ -28717,18 +28717,34 @@ impl Connection {
             return false;
         }
         // An expression index leaves `columns` empty, so it never matches.
-        table.indexes.iter().any(|index| {
-            let mut previous_key: Option<usize> = None;
-            index.columns.iter().enumerate().any(|(key_pos, column)| {
-                let Some(group_pos) = keys.iter().position(|key| key.eq_ignore_ascii_case(column))
-                else {
-                    return false;
-                };
-                let out_of_order = previous_key.is_some_and(|previous| group_pos < previous);
-                previous_key = Some(group_pos);
-                out_of_order || index.key_term_descending(key_pos)
+        // Also route `LIMIT` queries whose leading index columns match the
+        // GROUP BY keys through the storage substrate (bd-vbqub): walking the
+        // index streams only the requested groups instead of scanning the
+        // entire mirror table.
+        let limit_streamable = select.limit.is_some()
+            && table.indexes.iter().any(|index| {
+                index.where_clause.is_none()
+                    && keys.len() <= index.columns.len()
+                    && index
+                        .columns
+                        .iter()
+                        .zip(&keys)
+                        .all(|(col, key)| col.eq_ignore_ascii_case(key))
+            });
+        limit_streamable
+            || table.indexes.iter().any(|index| {
+                let mut previous_key: Option<usize> = None;
+                index.columns.iter().enumerate().any(|(key_pos, column)| {
+                    let Some(group_pos) =
+                        keys.iter().position(|key| key.eq_ignore_ascii_case(column))
+                    else {
+                        return false;
+                    };
+                    let out_of_order = previous_key.is_some_and(|previous| group_pos < previous);
+                    previous_key = Some(group_pos);
+                    out_of_order || index.key_term_descending(key_pos)
+                })
             })
-        })
     }
 
     /// The statement shapes the GROUP BY storage substrate compiles, whatever
@@ -28849,11 +28865,7 @@ impl Connection {
                     .order_by
                     .iter()
                     .zip(group_by.iter())
-                    .all(|(term, key)| {
-                        term.nulls.is_none()
-                            && !matches!(term.direction, Some(SortDirection::Desc))
-                            && &term.expr == key
-                    }))
+                    .all(|(term, key)| term.nulls.is_none() && &term.expr == key))
     }
 
     async fn try_execute_group_by_storage_substrate(

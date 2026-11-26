@@ -444,3 +444,72 @@ fn equality_prefix_residual_keeps_collation_and_index_hint_guards() {
         assert_table_scan(&compile(sql, &schema), sql);
     }
 }
+
+#[test]
+fn bd_vbqub_grouped_order_by_desc_limit_streams_in_reverse_without_sorter() {
+    let schema = schema('D', &["post_id"]);
+
+    // Whole-index reverse walk with LIMIT: Last + Prev on index, no SorterOpen.
+    let desc_walk = compile(
+        "SELECT post_id, count(*), sum(n) FROM likes GROUP BY post_id ORDER BY post_id DESC LIMIT 5",
+        &schema,
+    );
+    assert!(
+        !desc_walk.ops().iter().any(|op| op.opcode == Opcode::SorterOpen),
+        "ORDER BY post_id DESC LIMIT 5 must stream without a sorter"
+    );
+    assert!(
+        desc_walk.ops().iter().any(|op| op.opcode == Opcode::Last),
+        "ORDER BY post_id DESC LIMIT 5 must start at Last on ASC index"
+    );
+    assert!(
+        desc_walk.ops().iter().any(|op| op.opcode == Opcode::Prev),
+        "ORDER BY post_id DESC LIMIT 5 must walk backwards with Prev"
+    );
+    assert!(
+        desc_walk.ops().iter().any(|op| op.opcode == Opcode::DecrJumpZero),
+        "ORDER BY post_id DESC LIMIT 5 must stop at LIMIT via DecrJumpZero"
+    );
+
+    // Bounded range reverse walk with LIMIT: SeekLE + Prev, no SorterOpen.
+    let desc_range = compile(
+        "SELECT post_id, count(*), sum(n) FROM likes WHERE post_id BETWEEN 10 AND 50 GROUP BY post_id ORDER BY post_id DESC LIMIT 5",
+        &schema,
+    );
+    assert!(
+        !desc_range.ops().iter().any(|op| op.opcode == Opcode::SorterOpen),
+        "range ORDER BY post_id DESC LIMIT 5 must stream without a sorter"
+    );
+    assert!(
+        desc_range.ops().iter().any(|op| op.opcode == Opcode::SeekLE),
+        "range ORDER BY post_id DESC LIMIT 5 must anchor at upper bound via SeekLE"
+    );
+    assert!(
+        desc_range.ops().iter().any(|op| op.opcode == Opcode::Prev),
+        "range ORDER BY post_id DESC LIMIT 5 must step backwards with Prev"
+    );
+
+    // Rowid GROUP BY ORDER BY id DESC LIMIT 5: Last + Prev on table, no SorterOpen.
+    let desc_rowid = compile(
+        "SELECT id, count(*), sum(n) FROM likes GROUP BY id ORDER BY id DESC LIMIT 5",
+        &schema,
+    );
+    assert!(
+        !desc_rowid.ops().iter().any(|op| op.opcode == Opcode::SorterOpen),
+        "GROUP BY id ORDER BY id DESC LIMIT 5 must stream rowids without a sorter"
+    );
+    assert!(desc_rowid.ops().iter().any(|op| op.opcode == Opcode::Last));
+    assert!(desc_rowid.ops().iter().any(|op| op.opcode == Opcode::Prev));
+
+    // Unindexed column with ORDER BY DESC falls back to a descending SorterOpen ('-').
+    let desc_unindexed = compile(
+        "SELECT n, count(*) FROM likes GROUP BY n ORDER BY n DESC LIMIT 5",
+        &schema,
+    );
+    assert!(
+        desc_unindexed.ops().iter().any(|op| {
+            op.opcode == Opcode::SorterOpen && matches!(&op.p4, P4::Str(s) if s == "-")
+        }),
+        "unindexed GROUP BY n ORDER BY n DESC must open a descending sorter"
+    );
+}

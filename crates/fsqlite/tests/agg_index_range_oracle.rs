@@ -641,6 +641,173 @@ fn grouped_desc_index_keys_stream_in_index_order() {
     });
 }
 
+/// bd-vbqub: `GROUP BY` on an indexed column (or rowid) with `ORDER BY ... ASC`
+/// or `ORDER BY ... DESC` and `LIMIT` / `OFFSET` / `HAVING` streams directly
+/// from the index (`Rewind`/`Next` or `Last`/`Prev`) with no sorter, stopping
+/// at `LIMIT`, while matching live bundled stock SQLite 3.54.1 across `:memory:`
+/// and file-backed × direct and prepared statements (including NULLs, one-sided
+/// and two-sided ranges, composite mixed-direction indexes, unindexed DESC
+/// fallback, and `NOT INDEXED`).
+#[test]
+fn bd_vbqub_grouped_order_by_asc_and_desc_limit_streams_and_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bd_vbqub_order_limit.db");
+        let ddl = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);",
+            "CREATE INDEX t_a ON t(a);",
+            "CREATE INDEX t_ab_desc ON t(a, b DESC);",
+            "CREATE INDEX t_a_desc ON t(a DESC);",
+        ];
+        let mut inserts = Vec::new();
+        for i in 1..=300_i64 {
+            let a = if i % 25 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 40).to_string()
+            };
+            let b = if i % 17 == 0 {
+                "NULL".to_owned()
+            } else {
+                ((i * 7) % 10).to_string()
+            };
+            inserts.push(format!(
+                "INSERT INTO t VALUES ({i}, {a}, {b}, {});",
+                (i * 13) % 97
+            ));
+        }
+
+        let streamed_no_sorter = [
+            // Core bd-vbqub ASC & DESC LIMIT shapes on ASC index.
+            "SELECT a, count(*), sum(c) FROM t GROUP BY a ORDER BY a LIMIT 5",
+            "SELECT a, count(*), sum(c) FROM t GROUP BY a ORDER BY a DESC LIMIT 5",
+            "SELECT a, count(*), sum(c) FROM t GROUP BY a ORDER BY a LIMIT 5 OFFSET 2",
+            "SELECT a, count(*), sum(c) FROM t GROUP BY a ORDER BY a DESC LIMIT 5 OFFSET 2",
+            // All groups (including trailing NULL group in DESC, leading NULL group in ASC).
+            "SELECT a, count(*), sum(c) FROM t GROUP BY a ORDER BY a LIMIT 100",
+            "SELECT a, count(*), sum(c) FROM t GROUP BY a ORDER BY a DESC LIMIT 100",
+            // HAVING skips non-matching groups while streaming.
+            "SELECT a, count(*), sum(c) FROM t GROUP BY a HAVING sum(c) > 300 ORDER BY a DESC LIMIT 5",
+            // LIMIT 0 edge case.
+            "SELECT a, count(*), sum(c) FROM t GROUP BY a ORDER BY a DESC LIMIT 0",
+            // Covering index (no table lookup) DESC without LIMIT.
+            "SELECT a, count(*) FROM t GROUP BY a ORDER BY a DESC",
+            // Bounded range ASC & DESC with LIMIT, plus one-sided upper/lower bounds (NULL safety!).
+            "SELECT a, count(*), sum(c) FROM t WHERE a BETWEEN 10 AND 25 GROUP BY a ORDER BY a LIMIT 5",
+            "SELECT a, count(*), sum(c) FROM t WHERE a BETWEEN 10 AND 25 GROUP BY a ORDER BY a DESC LIMIT 5",
+            "SELECT a, count(*), sum(c) FROM t WHERE a <= 15 GROUP BY a ORDER BY a DESC LIMIT 5",
+            "SELECT a, count(*), sum(c) FROM t WHERE a <= 15 GROUP BY a ORDER BY a DESC LIMIT 100",
+            "SELECT a, count(*), sum(c) FROM t WHERE a < 15 GROUP BY a ORDER BY a DESC LIMIT 5",
+            "SELECT a, count(*), sum(c) FROM t WHERE a >= 25 GROUP BY a ORDER BY a DESC LIMIT 5",
+            "SELECT a, count(*), sum(c) FROM t WHERE a > 25 GROUP BY a ORDER BY a DESC LIMIT 5",
+            // Explicit INDEXED BY on ASC and DESC indexes.
+            "SELECT a, count(*), sum(c) FROM t INDEXED BY t_a GROUP BY a ORDER BY a DESC LIMIT 5",
+            "SELECT a, count(*), sum(c) FROM t INDEXED BY t_a_desc GROUP BY a ORDER BY a DESC LIMIT 5",
+            "SELECT a, count(*), sum(c) FROM t INDEXED BY t_a_desc GROUP BY a ORDER BY a LIMIT 5",
+            // Composite mixed-direction index reversed: (a ASC, b DESC) walked backward -> (a DESC, b ASC).
+            "SELECT a, b, count(*), sum(c) FROM t GROUP BY a, b ORDER BY a DESC, b ASC LIMIT 12",
+            "SELECT a, b, count(*), sum(c) FROM t GROUP BY a, b ORDER BY a ASC, b DESC LIMIT 12",
+            // Rowid GROUP BY ORDER BY id DESC LIMIT 5.
+            "SELECT id, count(*), sum(c) FROM t GROUP BY id ORDER BY id DESC LIMIT 5",
+            "SELECT id, count(*), sum(c) FROM t WHERE c > 50 GROUP BY id ORDER BY id DESC LIMIT 5",
+        ];
+
+        let sorted_substrate = [
+            // Unindexed column DESC + LIMIT (uses descending sorter, still matches stock).
+            "SELECT c, count(*) FROM t GROUP BY c ORDER BY c DESC LIMIT 8",
+            // NOT INDEXED negative control (must not open index, still matches stock).
+            "SELECT a, count(*), sum(c) FROM t NOT INDEXED GROUP BY a ORDER BY a DESC LIMIT 5",
+            // Composite direction mismatch against (a ASC, b DESC): neither forward nor reverse matches.
+            "SELECT a, b, count(*) FROM t GROUP BY a, b ORDER BY a DESC, b DESC LIMIT 10",
+            // Empty range (no matching rows).
+            "SELECT a, count(*), sum(c) FROM t WHERE a BETWEEN 500 AND 600 GROUP BY a ORDER BY a DESC LIMIT 5",
+        ];
+
+        let fallback_nulls_order = [
+            // NULLS FIRST / NULLS LAST overrides (falls back cleanly to core, matches stock).
+            "SELECT a, count(*), sum(c) FROM t GROUP BY a ORDER BY a DESC NULLS FIRST LIMIT 5",
+            "SELECT a, count(*), sum(c) FROM t GROUP BY a ORDER BY a ASC NULLS LAST LIMIT 5",
+        ];
+
+        for path in [":memory:", file.to_str().unwrap()] {
+            let f = Connection::open(path).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for stmt in ddl
+                .iter()
+                .copied()
+                .chain(inserts.iter().map(String::as_str))
+            {
+                f.execute(stmt).await.unwrap();
+                r.execute_batch(stmt).unwrap();
+            }
+            if path != ":memory:" {
+                f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+                    .await
+                    .unwrap();
+            }
+
+            for sql in streamed_no_sorter.iter().chain(&sorted_substrate) {
+                let want = sqlite_rows(&r, sql, &[]);
+                let got = frank_rows(&f, sql, &[]).await;
+                assert_eq!(got, want, "direct mismatch on `{sql}` ({path})");
+
+                let prepared = f.prepare(sql).await.unwrap();
+                let got_prep: Vec<Vec<String>> = prepared
+                    .query()
+                    .await
+                    .unwrap_or_else(|e| panic!("prepared `{sql}` ({path}): {e}"))
+                    .iter()
+                    .map(|row| row.values().iter().map(render).collect())
+                    .collect();
+                assert_eq!(got_prep, want, "prepared mismatch on `{sql}` ({path})");
+            }
+
+            if path != ":memory:" {
+                f.execute("PRAGMA fsqlite.parity_cert_strict = OFF;")
+                    .await
+                    .unwrap();
+            }
+            for sql in fallback_nulls_order {
+                let want = sqlite_rows(&r, sql, &[]);
+                let got = frank_rows(&f, sql, &[]).await;
+                assert_eq!(got, want, "fallback direct mismatch on `{sql}` ({path})");
+
+                let prepared = f.prepare(sql).await.unwrap();
+                let got_prep: Vec<Vec<String>> = prepared
+                    .query()
+                    .await
+                    .unwrap_or_else(|e| panic!("fallback prepared `{sql}` ({path}): {e}"))
+                    .iter()
+                    .map(|row| row.values().iter().map(render).collect())
+                    .collect();
+                assert_eq!(
+                    got_prep, want,
+                    "fallback prepared mismatch on `{sql}` ({path})"
+                );
+            }
+
+            // Prove no SorterOpen on streamed shapes.
+            for sql in streamed_no_sorter {
+                assert!(
+                    !has_op(&f, sql, "SorterOpen").await,
+                    "expected streamed GROUP BY without SorterOpen for `{sql}` ({path})"
+                );
+            }
+            // Prove NOT INDEXED negative control opens no secondary index.
+            assert!(
+                !has_op(
+                    &f,
+                    "SELECT a, count(*), sum(c) FROM t NOT INDEXED GROUP BY a ORDER BY a DESC LIMIT 5",
+                    "IdxRowid",
+                )
+                .await
+            );
+
+            f.close().await.unwrap();
+        }
+    });
+}
+
 /// bd-2fb53: a lone COUNT(*) whose WHERE is exactly a range on an index's key,
 /// `IS NULL` or `IS NOT NULL` counts from the index's pages (`IdxCountBefore`,
 /// whole leaves at a time) and matches stock: on a file database with indexes

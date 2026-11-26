@@ -5514,7 +5514,7 @@ pub fn codegen_select(
             done_label,
             end_label,
             from_index_hint,
-            stmt.order_by.len(),
+            &stmt.order_by,
         )
     } else if is_simple_count_star(columns)
         && stmt.limit.is_none()
@@ -29697,15 +29697,26 @@ fn codegen_select_group_by_aggregate(
     done_label: crate::Label,
     end_label: crate::Label,
     from_index_hint: Option<&fsqlite_ast::IndexHint>,
-    // The ORDER BY's length. It is an ASC prefix of the GROUP BY keys (the
-    // only shape routed here), so the keys past it may come out in any order:
-    // they may stream in a DESC index key's order, as stock emits them.
-    order_by_len: usize,
+    // The statement's ORDER BY terms (empty, or a prefix of the GROUP BY keys
+    // with default NULLS ordering). Terms past it may come out in any order,
+    // and an index walk or range scan may run in reverse (`Last`/`Prev`) when
+    // every ORDER BY term matches the reversed index key directions (bd-vbqub).
+    order_by: &[OrderingTerm],
 ) -> Result<(), CodegenError> {
     let index_seek_constraint = aggregate_index_seek_constraint(from_index_hint);
     let allow_index_seek = index_seek_constraint.allows_index_seek();
     let required_index = index_seek_constraint.required_index();
     let forced_indexed_by = matches!(from_index_hint, Some(fsqlite_ast::IndexHint::IndexedBy(_)));
+    let order_by_matches_group_prefix = order_by.len() <= group_by.len()
+        && order_by.iter().zip(group_by.iter()).all(|(term, key)| {
+            term.nulls.is_none()
+                && (&term.expr == key || having_exprs_match(&term.expr, key, table, table_alias))
+        });
+    let effective_order_by: &[OrderingTerm] = if order_by_matches_group_prefix {
+        order_by
+    } else {
+        &[]
+    };
 
     // Resolve SELECT-list aliases referenced from HAVING (e.g.
     // `SELECT product_id, SUM(qty) AS total_qty ... HAVING total_qty >= 10`)
@@ -29941,58 +29952,74 @@ fn codegen_select_group_by_aggregate(
                 .iter()
                 .all(|&column| index_stores_column(index, column))
     };
-    // Whether rows read in `index`'s order arrive grouped, past an equality
-    // prefix of `prefix_len` key columns: each GROUP BY key is a plain BINARY
-    // column pinned by the prefix or one of the index's next BINARY keys. The
-    // keys the ORDER BY names come first, in order, on ASC index keys; the
-    // rest fill the following index positions in any order and direction.
-    // Groups then form as rows arrive, in index order, which is the order
-    // stock emits them in when it walks that index (bd-gazf2): `GROUP BY x, a`
-    // over `(a, x)` comes out in `(a, x)` order, and a DESC key descending.
-    let groups_in_index_order = |index: &IndexSchema, prefix_len: usize| {
-        let is_binary = |collation: Option<&str>| {
-            collation.is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
-        };
-        if !index.has_plain_column_key() {
-            return false;
-        }
-        let mut next_key = prefix_len;
-        let mut free_positions = Vec::new();
-        for (key_pos, key) in group_by_keys.iter().enumerate() {
-            let GroupByKey::Column(column) = key else {
-                return false;
+    // Whether rows read in `index`'s order (forward when `reverse == false`,
+    // backward via `Last`/`Prev` when `reverse == true`) arrive grouped, past
+    // an equality prefix of `prefix_len` key columns: each GROUP BY key is a
+    // plain BINARY column pinned by the prefix or one of the index's next
+    // BINARY keys. The keys `effective_order_by` names come first, in order,
+    // matching each key term's effective direction (`key_term_descending ^
+    // reverse`); the rest fill the following index positions in any order and
+    // direction. Groups then form as rows arrive, in index order (bd-gazf2 /
+    // bd-vbqub), so a LIMIT ends the walk after its last group.
+    let groups_in_index_order_dir =
+        |index: &IndexSchema, prefix_len: usize, reverse: bool| {
+            let is_binary = |collation: Option<&str>| {
+                collation.is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
             };
-            let Some(position) = index_key_position_of(index, table, *column)
-                .and_then(|position| usize::try_from(position).ok())
-            else {
-                return false;
-            };
-            if !is_binary(table.columns[*column].collation.as_deref()) {
+            if !index.has_plain_column_key() {
                 return false;
             }
-            if position < prefix_len {
-                continue;
-            }
-            if !is_binary(index.key_term_collation(position)) {
-                return false;
-            }
-            if key_pos < order_by_len {
-                if position != next_key || index.key_term_descending(position) {
+            let mut next_key = prefix_len;
+            let mut free_positions = Vec::new();
+            for (key_pos, key) in group_by_keys.iter().enumerate() {
+                let GroupByKey::Column(column) = key else {
+                    return false;
+                };
+                let Some(position) = index_key_position_of(index, table, *column)
+                    .and_then(|position| usize::try_from(position).ok())
+                else {
+                    return false;
+                };
+                if !is_binary(table.columns[*column].collation.as_deref()) {
                     return false;
                 }
-                next_key += 1;
-            } else {
-                free_positions.push(position);
+                if position < prefix_len {
+                    continue;
+                }
+                if !is_binary(index.key_term_collation(position)) {
+                    return false;
+                }
+                if let Some(term) = effective_order_by.get(key_pos) {
+                    if term.nulls.is_some() || position != next_key {
+                        return false;
+                    }
+                    let want_desc = matches!(term.direction, Some(SortDirection::Desc));
+                    let effective_desc = index.key_term_descending(position) ^ reverse;
+                    if effective_desc != want_desc {
+                        return false;
+                    }
+                    next_key += 1;
+                } else {
+                    free_positions.push(position);
+                }
             }
+            // The keys past the ORDER BY fill the next index positions in any
+            // order: rows equal on all of them are still adjacent.
+            free_positions.sort_unstable();
+            free_positions.dedup();
+            free_positions
+                .iter()
+                .enumerate()
+                .all(|(offset, &position)| position == next_key + offset)
+        };
+    let groups_in_index_order = |index: &IndexSchema, prefix_len: usize| {
+        if groups_in_index_order_dir(index, prefix_len, false) {
+            Some(false)
+        } else if groups_in_index_order_dir(index, prefix_len, true) {
+            Some(true)
+        } else {
+            None
         }
-        // The keys past the ORDER BY fill the next index positions in any
-        // order: rows equal on all of them are still adjacent.
-        free_positions.sort_unstable();
-        free_positions.dedup();
-        free_positions
-            .iter()
-            .enumerate()
-            .all(|(offset, &position)| position == next_key + offset)
     };
     // A range on an index's leading key (`WHERE a < 20`, `created > ?1`)
     // walks that range instead of the whole table, as stock's `SEARCH t USING
@@ -30020,16 +30047,33 @@ fn codegen_select_group_by_aggregate(
         ranges
             .iter()
             .copied()
-            .find(|(index, range)| range.exact && covers_grouping(index))
+            .find(|(index, range)| {
+                range.exact && covers_grouping(index) && groups_in_index_order(index, 0).is_some()
+            })
+            .or_else(|| {
+                ranges
+                    .iter()
+                    .copied()
+                    .find(|(index, range)| range.exact && covers_grouping(index))
+            })
+            .or_else(|| {
+                ranges
+                    .iter()
+                    .copied()
+                    .find(|(index, _)| groups_in_index_order(index, 0).is_some())
+            })
             .or_else(|| ranges.first().copied())
     } else {
         None
     };
-    // With no seek, an index whose order groups the keys can still feed the
-    // grouping, read whole in order: it pays when the index covers the query
-    // (no table read at all) or a LIMIT ends the walk after its last group.
-    // Under `INDEXED BY`, prefer walking the forced index when it groups in order.
-    // The whole WHERE filters each row.
+    let index_range_stream_dir =
+        index_range_input.and_then(|(index, _)| groups_in_index_order(index, 0));
+    let index_range_reverse = index_range_stream_dir == Some(true);
+    // With no seek, an index whose order groups the keys (forward or reverse)
+    // can still feed the grouping, read whole in order: it pays when the index
+    // covers the query (no table read at all) or a LIMIT ends the walk after
+    // its last group. Under `INDEXED BY`, prefer walking the forced index when
+    // it groups in order. The whole WHERE filters each row.
     let index_walk_input = if allow_index_seek
         && !table.without_rowid
         && index_eq_seek.is_none()
@@ -30037,19 +30081,22 @@ fn codegen_select_group_by_aggregate(
         && index_range_input.is_none()
     {
         let walkable = || {
-            table.indexes.iter().filter(|index| {
-                index_matches_required(index, required_index)
-                    && index.supports_direct_column_lookup()
-                    && groups_in_index_order(index, 0)
+            table.indexes.iter().filter_map(|index| {
+                (index_matches_required(index, required_index)
+                    && index.supports_direct_column_lookup())
+                .then(|| groups_in_index_order(index, 0).map(|reverse| (index, reverse)))
+                .flatten()
             })
         };
         walkable()
-            .find(|index| where_clause.is_none() && covers_grouping(index))
+            .find(|(index, _)| where_clause.is_none() && covers_grouping(index))
             .or_else(|| limit_clause.and_then(|_| walkable().next()))
             .or_else(|| required_index.and_then(|_| walkable().next()))
     } else {
         None
     };
+    let index_walk_reverse = index_walk_input.is_some_and(|(_, reverse)| reverse);
+    let index_walk_index = index_walk_input.map(|(index, _)| index);
     let covering_index = index_eq_seek
         .as_ref()
         .filter(|target| !target.has_residual)
@@ -30065,15 +30112,14 @@ fn codegen_select_group_by_aggregate(
                 .filter(|(_, range)| range.exact)
                 .map(|(index, _)| index)
         })
-        .or_else(|| index_walk_input.filter(|_| where_clause.is_none()))
+        .or_else(|| index_walk_index.filter(|_| where_clause.is_none()))
         .filter(|index| covers_grouping(index));
-    // bd-w4pr1.12 (lever GR): with no index input the table is scanned in
-    // rowid order, so a GROUP BY on the rowid alone (the INTEGER PRIMARY KEY,
+    // bd-w4pr1.12 (lever GR) / bd-vbqub: with no index input the table is
+    // scanned in rowid order (`Rewind`/`Next` ascending, `Last`/`Prev`
+    // descending), so a GROUP BY on the rowid alone (the INTEGER PRIMARY KEY,
     // or `rowid` itself, which `resolve_column_ref` resolves to the rowid) gets
-    // one row per group, in ascending key order: the order the sorter would
-    // give, and stock's, which scans the table for it with no sorter. A
-    // grouping that tracks its keys' spellings for a min() or max() keeps the
-    // sorter.
+    // one row per group in key order and exits early on LIMIT. A grouping that
+    // tracks its keys' spellings for a min() or max() keeps the sorter.
     let key_is_rowid = |key: &GroupByKey| match key {
         GroupByKey::Column(column) => table.columns[*column].is_ipk,
         GroupByKey::Expression(expr) => matches!(
@@ -30081,11 +30127,15 @@ fn codegen_select_group_by_aggregate(
             Some(SortKeySource::Rowid)
         ),
     };
+    let rowid_reverse = matches!(
+        effective_order_by.first().and_then(|term| term.direction),
+        Some(SortDirection::Desc)
+    );
     let groups_in_rowid_order = !forced_indexed_by
         && index_eq_seek.is_none()
         && index_in_seek.is_none()
         && index_range_input.is_none()
-        && index_walk_input.is_none()
+        && index_walk_index.is_none()
         && covering_index.is_none()
         && !table.without_rowid
         && !key_spelling_tracked
@@ -30096,16 +30146,27 @@ fn codegen_select_group_by_aggregate(
     // over its block in index order, and their index's first key is ASC.
     let streams_groups = index_eq_seek
         .as_ref()
-        .is_some_and(|target| groups_in_index_order(target.index, target.values.len()))
+        .is_some_and(|target| groups_in_index_order_dir(target.index, target.values.len(), false))
         || index_in_seek
             .as_ref()
-            .is_some_and(|target| groups_in_index_order(target.index, 0))
-        || index_range_input.is_some_and(|(index, _)| groups_in_index_order(index, 0))
-        || index_walk_input.is_some()
+            .is_some_and(|target| groups_in_index_order_dir(target.index, 0, false))
+        || index_range_stream_dir.is_some()
+        || index_walk_index.is_some()
         || groups_in_rowid_order;
     if !streams_groups {
         // Open sorter: p2 = number of key columns (for sorting by group keys).
-        let sort_order: String = std::iter::repeat_n('+', num_group_keys).collect();
+        let sort_order: String = (0..num_group_keys)
+            .map(|i| {
+                if effective_order_by
+                    .get(i)
+                    .is_some_and(|term| matches!(term.direction, Some(SortDirection::Desc)))
+                {
+                    '-'
+                } else {
+                    '+'
+                }
+            })
+            .collect();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         b.emit_op(
             Opcode::SorterOpen,
@@ -30137,7 +30198,7 @@ fn codegen_select_group_by_aggregate(
         .map(|target| target.index)
         .or_else(|| index_in_seek.as_ref().map(|target| target.index))
         .or_else(|| index_range_input.map(|(index, _)| index))
-        .or(index_walk_input);
+        .or(index_walk_index);
     if let Some(index) = input_index {
         b.emit_op(
             Opcode::OpenRead,
@@ -30201,7 +30262,18 @@ fn codegen_select_group_by_aggregate(
     if indexed_input {
         b.emit_jump_to_label(Opcode::Goto, 0, 0, input_driver, P4::None, 0);
     } else {
-        b.emit_jump_to_label(Opcode::Rewind, cursor, 0, scan_done, P4::None, 0);
+        b.emit_jump_to_label(
+            if groups_in_rowid_order && rowid_reverse {
+                Opcode::Last
+            } else {
+                Opcode::Rewind
+            },
+            cursor,
+            0,
+            scan_done,
+            P4::None,
+            0,
+        );
     }
     b.resolve_label(input_row);
 
@@ -30421,55 +30493,130 @@ fn codegen_select_group_by_aggregate(
                 .and_then(|name| table.column_index(name))
                 .map_or('A', |column| table.columns[column].affinity);
             // A NULL bound matches no key; NULL keys match no bound, so a walk
-            // with no lower bound starts past them.
-            let upper = range.upper.map(|bound| {
-                let reg = b.alloc_reg();
-                emit_leading_key_bound(b, bound, affinity, reg);
-                b.emit_jump_to_label(Opcode::IsNull, reg, 0, range_done, P4::None, 0);
-                (reg, bound.inclusive)
-            });
-            let probe_reg = b.alloc_reg();
-            let seek = if let Some(bound) = range.lower {
-                emit_leading_key_bound(b, bound, affinity, probe_reg);
-                b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, range_done, P4::None, 0);
-                if bound.inclusive { Opcode::SeekGE } else { Opcode::SeekGT }
+            // with no lower bound starts past them (ascending) or exits on the
+            // first NULL key reached (descending).
+            if index_range_reverse {
+                let lower = range.lower.map(|bound| {
+                    let reg = b.alloc_reg();
+                    emit_leading_key_bound(b, bound, affinity, reg);
+                    b.emit_jump_to_label(Opcode::IsNull, reg, 0, range_done, P4::None, 0);
+                    (reg, bound.inclusive)
+                });
+                if let Some(bound) = range.upper {
+                    let probe_reg = b.alloc_reg();
+                    emit_leading_key_bound(b, bound, affinity, probe_reg);
+                    b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, range_done, P4::None, 0);
+                    let probe_record_reg = b.alloc_reg();
+                    b.emit_op(Opcode::MakeRecord, probe_reg, 1, probe_record_reg, P4::None, 0);
+                    b.emit_jump_to_label(
+                        ordered_scan_seek_opcode(true, !bound.inclusive),
+                        idx_cursor,
+                        probe_record_reg,
+                        range_done,
+                        P4::None,
+                        0,
+                    );
+                } else {
+                    b.emit_jump_to_label(Opcode::Last, idx_cursor, 0, range_done, P4::None, 0);
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let walk_top = b.current_addr() as i32;
+                if let Some((lower_reg, inclusive)) = lower {
+                    emit_key_past_far_bound_exit(
+                        b, idx_cursor, 0, lower_reg, inclusive, true, range_done,
+                    );
+                } else {
+                    let key_reg = b.alloc_reg();
+                    b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::IsNull, key_reg, 0, range_done, P4::None, 0);
+                }
+                let skip_row = b.emit_label();
+                emit_row(b, skip_row);
+                b.resolve_label(skip_row);
+                b.emit_op(Opcode::Prev, idx_cursor, walk_top, 0, P4::None, 0);
             } else {
-                b.emit_op(Opcode::Null, 0, probe_reg, 0, P4::None, 0);
-                Opcode::SeekGT
-            };
-            let probe_record_reg = b.alloc_reg();
-            b.emit_op(Opcode::MakeRecord, probe_reg, 1, probe_record_reg, P4::None, 0);
-            b.emit_jump_to_label(seek, idx_cursor, probe_record_reg, range_done, P4::None, 0);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let walk_top = b.current_addr() as i32;
-            if let Some((upper_reg, inclusive)) = upper {
-                emit_key_past_far_bound_exit(
-                    b, idx_cursor, 0, upper_reg, inclusive, false, range_done,
-                );
+                let upper = range.upper.map(|bound| {
+                    let reg = b.alloc_reg();
+                    emit_leading_key_bound(b, bound, affinity, reg);
+                    b.emit_jump_to_label(Opcode::IsNull, reg, 0, range_done, P4::None, 0);
+                    (reg, bound.inclusive)
+                });
+                let probe_reg = b.alloc_reg();
+                let seek = if let Some(bound) = range.lower {
+                    emit_leading_key_bound(b, bound, affinity, probe_reg);
+                    b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, range_done, P4::None, 0);
+                    if bound.inclusive { Opcode::SeekGE } else { Opcode::SeekGT }
+                } else {
+                    b.emit_op(Opcode::Null, 0, probe_reg, 0, P4::None, 0);
+                    Opcode::SeekGT
+                };
+                let probe_record_reg = b.alloc_reg();
+                b.emit_op(Opcode::MakeRecord, probe_reg, 1, probe_record_reg, P4::None, 0);
+                b.emit_jump_to_label(seek, idx_cursor, probe_record_reg, range_done, P4::None, 0);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let walk_top = b.current_addr() as i32;
+                if let Some((upper_reg, inclusive)) = upper {
+                    emit_key_past_far_bound_exit(
+                        b, idx_cursor, 0, upper_reg, inclusive, false, range_done,
+                    );
+                }
+                let skip_row = b.emit_label();
+                emit_row(b, skip_row);
+                b.resolve_label(skip_row);
+                b.emit_op(Opcode::Next, idx_cursor, walk_top, 0, P4::None, 0);
             }
-            let skip_row = b.emit_label();
-            emit_row(b, skip_row);
-            b.resolve_label(skip_row);
-            b.emit_op(Opcode::Next, idx_cursor, walk_top, 0, P4::None, 0);
             b.resolve_label(range_done);
-        } else if index_walk_input.is_some() {
-            // The whole index in key order, NULL keys (a group of their own)
-            // first.
+        } else if index_walk_index.is_some() {
+            // The whole index in key order (`Rewind`/`Next` forward, NULLs
+            // first; `Last`/`Prev` reverse, NULLs last for ASC indexes).
             let walk_done = b.emit_label();
-            b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, walk_done, P4::None, 0);
+            b.emit_jump_to_label(
+                if index_walk_reverse {
+                    Opcode::Last
+                } else {
+                    Opcode::Rewind
+                },
+                idx_cursor,
+                0,
+                walk_done,
+                P4::None,
+                0,
+            );
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let walk_top = b.current_addr() as i32;
             let skip_row = b.emit_label();
             emit_row(b, skip_row);
             b.resolve_label(skip_row);
-            b.emit_op(Opcode::Next, idx_cursor, walk_top, 0, P4::None, 0);
+            b.emit_op(
+                if index_walk_reverse {
+                    Opcode::Prev
+                } else {
+                    Opcode::Next
+                },
+                idx_cursor,
+                walk_top,
+                0,
+                P4::None,
+                0,
+            );
             b.resolve_label(walk_done);
         }
         b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
         b.set_next_anon_placeholder(after_body_placeholder);
     } else {
         b.resolve_label(input_driver);
-        b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
+        b.emit_op(
+            if groups_in_rowid_order && rowid_reverse {
+                Opcode::Prev
+            } else {
+                Opcode::Next
+            },
+            cursor,
+            scan_body,
+            0,
+            P4::None,
+            0,
+        );
     }
 
     // End of pass 1. A streamed table scan steps its cursor from the group
@@ -30791,9 +30938,21 @@ fn codegen_select_group_by_aggregate(
         // Back to the index driver for the next row.
         b.emit_op(Opcode::Return, return_reg, 0, 0, P4::None, 0);
     } else if streams_groups {
-        // The next row of the table scan. Past its last row this falls
-        // through to the final group, as the scan's own end does.
-        b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
+        // The next row of the table scan (`Prev` when streaming rowids DESC).
+        // Past its last row this falls through to the final group, as the
+        // scan's own end does.
+        b.emit_op(
+            if groups_in_rowid_order && rowid_reverse {
+                Opcode::Prev
+            } else {
+                Opcode::Next
+            },
+            cursor,
+            scan_body,
+            0,
+            P4::None,
+            0,
+        );
     } else if let Some(sort_loop_body) = sort_loop_body {
         // SorterNext: advance to next sorted row.
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
