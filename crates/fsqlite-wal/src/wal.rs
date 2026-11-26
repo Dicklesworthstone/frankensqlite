@@ -568,6 +568,15 @@ impl<F: VfsFile> WalFile<F> {
             };
 
             let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
+            if frame_header.page_number == 0 {
+                log_replay_decision(
+                    "refresh_incremental",
+                    frame_no,
+                    last_commit_count,
+                    "zero_page_stop",
+                );
+                break;
+            }
             if frame_header.salts != self.header.salts {
                 log_replay_decision(
                     "refresh_incremental",
@@ -760,6 +769,14 @@ impl<F: VfsFile> WalFile<F> {
                 break;
             };
             let header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
+            if header.page_number == 0 {
+                if index < prefix_frame_count {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: "zero page number inside the retained append prefix".to_owned(),
+                    });
+                }
+                break;
+            }
             let expected = compute_wal_frame_checksum(
                 frame_buf,
                 self.page_size,
@@ -4035,6 +4052,50 @@ mod tests {
             assert_eq!(wal.last_commit_frame_header(), marker);
             assert_eq!(wal.file().file_size(&cx).unwrap(), size);
         }
+    }
+
+    #[test]
+    fn incremental_and_retained_refresh_stop_at_the_same_zero_page_as_open() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut writer = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create WAL");
+        writer.append_frame(&cx, 1, &sample_page(1), 1).unwrap();
+        let mut reader = WalFile::open(&cx, open_wal_file(&vfs, &cx)).unwrap();
+        let generation = reader.generation_identity();
+        let checksum = reader.running_checksum();
+        let marker = reader.last_commit_frame_header();
+
+        // The rolling checksum is valid through the next commit. A page-zero
+        // frame in between still terminates the chain for every replay path.
+        writer.append_frame(&cx, 0, &sample_page(2), 0).unwrap();
+        let damaged_prefix_checksum = writer.running_checksum();
+        writer.append_frame(&cx, 2, &sample_page(3), 2).unwrap();
+
+        let reopened = WalFile::open(&cx, open_wal_file(&vfs, &cx)).unwrap();
+        assert_eq!(reopened.frame_count(), 1);
+        reader.refresh(&cx).expect("incremental replay");
+        assert_eq!(reader.frame_count(), reopened.frame_count());
+        assert_eq!(reader.last_commit_frame_header(), marker);
+        assert_eq!(reader.running_checksum(), checksum);
+
+        reader
+            .refresh_preserving_append_prefix(&cx, generation, 1, checksum)
+            .expect("damage only in the candidate suffix");
+        assert_eq!(reader.frame_count(), reopened.frame_count());
+        assert_eq!(reader.last_commit_frame_header(), marker);
+        assert_eq!(reader.running_checksum(), checksum);
+
+        // Damage inside the claimed prefix invalidates the claim and must
+        // leave the previously accepted state intact.
+        assert!(matches!(
+            reader
+                .refresh_preserving_append_prefix(&cx, generation, 2, damaged_prefix_checksum)
+                .wait(),
+            Err(FrankenError::WalCorrupt { .. })
+        ));
+        assert_eq!(reader.frame_count(), 1);
+        assert_eq!(reader.running_checksum(), checksum);
     }
 
     #[test]
