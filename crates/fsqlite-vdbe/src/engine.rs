@@ -13683,6 +13683,14 @@ impl VdbeEngine {
         // statement keeps its earlier rows and runs no rewind.
         if !matches!(outcome, Ok(ExecOutcome::Done)) {
             self.reclaim_all_unlanded_storage_cursor_rowids(true);
+            // A failed execution cannot resume its accumulators. Drop them
+            // before returning so application cleanup runs even when this
+            // engine is retained for reuse. Keep the other cold state: the
+            // connection still needs its write-rollback bookkeeping.
+            if let Some(cold_state) = self.cold_state_mut() {
+                cold_state.aggregates.clear();
+                cold_state.window_contexts.clear();
+            }
         }
         outcome
     }
@@ -22353,14 +22361,11 @@ impl VdbeEngine {
             ));
         }
 
-        // For DISTINCT aggregates, skip if we've already seen these args.
-        // NULL values are always skipped for DISTINCT (SQL semantics).
+        // DISTINCT removes duplicate argument values, including repeated
+        // NULLs. Whether to ignore the first NULL belongs to the aggregate:
+        // count/sum ignore it, while application functions and JSON may not.
         let should_step = if let Some(ref mut seen) = ctx.distinct_seen {
-            if step.args.iter().any(|a| matches!(a, SqliteValue::Null)) {
-                false
-            } else {
-                seen.insert(distinct_key_collated(step.args, step.agg_collation))
-            }
+            seen.insert(distinct_key_collated(step.args, step.agg_collation))
         } else {
             true
         };
@@ -22376,7 +22381,8 @@ impl VdbeEngine {
             });
             let is_min_max = (step.func_name.eq_ignore_ascii_case("min")
                 || step.func_name.eq_ignore_ascii_case("max"))
-                && !step.args.is_empty();
+                && !step.args.is_empty()
+                && ctx.func.is_builtin_min_max();
             if step.track_minmax_skip && is_min_max {
                 skipped = agg_step_min_max_tracked(
                     &mut ctx.state,
@@ -49403,6 +49409,318 @@ mod tests {
 
     fn typed_agg_steps() -> u64 {
         FSQLITE_VDBE_TYPED_AGG_STEPS_TOTAL.with(Cell::get)
+    }
+
+    /// An application accumulator deliberately unlike the built-in MIN/MAX
+    /// state. Its result counts rows and NULLs so both dispatch decisions are
+    /// visible; dropping its state models an application's cleanup guard.
+    struct ObservedAggregate {
+        name: &'static str,
+        released: Arc<AtomicUsize>,
+    }
+
+    struct ObservedAggregateState {
+        rows: i64,
+        nulls: i64,
+        released: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ObservedAggregateState {
+        fn drop(&mut self) {
+            self.released.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    impl fsqlite_func::AggregateFunction for ObservedAggregate {
+        type State = ObservedAggregateState;
+
+        fn initial_state(&self) -> Self::State {
+            ObservedAggregateState {
+                rows: 0,
+                nulls: 0,
+                released: Arc::clone(&self.released),
+            }
+        }
+
+        fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+            state.rows += 1;
+            if args.first().is_some_and(SqliteValue::is_null) {
+                state.nulls += 1;
+            }
+            Ok(())
+        }
+
+        fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(state.rows * 10 + state.nulls))
+        }
+
+        fn num_args(&self) -> i32 {
+            1
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+    }
+
+    #[test]
+    fn test_distinct_aggregate_passes_one_null_to_the_function() {
+        let mut builder = ProgramBuilder::new();
+        let input = builder.alloc_reg();
+        let accum = builder.alloc_regs(3);
+        let functions = [
+            (accum, "observe_all"),
+            (accum + 1, "count"),
+            (accum + 2, "sum"),
+        ];
+        for value in [None, None, Some(7), Some(7), Some(9), None] {
+            match value {
+                Some(value) => {
+                    builder.emit_op(Opcode::Integer, value, input, 0, P4::None, 0);
+                }
+                None => {
+                    builder.emit_op(Opcode::Null, 0, input, 0, P4::None, 0);
+                }
+            }
+            for (register, name) in functions {
+                builder.emit_op(
+                    Opcode::AggStep,
+                    1,
+                    input,
+                    register,
+                    P4::FuncName(name.to_owned()),
+                    1,
+                );
+            }
+        }
+        for (register, name) in functions {
+            builder.emit_op(
+                Opcode::AggFinal,
+                register,
+                1,
+                0,
+                P4::FuncName(name.to_owned()),
+                0,
+            );
+        }
+        builder.emit_op(Opcode::ResultRow, accum, 3, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let released = Arc::new(AtomicUsize::new(0));
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        registry.register_application_aggregate_captured(
+            "observe_all",
+            fsqlite_func::FunctionArity::exact(1),
+            ObservedAggregate {
+                name: "observe_all",
+                released: Arc::clone(&released),
+            },
+        );
+        let mut engine = VdbeEngine::new(program.register_count());
+        engine.set_function_registry(Arc::new(registry));
+        assert_eq!(
+            run_async(engine.execute(&program)).expect("aggregate execution should succeed"),
+            ExecOutcome::Done
+        );
+        let rows: Vec<Vec<SqliteValue>> = engine
+            .results()
+            .iter()
+            .map(|row| row.clone().into_vec())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![vec![
+                SqliteValue::Integer(31),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(16),
+            ]]
+        );
+        assert_eq!(released.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_min_max_shortcuts_require_the_builtin_implementation() {
+        for name in ["min", "max"] {
+            for tracked in [false, true] {
+                let mut builder = ProgramBuilder::new();
+                let input = builder.alloc_reg();
+                let accum = builder.alloc_reg();
+                let skip = builder.alloc_reg();
+                for value in [Some("a"), Some("Z"), None] {
+                    match value {
+                        Some(value) => {
+                            builder.emit_op(
+                                Opcode::String8,
+                                0,
+                                input,
+                                0,
+                                P4::Str(value.to_owned()),
+                                0,
+                            );
+                        }
+                        None => {
+                            builder.emit_op(Opcode::Null, 0, input, 0, P4::None, 0);
+                        }
+                    }
+                    if tracked {
+                        builder.emit_op(
+                            Opcode::CollSeq,
+                            skip,
+                            0,
+                            0,
+                            P4::Collation("NOCASE".to_owned()),
+                            0,
+                        );
+                    }
+                    builder.emit_op(
+                        Opcode::AggStep,
+                        0,
+                        input,
+                        accum,
+                        P4::FuncNameCollated(name.to_owned(), "NOCASE".to_owned()),
+                        1,
+                    );
+                }
+                builder.emit_op(
+                    Opcode::AggFinal,
+                    accum,
+                    1,
+                    0,
+                    P4::FuncName(name.to_owned()),
+                    0,
+                );
+                builder.emit_op(Opcode::ResultRow, accum, 1, 0, P4::None, 0);
+                builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                let program = builder.finish().expect("program should build");
+
+                // Check the built-in and both supported registration paths.
+                for registration in 0..3 {
+                    let released = Arc::new(AtomicUsize::new(0));
+                    let mut registry = FunctionRegistry::new();
+                    register_builtins(&mut registry);
+                    if registration != 0 {
+                        let function = ObservedAggregate {
+                            name,
+                            released: Arc::clone(&released),
+                        };
+                        if registration == 1 {
+                            registry.register_aggregate(function);
+                        } else {
+                            registry.register_application_aggregate_captured(
+                                name,
+                                fsqlite_func::FunctionArity::exact(1),
+                                function,
+                            );
+                        }
+                    }
+                    let mut engine = VdbeEngine::new(program.register_count());
+                    engine.set_function_registry(Arc::new(registry));
+                    assert_eq!(
+                        run_async(engine.execute(&program))
+                            .expect("min/max execution should succeed"),
+                        ExecOutcome::Done
+                    );
+                    let rows: Vec<Vec<SqliteValue>> = engine
+                        .results()
+                        .iter()
+                        .map(|row| row.clone().into_vec())
+                        .collect();
+                    let expected = if registration == 0 {
+                        SqliteValue::Text(if name == "min" { "a" } else { "Z" }.into())
+                    } else {
+                        SqliteValue::Integer(31)
+                    };
+                    assert_eq!(rows, vec![vec![expected]], "{name}, tracked={tracked}");
+                    assert_eq!(
+                        released.load(AtomicOrdering::Relaxed),
+                        usize::from(registration != 0)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_failed_execution_releases_aggregate_state_before_engine_reuse() {
+        struct FailAfterAggregate;
+
+        impl ScalarFunction for FailAfterAggregate {
+            fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
+                Err(FrankenError::function_error("after aggregate"))
+            }
+
+            fn num_args(&self) -> i32 {
+                0
+            }
+
+            fn name(&self) -> &str {
+                "fail_after_aggregate"
+            }
+        }
+
+        for halt_error in [false, true] {
+            let mut builder = ProgramBuilder::new();
+            let input = builder.alloc_reg();
+            let accum = builder.alloc_reg();
+            let output = builder.alloc_reg();
+            builder.emit_op(Opcode::Integer, 7, input, 0, P4::None, 0);
+            builder.emit_op(
+                Opcode::AggStep,
+                0,
+                input,
+                accum,
+                P4::FuncName("observe_all".to_owned()),
+                1,
+            );
+            if halt_error {
+                builder.emit_op(
+                    Opcode::Halt,
+                    ErrorCode::Error as i32,
+                    0,
+                    0,
+                    P4::Str("after aggregate".to_owned()),
+                    0,
+                );
+            } else {
+                builder.emit_op(
+                    Opcode::Function,
+                    0,
+                    0,
+                    output,
+                    P4::FuncName("fail_after_aggregate".to_owned()),
+                    0,
+                );
+                builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            }
+            let program = builder.finish().expect("program should build");
+            let released = Arc::new(AtomicUsize::new(0));
+            let mut registry = FunctionRegistry::new();
+            registry.register_aggregate(ObservedAggregate {
+                name: "observe_all",
+                released: Arc::clone(&released),
+            });
+            registry.register_scalar(FailAfterAggregate);
+            let mut engine = VdbeEngine::new(program.register_count());
+            engine.set_function_registry(Arc::new(registry));
+
+            for expected in 1..=2 {
+                let outcome = run_async(engine.execute(&program));
+                if halt_error {
+                    assert!(matches!(outcome, Ok(ExecOutcome::Error { .. })));
+                } else {
+                    assert!(outcome.is_err());
+                }
+                assert_eq!(
+                    released.load(AtomicOrdering::Relaxed),
+                    expected,
+                    "cleanup must run before returning the error"
+                );
+            }
+            drop(engine);
+            assert_eq!(released.load(AtomicOrdering::Relaxed), 2);
+        }
     }
 
     /// Finalize and remove the accumulator in register `accum_reg`.

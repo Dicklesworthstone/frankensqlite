@@ -82,6 +82,15 @@ pub trait AggregateFunction: Send + Sync {
         None
     }
 
+    /// Whether the engine may use the built-in MIN/MAX accumulator operations.
+    ///
+    /// Opting in requires the built-in comparison semantics and an accumulator
+    /// of type `Option<SqliteValue>`. Application implementations should leave
+    /// this false, even when registered under the name `min` or `max`.
+    fn is_builtin_min_max(&self) -> bool {
+        false
+    }
+
     /// Consume the accumulator and produce the final result.
     fn finalize(&self, state: Self::State) -> Result<SqliteValue>;
 
@@ -174,6 +183,10 @@ where
 
     fn typed_step(&self) -> Option<TypedAggregateStep> {
         self.inner.typed_step()
+    }
+
+    fn is_builtin_min_max(&self) -> bool {
+        self.inner.is_builtin_min_max()
     }
 
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {

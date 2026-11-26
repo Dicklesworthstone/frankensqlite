@@ -321,6 +321,10 @@ pub struct AggMaxFunc;
 impl AggregateFunction for AggMaxFunc {
     type State = Option<SqliteValue>;
 
+    fn is_builtin_min_max(&self) -> bool {
+        true
+    }
+
     fn initial_state(&self) -> Self::State {
         None
     }
@@ -363,6 +367,10 @@ pub struct AggMinFunc;
 
 impl AggregateFunction for AggMinFunc {
     type State = Option<SqliteValue>;
+
+    fn is_builtin_min_max(&self) -> bool {
+        true
+    }
 
     fn initial_state(&self) -> Self::State {
         None
