@@ -102060,78 +102060,59 @@ impl Connection {
     ) -> Result<(Option<usize>, SqliteValue)> {
         let (is_max, arg, filter, is_distinct) = tracking;
         let collation = join_expr_effective_collation(arg, col_map);
-        let mut best: Option<SqliteValue> = None;
-        let mut seen_distinct: Vec<SqliteValue> = Vec::new();
-        let mut reg_hit = false;
-        let mut bare_row = None;
-        for (index, row) in group_rows.iter().enumerate() {
-            if filter.is_some() {
-                reg_hit = index > 0;
-            }
-            if let Some(filter) = filter {
-                let keep = self
-                    .eval_row_expr_allowing_subqueries_with_using(filter, row, col_map, using_skip)
+        let mut tracker = MinMaxBareTracker::new(*is_max, filter.is_some(), collation.as_deref(), coll_snap);
+        if *is_distinct {
+            // bd-ma0e1: pre-evaluate filter and argument per row, then mark
+            // first occurrences via O(n log n) sort instead of scanning every
+            // earlier distinct value in O(n^2) time while preserving stock's
+            // exact `reg_hit` bare-column semantics on duplicates.
+            let mut evaluated: Vec<Option<SqliteValue>> = Vec::with_capacity(group_rows.len());
+            for row in group_rows {
+                if let Some(filter) = filter {
+                    let keep = self
+                        .eval_row_expr_allowing_subqueries_with_using(
+                            filter, row, col_map, using_skip,
+                        )
+                        .await?;
+                    if !is_sqlite_truthy(&keep) {
+                        evaluated.push(None);
+                        continue;
+                    }
+                }
+                let value = self
+                    .eval_row_expr_allowing_subqueries_with_using(arg, row, col_map, using_skip)
                     .await?;
-                if !is_sqlite_truthy(&keep) {
-                    if !reg_hit {
-                        bare_row = Some(index);
-                    }
-                    continue;
-                }
+                evaluated.push(Some(value));
             }
-            let value = self
-                .eval_row_expr_allowing_subqueries_with_using(arg, row, col_map, using_skip)
-                .await?;
-            if *is_distinct {
-                let is_dup = if value.is_null() {
-                    seen_distinct.iter().any(SqliteValue::is_null)
-                } else {
-                    seen_distinct.iter().any(|prev| {
-                        !prev.is_null()
-                            && cmp_sqlite_values_collated_snapshot(
-                                prev,
-                                &value,
-                                collation.as_deref(),
-                                coll_snap,
-                            ) == std::cmp::Ordering::Equal
-                    })
-                };
-                if is_dup {
-                    if !reg_hit {
-                        bare_row = Some(index);
-                    }
-                    continue;
-                }
-                seen_distinct.push(value.clone());
+            let first_flags = first_distinct_flags(
+                &evaluated,
+                Option::as_ref,
+                collation.as_deref(),
+                coll_snap,
+            );
+            for (index, (value, is_first)) in evaluated.into_iter().zip(first_flags).enumerate() {
+                tracker.step(index, value, !is_first);
             }
-            if value.is_null() {
-                reg_hit = best.is_some();
-            } else {
-                let replace = best.as_ref().is_none_or(|best_value| {
-                    let ordering = cmp_sqlite_values_collated_snapshot(
-                        &value,
-                        best_value,
-                        collation.as_deref(),
-                        coll_snap,
-                    );
-                    if *is_max {
-                        ordering == std::cmp::Ordering::Greater
-                    } else {
-                        ordering == std::cmp::Ordering::Less
+        } else {
+            for (index, row) in group_rows.iter().enumerate() {
+                if let Some(filter) = filter {
+                    let keep = self
+                        .eval_row_expr_allowing_subqueries_with_using(
+                            filter, row, col_map, using_skip,
+                        )
+                        .await?;
+                    if !is_sqlite_truthy(&keep) {
+                        tracker.step(index, None, false);
+                        continue;
                     }
-                });
-                if replace {
-                    best = Some(value);
-                    reg_hit = false;
-                } else {
-                    reg_hit = true;
                 }
-            }
-            if !reg_hit {
-                bare_row = Some(index);
+                let value = self
+                    .eval_row_expr_allowing_subqueries_with_using(arg, row, col_map, using_skip)
+                    .await?;
+                tracker.step(index, Some(value), false);
             }
         }
-        Ok((bare_row, best.unwrap_or(SqliteValue::Null)))
+        Ok(tracker.finish())
     }
 
     /// Stable-reorder the materialized rows of a GROUP BY + JOIN so that, within
@@ -108255,85 +108236,69 @@ impl Connection {
                         )
                     });
 
-                let mut best: Option<SqliteValue> = None;
-                let mut seen_distinct: Vec<SqliteValue> = Vec::new();
-                let mut reg_hit = false;
-                let mut bare_row: Option<&Vec<SqliteValue>> = None;
-                for (row_idx, row) in group_rows.iter().enumerate() {
-                    if filter.is_some() {
-                        reg_hit = row_idx > 0;
-                    }
-                    if let Some(filter_expr) = filter {
-                        let filter_value = self
-                            .eval_row_expr_allowing_subqueries(filter_expr, row, &col_map)
-                            .await?;
-                        if !is_sqlite_truthy(&filter_value) {
-                            if !reg_hit {
-                                bare_row = Some(row);
+                let mut tracker =
+                    MinMaxBareTracker::new(*is_max, filter.is_some(), collation, &coll_snap);
+                if *tracked_distinct {
+                    // bd-ma0e1: pre-evaluate filter and argument per row, then
+                    // mark first occurrences in O(n log n) via sort instead of
+                    // quadratic `seen_distinct` scans.
+                    let mut evaluated: Vec<Option<SqliteValue>> =
+                        Vec::with_capacity(group_rows.len());
+                    for row in group_rows {
+                        if let Some(filter_expr) = filter {
+                            let filter_value = self
+                                .eval_row_expr_allowing_subqueries(filter_expr, row, &col_map)
+                                .await?;
+                            if !is_sqlite_truthy(&filter_value) {
+                                evaluated.push(None);
+                                continue;
                             }
-                            continue;
                         }
-                    }
-                    let value = if let Some(index) = arg_col {
-                        row.get(index).cloned().unwrap_or(SqliteValue::Null)
-                    } else if let Some(expr) = arg_expr {
-                        self.eval_row_expr_allowing_subqueries(expr, row, &col_map)
-                            .await?
-                    } else {
-                        SqliteValue::Null
-                    };
-                    if *tracked_distinct {
-                        let is_dup = if value.is_null() {
-                            seen_distinct.iter().any(SqliteValue::is_null)
+                        let value = if let Some(index) = arg_col {
+                            row.get(index).cloned().unwrap_or(SqliteValue::Null)
+                        } else if let Some(expr) = arg_expr {
+                            self.eval_row_expr_allowing_subqueries(expr, row, &col_map)
+                                .await?
                         } else {
-                            seen_distinct.iter().any(|prev| {
-                                !prev.is_null()
-                                    && cmp_sqlite_values_collated_snapshot(
-                                        prev,
-                                        &value,
-                                        collation,
-                                        &coll_snap,
-                                    ) == std::cmp::Ordering::Equal
-                            })
+                            SqliteValue::Null
                         };
-                        if is_dup {
-                            if !reg_hit {
-                                bare_row = Some(row);
-                            }
-                            continue;
-                        }
-                        seen_distinct.push(value.clone());
+                        evaluated.push(Some(value));
                     }
-                    if value.is_null() {
-                        reg_hit = best.is_some();
-                    } else {
-                        let replace = best.as_ref().is_none_or(|previous| {
-                            let ordering = cmp_sqlite_values_collated_snapshot(
-                                &value,
-                                previous,
-                                collation,
-                                &coll_snap,
-                            );
-                            if *is_max {
-                                ordering == std::cmp::Ordering::Greater
-                            } else {
-                                ordering == std::cmp::Ordering::Less
+                    let first_flags =
+                        first_distinct_flags(&evaluated, Option::as_ref, collation, &coll_snap);
+                    for (row_idx, (value, is_first)) in
+                        evaluated.into_iter().zip(first_flags).enumerate()
+                    {
+                        tracker.step(row_idx, value, !is_first);
+                    }
+                } else {
+                    for (row_idx, row) in group_rows.iter().enumerate() {
+                        if let Some(filter_expr) = filter {
+                            let filter_value = self
+                                .eval_row_expr_allowing_subqueries(filter_expr, row, &col_map)
+                                .await?;
+                            if !is_sqlite_truthy(&filter_value) {
+                                tracker.step(row_idx, None, false);
+                                continue;
                             }
-                        });
-                        if replace {
-                            best = Some(value);
-                            reg_hit = false;
+                        }
+                        let value = if let Some(index) = arg_col {
+                            row.get(index).cloned().unwrap_or(SqliteValue::Null)
+                        } else if let Some(expr) = arg_expr {
+                            self.eval_row_expr_allowing_subqueries(expr, row, &col_map)
+                                .await?
                         } else {
-                            reg_hit = true;
-                        }
-                    }
-                    if !reg_hit {
-                        bare_row = Some(row);
+                            SqliteValue::Null
+                        };
+                        tracker.step(row_idx, Some(value), false);
                     }
                 }
+                let (bare_idx, best_value) = tracker.finish();
                 Some((
-                    bare_row.or_else(|| group_rows.first()),
-                    best.unwrap_or(SqliteValue::Null),
+                    bare_idx
+                        .and_then(|idx| group_rows.get(idx))
+                        .or_else(|| group_rows.first()),
+                    best_value,
                 ))
             } else {
                 None
@@ -162126,15 +162091,32 @@ fn retain_first_distinct<T>(
     collation: Option<&str>,
     registry: &CollationRegistry,
 ) {
+    let keep = first_distinct_flags(items, |item| Some(key(item)), collation, registry);
+    let mut keep = keep.into_iter();
+    items.retain(|_| keep.next().unwrap_or(false));
+}
+
+/// Mark the earliest item of each DISTINCT class among items where `key(item)`
+/// is `Some`. Items whose keys are `None` receive `false`; items whose `Some`
+/// keys compare equal under `collation` share a class (`1` and `1.0`,
+/// NOCASE-equal text, every NULL), with only the smallest index marked `true`.
+/// Sorting positions keeps this O(n log n) instead of O(n^2) (bd-ma0e1).
+fn first_distinct_flags<T>(
+    items: &[T],
+    key: impl Fn(&T) -> Option<&SqliteValue>,
+    collation: Option<&str>,
+    registry: &CollationRegistry,
+) -> Vec<bool> {
+    let mut positions: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| key(item).is_some().then_some(idx))
+        .collect();
     let compare = |left: usize, right: usize| {
-        cmp_sqlite_values_collated_snapshot(
-            key(&items[left]),
-            key(&items[right]),
-            collation,
-            registry,
-        )
+        let left_val = key(&items[left]).expect("filtered to Some");
+        let right_val = key(&items[right]).expect("filtered to Some");
+        cmp_sqlite_values_collated_snapshot(left_val, right_val, collation, registry)
     };
-    let mut positions: Vec<usize> = (0..items.len()).collect();
     positions.sort_unstable_by(|&left, &right| compare(left, right).then(left.cmp(&right)));
     let mut keep = vec![false; items.len()];
     let mut class_first: Option<usize> = None;
@@ -162144,8 +162126,89 @@ fn retain_first_distinct<T>(
             class_first = Some(position);
         }
     }
-    let mut keep = keep.into_iter();
-    items.retain(|_| keep.next().unwrap_or(false));
+    keep
+}
+
+/// Track the winning extremum value and bare-column representative row index
+/// for `min()` / `max()` queries using SQLite's exact `reg_hit` semantics
+/// (including `FILTER`, `NULL`s, and `DISTINCT` duplicates leaving the
+/// accumulator untouched while still supplying bare columns when `reg_hit` is
+/// clear).
+struct MinMaxBareTracker<'a> {
+    is_max: bool,
+    has_filter: bool,
+    collation: Option<&'a str>,
+    coll_snap: &'a CollationRegistry,
+    best: Option<SqliteValue>,
+    reg_hit: bool,
+    bare_row: Option<usize>,
+}
+
+impl<'a> MinMaxBareTracker<'a> {
+    const fn new(
+        is_max: bool,
+        has_filter: bool,
+        collation: Option<&'a str>,
+        coll_snap: &'a CollationRegistry,
+    ) -> Self {
+        Self {
+            is_max,
+            has_filter,
+            collation,
+            coll_snap,
+            best: None,
+            reg_hit: false,
+            bare_row: None,
+        }
+    }
+
+    fn step(&mut self, index: usize, evaluated: Option<SqliteValue>, is_duplicate: bool) {
+        if self.has_filter {
+            self.reg_hit = index > 0;
+        }
+        let Some(value) = evaluated else {
+            if !self.reg_hit {
+                self.bare_row = Some(index);
+            }
+            return;
+        };
+        if is_duplicate {
+            if !self.reg_hit {
+                self.bare_row = Some(index);
+            }
+            return;
+        }
+        if value.is_null() {
+            self.reg_hit = self.best.is_some();
+        } else {
+            let replace = self.best.as_ref().is_none_or(|best_value| {
+                let ordering = cmp_sqlite_values_collated_snapshot(
+                    &value,
+                    best_value,
+                    self.collation,
+                    self.coll_snap,
+                );
+                if self.is_max {
+                    ordering == std::cmp::Ordering::Greater
+                } else {
+                    ordering == std::cmp::Ordering::Less
+                }
+            });
+            if replace {
+                self.best = Some(value);
+                self.reg_hit = false;
+            } else {
+                self.reg_hit = true;
+            }
+        }
+        if !self.reg_hit {
+            self.bare_row = Some(index);
+        }
+    }
+
+    fn finish(self) -> (Option<usize>, SqliteValue) {
+        (self.bare_row, self.best.unwrap_or(SqliteValue::Null))
+    }
 }
 
 /// Extended aggregate computation with optional collation for MIN/MAX.

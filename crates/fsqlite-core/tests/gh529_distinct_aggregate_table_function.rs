@@ -247,6 +247,181 @@ async fn timed_issue_query(conn: &Connection, n: u64) -> Duration {
     elapsed
 }
 
+async fn assert_agree_direct_and_prepared(
+    mode: &str,
+    fconn: &Connection,
+    rconn: &rusqlite::Connection,
+    sql: &str,
+) {
+    assert_agree(fconn, rconn, sql).await;
+    let mut st = rconn
+        .prepare(sql)
+        .unwrap_or_else(|e| panic!("[{mode}] stock rejects `{sql}`: {e}"));
+    let n = st.column_count();
+    let expected: Vec<Vec<String>> = st
+        .query_map([], |row| {
+            Ok((0..n)
+                .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                .collect())
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    let prep = fconn
+        .prepare(sql)
+        .await
+        .unwrap_or_else(|e| panic!("[{mode}] fsqlite prepare `{sql}`: {e:?}"));
+    let actual: Vec<Vec<String>> = prep
+        .query()
+        .await
+        .unwrap_or_else(|e| panic!("[{mode}] fsqlite prepared query `{sql}`: {e:?}"))
+        .iter()
+        .map(|r| r.values().iter().map(tag_f).collect())
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "[{mode}] prepared DISTINCT aggregate mismatch on `{sql}`"
+    );
+}
+
+#[test]
+fn bd_ma0e1_distinct_minmax_bare_columns_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let f_path = dir.path().join("ma0e1_f.db");
+        let r_path = dir.path().join("ma0e1_r.db");
+        let pairs = vec![
+            (
+                ":memory:",
+                Connection::open(":memory:").await.unwrap(),
+                rusqlite::Connection::open_in_memory().unwrap(),
+            ),
+            (
+                "file-backed",
+                Connection::open(f_path.to_str().unwrap()).await.unwrap(),
+                rusqlite::Connection::open(&r_path).unwrap(),
+            ),
+        ];
+
+        // Shapes specifically crafted to exercise SQLite's `reg_hit` bare-column
+        // register semantics on DISTINCT duplicates:
+        // - Immediate duplicate extremum (`5, 5`): `reg_hit` stays false so the
+        //   duplicate updates the bare column.
+        // - Non-adjacent duplicate extremum (`5, 1, 5`): the intermediate `1`
+        //   sets `reg_hit = true`, so the later `5` leaves the bare column alone.
+        // - Leading NULLs, duplicate NULLs, all-NULL, numeric ties (`7` vs `7.0`),
+        //   collated ties (`'z'` vs `'Z'`, `'a'` vs `'a '`), and FILTER rejecting
+        //   row 0, middle rows, or all rows.
+        const ADJACENT_DUP: &str = "'[2, 5, 5, 1, 5]'";
+        const NON_ADJ_DUP: &str = "'[5, 1, 5, 5]'";
+        const NULL_AND_DUP: &str = "'[null, null, 3, 3.0, 1, 3, null]'";
+        const ALL_NULL: &str = "'[null, null, null]'";
+        const COLL_TEXT: &str = r#"'["b", "z", "Z", "a", "Z", "a ", "a"]'"#;
+        const GROUPED: &str = r#"'[{"g":"x","v":5,"tag":"first5"},{"g":"x","v":5,"tag":"second5"},{"g":"x","v":2,"tag":"two"},{"g":"x","v":5,"tag":"third5"},{"g":"y","v":null,"tag":"n1"},{"g":"y","v":null,"tag":"n2"},{"g":"z","v":1,"tag":"one"},{"g":"z","v":1.0,"tag":"one_f"},{"g":"z","v":4,"tag":"four"}]'"#;
+
+        let queries = [
+            // Single-group table-valued source: adjacent vs non-adjacent duplicate extrema.
+            format!("SELECT max(DISTINCT value), key, value FROM json_each({ADJACENT_DUP})"),
+            format!("SELECT min(DISTINCT value), key, value FROM json_each({ADJACENT_DUP})"),
+            format!("SELECT max(DISTINCT value), key, value FROM json_each({NON_ADJ_DUP})"),
+            format!("SELECT min(DISTINCT value), key, value FROM json_each({NON_ADJ_DUP})"),
+            // NULLs and integer/float ties.
+            format!("SELECT max(DISTINCT value), key, value FROM json_each({NULL_AND_DUP})"),
+            format!("SELECT min(DISTINCT value), key, value FROM json_each({NULL_AND_DUP})"),
+            format!("SELECT max(DISTINCT value), key, value FROM json_each({ALL_NULL})"),
+            format!("SELECT min(DISTINCT value), key, value FROM json_each({ALL_NULL})"),
+            // Collated ties.
+            format!("SELECT max(DISTINCT value COLLATE NOCASE), key, value FROM json_each({COLL_TEXT})"),
+            format!("SELECT min(DISTINCT value COLLATE NOCASE), key, value FROM json_each({COLL_TEXT})"),
+            format!("SELECT min(DISTINCT value COLLATE RTRIM), key, value FROM json_each({COLL_TEXT})"),
+            // FILTER rejecting row 0, rejecting some rows, rejecting all rows.
+            format!("SELECT max(DISTINCT value) FILTER (WHERE key > 0), key, value FROM json_each({ADJACENT_DUP})"),
+            format!("SELECT max(DISTINCT value) FILTER (WHERE key != 2), key, value FROM json_each({ADJACENT_DUP})"),
+            format!("SELECT max(DISTINCT value) FILTER (WHERE key < 0), key, value FROM json_each({ADJACENT_DUP})"),
+            format!("SELECT min(DISTINCT value) FILTER (WHERE value IS NOT NULL), key, value FROM json_each({NULL_AND_DUP})"),
+            format!("SELECT max(DISTINCT value) FILTER (WHERE value < 0), key, value FROM json_each({NULL_AND_DUP})"),
+            // Nested tracked min/max(DISTINCT) inside a mixed output expression.
+            format!("SELECT CAST(max(DISTINCT value) AS TEXT) || ':' || CAST(key AS TEXT) FROM json_each({ADJACENT_DUP})"),
+            format!("SELECT CAST(min(DISTINCT value) FILTER (WHERE key > 0) AS TEXT) || ':' || CAST(key AS TEXT) FROM json_each({NULL_AND_DUP})"),
+            // GROUP BY over table-valued source.
+            format!(
+                "SELECT json_extract(value, '$.g') AS g, \
+                 max(DISTINCT json_extract(value, '$.v')), \
+                 json_extract(value, '$.tag') \
+                 FROM json_each({GROUPED}) GROUP BY g ORDER BY g"
+            ),
+            format!(
+                "SELECT json_extract(value, '$.g') AS g, \
+                 min(DISTINCT json_extract(value, '$.v')) FILTER (WHERE json_extract(value, '$.tag') != 'first5'), \
+                 json_extract(value, '$.tag') \
+                 FROM json_each({GROUPED}) GROUP BY g ORDER BY g"
+            ),
+            // JOIN sources (exercises `join_minmax_bare_extremum`): single-group and GROUP BY.
+            format!(
+                "SELECT max(DISTINCT a.value), a.key, a.value, b.value \
+                 FROM json_each({ADJACENT_DUP}) AS a JOIN json_each('[10]') AS b ON b.value = 10"
+            ),
+            format!(
+                "SELECT max(DISTINCT a.value), a.key, a.value \
+                 FROM json_each({NON_ADJ_DUP}) AS a JOIN json_each('[10]') AS b ON b.value = 10"
+            ),
+            format!(
+                "SELECT max(DISTINCT a.value) FILTER (WHERE a.key > 0), a.key, a.value \
+                 FROM json_each({ADJACENT_DUP}) AS a JOIN json_each('[10]') AS b ON b.value = 10"
+            ),
+            format!(
+                "SELECT max(DISTINCT a.value) FILTER (WHERE a.key < 0), a.key, a.value \
+                 FROM json_each({ADJACENT_DUP}) AS a JOIN json_each('[10]') AS b ON b.value = 10"
+            ),
+            format!(
+                "SELECT min(DISTINCT a.value COLLATE NOCASE), a.key, a.value \
+                 FROM json_each({COLL_TEXT}) AS a JOIN json_each('[10]') AS b ON b.value = 10"
+            ),
+            format!(
+                "SELECT a.type, max(DISTINCT a.value), a.key, a.value \
+                 FROM json_each({NULL_AND_DUP}) AS a JOIN json_each('[1, 2]') AS b ON b.key = 0 \
+                 GROUP BY a.type ORDER BY a.type"
+            ),
+            format!(
+                "SELECT a.type, max(DISTINCT a.value), a.key \
+                 FROM json_each({NUMBERS}) AS a JOIN json_each('[1, 2]') AS b USING (type) \
+                 GROUP BY a.type ORDER BY a.type"
+            ),
+        ];
+
+        for (mode, f, r) in &pairs {
+            for sql in &queries {
+                assert_agree_direct_and_prepared(mode, f, r, sql).await;
+            }
+        }
+    });
+}
+
+async fn timed_minmax_bare_single(conn: &Connection, n: u64) -> Duration {
+    let sql = format!("SELECT max(DISTINCT value), value FROM generate_series(1, {n})");
+    let expected = [n.to_string(), n.to_string()];
+    let started = Instant::now();
+    let rows = conn.query(&sql).await.unwrap();
+    let elapsed = started.elapsed();
+    let actual: Vec<String> = rows[0].values().iter().map(SqliteValue::to_text).collect();
+    assert_eq!(actual, expected, "single bare max(DISTINCT) n = {n}");
+    elapsed
+}
+
+async fn timed_minmax_bare_join(conn: &Connection, n: u64) -> Duration {
+    let sql = format!(
+        "SELECT max(DISTINCT a.value), a.value \
+         FROM generate_series(1, {n}) AS a JOIN generate_series(1, 1) AS b ON b.value = 1"
+    );
+    let expected = [n.to_string(), n.to_string()];
+    let started = Instant::now();
+    let rows = conn.query(&sql).await.unwrap();
+    let elapsed = started.elapsed();
+    let actual: Vec<String> = rows[0].values().iter().map(SqliteValue::to_text).collect();
+    assert_eq!(actual, expected, "join bare max(DISTINCT) n = {n}");
+    elapsed
+}
+
 #[test]
 fn distinct_aggregate_cost_grows_with_input_not_its_square() {
     asupersync::test_utils::run_test(|| async {
@@ -254,27 +429,34 @@ fn distinct_aggregate_cost_grows_with_input_not_its_square() {
         // 8x the rows: about 8x the time when deduplication sorts, 64x when it
         // scans every earlier value. Best of three absorbs scheduler noise.
         let (small, large) = (5_000, 40_000);
-        let mut best = [[Duration::MAX; 2]; 2];
+        let mut best = [[Duration::MAX; 2]; 4];
         for _ in 0..3 {
             for (slot, n) in [small, large].into_iter().enumerate() {
                 best[0][slot] = best[0][slot].min(timed_distinct_aggregates(&conn, n).await);
                 best[1][slot] = best[1][slot].min(timed_issue_query(&conn, n).await);
+                best[2][slot] = best[2][slot].min(timed_minmax_bare_single(&conn, n).await);
+                best[3][slot] = best[3][slot].min(timed_minmax_bare_join(&conn, n).await);
             }
         }
-        let superlinear: Vec<String> = ["six aggregates", "issue query"]
-            .iter()
-            .zip(best)
-            .filter_map(|(shape, [small_best, large_best])| {
-                let ratio = large_best.as_secs_f64() / small_best.as_secs_f64().max(1e-6);
-                eprintln!(
-                    "GH529 {shape} best n={small}: {small_best:?}, n={large}: {large_best:?}, \
-                     ratio {ratio:.1}"
-                );
-                (ratio >= 24.0).then(|| {
-                    format!("{shape}: 8x the rows cost {ratio:.1}x the time")
-                })
+        let superlinear: Vec<String> = [
+            "six aggregates",
+            "issue query",
+            "bare max(DISTINCT) single",
+            "bare max(DISTINCT) join",
+        ]
+        .iter()
+        .zip(best)
+        .filter_map(|(shape, [small_best, large_best])| {
+            let ratio = large_best.as_secs_f64() / small_best.as_secs_f64().max(1e-6);
+            eprintln!(
+                "GH529 {shape} best n={small}: {small_best:?}, n={large}: {large_best:?}, \
+                 ratio {ratio:.1}"
+            );
+            (ratio >= 24.0).then(|| {
+                format!("{shape}: 8x the rows cost {ratio:.1}x the time")
             })
-            .collect();
+        })
+        .collect();
         assert!(
             superlinear.is_empty(),
             "DISTINCT deduplication is superlinear: {superlinear:?}"
