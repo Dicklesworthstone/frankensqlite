@@ -362,46 +362,207 @@ fn fallback_select_limits_do_not_evaluate_unreachable_rows() {
     compare_fallback_limit_cases(cases);
 }
 
-/// The remaining bd-ct8zm family needs a streaming or safely flattened
-/// derived/CTE source. Keep its full oracle assertions separate from the
-/// zero-limit and plain-table join fixes; MATERIALIZED is an error control.
+/// A plain derived/CTE consumer can bound a UNION ALL source before it
+/// materializes. Filters, sorting, set operations, shared/recursive CTEs,
+/// and explicit MATERIALIZED retain their existing execution semantics.
+const DERIVED_COMPOUND_LIMIT_CASES: &[(&str, &[i64])] = &[
+    (
+        "SELECT (SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808)))",
+        &[],
+    ),
+    (
+        "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808)) LIMIT 1",
+        &[],
+    ),
+    (
+        "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808)) LIMIT ?",
+        &[1],
+    ),
+    (
+        "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808)) LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    // A FROM-less UNION ALL arm keeps this wrapper as a coroutine in
+    // stock, so its skipped source rows still evaluate their projection.
+    (
+        "SELECT v FROM (SELECT abs(x) AS v FROM e UNION ALL SELECT 99) LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "WITH c(v) AS (SELECT abs(x) FROM e UNION ALL SELECT 99) \
+         SELECT v FROM c LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808)) ORDER BY v LIMIT 1",
+        &[],
+    ),
+    (
+        "WITH c(v) AS (SELECT v FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808)) SELECT v FROM c LIMIT 1",
+        &[],
+    ),
+    (
+        "WITH c(v) AS MATERIALIZED (SELECT v FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808)) SELECT v FROM c LIMIT 1",
+        &[],
+    ),
+    (
+        "SELECT q.* FROM (SELECT v AS n, k AS tag FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808), 0) AS q LIMIT 1",
+        &[],
+    ),
+    (
+        "WITH c(z) AS (SELECT v FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808)) SELECT z FROM c LIMIT 1",
+        &[],
+    ),
+    (
+        "WITH c(z) AS NOT MATERIALIZED (SELECT v FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808)) SELECT z FROM c LIMIT 1",
+        &[],
+    ),
+    (
+        "SELECT v FROM (SELECT v FROM s WHERE k = ? UNION ALL SELECT abs(?)) LIMIT ?",
+        &[2, i64::MIN, 1],
+    ),
+    (
+        "WITH c(z) AS (SELECT v FROM s WHERE k = ? UNION ALL SELECT abs(?)) \
+         SELECT z FROM c LIMIT ?",
+        &[2, i64::MIN, 1],
+    ),
+    (
+        "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808)) LIMIT ? OFFSET ?",
+        &[1, -4],
+    ),
+    (
+        "SELECT v FROM (SELECT v FROM s UNION ALL \
+         SELECT abs(-9223372036854775808)) LIMIT 2",
+        &[],
+    ),
+    // The next arm is needed when the first cannot satisfy the limit.
+    (
+        "SELECT v FROM (SELECT v FROM s WHERE k = 99 UNION ALL \
+         SELECT abs(-9223372036854775808)) LIMIT 1",
+        &[],
+    ),
+    (
+        "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808)) LIMIT 2",
+        &[],
+    ),
+    // Capping before a filter, deduplication or sort changes the answer.
+    (
+        "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+         SELECT abs(-9223372036854775808)) WHERE v < 0 LIMIT 1",
+        &[],
+    ),
+    (
+        "SELECT DISTINCT v FROM (SELECT 1 AS v UNION ALL SELECT 1 UNION ALL \
+         SELECT abs(-9223372036854775808)) LIMIT 2",
+        &[],
+    ),
+    (
+        "SELECT v FROM (SELECT 80 AS v UNION SELECT abs(-9223372036854775808)) LIMIT 1",
+        &[],
+    ),
+    (
+        "SELECT v FROM (SELECT 80 AS v UNION ALL SELECT abs(-9223372036854775808) \
+         ORDER BY 1) LIMIT 1",
+        &[],
+    ),
+    (
+        "SELECT v FROM (SELECT 80 AS v UNION ALL SELECT abs(-9223372036854775808) \
+         LIMIT 1 OFFSET 1) LIMIT 1",
+        &[],
+    ),
+    (
+        "SELECT sum(v) FROM (SELECT 80 AS v UNION ALL \
+         SELECT abs(-9223372036854775808)) LIMIT 1",
+        &[],
+    ),
+    (
+        "WITH c(v) AS (SELECT 80 UNION ALL SELECT abs(-9223372036854775808)) \
+         SELECT c.v FROM c JOIN c AS d ON 1 LIMIT 1",
+        &[],
+    ),
+    // SQLite recognizes recursion without the RECURSIVE keyword too.
+    (
+        "WITH c(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM c WHERE v < 3) \
+         SELECT v FROM c LIMIT 2",
+        &[],
+    ),
+    // Limiting execution does not hide static errors in later arms.
+    (
+        "SELECT v FROM (SELECT 80 AS v UNION ALL SELECT missing FROM s) LIMIT 1",
+        &[],
+    ),
+    (
+        "SELECT v FROM (SELECT 80 AS v UNION ALL SELECT no_such_function(0)) LIMIT 1",
+        &[],
+    ),
+];
+
 #[test]
-#[ignore = "bd-ct8zm: derived/CTE compound sources still materialize beyond a positive outer LIMIT"]
 fn derived_compound_limits_do_not_evaluate_unreachable_rows() {
+    compare_fallback_limit_cases(DERIVED_COMPOUND_LIMIT_CASES);
+}
+
+#[test]
+fn derived_compound_limit_rebinds_on_prepared_reuse() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = open_pair(file_backed, &dir).await;
+            for sql in [
+                "SELECT v FROM (SELECT ? AS v UNION ALL \
+                 SELECT abs(-9223372036854775808)) LIMIT ?",
+                "WITH c(z) AS (SELECT ? UNION ALL SELECT abs(-9223372036854775808)) \
+                 SELECT z FROM c LIMIT ?",
+            ] {
+                let prepared = f.prepare(sql).await.expect(sql);
+                for limit in [1, 2, 1] {
+                    let params = [7, limit];
+                    let values = params.map(SqliteValue::Integer);
+                    let expected = rq(&r, sql, &params);
+                    let actual = prepared
+                        .query_with_params(&values)
+                        .await
+                        .map(|rows| tag_rows(&rows))
+                        .map_err(|error| error.to_string());
+                    assert_eq!(
+                        actual, expected,
+                        "file={file_backed} {sql} {params:?}: recompute source cap for each execution"
+                    );
+                }
+            }
+            f.close().await.unwrap();
+        }
+    });
+}
+
+/// A positive OFFSET must skip expressions inside each compound arm; a
+/// materialized LIMIT+OFFSET prefix still evaluates these unreachable rows.
+#[test]
+#[ignore = "bd-ct8zm: compound OFFSET still evaluates skipped arm projections"]
+fn compound_offsets_skip_unreachable_projection_rows() {
     let cases: &[(&str, &[i64])] = &[
+        ("SELECT abs(x) FROM e UNION ALL SELECT 99 LIMIT 1 OFFSET 2", &[]),
         (
-            "SELECT (SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
-             SELECT abs(-9223372036854775808)))",
+            "SELECT v FROM (SELECT abs(x) AS v FROM e UNION ALL SELECT 99 FROM u) \
+             LIMIT 1 OFFSET 2",
             &[],
         ),
         (
-            "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
-             SELECT abs(-9223372036854775808)) LIMIT 1",
-            &[],
-        ),
-        (
-            "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
-             SELECT abs(-9223372036854775808)) LIMIT ?",
-            &[1],
-        ),
-        (
-            "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
-             SELECT abs(-9223372036854775808)) LIMIT 1 OFFSET 1",
-            &[],
-        ),
-        (
-            "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
-             SELECT abs(-9223372036854775808)) ORDER BY v LIMIT 1",
-            &[],
-        ),
-        (
-            "WITH c(v) AS (SELECT v FROM s WHERE k = 2 UNION ALL \
-             SELECT abs(-9223372036854775808)) SELECT v FROM c LIMIT 1",
-            &[],
-        ),
-        (
-            "WITH c(v) AS MATERIALIZED (SELECT v FROM s WHERE k = 2 UNION ALL \
-             SELECT abs(-9223372036854775808)) SELECT v FROM c LIMIT 1",
+            "WITH c(v) AS (SELECT abs(x) FROM e UNION ALL SELECT 99 FROM u) \
+             SELECT v FROM c LIMIT 1 OFFSET 2",
             &[],
         ),
     ];
