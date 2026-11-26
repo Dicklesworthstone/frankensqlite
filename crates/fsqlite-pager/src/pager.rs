@@ -34330,6 +34330,12 @@ where
         Some((usable_size, full_page_size))
     }
 
+    fn is_sole_transaction(&self) -> bool {
+        self.maintenance_lease
+            .as_ref()
+            .is_some_and(PagerMaintenanceLease::is_sole_transaction)
+    }
+
     fn set_auto_vacuum_state(&mut self, mode: AutoVacuumMode, largest_root_page: u32) {
         self.pointer_map = PointerMapState {
             mode,

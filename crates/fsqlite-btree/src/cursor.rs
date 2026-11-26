@@ -493,6 +493,15 @@ pub trait PageWriter: PageReader {
         None
     }
 
+    /// Whether this writer belongs to the sole active same-process transaction
+    /// on its database file.
+    ///
+    /// Conservative default is `false` so multi-writer / mock contexts never
+    /// widen write sets onto sibling pages.
+    fn is_sole_transaction(&self) -> bool {
+        false
+    }
+
     /// Read the 5-byte pointer-map entry for `child_page`.
     fn read_ptrmap_entry<'a>(
         &'a self,
@@ -761,6 +770,10 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
 
     fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
         self.txn.pointer_map_page_sizes()
+    }
+
+    fn is_sole_transaction(&self) -> bool {
+        self.txn.is_sole_transaction()
     }
 
     fn read_ptrmap_entry<'a>(
@@ -9740,6 +9753,18 @@ impl<P: PageWriter> BtCursor<P> {
         cell_data: &[u8],
         insert_idx: u16,
     ) -> Result<()> {
+        self.balance_for_insert_inner(cx, cell_data, insert_idx, false)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn balance_for_insert_inner(
+        &mut self,
+        cx: &Cx,
+        cell_data: &[u8],
+        insert_idx: u16,
+        allow_sibling_repack: bool,
+    ) -> Result<()> {
         let depth = self.stack.len();
         if depth == 0 {
             return Err(FrankenError::internal("cursor stack empty during balance"));
@@ -9860,43 +9885,69 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             let mut outcome = if leaf_entry.header.page_type == cell::BtreePageType::LeafTable {
-                let local_split_start = instrumentation::profile_start();
-                match balance::balance_table_leaf_local_split(
-                    cx,
-                    &mut self.pager,
-                    parent_page_no,
-                    child_idx,
-                    leaf_entry.page_no,
-                    cell_data,
-                    insert_idx as usize,
-                    self.usable_size,
-                    self.page_size,
-                    parent_is_root,
-                )
-                .await?
-                {
-                    Some(outcome) => {
-                        instrumentation::record_local_split_attempt(local_split_start, true);
-                        self.note_split_event();
-                        outcome
-                    }
-                    None => {
-                        instrumentation::record_local_split_attempt(local_split_start, false);
-                        let nonroot_start = instrumentation::profile_start();
-                        let outcome = balance::balance_nonroot(
-                            cx,
-                            &mut self.pager,
-                            parent_page_no,
-                            child_idx,
-                            &[cell_data.to_vec()],
-                            insert_idx as usize,
-                            self.usable_size,
-                            self.page_size,
-                            parent_is_root,
-                        )
-                        .await?;
-                        instrumentation::record_nonroot_balance(nonroot_start);
-                        outcome
+                // bd-5qnn4: when a row-growing UPDATE overflows a table leaf
+                // while we are the sole transaction on this database, pack
+                // into an underfull adjacent leaf before splitting 1->2 so
+                // left/right leaves do not stay stranded half-empty.
+                let repacked = if allow_sibling_repack && self.pager.is_sole_transaction() {
+                    balance::balance_table_leaf_sibling_repack(
+                        cx,
+                        &mut self.pager,
+                        parent_page_no,
+                        child_idx,
+                        leaf_entry.page_no,
+                        cell_data,
+                        insert_idx as usize,
+                        self.usable_size,
+                        self.page_size,
+                        parent_is_root,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                if let Some(outcome) = repacked {
+                    self.note_split_event();
+                    outcome
+                } else {
+                    let local_split_start = instrumentation::profile_start();
+                    match balance::balance_table_leaf_local_split(
+                        cx,
+                        &mut self.pager,
+                        parent_page_no,
+                        child_idx,
+                        leaf_entry.page_no,
+                        cell_data,
+                        insert_idx as usize,
+                        self.usable_size,
+                        self.page_size,
+                        parent_is_root,
+                    )
+                    .await?
+                    {
+                        Some(outcome) => {
+                            instrumentation::record_local_split_attempt(local_split_start, true);
+                            self.note_split_event();
+                            outcome
+                        }
+                        None => {
+                            instrumentation::record_local_split_attempt(local_split_start, false);
+                            let nonroot_start = instrumentation::profile_start();
+                            let outcome = balance::balance_nonroot(
+                                cx,
+                                &mut self.pager,
+                                parent_page_no,
+                                child_idx,
+                                &[cell_data.to_vec()],
+                                insert_idx as usize,
+                                self.usable_size,
+                                self.page_size,
+                                parent_is_root,
+                            )
+                            .await?;
+                            instrumentation::record_nonroot_balance(nonroot_start);
+                            outcome
+                        }
                     }
                 }
             } else {
@@ -11557,6 +11608,17 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
         data: &[u8],
     ) -> Result<()> {
+        self.table_insert_from_current_position_inner(cx, rowid, data, false)
+            .await
+    }
+
+    async fn table_insert_from_current_position_inner(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        data: &[u8],
+        allow_sibling_repack: bool,
+    ) -> Result<()> {
         if self.stack.is_empty() && !self.seed_empty_root_leaf_cursor(cx).await? {
             return Err(FrankenError::internal("cursor stack is empty"));
         }
@@ -11625,7 +11687,9 @@ impl<P: PageWriter> BtCursor<P> {
             }
             Ok(false) => {
                 instrumentation::record_conservative_reload_fallback();
-                let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx).await;
+                let balance_result = self
+                    .balance_for_insert_inner(cx, &cell_data, insert_idx, allow_sibling_repack)
+                    .await;
                 self.cell_buf = cell_data;
                 if balance_result.is_ok() {
                     self.last_insert_rowid = Some(rowid);
@@ -12828,6 +12892,35 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
         data: &[u8],
     ) -> Result<()> {
+        self.table_insert_prechecked_absent_inner(cx, rowid, data, false)
+            .await
+    }
+
+    /// Replacement variant of [`Self::table_insert_prechecked_absent`] used by
+    /// `UPDATE` when rewriting a row whose new cell no longer fits in place.
+    ///
+    /// Permits 2-sibling underfull leaf repacking (bd-5qnn4) when this
+    /// transaction is the sole same-process transaction on its file, avoiding
+    /// half-empty leaves left behind by growing-row `UPDATE` passes while
+    /// keeping pure `INSERT` and concurrent-writer paths untouched.
+    #[doc(hidden)]
+    pub async fn table_replace_prechecked_absent(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<()> {
+        self.table_insert_prechecked_absent_inner(cx, rowid, data, true)
+            .await
+    }
+
+    async fn table_insert_prechecked_absent_inner(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        data: &[u8],
+        allow_sibling_repack: bool,
+    ) -> Result<()> {
         let result = self
             .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
             if !cursor.current_position_admits_table_insert(rowid)? {
@@ -12842,7 +12935,7 @@ impl<P: PageWriter> BtCursor<P> {
                 }
             }
             cursor
-                .table_insert_from_current_position(cx, rowid, data)
+                .table_insert_from_current_position_inner(cx, rowid, data, allow_sibling_repack)
                 .await
         })
             .await;

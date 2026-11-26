@@ -1704,6 +1704,15 @@ pub trait TransactionHandle: sealed::Sealed + Send {
         None
     }
 
+    /// Whether this transaction is the sole active same-process admission on
+    /// its database file (no other transaction, opener, or maintenance active).
+    ///
+    /// Conservative default is `false` so test/mock transactions never widen
+    /// structural write sets onto sibling pages when peers might exist.
+    fn is_sole_transaction(&self) -> bool {
+        false
+    }
+
     /// Update transaction-local auto-vacuum mode and `largest_root_page`
     /// (e.g. when initializing an empty database, toggling `FULL <-> INCREMENTAL`,
     /// or packing/compacting root pages).
@@ -2742,6 +2751,10 @@ impl TransactionHandle for TransactionKind {
 
     fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
         dispatch_transaction_kind!(self, txn => txn.pointer_map_page_sizes())
+    }
+
+    fn is_sole_transaction(&self) -> bool {
+        dispatch_transaction_kind!(self, txn => txn.is_sole_transaction())
     }
 
     fn set_auto_vacuum_state(

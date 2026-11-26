@@ -5485,6 +5485,10 @@ impl PageWriter for SharedTxnPageIo {
         self.txn.borrow().pointer_map_page_sizes()
     }
 
+    fn is_sole_transaction(&self) -> bool {
+        self.txn.borrow().is_sole_transaction()
+    }
+
     #[allow(clippy::await_holding_refcell_ref)]
     async fn read_ptrmap_entry(
         &self,
@@ -6353,6 +6357,22 @@ impl CursorBackend {
             Self::Txn(c) => c.table_insert_prechecked_absent(cx, rowid, data).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: table_insert not permitted".to_owned(),
+            )),
+        }
+    }
+
+    async fn table_replace_prechecked_absent(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<()> {
+        match self {
+            Self::Mem(c) => c.table_replace_prechecked_absent(cx, rowid, data).await,
+            Self::Temp(c) => c.table_replace_prechecked_absent(cx, rowid, data).await,
+            Self::Txn(c) => c.table_replace_prechecked_absent(cx, rowid, data).await,
+            Self::TimeTravel(_) => Err(FrankenError::Internal(
+                "time-travel cursors are read-only: table_replace not permitted".to_owned(),
             )),
         }
     }
@@ -16101,7 +16121,7 @@ impl VdbeEngine {
                                         {
                                             lean_future(|| sc.cursor.delete(&sc.cx)).await?;
                                             lean_future(|| {
-                                                sc.cursor.table_insert_prechecked_absent(&sc.cx, rowid, blob)
+                                                sc.cursor.table_replace_prechecked_absent(&sc.cx, rowid, blob)
                                             })
                                             .await?;
                                         } else {
@@ -16272,8 +16292,21 @@ impl VdbeEngine {
                                             )?;
                                         }
                                         let rightmost_insert = sc.cursor.eof();
-                                        lean_future(|| sc.cursor.table_insert_prechecked_absent(&sc.cx, rowid, blob))
+                                        if is_update {
+                                            lean_future(|| {
+                                                sc.cursor.table_replace_prechecked_absent(
+                                                    &sc.cx, rowid, blob,
+                                                )
+                                            })
                                             .await?;
+                                        } else {
+                                            lean_future(|| {
+                                                sc.cursor.table_insert_prechecked_absent(
+                                                    &sc.cx, rowid, blob,
+                                                )
+                                            })
+                                            .await?;
+                                        }
                                         if rightmost_insert {
                                             lean_future(|| {
                                                 sc.cursor.table_refresh_rightmost_leaf_cache_after_insert(

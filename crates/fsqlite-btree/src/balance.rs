@@ -1507,6 +1507,422 @@ pub(crate) async fn balance_table_leaf_local_split<W: PageWriter>(
     }
 }
 
+/// Minimum free space fraction (`usable_size / 4`, i.e., `< 75%` full) an
+/// adjacent sibling leaf must have before `balance_table_leaf_sibling_repack`
+/// moves cells into it.
+const SIBLING_REPACK_MIN_FREE_DIVISOR: usize = 4;
+
+fn gather_table_leaf_cells<'a>(
+    page_bytes: &'a [u8],
+    header: &BtreePageHeader,
+    header_offset: usize,
+    usable_size: u32,
+    overflow_cell: Option<(&'a [u8], usize)>,
+) -> Result<(Vec<GatheredCell<'a>>, usize)> {
+    let usable_bytes = usable_prefix(page_bytes, usable_size);
+    let ptrs = read_cell_pointers(usable_bytes, header, header_offset)?;
+    let extra = usize::from(overflow_cell.is_some());
+    let mut cells = Vec::with_capacity(ptrs.len().saturating_add(extra));
+    let mut total_cell_bytes = 0usize;
+    let insert_idx = overflow_cell.map(|(_, idx)| idx.min(ptrs.len()));
+    let mut overflow_inserted = false;
+
+    for (cell_idx, &ptr) in ptrs.iter().enumerate() {
+        if let (Some((overflow, _)), Some(target_idx)) = (overflow_cell, insert_idx)
+            && cell_idx == target_idx
+        {
+            let cost = overflow
+                .len()
+                .max(MIN_CELL_ALLOCATION)
+                .checked_add(usize::from(CELL_POINTER_SIZE))
+                .ok_or_else(|| FrankenError::internal("balance: overflow cell size overflow"))?;
+            total_cell_bytes = total_cell_bytes
+                .checked_add(cost)
+                .ok_or_else(|| FrankenError::internal("balance: total cell bytes overflow"))?;
+            cells.push(GatheredCell {
+                size: u16::try_from(overflow.len()).unwrap_or(u16::MAX),
+                data: Cow::Borrowed(overflow),
+            });
+            overflow_inserted = true;
+        }
+
+        let ptr = usize::from(ptr);
+        let cell_ref = CellRef::parse(usable_bytes, ptr, BtreePageType::LeafTable, usable_size)?;
+        let cell_end = ptr + cell_on_page_size_from_ref(&cell_ref, ptr);
+        let raw = &usable_bytes[ptr..cell_end];
+        let cost = raw
+            .len()
+            .max(MIN_CELL_ALLOCATION)
+            .checked_add(usize::from(CELL_POINTER_SIZE))
+            .ok_or_else(|| FrankenError::internal("balance: leaf cell size overflow"))?;
+        total_cell_bytes = total_cell_bytes
+            .checked_add(cost)
+            .ok_or_else(|| FrankenError::internal("balance: total cell bytes overflow"))?;
+        cells.push(GatheredCell {
+            size: u16::try_from(raw.len()).unwrap_or(u16::MAX),
+            data: Cow::Borrowed(raw),
+        });
+    }
+
+    if let Some((overflow, _)) = overflow_cell
+        && !overflow_inserted
+    {
+        let cost = overflow
+            .len()
+            .max(MIN_CELL_ALLOCATION)
+            .checked_add(usize::from(CELL_POINTER_SIZE))
+            .ok_or_else(|| FrankenError::internal("balance: overflow cell size overflow"))?;
+        total_cell_bytes = total_cell_bytes
+            .checked_add(cost)
+            .ok_or_else(|| FrankenError::internal("balance: total cell bytes overflow"))?;
+        cells.push(GatheredCell {
+            size: u16::try_from(overflow.len()).unwrap_or(u16::MAX),
+            data: Cow::Borrowed(overflow),
+        });
+    }
+
+    Ok((cells, total_cell_bytes))
+}
+
+/// 2-sibling underfull table-leaf repack (bd-5qnn4).
+///
+/// When a row-growing `UPDATE` overflows `leaf_page_no` while this transaction
+/// is the sole active same-process transaction, `balance_table_leaf_local_split`
+/// alone strands the previous split's sibling ~50% empty (up to ~1.92x stock's
+/// page count). Before allocating a fresh page, inspect the immediate left
+/// sibling (and then immediate right sibling for descending updates): if that
+/// sibling is `< 75%` full (`>= usable_size / 4` free bytes) and greedily
+/// packing cells into it lets both existing siblings hold all cells without
+/// allocating a third page, rewrite just those two leaves and update their
+/// single parent divider.
+///
+/// Returns `Ok(None)` without mutating anything if neither adjacent sibling is
+/// eligible, letting the caller fall straight through to
+/// `balance_table_leaf_local_split`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn balance_table_leaf_sibling_repack<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    parent_page_no: PageNumber,
+    child_idx: usize,
+    leaf_page_no: PageNumber,
+    overflow_cell: &[u8],
+    overflow_insert_idx: usize,
+    usable_size: u32,
+    page_size: u32,
+    parent_is_root: bool,
+) -> Result<Option<BalanceResult>> {
+    let parent_page = writer.read_page_data(cx, parent_page_no).await?;
+    let parent_offset = header_offset_for_page(parent_page_no);
+    let parent_header = parse_page_header(parent_page.as_bytes(), parent_page_no)?;
+    if parent_header.page_type != BtreePageType::InteriorTable {
+        return Ok(None);
+    }
+    let total_children = usize::from(parent_header.cell_count) + 1;
+    if total_children < 2 || child_idx >= total_children {
+        return Ok(None);
+    }
+    let parent_ptrs = read_cell_pointers(
+        usable_prefix(parent_page.as_bytes(), usable_size),
+        &parent_header,
+        parent_offset,
+    )?;
+    let recorded_leaf_pgno = child_page_number(
+        parent_page.as_bytes(),
+        &parent_header,
+        &parent_ptrs,
+        parent_offset,
+        child_idx,
+        usable_size,
+    )?;
+    if recorded_leaf_pgno != leaf_page_no {
+        return Ok(None);
+    }
+
+    let usable = usable_size as usize;
+    let min_free = usable / SIBLING_REPACK_MIN_FREE_DIVISOR;
+    if min_free == 0 {
+        return Ok(None);
+    }
+    let leaf_hdr_size = usize::from(BtreePageType::LeafTable.header_size());
+
+    // Build candidate list: try left sibling first (ascending scans), then
+    // right sibling (descending scans).
+    let mut candidates: [(usize, bool); 2] = [(0, false); 2];
+    let mut candidate_count = 0usize;
+    if child_idx > 0 {
+        candidates[candidate_count] = (child_idx - 1, true);
+        candidate_count += 1;
+    }
+    if child_idx + 1 < total_children {
+        candidates[candidate_count] = (child_idx + 1, false);
+        candidate_count += 1;
+    }
+
+    let leaf_page = writer.read_page_data(cx, leaf_page_no).await?;
+    let leaf_offset = header_offset_for_page(leaf_page_no);
+    let leaf_header = parse_page_header(leaf_page.as_bytes(), leaf_page_no)?;
+    if leaf_header.page_type != BtreePageType::LeafTable {
+        return Ok(None);
+    }
+    let leaf_base = leaf_offset + leaf_hdr_size;
+
+    let mut gathered_leaf: Option<(Vec<GatheredCell<'_>>, usize)> = None;
+
+    for &(sibling_idx, sibling_is_left) in &candidates[..candidate_count] {
+        let sibling_pgno = child_page_number(
+            parent_page.as_bytes(),
+            &parent_header,
+            &parent_ptrs,
+            parent_offset,
+            sibling_idx,
+            usable_size,
+        )?;
+        if sibling_pgno == leaf_page_no {
+            continue;
+        }
+
+        let sibling_page = writer.read_page_data(cx, sibling_pgno).await?;
+        let sib_offset = header_offset_for_page(sibling_pgno);
+        let sib_header = parse_page_header(sibling_page.as_bytes(), sibling_pgno)?;
+        if sib_header.page_type != BtreePageType::LeafTable {
+            continue;
+        }
+
+        // Fast O(1) header check: when there is no freeblock list, total free
+        // space on the sibling cannot exceed the unallocated gap plus
+        // fragmented bytes. Skip packed siblings without parsing cells.
+        let sib_base = sib_offset + leaf_hdr_size;
+        let sib_ptr_end =
+            sib_base + usize::from(sib_header.cell_count) * usize::from(CELL_POINTER_SIZE);
+        let unallocated_free = sib_header
+            .content_offset(usable_size)
+            .saturating_sub(sib_ptr_end);
+        if sib_header.first_freeblock == 0
+            && unallocated_free.saturating_add(usize::from(sib_header.fragmented_free_bytes))
+                < min_free
+        {
+            continue;
+        }
+
+        let (sib_cells, sib_cell_bytes) = gather_table_leaf_cells(
+            sibling_page.as_bytes(),
+            &sib_header,
+            sib_offset,
+            usable_size,
+            None,
+        )?;
+        let sib_free = usable.saturating_sub(sib_base.saturating_add(sib_cell_bytes));
+        if sib_free < min_free {
+            continue;
+        }
+
+        if gathered_leaf.is_none() {
+            gathered_leaf = Some(gather_table_leaf_cells(
+                leaf_page.as_bytes(),
+                &leaf_header,
+                leaf_offset,
+                usable_size,
+                Some((overflow_cell, overflow_insert_idx)),
+            )?);
+        }
+        let Some((leaf_cells, leaf_cell_bytes)) = gathered_leaf.as_ref() else {
+            return Ok(None);
+        };
+        let leaf_cell_bytes = *leaf_cell_bytes;
+
+        // Require at least two cells on the overflowing leaf (each output leaf
+        // must remain non-empty) and total combined bytes within two pages.
+        if leaf_cells.len() < 2
+            || sib_cells.len().saturating_add(leaf_cells.len()) > MAX_GATHERED_CELLS
+            || sib_base
+                .saturating_add(leaf_base)
+                .saturating_add(sib_cell_bytes)
+                .saturating_add(leaf_cell_bytes)
+                > usable.saturating_mul(2)
+        {
+            continue;
+        }
+
+        let (
+            first_child,
+            left_pgno,
+            right_pgno,
+            left_original,
+            right_original,
+            left_page,
+            right_page,
+            divider,
+        ) = if sibling_is_left {
+            let mut left_used = sib_base.saturating_add(sib_cell_bytes);
+            let mut move_count = 0usize;
+            let mut moved_bytes = 0usize;
+            for cell in &leaf_cells[..leaf_cells.len() - 1] {
+                let Some(cost) = cell_cost(cell) else {
+                    move_count = 0;
+                    break;
+                };
+                if left_used.saturating_add(cost) <= usable {
+                    left_used += cost;
+                    moved_bytes += cost;
+                    move_count += 1;
+                } else {
+                    break;
+                }
+            }
+            if move_count == 0
+                || leaf_base.saturating_add(leaf_cell_bytes.saturating_sub(moved_bytes)) > usable
+            {
+                continue;
+            }
+
+            let mut left_cells = Vec::with_capacity(sib_cells.len() + move_count);
+            left_cells.extend(sib_cells.iter().cloned());
+            left_cells.extend(leaf_cells[..move_count].iter().cloned());
+            let right_cells = &leaf_cells[move_count..];
+
+            let left_page = build_page(
+                &left_cells,
+                BtreePageType::LeafTable,
+                sib_offset,
+                usable_size,
+                page_size,
+                None,
+            )?;
+            let right_page = build_page(
+                right_cells,
+                BtreePageType::LeafTable,
+                leaf_offset,
+                usable_size,
+                page_size,
+                None,
+            )?;
+            let divider =
+                table_leaf_divider_bytes(sibling_pgno, &leaf_cells[move_count - 1], usable_size)?;
+            (
+                child_idx - 1,
+                sibling_pgno,
+                leaf_page_no,
+                sibling_page.clone(),
+                leaf_page.clone(),
+                left_page,
+                right_page,
+                divider,
+            )
+        } else {
+            let mut right_used = sib_base.saturating_add(sib_cell_bytes);
+            let mut move_count = 0usize;
+            let mut moved_bytes = 0usize;
+            for cell in leaf_cells[1..].iter().rev() {
+                let Some(cost) = cell_cost(cell) else {
+                    move_count = 0;
+                    break;
+                };
+                if right_used.saturating_add(cost) <= usable {
+                    right_used += cost;
+                    moved_bytes += cost;
+                    move_count += 1;
+                } else {
+                    break;
+                }
+            }
+            if move_count == 0
+                || leaf_base.saturating_add(leaf_cell_bytes.saturating_sub(moved_bytes)) > usable
+            {
+                continue;
+            }
+
+            let split_in_leaf = leaf_cells.len() - move_count;
+            let left_cells = &leaf_cells[..split_in_leaf];
+            let mut right_cells = Vec::with_capacity(move_count + sib_cells.len());
+            right_cells.extend(leaf_cells[split_in_leaf..].iter().cloned());
+            right_cells.extend(sib_cells.iter().cloned());
+
+            let left_page = build_page(
+                left_cells,
+                BtreePageType::LeafTable,
+                leaf_offset,
+                usable_size,
+                page_size,
+                None,
+            )?;
+            let right_page = build_page(
+                &right_cells,
+                BtreePageType::LeafTable,
+                sib_offset,
+                usable_size,
+                page_size,
+                None,
+            )?;
+            let divider = table_leaf_divider_bytes(
+                leaf_page_no,
+                &leaf_cells[split_in_leaf - 1],
+                usable_size,
+            )?;
+            (
+                child_idx,
+                leaf_page_no,
+                sibling_pgno,
+                leaf_page.clone(),
+                sibling_page.clone(),
+                left_page,
+                right_page,
+                divider,
+            )
+        };
+
+        let original_pages = [
+            (left_pgno, left_original.clone()),
+            (right_pgno, right_original.clone()),
+        ];
+        let mut pending_page_writes = [
+            (left_pgno, left_page, Some(left_original)),
+            (right_pgno, right_page, Some(right_original)),
+        ];
+        pending_page_writes.sort_by_key(|(pgno, _, _)| pgno.get());
+
+        for (pgno, page_bytes, original_page) in pending_page_writes {
+            if let Err(err) = write_or_claim_sibling_page(
+                cx,
+                writer,
+                pgno,
+                page_bytes,
+                original_page.as_ref().map(PageData::as_bytes),
+            )
+            .await
+            {
+                restore_pages_best_effort(cx, writer, &original_pages).await;
+                return Err(err);
+            }
+        }
+
+        let new_pgnos = [left_pgno, right_pgno];
+        let new_dividers = [(left_pgno, divider)];
+        return match apply_child_replacement(
+            cx,
+            writer,
+            parent_page_no,
+            usable_size,
+            page_size,
+            first_child,
+            2,
+            &new_pgnos,
+            &new_dividers,
+            parent_is_root,
+        )
+        .await
+        {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(err) => {
+                restore_pages_best_effort(cx, writer, &original_pages).await;
+                Err(err)
+            }
+        };
+    }
+
+    Ok(None)
+}
+
 async fn free_pages_best_effort<W: PageWriter>(cx: &Cx, writer: &mut W, pages: &[PageNumber]) {
     for &pgno in pages {
         let _ = writer.free_page(cx, pgno).await;
@@ -5495,6 +5911,250 @@ mod tests {
                 leaf_pages < 100,
                 "12,000 small index keys should pack into <100 4 KiB leaf pages, got {leaf_pages}"
             );
+        });
+    }
+
+    fn leaf_rowids(page: &[u8]) -> Vec<i64> {
+        let header = BtreePageHeader::parse(page, 0).expect("parse leaf header");
+        let ptrs = read_cell_pointers(page, &header, 0).expect("read leaf pointers");
+        ptrs.into_iter()
+            .map(|ptr| {
+                CellRef::parse_leaf_table_rowid(page, usize::from(ptr)).expect("parse leaf rowid")
+            })
+            .collect()
+    }
+
+    fn interior_dividers(page: &[u8]) -> Vec<(u32, i64)> {
+        let header = BtreePageHeader::parse(page, 0).expect("parse interior header");
+        let ptrs = read_cell_pointers(page, &header, 0).expect("read interior pointers");
+        ptrs.into_iter()
+            .map(|ptr| {
+                let cell =
+                    CellRef::parse(page, usize::from(ptr), BtreePageType::InteriorTable, USABLE)
+                        .expect("parse interior cell");
+                (
+                    cell.left_child.expect("interior left child").get(),
+                    cell.rowid.expect("interior divider rowid"),
+                )
+            })
+            .collect()
+    }
+
+    /// bd-5qnn4: overflowing a table leaf whose left sibling is < 75% full
+    /// packs cells leftward in 2->2 fashion with zero page allocations and
+    /// leaves the right sibling untouched.
+    #[test]
+    fn test_balance_table_leaf_sibling_repack_packs_into_underfull_left_sibling() {
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(20);
+            let payload = vec![b'x'; 200];
+            // 200B payload + 3B varints + 2B ptr = 205B/cell -> max 19 cells/4K leaf.
+            let left_rows: Vec<(i64, &[u8])> = (1..=9).map(|k| (k, payload.as_slice())).collect();
+            let mid_rows: Vec<(i64, &[u8])> = (10..=28).map(|k| (k, payload.as_slice())).collect();
+            let right_rows: Vec<(i64, &[u8])> = vec![(100, payload.as_slice())];
+
+            let right_original = build_leaf_table(&right_rows);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 9), (pn(4), 29)], pn(5)));
+            store.pages.insert(3, build_leaf_table(&left_rows));
+            store.pages.insert(4, build_leaf_table(&mid_rows));
+            store.pages.insert(5, right_original.clone());
+
+            let overflow_cell = build_leaf_table_cell(29, &payload);
+            let outcome = balance_table_leaf_sibling_repack(
+                &cx,
+                &mut store,
+                pn(2),
+                1,
+                pn(4),
+                &overflow_cell,
+                19,
+                USABLE,
+                USABLE,
+                true,
+            )
+            .await
+            .expect("left sibling repack should succeed")
+            .expect("underfull left sibling should accept repack");
+
+            assert!(matches!(outcome, BalanceResult::Done));
+            assert_eq!(store.pages.len(), 4, "2->2 repack must not allocate a page");
+            assert_eq!(
+                store.pages.get(&5),
+                Some(&right_original),
+                "untouched right sibling must remain byte-identical"
+            );
+
+            let left_keys = leaf_rowids(&store.pages[&3]);
+            let mid_keys = leaf_rowids(&store.pages[&4]);
+            assert!(
+                left_keys.len() >= 18,
+                "left sibling should pack to >=18 cells, got {}",
+                left_keys.len()
+            );
+            assert!(!mid_keys.is_empty(), "right leaf must stay non-empty");
+            let mut combined = left_keys.clone();
+            combined.extend(&mid_keys);
+            assert_eq!(combined, (1..=29).collect::<Vec<_>>());
+
+            let divs = interior_dividers(&store.pages[&2]);
+            assert_eq!(divs, vec![(3, *left_keys.last().unwrap()), (4, 29)]);
+        });
+    }
+
+    /// bd-5qnn4: when the left sibling is packed (>= 75% full) and the right
+    /// sibling is underfull (< 75% full), repack shifts trailing cells right
+    /// without touching the left sibling or allocating a page.
+    #[test]
+    fn test_balance_table_leaf_sibling_repack_packs_into_underfull_right_sibling() {
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(20);
+            let payload = vec![b'y'; 200];
+            let left_rows: Vec<(i64, &[u8])> = (1..=18).map(|k| (k, payload.as_slice())).collect();
+            let mid_ids: Vec<i64> = (19..=38).filter(|&k| k != 25).collect();
+            let mid_rows: Vec<(i64, &[u8])> =
+                mid_ids.iter().map(|&k| (k, payload.as_slice())).collect();
+            let right_rows: Vec<(i64, &[u8])> =
+                (39..=47).map(|k| (k, payload.as_slice())).collect();
+
+            let left_original = build_leaf_table(&left_rows);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 18), (pn(4), 38)], pn(5)));
+            store.pages.insert(3, left_original.clone());
+            store.pages.insert(4, build_leaf_table(&mid_rows));
+            store.pages.insert(5, build_leaf_table(&right_rows));
+
+            let overflow_cell = build_leaf_table_cell(25, &payload);
+            let outcome = balance_table_leaf_sibling_repack(
+                &cx,
+                &mut store,
+                pn(2),
+                1,
+                pn(4),
+                &overflow_cell,
+                6,
+                USABLE,
+                USABLE,
+                true,
+            )
+            .await
+            .expect("right sibling repack should succeed")
+            .expect("underfull right sibling should accept repack");
+
+            assert!(matches!(outcome, BalanceResult::Done));
+            assert_eq!(store.pages.len(), 4, "2->2 repack must not allocate a page");
+            assert_eq!(
+                store.pages.get(&3),
+                Some(&left_original),
+                "packed left sibling must remain byte-identical"
+            );
+
+            let mid_keys = leaf_rowids(&store.pages[&4]);
+            let right_keys = leaf_rowids(&store.pages[&5]);
+            assert!(
+                right_keys.len() >= 18,
+                "right sibling should pack to >=18 cells, got {}",
+                right_keys.len()
+            );
+            assert!(!mid_keys.is_empty(), "left leaf must stay non-empty");
+            let mut combined = mid_keys.clone();
+            combined.extend(&right_keys);
+            assert_eq!(combined, (19..=47).collect::<Vec<_>>());
+
+            let divs = interior_dividers(&store.pages[&2]);
+            assert_eq!(divs, vec![(3, 18), (4, *mid_keys.last().unwrap())]);
+        });
+    }
+
+    /// bd-5qnn4: when both adjacent siblings are already >= 75% full, repack
+    /// returns `Ok(None)` without writing any pages so `balance_table_leaf_local_split`
+    /// handles the split as before.
+    #[test]
+    fn test_balance_table_leaf_sibling_repack_declines_when_siblings_packed() {
+        run_async(async {
+            let cx = Cx::new();
+            let mut base = MemPageStore::new(20);
+            let payload = vec![b'z'; 200];
+            let left_rows: Vec<(i64, &[u8])> = (1..=18).map(|k| (k, payload.as_slice())).collect();
+            let mid_rows: Vec<(i64, &[u8])> = (19..=37).map(|k| (k, payload.as_slice())).collect();
+            let right_rows: Vec<(i64, &[u8])> =
+                (39..=56).map(|k| (k, payload.as_slice())).collect();
+
+            base.pages
+                .insert(2, build_interior_table(&[(pn(3), 18), (pn(4), 38)], pn(5)));
+            base.pages.insert(3, build_leaf_table(&left_rows));
+            base.pages.insert(4, build_leaf_table(&mid_rows));
+            base.pages.insert(5, build_leaf_table(&right_rows));
+
+            let mut store = RecordingMemPageStore::new(base);
+            let overflow_cell = build_leaf_table_cell(38, &payload);
+            let outcome = balance_table_leaf_sibling_repack(
+                &cx,
+                &mut store,
+                pn(2),
+                1,
+                pn(4),
+                &overflow_cell,
+                19,
+                USABLE,
+                USABLE,
+                true,
+            )
+            .await
+            .expect("packed sibling probe should not error");
+
+            assert!(outcome.is_none(), "packed siblings should decline repack");
+            assert_eq!(store.write_count(pn(2)), 0);
+            assert_eq!(store.write_count(pn(3)), 0);
+            assert_eq!(store.write_count(pn(4)), 0);
+            assert_eq!(store.write_count(pn(5)), 0);
+        });
+    }
+
+    /// bd-5qnn4: an error while updating the parent restores both rewritten
+    /// sibling leaves byte-for-byte.
+    #[test]
+    fn test_balance_table_leaf_sibling_repack_restores_leaves_on_parent_write_failure() {
+        run_async(async {
+            let cx = Cx::new();
+            let mut base = MemPageStore::new(20);
+            let payload = vec![b'r'; 200];
+            let left_rows: Vec<(i64, &[u8])> = (1..=9).map(|k| (k, payload.as_slice())).collect();
+            let mid_rows: Vec<(i64, &[u8])> = (10..=28).map(|k| (k, payload.as_slice())).collect();
+
+            let parent_original = build_interior_table(&[(pn(3), 9)], pn(4));
+            let left_original = build_leaf_table(&left_rows);
+            let mid_original = build_leaf_table(&mid_rows);
+            base.pages.insert(2, parent_original.clone());
+            base.pages.insert(3, left_original.clone());
+            base.pages.insert(4, mid_original.clone());
+
+            // Write 1 = left leaf (3), write 2 = right leaf (4), write 3 = parent (2) fails.
+            let mut store = FailingMemPageStore::new(base, 3);
+            let overflow_cell = build_leaf_table_cell(29, &payload);
+            let err = balance_table_leaf_sibling_repack(
+                &cx,
+                &mut store,
+                pn(2),
+                1,
+                pn(4),
+                &overflow_cell,
+                19,
+                USABLE,
+                USABLE,
+                true,
+            )
+            .await
+            .expect_err("injected parent write failure should surface");
+            let _ = err;
+
+            assert_eq!(store.inner.pages.get(&2), Some(&parent_original));
+            assert_eq!(store.inner.pages.get(&3), Some(&left_original));
+            assert_eq!(store.inner.pages.get(&4), Some(&mid_original));
         });
     }
 }

@@ -446,3 +446,192 @@ fn explain_marks_only_rowid_preserving_updates_for_in_place_rewrite() {
         }
     });
 }
+
+/// bd-5qnn4: growing-row UPDATEs must repack into underfull adjacent table
+/// leaves instead of stranding ~50% empty pages behind `balance_table_leaf_local_split`.
+#[test]
+fn bd_5qnn4_growing_update_leaf_density_stays_near_stock() {
+    asupersync::test_utils::run_test(|| async {
+        struct Case {
+            label: &'static str,
+            rows: i64,
+            indexed: bool,
+            updates: Vec<String>,
+        }
+
+        let desc_updates: Vec<String> = (0..20)
+            .rev()
+            .map(|chunk| {
+                let lo = chunk * 500 + 1;
+                let hi = (chunk + 1) * 500;
+                format!(
+                    "UPDATE t SET b = printf('%0300d', a) WHERE a BETWEEN {lo} AND {hi}"
+                )
+            })
+            .collect();
+
+        let cases = [
+            Case {
+                label: "grow_all",
+                rows: 20_000,
+                indexed: false,
+                updates: vec!["UPDATE t SET b = printf('%0300d', a) WHERE 1".to_owned()],
+            },
+            Case {
+                label: "grow_mod2",
+                rows: 20_000,
+                indexed: false,
+                updates: vec!["UPDATE t SET b = printf('%0300d', a) WHERE a % 2 = 0".to_owned()],
+            },
+            Case {
+                label: "grow_mod10",
+                rows: 20_000,
+                indexed: false,
+                updates: vec!["UPDATE t SET b = printf('%0300d', a) WHERE a % 10 = 0".to_owned()],
+            },
+            Case {
+                label: "grow_indexed_mod2",
+                rows: 10_000,
+                indexed: true,
+                updates: vec!["UPDATE t SET b = printf('%0300d', a) WHERE a % 2 = 0".to_owned()],
+            },
+            Case {
+                label: "grow_desc_chunks",
+                rows: 10_000,
+                indexed: false,
+                updates: desc_updates,
+            },
+        ];
+
+        for case in &cases {
+            let dir = tempfile::tempdir().unwrap();
+            let frank_path = dir.path().join(format!("{}_frank.db", case.label));
+            let stock_path = dir.path().join(format!("{}_stock.db", case.label));
+            let frank_str = frank_path.to_str().unwrap().to_owned();
+
+            let seed = format!(
+                "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);{}
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {})
+                 INSERT INTO t SELECT i, 'x' FROM n;",
+                if case.indexed {
+                    " CREATE INDEX tb ON t(b);"
+                } else {
+                    ""
+                },
+                case.rows
+            );
+
+            let frank = Connection::open(&frank_str).await.unwrap();
+            let stock = rusqlite::Connection::open(&stock_path).unwrap();
+            frank.execute_batch(&seed).await.unwrap();
+            stock.execute_batch(&seed).unwrap();
+
+            for sql in &case.updates {
+                frank.execute_batch(sql).await.unwrap();
+                stock.execute_batch(sql).unwrap();
+            }
+
+            // Flush WAL into the main DB file so stock SQLite dbstat inspects
+            // the committed B-tree directly.
+            let _ = frank.query("PRAGMA wal_checkpoint(TRUNCATE)").await.unwrap();
+            frank.close().await.unwrap();
+            drop(stock);
+
+            let frank_oracle = rusqlite::Connection::open(&frank_path).unwrap();
+            let stock_oracle = rusqlite::Connection::open(&stock_path).unwrap();
+
+            let integrity: String = frank_oracle
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                integrity, "ok",
+                "{}: stock integrity_check failed: {integrity}",
+                case.label
+            );
+
+            let summary_sql = "SELECT count(*), sum(a), sum(length(b)), \
+                               min(b), max(b) FROM t";
+            assert_eq!(
+                stock_rows(&frank_oracle, summary_sql),
+                stock_rows(&stock_oracle, summary_sql),
+                "{}: table summary differs from stock",
+                case.label
+            );
+            let sample_sql = "SELECT a, b FROM t WHERE a % 97 = 0 OR a IN (1, 2, 1000, 9999) ORDER BY a";
+            assert_eq!(
+                stock_rows(&frank_oracle, sample_sql),
+                stock_rows(&stock_oracle, sample_sql),
+                "{}: sample rows differ from stock",
+                case.label
+            );
+            if case.indexed {
+                let idx_sql = "SELECT a, b FROM t INDEXED BY tb WHERE b >= '00000' ORDER BY b, a LIMIT 40";
+                assert_eq!(
+                    stock_rows(&frank_oracle, idx_sql),
+                    stock_rows(&stock_oracle, idx_sql),
+                    "{}: indexed scan differs from stock",
+                    case.label
+                );
+            }
+
+            let frank_pages: i64 = frank_oracle
+                .query_row(
+                    "SELECT count(*) FROM dbstat WHERE name = 't'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let stock_pages: i64 = stock_oracle
+                .query_row(
+                    "SELECT count(*) FROM dbstat WHERE name = 't'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let ratio = frank_pages as f64 / stock_pages as f64;
+            assert!(
+                frank_pages * 100 <= stock_pages * 125,
+                "{}: table 't' page bloat exceeds 1.25x stock: frank={frank_pages} stock={stock_pages} ({ratio:.3}x)",
+                case.label
+            );
+        }
+
+        // Negative control: when another transaction is active on the same
+        // file-backed database (`is_sole_transaction() == false`), growing
+        // updates stay isolated and pass stock integrity_check.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent_grow.db");
+        let path_str = path.to_str().unwrap().to_owned();
+        let c1 = Connection::open(&path_str).await.unwrap();
+        c1.execute_batch(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+             INSERT INTO t SELECT i, 'x' FROM n;",
+        )
+        .await
+        .unwrap();
+        let c2 = Connection::open(&path_str).await.unwrap();
+        c2.execute_batch("BEGIN").await.unwrap();
+        let before = frank_rows(&c2, "SELECT sum(length(b)) FROM t").await;
+        assert_eq!(before, vec![vec![SqliteValue::Integer(2000)]]);
+
+        c1.execute_batch("UPDATE t SET b = printf('%0300d', a) WHERE a % 2 = 0")
+            .await
+            .unwrap();
+        // c2 still sees its snapshot before c1's growing update.
+        let during = frank_rows(&c2, "SELECT sum(length(b)) FROM t").await;
+        assert_eq!(during, vec![vec![SqliteValue::Integer(2000)]]);
+        c2.execute_batch("COMMIT").await.unwrap();
+        let after = frank_rows(&c2, "SELECT sum(length(b)) FROM t").await;
+        assert_eq!(after, vec![vec![SqliteValue::Integer(301_000)]]);
+        let _ = c1.query("PRAGMA wal_checkpoint(TRUNCATE)").await.unwrap();
+        c2.close().await.unwrap();
+        c1.close().await.unwrap();
+
+        let oracle = rusqlite::Connection::open(&path).unwrap();
+        let integrity: String = oracle
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    });
+}
