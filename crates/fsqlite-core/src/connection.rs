@@ -45871,6 +45871,18 @@ impl Connection {
                 // convertible to an integer (a fractional real, non-numeric
                 // text, NULL, or a blob) is a "datatype mismatch" in SQLite.
                 validate_limit_offset_lossless(select)?;
+                // A plain consumer of UNION ALL needs only the source prefix
+                // that its LIMIT can return. Preserve its projection and name
+                // scopes while letting the existing compound executor stop
+                // before an unreachable arm (bd-ct8zm).
+                let limited_source_owner;
+                let select = match push_down_union_all_source_limit(select, params)? {
+                    Some(limited) => {
+                        limited_source_owner = limited;
+                        &limited_source_owner
+                    }
+                    None => select,
+                };
                 // Time-travel: intercept FOR SYSTEM_TIME AS OF queries and
                 // execute against a historical MemDatabase snapshot (#23).
                 // A temporal clause belongs to its SELECT core. Let the
@@ -128122,6 +128134,128 @@ fn validate_limit_offset_lossless(select: &SelectStatement) -> Result<()> {
 /// bound constant-zero limit before materialization.
 fn bound_limit_clause_is_constant_zero(limit: &fsqlite_ast::LimitClause) -> bool {
     eval_constant_limit_integer(&limit.limit) == Some(0)
+}
+
+fn union_all_source_accepts_limit(query: &SelectStatement) -> bool {
+    query.with.is_none()
+        && query.limit.is_none()
+        && query.order_by.is_empty()
+        && !query.body.compounds.is_empty()
+        && query
+            .body
+            .compounds
+            .iter()
+            .all(|(op, _)| matches!(op, CompoundOp::UnionAll))
+}
+
+/// Bound a sole UNION ALL source when its consumer only projects columns.
+/// No row can be removed, duplicated, reordered, or observed by another
+/// consumer. Keep the outer LIMIT and all names intact; the source's literal
+/// cap lets `execute_compound_select` stop before evaluating a later arm.
+/// Positive OFFSET is deliberately excluded: skipping a source projection
+/// needs per-arm OFFSET handling, not merely a larger materialization cap.
+fn push_down_union_all_source_limit(
+    select: &SelectStatement,
+    params: Option<&[SqliteValue]>,
+) -> Result<Option<SelectStatement>> {
+    let Some(limit) = select.limit.as_ref() else {
+        return Ok(None);
+    };
+    if !select.body.compounds.is_empty() || !select.order_by.is_empty() {
+        return Ok(None);
+    }
+    let SelectCore::Select {
+        distinct: Distinctness::All,
+        columns,
+        from: Some(from),
+        where_clause: None,
+        group_by,
+        having: None,
+        windows,
+    } = &select.body.select
+    else {
+        return Ok(None);
+    };
+    if !from.joins.is_empty()
+        || !group_by.is_empty()
+        || !windows.is_empty()
+        || columns.iter().any(|column| {
+            !matches!(
+                column,
+                ResultColumn::Star
+                    | ResultColumn::TableStar(_)
+                    | ResultColumn::Expr {
+                        expr: Expr::Column(..),
+                        ..
+                    }
+            )
+        })
+    {
+        return Ok(None);
+    }
+    let source_query = match &from.source {
+        TableOrSubquery::Subquery { query, .. } if select.with.is_none() => query.as_ref(),
+        TableOrSubquery::Table {
+            name,
+            index_hint: None,
+            time_travel: None,
+            ..
+        } if name.schema.is_none() => {
+            let Some(with) = select.with.as_ref() else {
+                return Ok(None);
+            };
+            let [cte] = with.ctes.as_slice() else {
+                return Ok(None);
+            };
+            if with.recursive
+                || cte.materialized == Some(CteMaterialized::Materialized)
+                || !cte.name.eq_ignore_ascii_case(&name.name)
+                || cte_body_references_relation(&cte.query, &cte.name)
+            {
+                return Ok(None);
+            }
+            &cte.query
+        }
+        _ => return Ok(None),
+    };
+    if !union_all_source_accepts_limit(source_query) {
+        return Ok(None);
+    }
+    // Inspect bound values without replacing the statement's placeholders.
+    // A new literal source cap introduces no slots, so its original SQL-text
+    // parameter numbering survives both CTE splitting and fallback binding.
+    let bound;
+    let limit = if params.is_some_and(|values| !values.is_empty()) {
+        bound = bind_placeholders_in_select_for_fallback(select, params)?;
+        bound.limit.as_ref().expect("binding preserves LIMIT")
+    } else {
+        limit
+    };
+    let Some(rows) = eval_constant_limit_integer(&limit.limit).filter(|value| *value > 0) else {
+        return Ok(None);
+    };
+    if limit.offset.as_ref().is_some_and(|offset| {
+        eval_constant_limit_integer(offset).is_none_or(|value| value > 0)
+    }) {
+        return Ok(None);
+    }
+    let mut limited = select.clone();
+    let source = if let Some(with) = limited.with.as_mut() {
+        &mut with.ctes[0].query
+    } else if let SelectCore::Select {
+        from: Some(from), ..
+    } = &mut limited.body.select
+        && let TableOrSubquery::Subquery { query, .. } = &mut from.source
+    {
+        query.as_mut()
+    } else {
+        return Ok(None);
+    };
+    source.limit = Some(fsqlite_ast::LimitClause {
+        limit: Expr::Literal(Literal::Integer(rows), Span::ZERO),
+        offset: None,
+    });
+    Ok(Some(limited))
 }
 
 fn check_limit_value_lossless(expr: &Expr) -> Result<()> {
