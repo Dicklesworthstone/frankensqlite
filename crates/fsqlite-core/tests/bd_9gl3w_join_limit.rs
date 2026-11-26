@@ -5,12 +5,13 @@
 //! per `... JOIN k ON t.g = k.g LIMIT 5`, stock under 1 ms). The VDBE join
 //! codegen now compiles LIMIT/OFFSET where it emits each row, and a lookup
 //! join (a rowid or index seek per outer row) with a LIMIT runs there, so it
-//! stops after its last row.
+//! stops after its last row. bd-ct8zm also routes unordered nested-loop joins
+//! there when LIMIT/OFFSET can stop or skip row expression evaluation.
 //!
 //! The keepers compare rows, in order, with rusqlite's bundled SQLite for
 //! lookup joins (INNER and LEFT, rowid, index and UNIQUE text seeks, WHERE
-//! terms on both sides), a nested-loop join that keeps the materializing
-//! executor, `*`, aliases, and every LIMIT form: zero, negative, past the end,
+//! terms on both sides), unindexed joins, `*`, aliases, and every LIMIT form:
+//! zero, negative, past the end,
 //! `LIMIT a, b`, expressions, a subquery, and parameters (anonymous ones
 //! numbered in text order), ad hoc and prepared. The shapes are also checked
 //! as correlated EXISTS probes, which now carry LIMIT 1 over a lookup join.
@@ -302,6 +303,156 @@ fn join_limit_parameters_match_stock() {
         assert!(
             diffs.is_empty(),
             "{} divergence(s) from rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}
+
+/// bd-ct8zm: a LIMIT constrains execution, not just the returned vector.
+/// Overflowing expressions after the last requested row (or anywhere under
+/// LIMIT 0) must stay unevaluated. Sorting by that expression and requesting
+/// the overflowing row are controls that must still fail in both engines.
+#[test]
+fn fallback_select_limits_do_not_evaluate_unreachable_rows() {
+    let cases: &[(&str, &[i64])] = &[
+        ("SELECT abs(e.x) FROM e JOIN u ON u.a = 1 LIMIT 1", &[]),
+        ("SELECT abs(e.x) FROM e JOIN u ON u.a = 1 LIMIT 1 OFFSET 2", &[]),
+        ("SELECT abs(e.x) FROM e JOIN u ON u.a = 1 LIMIT 1 OFFSET 1", &[]),
+        ("SELECT abs(e.x) FROM e JOIN u ON u.a = 1 LIMIT -1", &[]),
+        ("SELECT abs(e.x) FROM e JOIN u ON u.a = 1 LIMIT -1 OFFSET 2", &[]),
+        ("SELECT abs(e.x) FROM e JOIN u ON u.a = 1 LIMIT ? OFFSET ?", &[1, 2]),
+        ("SELECT abs(e.x) FROM e JOIN u ON u.a = 1 LIMIT ?, ?", &[2, 1]),
+        ("SELECT abs(e.x) FROM e LEFT JOIN u ON u.a = 1 LIMIT 1", &[]),
+        ("SELECT abs(e.x), u.a FROM e LEFT JOIN u ON u.a = 2 LIMIT 1 OFFSET 2", &[]),
+        ("SELECT e.x FROM e JOIN u ON u.a = 1 WHERE abs(e.x) > 0 LIMIT 1", &[]),
+        ("SELECT e.x FROM e JOIN u ON abs(e.x) = u.a LIMIT 1", &[]),
+        ("SELECT e.x FROM e JOIN u ON abs(e.x) = u.a LIMIT 0", &[]),
+        ("SELECT abs(e.x) FROM e JOIN u ON u.a = 1 ORDER BY abs(e.x) LIMIT 1", &[]),
+        ("SELECT abs(x) FROM e GROUP BY x LIMIT 0", &[]),
+        ("SELECT abs(x) FROM e GROUP BY x LIMIT ?", &[0]),
+        ("SELECT ? + abs(x) FROM e GROUP BY x LIMIT ?", &[7, 0]),
+        ("SELECT abs(x) FROM e GROUP BY x LIMIT ?, ?", &[2, 0]),
+        ("SELECT abs(x) FROM e GROUP BY x LIMIT 1 - 1 OFFSET NULL", &[]),
+        ("SELECT sum(abs(x)) FROM e LIMIT 0", &[]),
+        ("SELECT sum(abs(e.x)) FROM e JOIN u ON u.a = 1 GROUP BY u.a LIMIT 0", &[]),
+        ("SELECT abs(x), row_number() OVER (ORDER BY x) FROM e LIMIT 0", &[]),
+        ("SELECT row_number() OVER (ORDER BY abs(x)) FROM e LIMIT ?", &[0]),
+        ("SELECT sum(abs(x)), row_number() OVER (ORDER BY x) FROM e GROUP BY x LIMIT 0", &[]),
+        ("SELECT abs(x) FROM e GROUP BY x ORDER BY abs(x) LIMIT 1", &[]),
+        ("SELECT row_number() OVER (ORDER BY abs(x)) FROM e LIMIT 1", &[]),
+        (
+            "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+             SELECT abs(-9223372036854775808)) LIMIT 0",
+            &[],
+        ),
+        (
+            "WITH c(v) AS (SELECT v FROM s WHERE k = 2 UNION ALL \
+             SELECT abs(-9223372036854775808)) SELECT v FROM c LIMIT ?",
+            &[0],
+        ),
+        // LIMIT cannot suppress errors found during name/function resolution.
+        ("SELECT missing FROM e GROUP BY x LIMIT 0", &[]),
+        ("SELECT no_such_function(x) FROM e GROUP BY x LIMIT 0", &[]),
+        ("WITH c AS (SELECT missing FROM e) SELECT * FROM c LIMIT 0", &[]),
+        ("WITH c AS (SELECT no_such_function(x) FROM e) SELECT * FROM c LIMIT 0", &[]),
+        ("SELECT * FROM (SELECT x FROM no_such_table) LIMIT 0", &[]),
+        ("SELECT abs(x) FROM e GROUP BY x LIMIT NULL", &[]),
+    ];
+    compare_fallback_limit_cases(cases);
+}
+
+/// The remaining bd-ct8zm family needs a streaming or safely flattened
+/// derived/CTE source. Keep its full oracle assertions separate from the
+/// zero-limit and plain-table join fixes; MATERIALIZED is an error control.
+#[test]
+#[ignore = "bd-ct8zm: derived/CTE compound sources still materialize beyond a positive outer LIMIT"]
+fn derived_compound_limits_do_not_evaluate_unreachable_rows() {
+    let cases: &[(&str, &[i64])] = &[
+        (
+            "SELECT (SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+             SELECT abs(-9223372036854775808)))",
+            &[],
+        ),
+        (
+            "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+             SELECT abs(-9223372036854775808)) LIMIT 1",
+            &[],
+        ),
+        (
+            "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+             SELECT abs(-9223372036854775808)) LIMIT ?",
+            &[1],
+        ),
+        (
+            "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+             SELECT abs(-9223372036854775808)) LIMIT 1 OFFSET 1",
+            &[],
+        ),
+        (
+            "SELECT v FROM (SELECT v FROM s WHERE k = 2 UNION ALL \
+             SELECT abs(-9223372036854775808)) ORDER BY v LIMIT 1",
+            &[],
+        ),
+        (
+            "WITH c(v) AS (SELECT v FROM s WHERE k = 2 UNION ALL \
+             SELECT abs(-9223372036854775808)) SELECT v FROM c LIMIT 1",
+            &[],
+        ),
+        (
+            "WITH c(v) AS MATERIALIZED (SELECT v FROM s WHERE k = 2 UNION ALL \
+             SELECT abs(-9223372036854775808)) SELECT v FROM c LIMIT 1",
+            &[],
+        ),
+    ];
+    compare_fallback_limit_cases(cases);
+}
+
+fn compare_fallback_limit_cases(cases: &[(&str, &[i64])]) {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = open_pair(file_backed, &dir).await;
+            let setup = "CREATE TABLE e(x INTEGER); \
+                         INSERT INTO e VALUES (1), (-9223372036854775808), (3); \
+                         CREATE TABLE s(k INTEGER, v INTEGER); \
+                         INSERT INTO s VALUES (1, 10), (2, 80), (3, 30); \
+                         ALTER TABLE u ADD COLUMN a INTEGER; \
+                         DELETE FROM u; INSERT INTO u(id, a) VALUES (1, 1);";
+            f.execute_batch(setup).await.unwrap();
+            r.execute_batch(setup).unwrap();
+            for &(sql, params) in cases {
+                let values: Vec<_> = params.iter().copied().map(SqliteValue::Integer).collect();
+                let stock = rq(&r, sql, params);
+                let direct = f
+                    .query_with_params(sql, &values)
+                    .await
+                    .map(|rows| tag_rows(&rows))
+                    .map_err(|error| error.to_string());
+                let prepared = match f.prepare(sql).await {
+                    Ok(statement) => statement
+                        .query_with_params(&values)
+                        .await
+                        .map(|rows| tag_rows(&rows))
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                for (path, actual) in [("direct", direct), ("prepared", prepared)] {
+                    if actual != stock {
+                        diffs.push(format!(
+                            "file={file_backed} {path} {sql} {params:?}: \
+                             fsqlite={actual:?}, stock={stock:?}"
+                        ));
+                    }
+                }
+            }
+            f.close().await.unwrap();
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} divergence(s):\n{}",
             diffs.len(),
             diffs.join("\n")
         );
