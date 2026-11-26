@@ -107,6 +107,14 @@ enum Script {
     /// As `HoldWrite`, and while still holding WRITE, create the absent
     /// `-wal-cert` sidecar, as an fsqlite commit would.
     HoldWriteCreateSidecar,
+    /// As `HoldWrite`, and while still holding WRITE, truncate the
+    /// `-wal-cert` sidecar to empty in place: what an fsqlite peer leaves when
+    /// it dies after the truncate that starts a new generation's first
+    /// append, before writing the continuity anchor (c9c513a65).
+    HoldWriteEmptySidecar,
+    /// As `HoldWriteEmptySidecar`, but the peer died part-way through writing
+    /// the anchor: the sidecar holds the first half of its newest record.
+    HoldWriteTearAnchor,
 }
 
 /// How long a holding child keeps WRITE before it commits: the parent's
@@ -128,6 +136,8 @@ impl StockRun {
             Script::HoldWrite => "hold",
             Script::HoldWriteTouchSidecar => "hold-touch",
             Script::HoldWriteCreateSidecar => "hold-create",
+            Script::HoldWriteEmptySidecar => "hold-empty",
+            Script::HoldWriteTearAnchor => "hold-tear",
         };
         let child = Command::new(std::env::current_exe().expect("test binary path"))
             .args([
@@ -168,6 +178,43 @@ impl StockRun {
             Duration::from_millis(millis),
         )
     }
+
+    /// When (unix microseconds) the child's checkpoint returned.
+    fn checkpoint_done_us(&self) -> u128 {
+        let text = std::fs::read_to_string(self.dir.join("result")).expect("checkpoint result");
+        text.split_whitespace()
+            .nth(4)
+            .and_then(|field| field.parse().ok())
+            .expect("checkpoint completion time")
+    }
+}
+
+/// The newest record of a `-wal-cert` sidecar: each record ends in a
+/// little-endian u32 footer holding its own length.
+fn newest_certificate_record(bytes: &[u8]) -> &[u8] {
+    let footer = bytes.len() - 4;
+    let record_len = usize::try_from(u32::from_le_bytes(
+        bytes[footer..].try_into().expect("footer"),
+    ))
+    .expect("record length");
+    &bytes[bytes.len() - record_len..]
+}
+
+/// The sidecar an fsqlite peer leaves when it dies part-way through the
+/// first append of a new generation (truncate, write the anchor, append its
+/// record; c9c513a65).
+#[derive(Clone, Copy)]
+enum KilledCompaction {
+    Empty,
+    TornAnchor,
+}
+
+fn killed_compaction_image(script: &str) -> Option<KilledCompaction> {
+    match script {
+        "hold-empty" => Some(KilledCompaction::Empty),
+        "hold-tear" => Some(KilledCompaction::TornAnchor),
+        _ => None,
+    }
 }
 
 #[test]
@@ -200,12 +247,7 @@ fn stock_checkpointer_child() {
             let mut cert = PathBuf::from(db).into_os_string();
             cert.push("-wal-cert");
             let bytes = std::fs::read(&cert).expect("read -wal-cert");
-            let footer = bytes.len() - 4;
-            let record_len = usize::try_from(u32::from_le_bytes(
-                bytes[footer..].try_into().expect("footer"),
-            ))
-            .expect("record length");
-            let record = bytes[bytes.len() - record_len..].to_vec();
+            let record = newest_certificate_record(&bytes).to_vec();
             use std::io::Write as _;
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
@@ -219,6 +261,24 @@ fn stock_checkpointer_child() {
             assert!(!Path::new(&cert).exists(), "no sidecar before the wait");
             std::fs::write(&cert, b"").expect("create -wal-cert");
         }
+        if let Some(image) = killed_compaction_image(script) {
+            let mut cert = PathBuf::from(db).into_os_string();
+            cert.push("-wal-cert");
+            let bytes = std::fs::read(&cert).expect("read -wal-cert");
+            let newest = newest_certificate_record(&bytes);
+            // The captured tail is a complete record the image no longer has.
+            assert!(
+                bytes.len() > newest.len(),
+                "{script}: the sidecar must hold more than its newest record ({} bytes)",
+                bytes.len()
+            );
+            let rewritten = match image {
+                KilledCompaction::Empty => Vec::new(),
+                KilledCompaction::TornAnchor => newest[..newest.len() / 2].to_vec(),
+            };
+            // In place, as the peer's truncate and write: same file identity.
+            std::fs::write(&cert, rewritten).expect("rewrite -wal-cert in place");
+        }
         stock.execute_batch("COMMIT").expect("stock commit");
     }
     let started = Instant::now();
@@ -228,9 +288,10 @@ fn stock_checkpointer_child() {
         })
         .expect("stock checkpoint");
     let millis = started.elapsed().as_millis();
+    let done_us = unix_us();
     std::fs::write(
         dir.join("result"),
-        format!("{busy} {log} {checkpointed} {millis}"),
+        format!("{busy} {log} {checkpointed} {millis} {done_us}"),
     )
     .expect("result");
 }
@@ -269,16 +330,17 @@ fn stock_integrity(db: &Path) -> String {
         .expect("integrity_check")
 }
 
-/// `fsqlite_seed`: commit one row through fsqlite first, so the `-wal-cert`
-/// sidecar holds a record of this file; without it no sidecar exists yet.
-async fn open_frank(db: &Path, fsqlite_seed: bool) -> Connection {
+/// `fsqlite_seeds`: commit that many rows through fsqlite first, so the
+/// `-wal-cert` sidecar holds that many records of this file; with none no
+/// sidecar exists yet.
+async fn open_frank(db: &Path, fsqlite_seeds: usize) -> Connection {
     let conn = Connection::open(db.to_str().expect("utf8 path"))
         .await
         .expect("fsqlite open");
     conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}"))
         .await
         .expect("busy_timeout");
-    if fsqlite_seed {
+    for _ in 0..fsqlite_seeds {
         conn.execute("INSERT INTO s(v) VALUES ('frank-seed')")
             .await
             .expect("fsqlite seed commit");
@@ -311,32 +373,80 @@ struct ShapeOutcome {
     retry: Option<Result<usize, FrankenError>>,
     /// `(busy, log, checkpointed, elapsed)` of the child's checkpoint.
     checkpoint: (i64, i64, i64, Duration),
+    /// When (unix microseconds) the COMMIT answered, and when the child's
+    /// checkpoint returned.
+    commit_done_us: u128,
+    checkpoint_done_us: u128,
     db: PathBuf,
 }
 
 /// [`run_shape`] on the test runtime, after one fsqlite commit.
 fn shape(dir: &Path, script: Script, table: &'static str, mode: &'static str) -> ShapeOutcome {
-    shape_with(dir, script, table, mode, true, Txn::WriteOnly)
+    shape_with(dir, script, table, mode, 1, Txn::WriteOnly)
 }
 
+/// How many times a holding script's shape is run to get its interleaving.
+const SHAPE_ATTEMPTS: usize = 3;
+
 /// [`run_shape`] on the test runtime.
+///
+/// bd-kcua5: a holding script (every script but [`Script::CommitAtGo`])
+/// means the stock TRUNCATE to reset the WAL while the COMMIT waits. Its
+/// child commits, which frees WRITE, and only then checkpoints, so the
+/// waiting COMMIT can take WRITE in between: it then commits in the old
+/// generation, before the reset, and the shape tests nothing it names (seen
+/// on hz4, 2026-11-26: a transaction that read `s` beside a changed sidecar
+/// answered `Ok(1)` after 308 ms). Such a run is discarded and the shape run
+/// again, from a fresh database: when the reset came first, the COMMIT can
+/// answer only after the checkpoint returned, so a COMMIT that answered
+/// first did not wait for the reset. Only that race is discarded: a COMMIT
+/// that answered before the checkpoint returned AND promptly (within the
+/// hold plus `PROMPT`) AND not with `Busy`. A COMMIT that stalled (slow, or
+/// `Busy` after its busy_timeout, the bd-reality-check-1022-llk6g.5.7
+/// failure) is never discarded: its assertions run and fail as before. The
+/// test fails if no attempt got the interleaving.
 fn shape_with(
     dir: &Path,
     script: Script,
     table: &'static str,
     mode: &'static str,
-    fsqlite_seed: bool,
+    fsqlite_seeds: usize,
     txn: Txn,
 ) -> ShapeOutcome {
-    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let out = std::sync::Arc::clone(&slot);
-    let dir = dir.to_path_buf();
-    asupersync::test_utils::run_test(|| async move {
-        let outcome = run_shape(&dir, script, table, mode, fsqlite_seed, txn).await;
-        *out.lock().expect("outcome slot") = Some(outcome);
-    });
-    let outcome = slot.lock().expect("outcome slot").take();
-    outcome.expect("the shape ran")
+    let mut missed = Vec::new();
+    for attempt in 1..=SHAPE_ATTEMPTS {
+        let attempt_dir = dir.join(format!("attempt-{attempt}"));
+        std::fs::create_dir_all(&attempt_dir).expect("attempt dir");
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let out = std::sync::Arc::clone(&slot);
+        asupersync::test_utils::run_test(|| async move {
+            let outcome = run_shape(&attempt_dir, script, table, mode, fsqlite_seeds, txn).await;
+            *out.lock().expect("outcome slot") = Some(outcome);
+        });
+        let outcome = slot
+            .lock()
+            .expect("outcome slot")
+            .take()
+            .expect("the shape ran");
+        let won_the_race = script != Script::CommitAtGo
+            && outcome.commit_done_us <= outcome.checkpoint_done_us
+            && outcome.took < PROMPT + Duration::from_millis(HOLD_MS)
+            && !matches!(outcome.commit, Err(FrankenError::Busy));
+        if !won_the_race {
+            return outcome;
+        }
+        let early = outcome.checkpoint_done_us - outcome.commit_done_us;
+        eprintln!(
+            "event=shape_interleaving_missed attempt={attempt} commit_answered_us_before_reset={early} \
+             commit={:?}",
+            outcome.commit
+        );
+        missed.push(early);
+    }
+    panic!(
+        "the COMMIT answered before the stock checkpoint returned in all {SHAPE_ATTEMPTS} \
+         attempts (by {missed:?} us): the shape never got its interleaving"
+    );
 }
 
 /// The transaction's statements before its COMMIT.
@@ -383,11 +493,11 @@ async fn run_shape(
     script: Script,
     table: &'static str,
     mode: &'static str,
-    fsqlite_seed: bool,
+    fsqlite_seeds: usize,
     txn: Txn,
 ) -> ShapeOutcome {
     let db = seed(dir);
-    let frank = open_frank(&db, fsqlite_seed).await;
+    let frank = open_frank(&db, fsqlite_seeds).await;
     let run = StockRun {
         db: db.clone(),
         dir: dir.to_path_buf(),
@@ -403,6 +513,7 @@ async fn run_shape(
     let started = Instant::now();
     let commit = frank.execute("COMMIT").await;
     let took = started.elapsed();
+    let commit_done_us = unix_us();
     let open_after = frank.in_transaction();
     if commit.is_err() && open_after {
         let _ = frank.execute("ROLLBACK").await;
@@ -432,6 +543,8 @@ async fn run_shape(
         open_after,
         retry,
         checkpoint: run.checkpoint_result(),
+        commit_done_us,
+        checkpoint_done_us: run.checkpoint_done_us(),
         db,
     }
 }
@@ -448,16 +561,16 @@ fn stock_shape(
     script: Script,
     table: &'static str,
     mode: &'static str,
-    fsqlite_seed: bool,
+    fsqlite_seeds: usize,
     txn: Txn,
 ) -> (i32, Vec<String>, Vec<String>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = seed(dir.path());
-    if fsqlite_seed {
+    if fsqlite_seeds > 0 {
         // The same files as the fsqlite run, `-wal-cert` sidecar included.
         let seed_db = db.clone();
         asupersync::test_utils::run_test(|| async move {
-            open_frank(&seed_db, true)
+            open_frank(&seed_db, fsqlite_seeds)
                 .await
                 .close()
                 .await
@@ -610,7 +723,7 @@ fn a_first_fsqlite_commit_with_no_sidecar_yet_lets_a_truncate_finish_and_commits
         Script::CommitAtGo,
         "s",
         "TRUNCATE",
-        false,
+        0,
         Txn::WriteOnly,
     );
     let (took, db) = (outcome.took, &outcome.db);
@@ -633,7 +746,7 @@ struct RefusedShape {
     script: Script,
     /// The table the stock child writes, and the transaction reads.
     table: &'static str,
-    fsqlite_seed: bool,
+    fsqlite_seeds: usize,
     /// The final rows of `t` and `s`, as stock leaves them.
     t: &'static [&'static str],
     s: &'static [&'static str],
@@ -669,7 +782,7 @@ fn refused_snapshot_shape(shape: &RefusedShape, txn: Txn) {
         shape.script,
         shape.table,
         "TRUNCATE",
-        shape.fsqlite_seed,
+        shape.fsqlite_seeds,
         txn,
     );
     let took = outcome.took;
@@ -703,7 +816,7 @@ fn refused_snapshot_shape(shape: &RefusedShape, txn: Txn) {
         shape.script,
         shape.table,
         "TRUNCATE",
-        shape.fsqlite_seed,
+        shape.fsqlite_seeds,
         txn,
     );
     assert_rows_as_stock_leaves_them(&context, &outcome.db, &stock, shape.t, shape.s);
@@ -716,7 +829,7 @@ const SAME_PAGE_FIRST: RefusedShape = RefusedShape {
     what: "stock wrote the same page first",
     script: Script::CommitAtGo,
     table: "t",
-    fsqlite_seed: true,
+    fsqlite_seeds: 1,
     t: &["seed", "stock", "frank"],
     s: &["seed", "frank-seed"],
 };
@@ -729,7 +842,7 @@ const SAME_PAGE_DURING_THE_WAIT: RefusedShape = RefusedShape {
     what: "stock wrote the same page during the wait",
     script: Script::HoldWrite,
     table: "t",
-    fsqlite_seed: true,
+    fsqlite_seeds: 1,
     t: &["seed", "stock", "frank"],
     s: &["seed", "frank-seed"],
 };
@@ -800,7 +913,7 @@ const SIDECAR_CHANGED: RefusedShape = RefusedShape {
     what: "the sidecar changed during the wait",
     script: Script::HoldWriteTouchSidecar,
     table: "s",
-    fsqlite_seed: true,
+    fsqlite_seeds: 1,
     t: &["seed", "frank"],
     s: &["seed", "frank-seed", "stock"],
 };
@@ -812,7 +925,7 @@ const SIDECAR_CREATED: RefusedShape = RefusedShape {
     what: "the sidecar was created during the wait",
     script: Script::HoldWriteCreateSidecar,
     table: "s",
-    fsqlite_seed: false,
+    fsqlite_seeds: 0,
     t: &["seed", "frank"],
     s: &["seed", "stock"],
 };
@@ -847,6 +960,75 @@ fn a_transaction_that_read_is_refused_when_the_sidecar_appeared_during_the_wait(
         return;
     }
     refused_snapshot_shape(&SIDECAR_CREATED, Txn::ReadsStockTable);
+}
+
+// bd-kcua5 (c9c513a65, bd-5eult): an fsqlite peer's first append of a new
+// generation truncates `-wal-cert`, writes the reset generation's newest
+// record back at offset 0 as a continuity anchor, then appends its own
+// record. A COMMIT that waited across the reset is kept only when that
+// anchor is byte-identical to the tail it captured and every later record
+// is the new generation's. The shapes below are what a peer killed part-way
+// through that compaction leaves while the COMMIT waits. The stock child
+// rewrites the sidecar in place, holding WRITE, before its own commit and
+// TRUNCATE: the checkpoint never touches `-wal-cert`, so the COMMIT finds
+// the same sidecar as after a peer's compaction in the new generation.
+// Only the fail-closed half is here. A shape that left the anchor alone
+// committed even under a mutant that accepts only an unchanged sidecar
+// (hz4, 2026-11-26), so it never reached the anchor proof; the admission
+// half rests on wal_adapter.rs's bd_5eult_* unit tests.
+
+/// Killed after the truncate: an empty sidecar. An empty anchor proves no
+/// continuity (another fsqlite commit may have hidden behind the reset), so
+/// the snapshot is refused as when the sidecar changed.
+const COMPACTION_KILLED_AFTER_TRUNCATE: RefusedShape = RefusedShape {
+    what: "a peer's compaction died after its truncate during the wait",
+    script: Script::HoldWriteEmptySidecar,
+    table: "s",
+    fsqlite_seeds: 2,
+    t: &["seed", "frank"],
+    s: &["seed", "frank-seed", "frank-seed", "stock"],
+};
+
+/// Killed part-way through the anchor write: a torn anchor proves nothing.
+const COMPACTION_KILLED_IN_THE_ANCHOR: RefusedShape = RefusedShape {
+    what: "a peer's compaction died writing its anchor during the wait",
+    script: Script::HoldWriteTearAnchor,
+    table: "s",
+    fsqlite_seeds: 2,
+    t: &["seed", "frank"],
+    s: &["seed", "frank-seed", "frank-seed", "stock"],
+};
+
+#[test]
+fn a_write_only_transaction_ends_with_stocks_rows_when_a_peer_compaction_left_no_anchor() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return;
+    }
+    refused_snapshot_shape(&COMPACTION_KILLED_AFTER_TRUNCATE, Txn::WriteOnly);
+}
+
+#[test]
+fn a_transaction_that_read_is_refused_when_a_peer_compaction_left_no_anchor() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return;
+    }
+    refused_snapshot_shape(&COMPACTION_KILLED_AFTER_TRUNCATE, Txn::ReadsStockTable);
+}
+
+#[test]
+fn a_write_only_transaction_ends_with_stocks_rows_when_a_peer_compaction_tore_its_anchor() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return;
+    }
+    refused_snapshot_shape(&COMPACTION_KILLED_IN_THE_ANCHOR, Txn::WriteOnly);
+}
+
+#[test]
+fn a_transaction_that_read_is_refused_when_a_peer_compaction_tore_its_anchor() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return;
+    }
+    refused_snapshot_shape(&COMPACTION_KILLED_IN_THE_ANCHOR, Txn::ReadsStockTable);
 }
 
 const CHURN_CHILD_ENV: &str = "FSQLITE_557_CHURN_CHILD";
@@ -1057,6 +1239,12 @@ fn unix_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis())
+}
+
+fn unix_us() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros())
 }
 
 /// The value of `key=` among a result line's space-separated fields.
@@ -1390,8 +1578,28 @@ fn two_fsqlite_fresh_loops_beside_a_truncating_stock_writer_never_stall_or_lose_
     if std::env::var_os(CHILD_ENV).is_some() || std::env::var_os(CHURN_CHILD_ENV).is_some() {
         return;
     }
-    stock_churn_oracle(2);
+    let stock = stock_churn_oracle(2);
     let frank = run_churn("frank", 2);
+    // bd-5eult's probe reads these: fsqlite's rows per loop against stock's
+    // on the same shape, and each refusal's text.
+    eprintln!(
+        "event=churn_two_loop_rows fsqlite={:?} stock={:?} refusals={:?}",
+        frank
+            .loops
+            .iter()
+            .map(|lane| lane.committed.len())
+            .collect::<Vec<_>>(),
+        stock
+            .loops
+            .iter()
+            .map(|lane| lane.committed.len())
+            .collect::<Vec<_>>(),
+        frank
+            .loops
+            .iter()
+            .flat_map(|lane| lane.errors.iter().map(|(_, line)| line.as_str()))
+            .collect::<Vec<_>>()
+    );
     assert_churn_consistent("fsqlite, two loops", &frank);
     for (k, lane) in frank.loops.iter().enumerate() {
         let other: Vec<&(i64, String)> = lane
@@ -1564,7 +1772,7 @@ fn close_shape(closer: Closer, detach: Detach) -> CloseOutcome {
             let mut steps = None;
             let (steps_slot, detach_now, db_path) = (&mut steps, &mut detach_at, &db);
             asupersync::test_utils::run_test(|| async move {
-                let frank = open_frank(db_path, false).await;
+                let frank = open_frank(db_path, 0).await;
                 for row in CLOSE_ROWS {
                     frank
                         .execute(&format!("INSERT INTO t(v) VALUES ('{row}')"))
