@@ -4,8 +4,10 @@
 //! index on every row turned bulk UPDATE quadratic.
 //!
 //! HARD GATE: results byte-identical to C SQLite (rusqlite) for absent and present keys, including
-//! the shapes that must KEEP the fallback (affinity conversion, NOCASE, typeless column, predicate
-//! not implied). The EXPLAIN checks pin which shapes lost the fallback scan and which kept it.
+//! the NOCASE, typeless-column and unimplied-predicate shapes. The EXPLAIN checks pin which shapes
+//! lost the fallback scan. An integer probe into a TEXT column is exact since 3eace60b4 (the probe
+//! takes the index's affinity before the seek, as in stock), and so is a NOCASE column's probe
+//! into its NOCASE index, as stock plans it.
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
@@ -129,7 +131,7 @@ const SCHEMA: &[&str] = &[
     // Partial composite UNIQUE index.
     "CREATE TABLE p (id TEXT PRIMARY KEY, a TEXT, k TEXT);",
     "CREATE UNIQUE INDEX p_ak ON p (a, k) WHERE k IS NOT NULL;",
-    // Must keep the fallback: NOCASE column, typeless column, predicate the probe does not imply.
+    // NOCASE column (an exact seek, as in stock), typeless column, predicate the probe does not imply.
     "CREATE TABLE n (id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE);",
     "CREATE INDEX n_k ON n (k) WHERE k IS NOT NULL;",
     "CREATE TABLE u (id INTEGER PRIMARY KEY, k);",
@@ -165,7 +167,7 @@ fn gh444_partial_and_composite_seeks_match_sqlite() {
             "SELECT id FROM t WHERE k = 'v2' AND id IS NOT 'zz'",
             "SELECT EXISTS(SELECT 1 FROM t WHERE id IS NOT 'b' AND k = 'v2')",
             "SELECT id FROM t WHERE k = '7' AND id IS NOT 'q' ORDER BY id",
-            // Integer probe into the TEXT column: affinity conversion, keeps the fallback.
+            // Integer probe into the TEXT column: the probe takes the index's TEXT affinity.
             "SELECT id FROM t WHERE k = 7 AND id IS NOT 'q' ORDER BY id",
             "SELECT id FROM t WHERE k = 8 AND id IS NOT 'q' ORDER BY id",
             "SELECT id FROM t WHERE k = '8' AND id IS NOT 'q' ORDER BY id",
@@ -186,7 +188,7 @@ fn gh444_partial_and_composite_seeks_match_sqlite() {
             "SELECT id FROM p WHERE a = 'A' AND k = 'k1' AND id IS NOT 'zz'",
             "SELECT id FROM p WHERE a = 'Q' AND k = 'k1' AND id IS NOT 'zz'",
             "SELECT id FROM p WHERE a = '2' AND k = 'k2' AND id IS NOT 'zz'",
-            // Keep-the-fallback shapes.
+            // NOCASE, typeless-column and unimplied-predicate shapes.
             "SELECT id FROM n WHERE k = 'ABC' AND id > 0",
             "SELECT id FROM n WHERE k = 'abd' AND id > 0",
             "SELECT id FROM u WHERE k = '1' AND id > 0 ORDER BY id",
@@ -209,9 +211,17 @@ fn gh444_exact_shapes_drop_the_fallback_scan() {
         }
         for s in [
             "SELECT 1 FROM t WHERE id IS NOT 'x' AND k = 'v' LIMIT 1",
+            // An integer probe into a TEXT column: the probe takes the index's affinity before
+            // the seek (3eace60b4), so the seek is exact. Stock 3.54.1 and 3.46.1 plan it as
+            // `SEARCH t USING INDEX t_k (k=?)`, the same plan as `k = 'v'`.
+            "SELECT 1 FROM t WHERE id IS NOT 'x' AND k = 7 LIMIT 1",
             "SELECT 1 FROM c WHERE a = 'Q' AND id IS NOT 3 LIMIT 1",
             "SELECT count(*) FROM c WHERE a = 'A' AND b = 'y'",
             "SELECT 1 FROM p WHERE a = 'A' AND k = 'k1' AND id IS NOT 'x' LIMIT 1",
+            // NOCASE: k is declared COLLATE NOCASE, so the probe compares with NOCASE, the
+            // index's order, and the seek is exact. Stock 3.54.1 and 3.46.1 plan it as
+            // `SEARCH n USING COVERING INDEX n_k (k=? AND rowid>?)`.
+            "SELECT id FROM n WHERE k = 'ABC' AND id > 0",
         ] {
             assert!(
                 !has_reachable_rewind(&f, s).await,
@@ -219,14 +229,13 @@ fn gh444_exact_shapes_drop_the_fallback_scan() {
             );
         }
         for s in [
-            // An integer probe into a TEXT column implies a conversion.
-            "SELECT 1 FROM t WHERE id IS NOT 'x' AND k = 7 LIMIT 1",
-            // NOCASE: the index order is not the BINARY probe's order.
-            "SELECT id FROM n WHERE k = 'ABC' AND id > 0",
+            // No usable index (g_k's predicate `flag = 1` is not implied): a table scan, the
+            // detector's positive control. Stock: `SCAN g`.
+            "SELECT id FROM g WHERE k = 'b'",
         ] {
             assert!(
                 has_reachable_rewind(&f, s).await,
-                "non-exact seek lost its fallback: `{s}`"
+                "a table scan must show a reachable Rewind: `{s}`"
             );
         }
     });
