@@ -551,7 +551,6 @@ fn derived_compound_limit_rebinds_on_prepared_reuse() {
 /// A positive OFFSET must skip expressions inside each compound arm; a
 /// materialized LIMIT+OFFSET prefix still evaluates these unreachable rows.
 #[test]
-#[ignore = "bd-ct8zm: compound OFFSET still evaluates skipped arm projections"]
 fn compound_offsets_skip_unreachable_projection_rows() {
     let cases: &[(&str, &[i64])] = &[
         ("SELECT abs(x) FROM e UNION ALL SELECT 99 LIMIT 1 OFFSET 2", &[]),

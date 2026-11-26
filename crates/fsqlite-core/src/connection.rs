@@ -45864,6 +45864,7 @@ impl Connection {
                         None => false,
                     };
                     if limit_is_zero {
+                        self.validate_select_before_limit_zero_short_circuit(select)?;
                         return Ok(Vec::new());
                     }
                 }
@@ -45943,7 +45944,12 @@ impl Connection {
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
+                    let resolved_limit = self.resolve_expression_only_limit(&bound, None).await?;
+                    if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+                        self.validate_select_before_limit_zero_short_circuit(&bound)?;
+                        return Ok(Vec::new());
+                    }
+                    bound.limit = None;
                     // bd-xvtao / bd-gjlhh: route by shape. The plain join
                     // executor returns raw un-grouped rows and evaluates
                     // aggregates as scalars (NULL per row), and rejects a
@@ -45953,9 +45959,7 @@ impl Connection {
                         self.execute_interpreted_select_by_shape(cx, rewritten.as_ref(), &bound)
                     })
                     .await?;
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
-                    }
+                    apply_resolved_expression_limit(&mut rows, resolved_limit);
                     return Ok(rows);
                 }
                 // 5G.4 (bd-3ly4): sqlite_master/sqlite_schema virtual table support.
@@ -46088,16 +46092,19 @@ impl Connection {
                         lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
+                    let resolved_limit = self.resolve_expression_only_limit(&bound, None).await?;
+                    if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+                        self.validate_select_before_limit_zero_short_circuit(&bound)?;
+                        return Ok(Vec::new());
+                    }
+                    bound.limit = None;
                     let mut rows =
                         boxed_future(|| self.execute_group_by_join_select(cx, &bound, None))
                             .await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
-                    }
+                    apply_resolved_expression_limit(&mut rows, resolved_limit);
                     return Ok(rows);
                 }
                 if !custom_implicit_aggregate
@@ -46246,16 +46253,19 @@ impl Connection {
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
+                    let resolved_limit = self.resolve_expression_only_limit(&bound, None).await?;
+                    if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+                        self.validate_select_before_limit_zero_short_circuit(&bound)?;
+                        return Ok(Vec::new());
+                    }
+                    bound.limit = None;
                     let mut rows =
                         boxed_future(|| self.execute_group_by_window_select(cx, &bound, None))
                             .await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
-                    }
+                    apply_resolved_expression_limit(&mut rows, resolved_limit);
                     Ok(rows)
                 } else if (has_group_by(select) || implicit_aggregate || ordered_aggregate)
                     && (has_joins(select)
@@ -46280,16 +46290,19 @@ impl Connection {
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
+                    let resolved_limit = self.resolve_expression_only_limit(&bound, None).await?;
+                    if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+                        self.validate_select_before_limit_zero_short_circuit(&bound)?;
+                        return Ok(Vec::new());
+                    }
+                    bound.limit = None;
                     let mut rows =
                         boxed_future(|| self.execute_group_by_join_select(cx, &bound, None))
                             .await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
-                    }
+                    apply_resolved_expression_limit(&mut rows, resolved_limit);
                     Ok(rows)
                 } else if custom_implicit_aggregate {
                     self.admit_select_mem_fallback(cx, "custom_aggregate_fallback")
@@ -46297,15 +46310,18 @@ impl Connection {
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
+                    let resolved_limit = self.resolve_expression_only_limit(&bound, None).await?;
+                    if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+                        self.validate_select_before_limit_zero_short_circuit(&bound)?;
+                        return Ok(Vec::new());
+                    }
+                    bound.limit = None;
                     let mut rows =
                         boxed_future(|| self.execute_group_by_select(&bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
-                    }
+                    apply_resolved_expression_limit(&mut rows, resolved_limit);
                     Ok(rows)
                 } else if implicit_aggregate
                     && self
@@ -46324,15 +46340,18 @@ impl Connection {
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
+                    let resolved_limit = self.resolve_expression_only_limit(&bound, None).await?;
+                    if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+                        self.validate_select_before_limit_zero_short_circuit(&bound)?;
+                        return Ok(Vec::new());
+                    }
+                    bound.limit = None;
                     let mut rows =
                         boxed_future(|| self.execute_group_by_select(&bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
-                    }
+                    apply_resolved_expression_limit(&mut rows, resolved_limit);
                     Ok(rows)
                 } else if (has_group_by(select) || ordered_aggregate)
                     && !self.select_grouped_inner_join_count_sum_is_vdbe_eligible(select)
@@ -46342,6 +46361,13 @@ impl Connection {
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
+                    // bd-ct8zm: LIMIT 0 must return immediately without scanning
+                    // or evaluating group/projection expressions.
+                    let resolved_limit = self.resolve_expression_only_limit(&bound, None).await?;
+                    if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+                        self.validate_select_before_limit_zero_short_circuit(&bound)?;
+                        return Ok(Vec::new());
+                    }
                     // Direct and prepared reads use the same grouped-output
                     // eligibility check before evaluating HAVING in bytecode.
                     let substrate_rows = boxed_future(|| {
@@ -46365,15 +46391,13 @@ impl Connection {
                     }
                     self.admit_select_mem_fallback(cx, "group_by_fallback")
                         .await?;
-                    let limit_clause = bound.limit.take();
+                    bound.limit = None;
                     let mut rows =
                         boxed_future(|| self.execute_group_by_select(&bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
-                    }
+                    apply_resolved_expression_limit(&mut rows, resolved_limit);
                     Ok(rows)
                 } else if has_window_functions(select) {
                     // Window function fallback: materialize rows, sort by
@@ -46390,14 +46414,17 @@ impl Connection {
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
+                    let resolved_limit = self.resolve_expression_only_limit(&bound, None).await?;
+                    if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+                        self.validate_select_before_limit_zero_short_circuit(&bound)?;
+                        return Ok(Vec::new());
+                    }
+                    bound.limit = None;
                     let mut rows = boxed_future(|| self.execute_window_select(&bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
-                    }
+                    apply_resolved_expression_limit(&mut rows, resolved_limit);
                     Ok(rows)
                 } else if self.has_primary_live_vtab_source(select) {
                     // Live virtual-table instances are not yet emitted through
@@ -46407,20 +46434,9 @@ impl Connection {
                     self.admit_select_mem_fallback(cx, "live_vtab_select_fallback")
                         .await?;
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
-                    let mut bound =
+                    let bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
-                    if limit_clause
-                        .as_ref()
-                        .is_some_and(bound_limit_clause_is_constant_zero)
-                    {
-                        return Ok(Vec::new());
-                    }
-                    let mut rows = boxed_future(|| self.execute_join_select(&bound, None)).await?;
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
-                    }
-                    Ok(rows)
+                    boxed_future(|| self.execute_join_select(&bound, None)).await
                 } else if (has_joins(select) || has_subquery_source(select))
                     && (!self.select_join_runs_in_vdbe(select)
                         || self.prefer_memdb_hash_join_dispatch(select))
@@ -46450,54 +46466,27 @@ impl Connection {
                         self.admit_select_mem_fallback(cx, "join_or_subquery_fallback")
                             .await?;
                     }
-                    let mut bound =
+                    let bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    // GH#386: for the two-table INNER JOIN outer-IPK keyset
-                    // shape, leave the LIMIT on the statement so the
-                    // streaming pushdown lane inside `execute_join_select`
-                    // can stop the outer scan early. If the lane refuses at
-                    // runtime, `execute_join_select`'s own tail applies the
-                    // same LIMIT clause, so semantics are unchanged.
-                    let limit_clause = if join_keyset_limit_pushdown_shape(&bound).is_some() {
-                        None
-                    } else {
-                        bound.limit.take()
-                    };
-                    if limit_clause
-                        .as_ref()
-                        .is_some_and(bound_limit_clause_is_constant_zero)
-                    {
-                        return Ok(Vec::new());
-                    }
+                    // bd-ct8zm + GH#386: keep `bound.limit` attached so
+                    // `execute_join_select` short-circuits LIMIT 0, streams
+                    // derived compounds, stops joins/WHERE/DISTINCT/projection
+                    // at LIMIT + OFFSET, and supports outer-IPK keyset pushdown.
                     let started = Instant::now();
-                    let mut rows = boxed_future(|| self.execute_join_select(&bound, None)).await?;
+                    let rows = boxed_future(|| self.execute_join_select(&bound, None)).await?;
                     if native_join_dispatch {
                         let elapsed_ns =
                             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                         self.log_native_join_dispatch(&bound, rows.len(), elapsed_ns);
-                    }
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
                     }
                     Ok(rows)
                 } else if has_table_function_source(select) {
                     self.admit_select_mem_fallback(cx, "join_or_subquery_fallback")
                         .await?;
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
-                    let mut bound =
+                    let bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
-                    if limit_clause
-                        .as_ref()
-                        .is_some_and(bound_limit_clause_is_constant_zero)
-                    {
-                        return Ok(Vec::new());
-                    }
-                    let mut rows = boxed_future(|| self.execute_join_select(&bound, None)).await?;
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
-                    }
-                    Ok(rows)
+                    boxed_future(|| self.execute_join_select(&bound, None)).await
                 } else if select_has_correlated_join_subquery(select) {
                     // Correlated scalar subqueries with JOINs in their FROM
                     // clause cannot be handled by the VDBE emit_scalar_subquery
@@ -46506,20 +46495,9 @@ impl Connection {
                     self.admit_select_mem_fallback(cx, "correlated_join_subquery_fallback")
                         .await?;
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
-                    let mut bound =
+                    let bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
-                    if limit_clause
-                        .as_ref()
-                        .is_some_and(bound_limit_clause_is_constant_zero)
-                    {
-                        return Ok(Vec::new());
-                    }
-                    let mut rows = boxed_future(|| self.execute_join_select(&bound, None)).await?;
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
-                    }
-                    Ok(rows)
+                    boxed_future(|| self.execute_join_select(&bound, None)).await
                 } else if where_should_route_to_fallback_for_shortcircuit(self, select) {
                     // bd-lryih P10: a non-correlated, non-VDBE-lowerable subquery
                     // sitting in a short-circuitable WHERE position (operand of
@@ -46535,13 +46513,6 @@ impl Connection {
                     self.admit_select_mem_fallback(cx, "where_shortcircuit_subquery_fallback")
                         .await?;
                     let mut bound = bind_placeholders_in_select_for_fallback(select, params)?;
-                    let limit_clause = bound.limit.take();
-                    if limit_clause
-                        .as_ref()
-                        .is_some_and(bound_limit_clause_is_constant_zero)
-                    {
-                        return Ok(Vec::new());
-                    }
                     // GH#407: a whole-table aggregate (for example COUNT(*))
                     // with a short-circuitable non-lowerable subquery in the
                     // WHERE must still fold its aggregate. execute_join_select
@@ -46554,18 +46525,25 @@ impl Connection {
                     // execute_join_select (single table with a subquery WHERE →
                     // select_join_is_vdbe_eligible is false), so the per-row
                     // short-circuit above is preserved — before aggregating.
-                    let mut rows = if has_group_by(&bound)
+                    if has_group_by(&bound)
                         || self.has_implicit_aggregation_with_registry(&bound)
                         || has_ordered_aggregate(&bound)
                     {
-                        boxed_future(|| self.execute_group_by_join_select(cx, &bound, None)).await?
+                        let resolved_limit =
+                            self.resolve_expression_only_limit(&bound, None).await?;
+                        if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+                            self.validate_select_before_limit_zero_short_circuit(&bound)?;
+                            return Ok(Vec::new());
+                        }
+                        bound.limit = None;
+                        let mut rows =
+                            boxed_future(|| self.execute_group_by_join_select(cx, &bound, None))
+                                .await?;
+                        apply_resolved_expression_limit(&mut rows, resolved_limit);
+                        Ok(rows)
                     } else {
-                        boxed_future(|| self.execute_join_select(&bound, None)).await?
-                    };
-                    if let Some(limit) = limit_clause {
-                        self.apply_limit_clause(&mut rows, &limit, None)?;
+                        boxed_future(|| self.execute_join_select(&bound, None)).await
                     }
-                    Ok(rows)
                 } else {
                     let arc_prog;
                     let program: &VdbeProgram = if let Some(p) = precompiled {
@@ -57234,22 +57212,34 @@ impl Connection {
     ) -> Result<Vec<Row>> {
         let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
         let mut bound = bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-        let limit_clause = bound.limit.take();
-        let mut rows = if self.select_requires_grouped_window_pipeline(&bound) {
-            self.execute_group_by_window_select(cx, &bound, None)
-                .await?
+        if self.select_requires_grouped_window_pipeline(&bound) {
+            let resolved_limit = self.resolve_expression_only_limit(&bound, None).await?;
+            if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+                self.validate_select_before_limit_zero_short_circuit(&bound)?;
+                return Ok(Vec::new());
+            }
+            bound.limit = None;
+            let mut rows = self
+                .execute_group_by_window_select(cx, &bound, None)
+                .await?;
+            apply_resolved_expression_limit(&mut rows, resolved_limit);
+            Ok(rows)
         } else if has_group_by(&bound)
             || self.has_implicit_aggregation_with_registry(&bound)
             || has_ordered_aggregate(&bound)
         {
-            self.execute_group_by_join_select(cx, &bound, None).await?
+            let resolved_limit = self.resolve_expression_only_limit(&bound, None).await?;
+            if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+                self.validate_select_before_limit_zero_short_circuit(&bound)?;
+                return Ok(Vec::new());
+            }
+            bound.limit = None;
+            let mut rows = self.execute_group_by_join_select(cx, &bound, None).await?;
+            apply_resolved_expression_limit(&mut rows, resolved_limit);
+            Ok(rows)
         } else {
-            self.execute_join_select(&bound, None).await?
-        };
-        if let Some(limit) = limit_clause {
-            self.apply_limit_clause(&mut rows, &limit, None)?;
+            self.execute_join_select(&bound, None).await
         }
-        Ok(rows)
     }
 
     fn select_correlated_exists_where_can_use_indexed_count_probe(
@@ -60828,6 +60818,21 @@ impl Connection {
             return Ok(());
         }
         self.validate_select_column_references(select)
+    }
+
+    fn validate_select_before_limit_zero_short_circuit(
+        &self,
+        select: &SelectStatement,
+    ) -> Result<()> {
+        self.validate_join_using_columns(select)?;
+        let skip_column_ref_validation =
+            (select.body.compounds.is_empty() && is_expression_only_select(select))
+                || self.has_primary_live_vtab_source(select)
+                || select_references_non_main_schema(select);
+        if !skip_column_ref_validation {
+            self.validate_select_column_references(select)?;
+        }
+        Ok(())
     }
 
     fn in_lhs_column_count(&self, lhs: &Expr) -> usize {
@@ -111866,6 +111871,7 @@ impl Connection {
         // or ORDER BY).
         let resolved_limit = self.resolve_expression_only_limit(select, params).await?;
         if resolved_limit.is_some_and(|limit| limit.limit == 0) {
+            self.validate_select_before_limit_zero_short_circuit(select)?;
             return Ok(Vec::new());
         }
 
@@ -111892,6 +111898,12 @@ impl Connection {
             None
         };
 
+        let all_union_all = select
+            .body
+            .compounds
+            .iter()
+            .all(|(op, _)| matches!(op, CompoundOp::UnionAll));
+
         let mut streaming_suffix_start = select.body.compounds.len();
         if streaming_needed.is_some() {
             while streaming_suffix_start > 0 {
@@ -111913,6 +111925,155 @@ impl Connection {
                 offset: None,
             })
         };
+
+        // bd-ct8zm: skipping a later arm must never hide static column/table
+        // errors in that arm.
+        if streaming_suffix_start < select.body.compounds.len()
+            || (select.order_by.is_empty()
+                && all_union_all
+                && resolved_limit.is_some_and(|limit| limit.offset > 0))
+        {
+            self.validate_select_before_limit_zero_short_circuit(select)?;
+        }
+
+        // bd-ct8zm: for an unordered all-UNION-ALL compound with a positive
+        // OFFSET, skip rows before projection inside each simple FROM arm
+        // (matching SQLite's compound VDBE OFFSET register) instead of
+        // materializing LIMIT+OFFSET projected rows from arm 0.
+        if select.order_by.is_empty()
+            && all_union_all
+            && let Some(limit) = resolved_limit
+            && limit.offset > 0
+        {
+            let mut remaining_offset = usize::try_from(limit.offset).unwrap_or(usize::MAX);
+            let mut remaining_limit = (limit.limit >= 0)
+                .then(|| usize::try_from(limit.limit).unwrap_or(usize::MAX));
+            let mut result = Vec::new();
+            let all_arms = std::iter::once(&select.body.select)
+                .chain(select.body.compounds.iter().map(|(_, core)| core));
+            for (arm_idx, core) in all_arms.enumerate() {
+                if remaining_limit == Some(0) {
+                    break;
+                }
+                let arm_with = (arm_idx == 0).then(|| select.with.clone()).flatten();
+                if remaining_offset > 0
+                    && !self.scalar_function_overridden.get()
+                    && let SelectCore::Select {
+                        distinct: Distinctness::All,
+                        from: Some(from),
+                        where_clause,
+                        group_by,
+                        having: None,
+                        windows,
+                        ..
+                    } = core
+                    && group_by.is_empty()
+                    && windows.is_empty()
+                    && where_clause
+                        .as_deref()
+                        .is_none_or(|expr| !expr_has_any_subquery(expr))
+                {
+                    let count_select = SelectStatement {
+                        with: arm_with.clone(),
+                        body: SelectBody {
+                            select: SelectCore::Select {
+                                distinct: Distinctness::All,
+                                columns: vec![ResultColumn::Expr {
+                                    expr: Expr::FunctionCall {
+                                        name: "count".to_owned(),
+                                        args: FunctionArgs::Star,
+                                        distinct: false,
+                                        order_by: Vec::new(),
+                                        filter: None,
+                                        over: None,
+                                        span: Span::ZERO,
+                                    },
+                                    alias: None,
+                                }],
+                                from: Some(from.clone()),
+                                where_clause: where_clause.clone(),
+                                group_by: Vec::new(),
+                                having: None,
+                                windows: Vec::new(),
+                            },
+                            compounds: Vec::new(),
+                        },
+                        order_by: Vec::new(),
+                        limit: None,
+                    };
+                    let count_rows = self
+                        .execute_statement(&Statement::Select(count_select), params)
+                        .await?;
+                    if let Some(arm_count) = count_rows
+                        .first()
+                        .and_then(|row| row.values().first())
+                        .and_then(SqliteValue::as_integer)
+                        .and_then(|count| usize::try_from(count).ok())
+                    {
+                        if arm_count <= remaining_offset {
+                            remaining_offset -= arm_count;
+                            continue;
+                        }
+                        let arm_limit_i64 = remaining_limit
+                            .and_then(|rem| i64::try_from(rem).ok())
+                            .unwrap_or(-1);
+                        let arm_offset_i64 = i64::try_from(remaining_offset).ok();
+                        let arm_select = SelectStatement {
+                            with: arm_with,
+                            body: SelectBody {
+                                select: core.clone(),
+                                compounds: Vec::new(),
+                            },
+                            order_by: Vec::new(),
+                            limit: Some(fsqlite_ast::LimitClause {
+                                limit: Expr::Literal(Literal::Integer(arm_limit_i64), Span::ZERO),
+                                offset: arm_offset_i64.map(|off| {
+                                    Expr::Literal(Literal::Integer(off), Span::ZERO)
+                                }),
+                            }),
+                        };
+                        let arm_rows = self
+                            .execute_statement(&Statement::Select(arm_select), params)
+                            .await?;
+                        remaining_offset = 0;
+                        if let Some(rem) = remaining_limit.as_mut() {
+                            *rem = rem.saturating_sub(arm_rows.len());
+                        }
+                        result.extend(arm_rows);
+                        continue;
+                    }
+                }
+                let arm_limit = remaining_limit
+                    .map(|rem| rem.saturating_add(remaining_offset))
+                    .and_then(make_arm_limit);
+                let arm_select = SelectStatement {
+                    with: arm_with,
+                    body: SelectBody {
+                        select: core.clone(),
+                        compounds: Vec::new(),
+                    },
+                    order_by: Vec::new(),
+                    limit: arm_limit,
+                };
+                let mut arm_rows = self
+                    .execute_statement(&Statement::Select(arm_select), params)
+                    .await?;
+                if remaining_offset > 0 {
+                    if arm_rows.len() <= remaining_offset {
+                        remaining_offset -= arm_rows.len();
+                        continue;
+                    }
+                    arm_rows.drain(..remaining_offset);
+                    remaining_offset = 0;
+                }
+                if let Some(rem) = remaining_limit.as_mut() {
+                    arm_rows.truncate(*rem);
+                    *rem = rem.saturating_sub(arm_rows.len());
+                }
+                result.extend(arm_rows);
+            }
+            return Ok(result);
+        }
 
         let needs_collation_aware_dedup = select.body.compounds[..streaming_suffix_start]
             .iter()
@@ -112329,6 +112490,23 @@ impl Connection {
         // default, and recursive CTEs, so existing behavior is unchanged.
         let inlined_not_materialized = inline_not_materialized_ctes(select);
         let select = inlined_not_materialized.as_ref().unwrap_or(select);
+
+        // bd-ct8zm: `LIMIT 0` on a WITH SELECT returns zero rows without
+        // materializing any CTE (matching SQLite's `computeLimitRegisters`,
+        // even for `AS MATERIALIZED` CTEs), provided the LIMIT expression
+        // itself does not read a CTE from this WITH clause.
+        if let Some(limit_clause) = select.limit.as_ref()
+            && select
+                .with
+                .as_ref()
+                .is_none_or(|with| !limit_clause_references_any_cte(limit_clause, with))
+        {
+            let pre_limit = self.resolve_expression_only_limit(select, params).await?;
+            if pre_limit.is_some_and(|limit| limit.limit == 0) {
+                self.validate_select_before_limit_zero_short_circuit(select)?;
+                return Ok(Vec::new());
+            }
+        }
 
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "select",
@@ -116636,6 +116814,7 @@ impl Connection {
                         join.join_type.kind,
                         &on_expr,
                         &col_map,
+                        None,
                     )
                 })
                 .await?;
@@ -116652,6 +116831,7 @@ impl Connection {
                         using_left_slots.as_deref(),
                         using_skip,
                         right_using_skip,
+                        None,
                     )
                 })?;
             }
@@ -116829,6 +117009,40 @@ impl Connection {
             preloaded.push(pre);
         }
 
+        // bd-ct8zm: evaluate LIMIT / OFFSET once up front so LIMIT 0 skips
+        // subquery / TVF / table execution and finite limits bound derived
+        // subqueries, joins, WHERE filtering, pre-projection ORDER BY, and
+        // projection before touching unreturned rows.
+        let resolved_limit = self.resolve_expression_only_limit(select, None).await?;
+        let is_distinct = is_distinct_select(select);
+        let limit_is_zero = resolved_limit
+            .as_ref()
+            .is_some_and(|resolved| resolved.limit == 0);
+        let finite_limit: Option<(usize, usize)> =
+            resolved_limit.as_ref().and_then(|resolved| {
+                if resolved.limit >= 0 {
+                    let lim = usize::try_from(resolved.limit).unwrap_or(usize::MAX);
+                    let off = usize::try_from(resolved.offset.max(0)).unwrap_or(usize::MAX);
+                    Some((lim, off))
+                } else {
+                    None
+                }
+            });
+        let row_budget: Option<usize> =
+            finite_limit.map(|(lim, off)| lim.saturating_add(off));
+        let all_columns_pure_slots = columns.iter().all(|c| {
+            matches!(
+                c,
+                ResultColumn::Star
+                    | ResultColumn::TableStar(_)
+                    | ResultColumn::Expr {
+                        expr: Expr::Column(..),
+                        ..
+                    }
+            )
+        });
+        let mut deferred_streaming_derived_compound: Option<&SelectStatement> = None;
+
         // Execute subqueries / table-valued functions now that the schema
         // borrow is dropped. Collect all such sources in source order.
         let all_sources: Vec<&TableOrSubquery> = std::iter::once(&from.source)
@@ -116922,7 +117136,65 @@ impl Connection {
                 };
                 match effective_src {
                     TableOrSubquery::Subquery { query, .. } => {
-                        let subquery_statement = Statement::Select(query.as_ref().clone());
+                        if limit_is_zero {
+                            *pre = Some(Vec::new());
+                            continue;
+                        }
+                        let single_source_unordered_budget = (i == 0
+                            && from.joins.is_empty()
+                            && select.order_by.is_empty())
+                        .then_some(row_budget)
+                        .flatten();
+                        let subquery_trailing_union_all = query
+                            .body
+                            .compounds
+                            .last()
+                            .is_some_and(|(op, _)| matches!(op, fsqlite_ast::CompoundOp::UnionAll));
+                        if single_source_unordered_budget.is_some()
+                            && ((where_clause.is_some() && !is_distinct)
+                                || (is_distinct && all_columns_pure_slots))
+                            && !query.body.compounds.is_empty()
+                            && query.order_by.is_empty()
+                            && query.limit.is_none()
+                            && subquery_trailing_union_all
+                        {
+                            // bd-ct8zm: defer execution of this derived compound so
+                            // its trailing UNION ALL arms stream through the outer
+                            // WHERE / DISTINCT filter and stop at `row_budget`.
+                            deferred_streaming_derived_compound = Some(query.as_ref());
+                            *pre = Some(Vec::new());
+                            continue;
+                        }
+                        let mut subquery_to_run = query.as_ref().clone();
+                        if let Some(budget) = single_source_unordered_budget
+                            && where_clause.is_none()
+                            && !is_distinct
+                            && (query.body.compounds.is_empty() || subquery_trailing_union_all)
+                            && let Ok(budget_i64) = i64::try_from(budget)
+                        {
+                            match subquery_to_run.limit.as_mut() {
+                                None => {
+                                    subquery_to_run.limit = Some(fsqlite_ast::LimitClause {
+                                        limit: Expr::Literal(
+                                            Literal::Integer(budget_i64),
+                                            Span::ZERO,
+                                        ),
+                                        offset: None,
+                                    });
+                                }
+                                Some(inner_limit) => {
+                                    if let Expr::Literal(Literal::Integer(n), _) = inner_limit.limit
+                                        && (n < 0 || n > budget_i64)
+                                    {
+                                        inner_limit.limit = Expr::Literal(
+                                            Literal::Integer(budget_i64),
+                                            Span::ZERO,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        let subquery_statement = Statement::Select(subquery_to_run);
                         let rows =
                             lean_future(|| self.execute_statement(&subquery_statement, params))
                                 .await?;
@@ -116942,6 +117214,10 @@ impl Connection {
                         *pre = Some(row_data);
                     }
                     TableOrSubquery::TableFunction { name, args, .. } => {
+                        if limit_is_zero {
+                            *pre = Some(Vec::new());
+                            continue;
+                        }
                         // bd-tfwym: a lateral TVF is evaluated per-row inside the
                         // join loop, not pre-materialized here. Leave the empty
                         // placeholder in `preloaded[i]`; `table_rows[i]` is unused
@@ -116964,6 +117240,10 @@ impl Connection {
                         );
                     }
                     TableOrSubquery::ParenJoin(inner) => {
+                        if limit_is_zero {
+                            self.validate_select_before_limit_zero_short_circuit(select)?;
+                            return Ok(Vec::new());
+                        }
                         let unwrapped = unwrap_single_item_paren_join(inner);
                         let (meta, rows) = Box::pin(self.materialize_paren_join_from(
                             unwrapped,
@@ -117071,7 +117351,10 @@ impl Connection {
         let primary_width = table_sources[0].scan_width();
         let mut live_vtab_scan_plans = Vec::with_capacity(table_sources.len());
         for src in &table_sources {
-            if src.local_table_binding().is_some() && self.has_live_vtab_instance(&src.table_name) {
+            if !limit_is_zero
+                && src.local_table_binding().is_some()
+                && self.has_live_vtab_instance(&src.table_name)
+            {
                 live_vtab_scan_plans.push(Some(self.plan_live_vtab_scan(
                     src,
                     where_clause.as_deref(),
@@ -117125,7 +117408,9 @@ impl Connection {
         };
         #[cfg(not(feature = "ext-fts5"))]
         let effective_where_clause_for_eval = effective_where_clause;
-        let fts5_aux_context = {
+        let fts5_aux_context = if limit_is_zero {
+            Fts5AuxContext::default()
+        } else {
             #[cfg(feature = "ext-fts5")]
             {
                 let mut context = Fts5AuxContext::default();
@@ -117202,14 +117487,20 @@ impl Connection {
             .joins
             .iter()
             .any(|j| matches!(j.join_type.kind, JoinKind::Right | JoinKind::Full));
-        let primary_where_pushdown =
-            if primary_null_extendable || self.scalar_function_overridden.get() {
-                None
-            } else {
-                effective_where_clause.and_then(|expr| {
-                    expr_references_only_col_map(expr, &col_map[..primary_width]).then_some(expr)
-                })
-            };
+        let primary_where_pushdown = if primary_null_extendable
+            || self.scalar_function_overridden.get()
+            || limit_is_zero
+            || deferred_streaming_derived_compound.is_some()
+            || (select.order_by.is_empty()
+                && row_budget.is_some()
+                && (!from.joins.is_empty() || is_distinct))
+        {
+            None
+        } else {
+            effective_where_clause.and_then(|expr| {
+                expr_references_only_col_map(expr, &col_map[..primary_width]).then_some(expr)
+            })
+        };
 
         // GH#386: two-table INNER JOIN outer-IPK keyset LIMIT pushdown. When
         // the ORDER BY is exactly the outer scan key, stream the outer scan
@@ -117218,7 +117509,11 @@ impl Connection {
         // pre-check `join_keyset_limit_pushdown_shape` leave `select.limit`
         // in place so the lane (and, on refusal, the shared tail LIMIT
         // application) can see it.
-        let keyset_streamed = if select.limit.is_some() && preloaded.iter().all(Option::is_none) {
+        let keyset_streamed = if !limit_is_zero
+            && deferred_streaming_derived_compound.is_none()
+            && select.limit.is_some()
+            && preloaded.iter().all(Option::is_none)
+        {
             lean_future(|| {
                 self.try_stream_keyset_limited_join_combined(select, from, &table_sources, &col_map)
             })
@@ -117250,10 +117545,19 @@ impl Connection {
             })
             .collect();
         let keep_masks = join_source_keep_masks(select, &table_sources, &rowid_aliases);
+        let primary_filter_limit = (from.joins.is_empty()
+            && select.order_by.is_empty()
+            && !is_distinct)
+            .then_some(row_budget)
+            .flatten();
         for (i, src) in table_sources.iter().enumerate() {
-            if keyset_stream_active {
-                // GH#386: the streaming keyset lane already produced the
-                // joined rows with a bounded outer scan; skip the full scans.
+            if keyset_stream_active
+                || limit_is_zero
+                || (i == 0 && deferred_streaming_derived_compound.is_some())
+            {
+                // GH#386 / bd-ct8zm: the streaming keyset lane, LIMIT 0, or
+                // deferred derived-compound streaming handles rows without
+                // eager full table scans.
                 table_rows.push(Vec::new());
                 continue;
             }
@@ -117270,6 +117574,7 @@ impl Connection {
                     primary_where_pushdown,
                     &col_map[..primary_width],
                     (!fts5_aux_context.is_empty()).then_some(&fts5_aux_context),
+                    primary_filter_limit,
                 )?);
             } else if let Some(cached) = scanned_cache.get(&src.scan_cache_key) {
                 // Same table referenced again (e.g. CTE self-join): clone cached rows.
@@ -117279,6 +117584,7 @@ impl Connection {
                     primary_where_pushdown,
                     &col_map[..primary_width],
                     (!fts5_aux_context.is_empty()).then_some(&fts5_aux_context),
+                    primary_filter_limit,
                 )?);
             } else {
                 if let Some(plan) = live_vtab_scan_plans[i].as_ref() {
@@ -117298,6 +117604,7 @@ impl Connection {
                         primary_where_pushdown,
                         &col_map[..primary_width],
                         (!fts5_aux_context.is_empty()).then_some(&fts5_aux_context),
+                        primary_filter_limit,
                     )?);
                     continue;
                 }
@@ -117385,6 +117692,7 @@ impl Connection {
                     primary_where_pushdown,
                     &col_map[..primary_width],
                     (!fts5_aux_context.is_empty()).then_some(&fts5_aux_context),
+                    primary_filter_limit,
                 )?);
             }
         }
@@ -117396,6 +117704,7 @@ impl Connection {
 
         // ── 4. Perform joins ──
         // Start with primary table rows as "left" side.
+        let mut where_already_applied = false;
         let mut combined: Vec<Vec<SqliteValue>> = if let Some(rows) = keyset_streamed {
             // GH#386: the streaming lane emitted the joined rows directly
             // (outer seek + per-row inner probe + early LIMIT stop) in the
@@ -117404,6 +117713,175 @@ impl Connection {
             // filter below is a no-op re-check (the whole WHERE is the seek
             // bound) and the stable ORDER BY sort is a no-op reorder.
             rows
+        } else if let Some(compound_query) = deferred_streaming_derived_compound {
+            // bd-ct8zm: stream the derived compound's trailing UNION ALL arms
+            // directly through the outer WHERE / pure-slot DISTINCT filter and
+            // halt as soon as `row_budget` rows survive, leaving trailing arms
+            // unevaluated.
+            let mut streaming_suffix_start = compound_query.body.compounds.len();
+            while streaming_suffix_start > 0
+                && matches!(
+                    compound_query.body.compounds[streaming_suffix_start - 1].0,
+                    fsqlite_ast::CompoundOp::UnionAll
+                )
+            {
+                streaming_suffix_start -= 1;
+            }
+            let mut arm_statements: Vec<Statement> =
+                Vec::with_capacity(1 + compound_query.body.compounds.len() - streaming_suffix_start);
+            if streaming_suffix_start > 0 {
+                arm_statements.push(Statement::Select(SelectStatement {
+                    with: compound_query.with.clone(),
+                    body: fsqlite_ast::SelectBody {
+                        select: compound_query.body.select.clone(),
+                        compounds: compound_query.body.compounds[..streaming_suffix_start].to_vec(),
+                    },
+                    order_by: Vec::new(),
+                    limit: None,
+                }));
+            } else {
+                arm_statements.push(Statement::Select(SelectStatement {
+                    with: compound_query.with.clone(),
+                    body: fsqlite_ast::SelectBody {
+                        select: compound_query.body.select.clone(),
+                        compounds: Vec::new(),
+                    },
+                    order_by: Vec::new(),
+                    limit: None,
+                }));
+            }
+            for (_, arm_core) in &compound_query.body.compounds[streaming_suffix_start..] {
+                arm_statements.push(Statement::Select(SelectStatement {
+                    with: compound_query.with.clone(),
+                    body: fsqlite_ast::SelectBody {
+                        select: arm_core.clone(),
+                        compounds: Vec::new(),
+                    },
+                    order_by: Vec::new(),
+                    limit: None,
+                }));
+            }
+
+            let membership_where = effective_where_clause_for_eval
+                .and_then(|expr| self.lower_json_key_exists_where(expr, &col_map));
+            let stream_where_expr = membership_where.as_ref().or(effective_where_clause_for_eval);
+            let _where_bindings_guard = stream_where_expr.and_then(|expr| {
+                if expr_has_any_subquery(expr) {
+                    None
+                } else {
+                    let mut bindings = JoinExprBindings::default();
+                    bindings.bind_expr(expr, &col_map, using_skip);
+                    Some(JoinExprBindingsGuard::push(bindings))
+                }
+            });
+            let _exists_memo_guard = stream_where_expr.map(|_| self.arm_exists_probe_memo());
+            let distinct_stream_meta = is_distinct.then(|| {
+                let distinct_collations = select_result_collations(select, &schema_snapshot);
+                let distinct_coll_snapshot =
+                    lock_unpoisoned(self.collation_registry.as_ref()).clone();
+                (distinct_collations, distinct_coll_snapshot)
+            });
+
+            let stream_body = async {
+                let mut streamed: Vec<Vec<SqliteValue>> = Vec::new();
+                let mut seen_distinct: Vec<Vec<SqliteValue>> = Vec::new();
+                'stream_arms: for arm_stmt in &arm_statements {
+                    let arm_rows = lean_future(|| self.execute_statement(arm_stmt, params)).await?;
+                    for arm_row in arm_rows {
+                        let mut row = arm_row.values;
+                        if row.len() != primary_width {
+                            row.resize(primary_width, SqliteValue::Null);
+                        }
+                        if let Some(keep) = keep_masks[0].as_deref() {
+                            prune_join_source_row(&mut row, keep);
+                        }
+                        if let Some(where_expr) = stream_where_expr {
+                            let keep = if params.is_none()
+                                && let Some(sync_result) = self.try_eval_expr_truthiness_sync(
+                                    where_expr, true, &row, &col_map,
+                                ) {
+                                sync_result?.unwrap_or(false)
+                            } else {
+                                lean_future(|| {
+                                    self.eval_expr_truthiness(
+                                        where_expr, true, &row, &col_map, params,
+                                    )
+                                })
+                                .await?
+                                .unwrap_or(false)
+                            };
+                            if !keep {
+                                continue;
+                            }
+                        }
+                        if let Some((ref distinct_collations, ref distinct_coll_snapshot)) =
+                            distinct_stream_meta
+                        {
+                            let mut key_vals = Vec::new();
+                            for col in columns {
+                                match col {
+                                    ResultColumn::Star => {
+                                        for (idx, v) in row.iter().enumerate() {
+                                            if !using_skip_indices.contains(&idx)
+                                                && !col_map
+                                                    .get(idx)
+                                                    .is_some_and(|(_, _, hidden)| *hidden)
+                                            {
+                                                key_vals.push(v.clone());
+                                            }
+                                        }
+                                    }
+                                    ResultColumn::TableStar(table_name) => {
+                                        if source_contains_named_source(all_sources[0], table_name)
+                                        {
+                                            key_vals.extend_from_slice(
+                                                &row[..table_sources[0].col_names.len()],
+                                            );
+                                        }
+                                    }
+                                    ResultColumn::Expr { expr, .. } => {
+                                        key_vals.push(self.eval_join_expr_with_using_registry(
+                                            expr, &row, &col_map, using_skip,
+                                        )?);
+                                    }
+                                }
+                            }
+                            let is_dup = seen_distinct.iter().any(|existing| {
+                                existing.len() == key_vals.len()
+                                    && existing.iter().zip(&key_vals).enumerate().all(
+                                        |(ci, (a, b))| {
+                                            let coll = distinct_collations
+                                                .get(ci)
+                                                .and_then(Option::as_deref);
+                                            cmp_sqlite_values_collated_snapshot(
+                                                a,
+                                                b,
+                                                coll,
+                                                distinct_coll_snapshot,
+                                            ) == std::cmp::Ordering::Equal
+                                        },
+                                    )
+                            });
+                            if is_dup {
+                                continue;
+                            }
+                            seen_distinct.push(key_vals);
+                        }
+                        streamed.push(row);
+                        if row_budget.is_some_and(|cap| streamed.len() >= cap) {
+                            break 'stream_arms;
+                        }
+                    }
+                }
+                Ok::<_, FrankenError>(streamed)
+            };
+            where_already_applied = true;
+            if let Some(where_expr) = stream_where_expr {
+                self.with_in_subquery_memo(where_expr, Box::pin(stream_body))
+                    .await?
+            } else {
+                stream_body.await?
+            }
         } else {
             // GH#420: move the primary rows rather than copying each one; the
             // join loop below reads only `table_rows[1..]`.
@@ -117436,10 +117914,23 @@ impl Connection {
             )
         });
         for (join_idx, join) in from.joins.iter().enumerate() {
-            if keyset_stream_active {
-                // GH#386: join already applied by the streaming keyset lane.
+            if keyset_stream_active || limit_is_zero {
+                // GH#386 / bd-ct8zm: join already applied by the streaming
+                // keyset lane or bypassed by LIMIT 0.
                 break;
             }
+            let join_row_limit = if join_idx + 1 == from.joins.len()
+                && select.order_by.is_empty()
+                && !is_distinct
+                && effective_where_clause_for_eval.is_none()
+                && matches!(
+                    join.join_type.kind,
+                    JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+                ) {
+                row_budget
+            } else {
+                None
+            };
             let right_rows = &table_rows[join_idx + 1];
             let right_width = table_sources[join_idx + 1].scan_width();
             let current_width: usize = table_sources[..=join_idx]
@@ -117572,6 +118063,7 @@ impl Connection {
                         join.join_type.kind,
                         &on_expr,
                         &col_map,
+                        join_row_limit,
                     )
                 })
                 .await?;
@@ -117592,13 +118084,20 @@ impl Connection {
                         using_left_slots.as_deref(),
                         using_skip,
                         right_using_skip,
+                        join_row_limit,
                     )
                 })?;
             }
         }
 
         // ── 5. Apply WHERE filter ──
-        if let Some(where_expr) = effective_where_clause_for_eval {
+        if !where_already_applied
+            && !limit_is_zero
+            && let Some(where_expr) = effective_where_clause_for_eval
+        {
+            let where_row_limit = (select.order_by.is_empty() && !is_distinct)
+                .then_some(row_budget)
+                .flatten();
             let membership_where = self.lower_json_key_exists_where(where_expr, &col_map);
             let where_expr = membership_where.as_ref().unwrap_or(where_expr);
             // The effective expression has already received any statement-level
@@ -117624,7 +118123,9 @@ impl Connection {
                 .with_in_subquery_memo(
                     where_expr,
                     Box::pin(async {
-                        let mut filtered = Vec::with_capacity(combined.len());
+                        let initial_cap =
+                            where_row_limit.map_or(combined.len(), |cap| combined.len().min(cap));
+                        let mut filtered = Vec::with_capacity(initial_cap);
                         for row in combined {
                             // WHERE is a truthiness context: stock compiles it through
                             // ExprIfTrue, so AND/OR short-circuit left-to-right and a
@@ -117655,6 +118156,9 @@ impl Connection {
                             };
                             if keep {
                                 filtered.push(row);
+                                if where_row_limit.is_some_and(|cap| filtered.len() >= cap) {
+                                    break;
+                                }
                             }
                         }
                         Ok::<_, FrankenError>(filtered)
@@ -117792,6 +118296,149 @@ impl Connection {
             }
         }
 
+        // ── 6b. Pre-projection ORDER BY + LIMIT (bd-ct8zm) ──
+        // When ORDER BY keys are subquery-free and do not re-evaluate a
+        // non-column projected expression, evaluate ONLY the sort keys, sort
+        // stably, and slice OFFSET..OFFSET+LIMIT BEFORE Step 7 projects the
+        // SELECT list. This matches SQLite's deferred projection for
+        // `SELECT abs(e.x) FROM e JOIN u ... ORDER BY e.k LIMIT 1`.
+        let mut order_by_applied = false;
+        let mut distinct_applied = deferred_streaming_derived_compound.is_some() && is_distinct;
+        let mut limit_applied = false;
+        if !limit_is_zero
+            && !select.order_by.is_empty()
+            && !is_distinct
+            && let Some((limit_count, offset_count)) = finite_limit
+        {
+            struct PreOrderTerm<'a> {
+                expr: &'a Expr,
+                desc: bool,
+                nulls: NullsOrder,
+                coll: Option<String>,
+            }
+            let pre_order_terms: Option<Vec<PreOrderTerm<'_>>> = select
+                .order_by
+                .iter()
+                .map(|term| {
+                    let idx = resolve_order_term_idx(&term.expr, &expanded_columns)?;
+                    let ResultColumn::Expr { expr, .. } = expanded_columns.get(idx)? else {
+                        return None;
+                    };
+                    if expr_has_any_subquery(expr)
+                        || (idx < projected_width
+                            && !matches!(strip_collate_wrappers(expr), Expr::Column(..)))
+                    {
+                        return None;
+                    }
+                    let desc = matches!(term.direction, Some(SortDirection::Desc));
+                    let nulls = term
+                        .nulls
+                        .unwrap_or_else(|| default_nulls_order(term.direction));
+                    let coll = match &term.expr {
+                        Expr::Collate { collation, .. } => Some(collation.clone()),
+                        _ => join_expr_effective_collation(expr, &col_map),
+                    };
+                    Some(PreOrderTerm {
+                        expr,
+                        desc,
+                        nulls,
+                        coll,
+                    })
+                })
+                .collect();
+            if let Some(pre_order_terms) = pre_order_terms {
+                let _pre_order_bindings_guard = if using_skip.is_none() {
+                    let mut bindings = JoinExprBindings::default();
+                    for term in &pre_order_terms {
+                        bindings.bind_expr(term.expr, &col_map, None);
+                    }
+                    Some(JoinExprBindingsGuard::push(bindings))
+                } else {
+                    None
+                };
+                let mut keyed: Vec<(Vec<SqliteValue>, Vec<SqliteValue>)> =
+                    Vec::with_capacity(combined.len());
+                for row in combined {
+                    let mut keys = Vec::with_capacity(pre_order_terms.len());
+                    for term in &pre_order_terms {
+                        keys.push(self.eval_join_expr_with_using_registry(
+                            term.expr, &row, &col_map, using_skip,
+                        )?);
+                    }
+                    keyed.push((keys, row));
+                }
+                let resolved_key_specs: Vec<(usize, bool, NullsOrder, Option<String>)> =
+                    pre_order_terms
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ki, term)| (ki, term.desc, term.nulls, term.coll))
+                        .collect();
+                let coll_snapshot = lock_unpoisoned(self.collation_registry.as_ref()).clone();
+                keyed.sort_by(|a, b| {
+                    compare_rows_by_resolved_order_terms(
+                        &a.0,
+                        &b.0,
+                        &resolved_key_specs,
+                        &coll_snapshot,
+                    )
+                });
+                combined = keyed
+                    .into_iter()
+                    .skip(offset_count)
+                    .take(limit_count)
+                    .map(|(_, row)| row)
+                    .collect();
+                extra_order_exprs.clear();
+                order_by_applied = true;
+                limit_applied = true;
+            }
+        }
+
+        // bd-ct8zm: for unordered non-DISTINCT queries with a finite LIMIT
+        // (or negative LIMIT with positive OFFSET), slice OFFSET..OFFSET+LIMIT
+        // before Step 7 projection so unreturned rows never evaluate projection
+        // expressions (e.g. `abs(INT64_MIN)`).
+        if !order_by_applied && select.order_by.is_empty() && !is_distinct {
+            if let Some((limit_count, offset_count)) = finite_limit {
+                if offset_count >= combined.len() {
+                    combined.clear();
+                } else {
+                    if offset_count > 0 {
+                        combined.drain(..offset_count);
+                    }
+                    combined.truncate(limit_count);
+                }
+                limit_applied = true;
+            } else if let Some(resolved) = resolved_limit.as_ref()
+                && resolved.offset > 0
+            {
+                let offset_count = usize::try_from(resolved.offset).unwrap_or(usize::MAX);
+                if offset_count >= combined.len() {
+                    combined.clear();
+                } else {
+                    combined.drain(..offset_count);
+                }
+                limit_applied = true;
+            }
+        }
+        let lazy_distinct_state = if !order_by_applied
+            && !distinct_applied
+            && select.order_by.is_empty()
+            && is_distinct
+            && let Some((limit_count, offset_count)) = finite_limit
+        {
+            let distinct_collations = select_result_collations(select, &schema_snapshot);
+            let distinct_coll_snapshot =
+                lock_unpoisoned(self.collation_registry.as_ref()).clone();
+            Some((
+                distinct_collations,
+                distinct_coll_snapshot,
+                limit_count.saturating_add(offset_count),
+            ))
+        } else {
+            None
+        };
+
         // ── 7. Project result columns ──
         // Check once whether any column contains a subquery expression.
         let has_subqueries = columns
@@ -117840,7 +118487,10 @@ impl Connection {
             .collect();
 
         let _projection_exists_memo_guard = has_subqueries.then(|| self.arm_exists_probe_memo());
-        let mut result: Vec<Row> = Vec::with_capacity(combined.len());
+        let initial_result_cap = lazy_distinct_state
+            .as_ref()
+            .map_or(combined.len(), |(_, _, budget)| combined.len().min(*budget));
+        let mut result: Vec<Row> = Vec::with_capacity(initial_result_cap);
         // bd-w4pr1.12: every projected row has the previous row's width, so
         // reserve exactly that. Growing from empty reserved four values for a
         // one-column row: 192 bytes a row, held for the whole result.
@@ -117938,12 +118588,45 @@ impl Connection {
                     );
                 }
             }
+            if let Some((ref distinct_collations, ref distinct_coll_snapshot, distinct_budget)) =
+                lazy_distinct_state
+            {
+                let is_dup = result.iter().any(|existing| {
+                    existing.values.len() >= projected_width
+                        && values.len() >= projected_width
+                        && existing.values[..projected_width]
+                            .iter()
+                            .zip(&values[..projected_width])
+                            .enumerate()
+                            .all(|(ci, (a, b))| {
+                                let coll = distinct_collations.get(ci).and_then(Option::as_deref);
+                                cmp_sqlite_values_collated_snapshot(
+                                    a,
+                                    b,
+                                    coll,
+                                    distinct_coll_snapshot,
+                                ) == std::cmp::Ordering::Equal
+                            })
+                });
+                if is_dup {
+                    continue;
+                }
+                projected_row_width = values.len();
+                result.push(Row { values });
+                if result.len() >= distinct_budget {
+                    break;
+                }
+                continue;
+            }
             projected_row_width = values.len();
             result.push(Row { values });
         }
+        if lazy_distinct_state.is_some() {
+            distinct_applied = true;
+        }
 
         // ── 8. Post-process: DISTINCT ──
-        if is_distinct_select(select) {
+        if is_distinct && !distinct_applied {
             let schema_snapshot = self.schema.borrow().clone();
             let distinct_collations = select_result_collations(select, &schema_snapshot);
             let distinct_coll_snapshot = lock_unpoisoned(self.collation_registry.as_ref()).clone();
@@ -117966,7 +118649,7 @@ impl Connection {
                 ResultColumn::Star | ResultColumn::TableStar(_) => None,
             })
             .collect();
-        if !select.order_by.is_empty() {
+        if !select.order_by.is_empty() && !order_by_applied {
             sort_rows_by_order_terms(
                 &mut result,
                 &select.order_by,
@@ -117983,9 +118666,9 @@ impl Connection {
             }
         }
 
-        // ── 8. Post-process: LIMIT / OFFSET ──
-        if let Some(ref limit_clause) = select.limit {
-            self.apply_limit_clause(&mut result, limit_clause, None)?;
+        // ── 10. Post-process: LIMIT / OFFSET ──
+        if !limit_applied {
+            apply_resolved_expression_limit(&mut result, resolved_limit);
         }
 
         Ok(result)
@@ -118015,12 +118698,17 @@ impl Connection {
         kind: fsqlite_ast::JoinKind,
         on_expr: &Expr,
         col_map: &[(String, String, bool)],
+        row_limit: Option<usize>,
     ) -> Result<Vec<Vec<SqliteValue>>> {
         use fsqlite_ast::JoinKind;
 
         let combined_width = left_width + right_width;
-        let mut result = Vec::new();
         let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+        let effective_row_limit = (!track_right).then_some(row_limit).flatten();
+        if effective_row_limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let mut result = Vec::new();
         let mut right_matched = if track_right {
             vec![false; right.len()]
         } else {
@@ -118049,6 +118737,9 @@ impl Connection {
                         right_matched[ri] = true;
                     }
                     result.push(scratch.clone());
+                    if effective_row_limit.is_some_and(|cap| result.len() >= cap) {
+                        return Ok(result);
+                    }
                 }
             }
 
@@ -118057,6 +118748,9 @@ impl Connection {
                 combined.extend_from_slice(left_row);
                 combined.extend(std::iter::repeat_n(SqliteValue::Null, right_width));
                 result.push(combined);
+                if effective_row_limit.is_some_and(|cap| result.len() >= cap) {
+                    return Ok(result);
+                }
             }
         }
 
@@ -128148,12 +128842,25 @@ fn union_all_source_accepts_limit(query: &SelectStatement) -> bool {
             .all(|(op, _)| matches!(op, CompoundOp::UnionAll))
 }
 
+fn union_all_source_all_arms_have_from(query: &SelectStatement) -> bool {
+    let core_has_from =
+        |core: &SelectCore| matches!(core, SelectCore::Select { from: Some(_), .. });
+    core_has_from(&query.body.select)
+        && query
+            .body
+            .compounds
+            .iter()
+            .all(|(_, core)| core_has_from(core))
+}
+
 /// Bound a sole UNION ALL source when its consumer only projects columns.
 /// No row can be removed, duplicated, reordered, or observed by another
-/// consumer. Keep the outer LIMIT and all names intact; the source's literal
-/// cap lets `execute_compound_select` stop before evaluating a later arm.
-/// Positive OFFSET is deliberately excluded: skipping a source projection
-/// needs per-arm OFFSET handling, not merely a larger materialization cap.
+/// consumer. Keep all names intact; the source's literal cap lets
+/// `execute_compound_select` stop before evaluating a later arm.
+/// When a positive OFFSET is present, push both LIMIT and OFFSET only when
+/// every UNION ALL arm has a FROM clause (matching SQLite's compound query
+/// flattener; a FROM-less arm keeps coroutine semantics where skipped rows
+/// still evaluate their source projection).
 fn push_down_union_all_source_limit(
     select: &SelectStatement,
     params: Option<&[SqliteValue]>,
@@ -128234,12 +128941,30 @@ fn push_down_union_all_source_limit(
     let Some(rows) = eval_constant_limit_integer(&limit.limit).filter(|value| *value > 0) else {
         return Ok(None);
     };
-    if limit.offset.as_ref().is_some_and(|offset| {
-        eval_constant_limit_integer(offset).is_none_or(|value| value > 0)
-    }) {
-        return Ok(None);
+    let positive_offset = match limit.offset.as_ref() {
+        None => None,
+        Some(offset) => {
+            let Some(value) = eval_constant_limit_integer(offset) else {
+                return Ok(None);
+            };
+            if value > 0 {
+                if !union_all_source_all_arms_have_from(source_query) {
+                    return Ok(None);
+                }
+                Some(value)
+            } else {
+                None
+            }
+        }
+    };
+    let mut limited = if positive_offset.is_some() && select_contains_any_placeholder(select) {
+        canonicalize_select_placeholders(select)?
+    } else {
+        select.clone()
+    };
+    if positive_offset.is_some() {
+        limited.limit = None;
     }
-    let mut limited = select.clone();
     let source = if let Some(with) = limited.with.as_mut() {
         &mut with.ctes[0].query
     } else if let SelectCore::Select {
@@ -128253,11 +128978,11 @@ fn push_down_union_all_source_limit(
     };
     source.limit = Some(fsqlite_ast::LimitClause {
         limit: Expr::Literal(Literal::Integer(rows), Span::ZERO),
-        offset: None,
+        offset: positive_offset
+            .map(|offset| Expr::Literal(Literal::Integer(offset), Span::ZERO)),
     });
     Ok(Some(limited))
 }
-
 fn check_limit_value_lossless(expr: &Expr) -> Result<()> {
     if eval_constant_limit_expr(expr).is_some_and(|value| {
         value
@@ -135152,7 +135877,18 @@ fn inline_not_materialized_ctes(select: &SelectStatement) -> Option<SelectStatem
 
     let mut inlinable: Vec<(String, SelectStatement)> = Vec::new();
     for cte in &with.ctes {
-        if cte.materialized != Some(CteMaterialized::NotMaterialized) {
+        let explicitly_not_materialized =
+            cte.materialized == Some(CteMaterialized::NotMaterialized);
+        // bd-ct8zm: SQLite treats an unhinted non-recursive CTE referenced once
+        // as NOT MATERIALIZED (inlined as a derived table), allowing outer LIMIT
+        // to stop compound evaluation before later arms. Keep explicit
+        // `MATERIALIZED` and multi-reference / per-row subquery CTEs on the
+        // materialize path so non-deterministic `random()` bodies evaluate once.
+        let single_use_unhinted = cte.materialized.is_none()
+            && select.body.compounds.is_empty()
+            && (!cte.query.body.compounds.is_empty() || select.limit.is_some())
+            && cte_has_single_non_looping_ref(select, &cte.name);
+        if !explicitly_not_materialized && !single_use_unhinted {
             continue;
         }
         // A body that references its own name is recursive even without the
@@ -135204,6 +135940,72 @@ fn inline_not_materialized_ctes(select: &SelectStatement) -> Option<SelectStatem
         );
     }
     (inlined > 0).then_some(rewritten)
+}
+
+/// True when `limit_clause` contains a subquery referencing any CTE in `with`.
+fn limit_clause_references_any_cte(
+    limit: &fsqlite_ast::LimitClause,
+    with: &fsqlite_ast::WithClause,
+) -> bool {
+    let expr_refs = |expr: &Expr| -> bool {
+        expr_contains_subquery_match(expr, &mut |sub| {
+            let sub_select = match sub {
+                SubqueryExprRef::Scalar(s)
+                | SubqueryExprRef::Exists(s)
+                | SubqueryExprRef::In(s) => s,
+            };
+            with.ctes
+                .iter()
+                .any(|cte| cte_body_references_relation(sub_select, &cte.name))
+        })
+    };
+    expr_refs(&limit.limit) || limit.offset.as_ref().is_some_and(expr_refs)
+}
+
+/// True when `select` contains exactly one unqualified relation reference to
+/// `cte_name` across all CTE bodies and the consumer query, and that reference
+/// is not evaluated inside a per-row loop (either directly in the consumer's
+/// top-level `FROM`, or inside a `FROM`-less consumer's expression list).
+fn cte_has_single_non_looping_ref(select: &SelectStatement, cte_name: &str) -> bool {
+    let mut total_refs = 0usize;
+    let _ = visit_select_qualified_names(select, &mut |qualified| {
+        if qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(cte_name) {
+            total_refs += 1;
+        }
+        Ok(())
+    });
+    if total_refs != 1 {
+        return false;
+    }
+    let SelectCore::Select { from, .. } = &select.body.select else {
+        return false;
+    };
+    let Some(from) = from.as_ref() else {
+        // FROM-less consumer (e.g. `WITH c AS (...) SELECT (SELECT v FROM c)`):
+        // executes once, not per outer row.
+        return true;
+    };
+    fn count_top_level_from_refs(from: &FromClause, name: &str) -> usize {
+        let count_source = |source: &TableOrSubquery| -> usize {
+            match source {
+                TableOrSubquery::Table {
+                    name: q,
+                    index_hint: None,
+                    time_travel: None,
+                    ..
+                } if q.schema.is_none() && q.name.eq_ignore_ascii_case(name) => 1,
+                TableOrSubquery::ParenJoin(inner) => count_top_level_from_refs(inner, name),
+                _ => 0,
+            }
+        };
+        count_source(&from.source)
+            + from
+                .joins
+                .iter()
+                .map(|j| count_source(&j.table))
+                .sum::<usize>()
+    }
+    count_top_level_from_refs(from, cte_name) == 1
 }
 
 /// True when `body` references `name` in a relation position (`FROM name` or the
@@ -183625,7 +184427,12 @@ fn execute_hash_join(
     using_recheck: Option<&[(usize, usize)]>,
     left_coalesce: Option<&[SmallVec<[usize; 4]>]>,
     col_map: &[(String, String, bool)],
+    row_limit: Option<usize>,
 ) -> Result<Vec<Vec<SqliteValue>>> {
+    let row_limit = (!track_right).then_some(row_limit).flatten();
+    if row_limit == Some(0) {
+        return Ok(Vec::new());
+    }
     let combined_width = left_width + right_width;
     let mut right_index: HashMap<CanonicalHashJoinKey, Vec<usize>> =
         HashMap::with_capacity(right.len());
@@ -183640,7 +184447,7 @@ fn execute_hash_join(
     } else {
         Vec::new()
     };
-    let mut result = Vec::with_capacity(left.len());
+    let mut result = Vec::with_capacity(row_limit.map_or(left.len(), |cap| left.len().min(cap)));
     for left_row in left {
         let mut matched = false;
         let probe_key = match left_coalesce {
@@ -183679,6 +184486,9 @@ fn execute_hash_join(
                 if track_right {
                     right_matched[ri] = true;
                 }
+                if row_limit.is_some_and(|cap| result.len() >= cap) {
+                    return Ok(result);
+                }
             }
         }
         if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
@@ -183686,6 +184496,9 @@ fn execute_hash_join(
             combined.extend_from_slice(left_row);
             combined.extend(std::iter::repeat_n(SqliteValue::Null, right_width));
             result.push(combined);
+            if row_limit.is_some_and(|cap| result.len() >= cap) {
+                return Ok(result);
+            }
         }
     }
     if track_right {
@@ -184182,8 +184995,14 @@ fn execute_single_join(
     using_left_slots: Option<&[SmallVec<[usize; 4]>]>,
     left_using_skip: Option<&HashSet<usize>>,
     right_using_skip: Option<&HashSet<usize>>,
+    row_limit: Option<usize>,
 ) -> Result<Vec<Vec<SqliteValue>>> {
     let combined_width = left_width + right_width;
+    let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+    let effective_row_limit = (!track_right).then_some(row_limit).flatten();
+    if effective_row_limit == Some(0) {
+        return Ok(Vec::new());
+    }
 
     // Resolve each referenced ON column once for this join step. The guard is
     // scoped across both the hash residual evaluator and the nested fallback,
@@ -184202,7 +185021,6 @@ fn execute_single_join(
         && let Some(plan) = plan_hash_join_predicate(expr, col_map, left_width)
         && let Some(hash_pairs) = hash_join_pairs_with_modes(&plan.equi_pairs, left_width)
     {
-        let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
         #[cfg(test)]
         FSQLITE_JOIN_HASH_FAST_PATH_HITS.with(|counter| counter.set(counter.get().wrapping_add(1)));
         #[cfg(test)]
@@ -184222,9 +185040,11 @@ fn execute_single_join(
             None,
             None,
             col_map,
+            effective_row_limit,
         );
     }
-    if let Some(JoinConstraint::On(expr)) = constraint
+    if effective_row_limit.is_none()
+        && let Some(JoinConstraint::On(expr)) = constraint
         && let Some(joined) = try_expression_keyed_join(
             left,
             right,
@@ -184264,7 +185084,6 @@ fn execute_single_join(
             && join_hash_pairs_are_binary(&equi_pairs, left_width)
             && let Some(hash_pairs) = hash_join_pairs_with_modes(&equi_pairs, left_width)
         {
-            let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
             return execute_hash_join(
                 left,
                 right,
@@ -184277,13 +185096,13 @@ fn execute_single_join(
                 Some(indices),
                 using_left_slots,
                 col_map,
+                effective_row_limit,
             );
         }
     }
 
     // ── Fallback: nested-loop join ──
     let mut result = Vec::new();
-    let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
     let mut right_matched = if track_right {
         vec![false; right.len()]
     } else {
@@ -184326,6 +185145,9 @@ fn execute_single_join(
                     right_matched[ri] = true;
                 }
                 result.push(scratch.clone());
+                if effective_row_limit.is_some_and(|cap| result.len() >= cap) {
+                    return Ok(result);
+                }
             }
         }
 
@@ -184335,6 +185157,9 @@ fn execute_single_join(
             combined.extend_from_slice(left_row);
             combined.extend(std::iter::repeat_n(SqliteValue::Null, right_width));
             result.push(combined);
+            if effective_row_limit.is_some_and(|cap| result.len() >= cap) {
+                return Ok(result);
+            }
         }
 
         // CROSS JOIN without constraint: handled by `passes = true` above.
@@ -184984,6 +185809,7 @@ fn maybe_filter_primary_join_rows(
     primary_where_pushdown: Option<&Expr>,
     primary_col_map: &[(String, String, bool)],
     fts5_aux_context: Option<&Fts5AuxContext>,
+    row_limit: Option<usize>,
 ) -> Result<Vec<Vec<SqliteValue>>> {
     if table_index != 0 {
         return Ok(row_data);
@@ -184991,13 +185817,19 @@ fn maybe_filter_primary_join_rows(
     let Some(expr) = primary_where_pushdown else {
         return Ok(row_data);
     };
+    if row_limit == Some(0) {
+        return Ok(Vec::new());
+    }
 
-    let mut filtered = Vec::with_capacity(row_data.len());
+    let mut filtered = Vec::with_capacity(row_limit.map_or(row_data.len(), |cap| row_data.len().min(cap)));
     let _fts5_aux_guard =
         fts5_aux_context.map(|context| Fts5AuxContextGuard::push(context.clone()));
     for row in row_data {
         if eval_join_predicate(expr, &row, primary_col_map)? {
             filtered.push(row);
+            if row_limit.is_some_and(|cap| filtered.len() >= cap) {
+                break;
+            }
         }
     }
     Ok(filtered)
