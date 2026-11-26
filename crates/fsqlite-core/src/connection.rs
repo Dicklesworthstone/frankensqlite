@@ -46084,7 +46084,13 @@ impl Connection {
                 // still evaluated exactly once by its executor. Binding the
                 // whole statement preserves anonymous parameter positions
                 // when the LIMIT follows parameters in other clauses.
-                if let Some(limit) = select.limit.as_ref() {
+                // bd-76ftv: a window SELECT without FROM is left to
+                // execute_fromless_window_select, which resolves its windows,
+                // their aliases and collations, then returns before any row
+                // for LIMIT 0; returning here skipped those checks.
+                if let Some(limit) = select.limit.as_ref()
+                    && !expression_only_has_window_functions(select)
+                {
                     let limit_is_zero = match eval_constant_limit_integer(&limit.limit) {
                         Some(value) => value == 0,
                         None if params.is_some_and(|values| !values.is_empty()) => {
@@ -61095,10 +61101,21 @@ impl Connection {
         select: &SelectStatement,
     ) -> Result<()> {
         self.validate_join_using_columns(select)?;
-        let skip_column_ref_validation =
-            (select.body.compounds.is_empty() && is_expression_only_select(select))
-                || self.has_primary_live_vtab_source(select)
-                || select_references_non_main_schema(select);
+        let expression_only = select.body.compounds.is_empty() && is_expression_only_select(select);
+        if expression_only {
+            // bd-76ftv: a SELECT without FROM checks its names in its own
+            // executor, which this short circuit skips. Stock resolves the
+            // whole statement at prepare whatever the LIMIT: a name in the
+            // result, WHERE, LIMIT or OFFSET that nothing provides, an
+            // aggregate's alias in WHERE, an aggregate in GROUP BY. Run the
+            // executors' static FROM-less checks here; they read the AST
+            // only and evaluate no row expression.
+            validate_fromless_projection_shape(select)?;
+            self.validate_fromless_aggregate_group_shape(select)?;
+        }
+        let skip_column_ref_validation = expression_only
+            || self.has_primary_live_vtab_source(select)
+            || select_references_non_main_schema(select);
         if !skip_column_ref_validation {
             self.validate_select_column_references(select)?;
         }
