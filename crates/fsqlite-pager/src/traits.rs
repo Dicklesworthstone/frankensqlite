@@ -1713,6 +1713,20 @@ pub trait TransactionHandle: sealed::Sealed + Send {
         false
     }
 
+    /// bd-emim5 (b) step 1: whether `page_no`, which
+    /// [`allocate_page`](Self::allocate_page) has just returned, is a fresh
+    /// end-of-file page private to this transaction until it commits.
+    ///
+    /// Such a page lies above every page this transaction can see, so no peer
+    /// holds it as a committed page; a peer can only hold the same number as
+    /// its own fresh page, in its own pager. The engine then writes it without
+    /// the in-process page lock; COMMIT still tracks and locks every page it
+    /// writes. A page reused from any freelist is a committed page and is never
+    /// private. The conservative default is `false`.
+    fn allocated_page_is_private_eof(&self, _page_no: PageNumber) -> bool {
+        false
+    }
+
     /// Update transaction-local auto-vacuum mode and `largest_root_page`
     /// (e.g. when initializing an empty database, toggling `FULL <-> INCREMENTAL`,
     /// or packing/compacting root pages).
@@ -2755,6 +2769,10 @@ impl TransactionHandle for TransactionKind {
 
     fn is_sole_transaction(&self) -> bool {
         dispatch_transaction_kind!(self, txn => txn.is_sole_transaction())
+    }
+
+    fn allocated_page_is_private_eof(&self, page_no: PageNumber) -> bool {
+        dispatch_transaction_kind!(self, txn => txn.allocated_page_is_private_eof(page_no))
     }
 
     fn set_auto_vacuum_state(

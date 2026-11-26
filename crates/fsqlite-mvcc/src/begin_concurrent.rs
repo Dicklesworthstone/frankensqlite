@@ -465,6 +465,13 @@ pub struct ConcurrentHandle {
     /// Per-page transactional state for staged writes, frees, synthetic
     /// conflict tracking, and held page locks.
     page_states: PageMap<PageTxnState>,
+    /// bd-emim5 (b) step 1: pages this transaction allocated from the end of
+    /// the file, above every page its snapshot can see. Until COMMIT they are
+    /// private: the engine writes them without the in-process page lock, and
+    /// they stay out of `page_states`, so out of FCW, `write_set_pages`, held
+    /// locks, write witnesses and savepoint snapshots. COMMIT tracks and locks
+    /// every page the pager writes, these included.
+    private_eof_pages: PageSet,
     /// Transaction state (Active / Committed / Aborted).
     state: TransactionState,
     /// Pages read by this transaction (for SSI rw-antidependency detection).
@@ -657,6 +664,7 @@ impl ConcurrentHandle {
             snapshot,
             serializable,
             page_states: PageMap::default(),
+            private_eof_pages: PageSet::default(),
             state: TransactionState::Active,
             read_set: PageSet::default(),
             read_index: PageMap::default(),
@@ -707,6 +715,7 @@ impl ConcurrentHandle {
         self.snapshot = snapshot;
         self.serializable = serializable;
         self.page_states.clear();
+        self.private_eof_pages.clear();
         self.invalidate_view_parts();
         self.savepoint_snapshot_cache = None;
         self.savepoint_snapshot_dirty.clear();
@@ -819,6 +828,21 @@ impl ConcurrentHandle {
         self.page_states
             .get(&page)
             .is_some_and(|state| state.held_lock)
+    }
+
+    /// bd-emim5 (b) step 1: record that the pager just handed this transaction
+    /// `page` from the end of the file, above every page its snapshot can see
+    /// (see `private_eof_pages`).
+    pub fn mark_private_eof_page(&mut self, page: PageNumber) {
+        self.private_eof_pages.insert(page);
+    }
+
+    /// Whether `page` is one of this transaction's private end-of-file pages.
+    /// A caller that also finds the page in this handle's lock set must treat
+    /// it as locked (a private page that was later freed is locked and freed).
+    #[must_use]
+    pub fn is_private_eof_page(&self, page: PageNumber) -> bool {
+        self.private_eof_pages.contains(&page)
     }
 
     /// Check whether this transaction is still active.
@@ -9789,6 +9813,45 @@ mod tests {
         assert!(!Arc::ptr_eq(&second.parts, &third.parts));
         assert!(third.read_pages.binary_search(&test_page(12)).is_ok());
         assert!(second.read_pages.binary_search(&test_page(12)).is_err());
+    }
+
+    /// bd-emim5 (b) step 1 keeper: a private end-of-file page belongs to one
+    /// transaction and to no conflict surface. It takes no page lock, is not a
+    /// tracked write page or write witness, and a new or recycled handle
+    /// carries none. Mutant "reset keeps the private pages": RED; the hazard is
+    /// a reused handle writing a page, committed by then, with no page lock.
+    #[test]
+    fn test_private_eof_pages_stay_off_the_conflict_surface_and_end_with_the_transaction_bd_emim5()
+    {
+        let lock_table = InProcessPageLockTable::new();
+        let mut handle = ConcurrentHandle::new(test_snapshot(10), test_token(9201));
+        assert!(!handle.is_private_eof_page(test_page(40)));
+        handle.mark_private_eof_page(test_page(40));
+        concurrent_write_page(&mut handle, &lock_table, test_page(5), test_data()).unwrap();
+        assert!(handle.is_private_eof_page(test_page(40)));
+        assert!(!handle.is_private_eof_page(test_page(5)));
+        assert!(!handle.holds_page_lock(test_page(40)));
+        assert!(!handle.tracks_write_conflict_page(test_page(40)));
+        assert_eq!(handle.write_set_pages().into_vec(), vec![test_page(5)]);
+        assert_eq!(handle.held_lock_pages(), vec![test_page(5)]);
+        assert!(
+            !handle
+                .write_witness_keys()
+                .contains(&WitnessKey::Page(test_page(40)))
+        );
+        // The page lock of a private page stays free for whoever commits it.
+        let mut peer = ConcurrentHandle::new(test_snapshot(10), test_token(9202));
+        concurrent_write_page(&mut peer, &lock_table, test_page(40), test_data()).unwrap();
+        concurrent_abort(&mut peer, &lock_table);
+
+        handle.reset_for_new_transaction(test_snapshot(20), test_token(9203));
+        assert!(
+            !handle.is_private_eof_page(test_page(40)),
+            "bd-emim5 step 1: a recycled handle must not inherit the previous transaction's \
+             private pages"
+        );
+        let fresh = ConcurrentHandle::new(test_snapshot(20), test_token(9204));
+        assert!(!fresh.is_private_eof_page(test_page(40)));
     }
 
     /// bd-i0tn6: a classic write skew whose reads and writes happen after an

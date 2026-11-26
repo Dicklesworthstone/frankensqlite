@@ -3680,6 +3680,9 @@ pub struct SharedTxnPageIo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConcurrentWriteTier {
     Tier0AlreadyOwned,
+    /// bd-emim5 (b) step 1: a fresh end-of-file page private to this
+    /// transaction until COMMIT (see `ConcurrentHandle::mark_private_eof_page`).
+    PrivateEof,
     Tier1FirstTouch,
     Tier2CommitSurfaceRare,
 }
@@ -3868,8 +3871,16 @@ impl SharedTxnPageIo {
         ctx: &ConcurrentContext,
         page_no: PageNumber,
     ) -> ConcurrentWriteTier {
-        if ctx.handle.lock().holds_page_lock(page_no) {
-            return ConcurrentWriteTier::Tier0AlreadyOwned;
+        {
+            let handle = ctx.handle.lock();
+            // A page this transaction locks keeps tier 0 even when it was
+            // private: freeing a private page locks it and marks it freed.
+            if handle.holds_page_lock(page_no) {
+                return ConcurrentWriteTier::Tier0AlreadyOwned;
+            }
+            if handle.is_private_eof_page(page_no) {
+                return ConcurrentWriteTier::PrivateEof;
+            }
         }
 
         if page_no == PageNumber::ONE {
@@ -4445,6 +4456,29 @@ impl SharedTxnPageIo {
         Ok(())
     }
 
+    /// bd-emim5 (b) step 1: write a fresh end-of-file page this transaction
+    /// owns privately. No peer can hold it as a committed page (it lies above
+    /// every page this snapshot sees); a peer can only hold the same number as
+    /// its own private page, in its own pager. So no page lock and no
+    /// write-time commit-index check are taken here: the commit plan tracks,
+    /// locks and checks every page the pager writes, and refuses the later of
+    /// two growers that took the same number.
+    // bd-h9o9r: the RefCell borrow is held across the pager await, as in the
+    // other tiers.
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn write_page_private_eof(
+        &self,
+        cx: &Cx,
+        page_no: PageNumber,
+        page_data_base: PageData,
+    ) -> Result<()> {
+        self.txn
+            .borrow_mut()
+            .write_page_data(cx, page_no, page_data_base)
+            .await?;
+        self.clear_stale_synthetic_pending_commit_surface(cx, "write_page_private_eof")
+    }
+
     // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
     // await in this function's body. The engine executes strictly
     // sequentially per connection, but the reachable-reentrancy audit and
@@ -4468,6 +4502,9 @@ impl SharedTxnPageIo {
             ConcurrentWriteTier::Tier0AlreadyOwned => {
                 self.write_page_tier0_already_owned(cx, &ctx, page_no, page_data_base)
                     .await
+            }
+            ConcurrentWriteTier::PrivateEof => {
+                self.write_page_private_eof(cx, page_no, page_data_base).await
             }
             ConcurrentWriteTier::Tier1FirstTouch => {
                 self.write_page_tier1_first_touch(cx, &ctx, page_no, page_data_base)
@@ -5161,7 +5198,9 @@ impl PageWriter for SharedTxnPageIo {
             let has_staged_write = {
                 let handle = ctx.handle.lock();
                 let (is_freed, has_staged_write) = concurrent_page_read_status(&handle, page_no);
-                !is_freed && has_staged_write
+                // bd-emim5 (b) step 1: a private end-of-file page is staged in
+                // the pager's write set only (`write_page_private_eof`).
+                !is_freed && (has_staged_write || handle.is_private_eof_page(page_no))
             };
             if !has_staged_write {
                 return false;
@@ -5224,6 +5263,13 @@ impl PageWriter for SharedTxnPageIo {
             }
         }
         let page_no = allocate_result?;
+        // bd-emim5 (b) step 1: a fresh end-of-file page is written without the
+        // in-process page lock until COMMIT (see `write_page_private_eof`).
+        if let Some(ctx) = concurrent.as_ref()
+            && self.txn.borrow().allocated_page_is_private_eof(page_no)
+        {
+            ctx.handle.lock().mark_private_eof_page(page_no);
+        }
         self.clear_stale_synthetic_pending_commit_surface(cx, "allocate_page")?;
         Ok(page_no)
     }

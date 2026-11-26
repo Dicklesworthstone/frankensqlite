@@ -34336,6 +34336,22 @@ where
             .is_some_and(PagerMaintenanceLease::is_sole_transaction)
     }
 
+    /// bd-emim5 (b) step 1: `allocate_page` pushes a page it takes from end of
+    /// file (the EOF loop, a lease pop, or this transaction's own quarantined
+    /// EOF page) onto `allocated_from_eof` and a reused freelist page onto
+    /// `allocated_from_freelist`, so the page just returned is fresh exactly
+    /// when it is the last EOF allocation. It must also lie above every page
+    /// this transaction can see (`published_db_size`): an EOF cursor that lags
+    /// the visible size would hand out a committed page, which keeps its lock.
+    /// Concurrent WAL transactions without a pointer map only.
+    fn allocated_page_is_private_eof(&self, page_no: PageNumber) -> bool {
+        self.mode == TransactionMode::Concurrent
+            && self.journal_mode == JournalMode::Wal
+            && !self.pointer_map.uses_pointer_map()
+            && self.allocated_from_eof.last() == Some(&page_no)
+            && page_no.get() > self.published_db_size.get()
+    }
+
     fn set_auto_vacuum_state(&mut self, mode: AutoVacuumMode, largest_root_page: u32) {
         self.pointer_map = PointerMapState {
             mode,
@@ -65566,6 +65582,109 @@ mod tests {
                     regrow.rollback(&cx).await.unwrap();
                 }
             }
+        });
+    }
+
+    /// bd-emim5 (b) step 1 keeper: `allocated_page_is_private_eof` is true
+    /// exactly for a fresh end-of-file page of a concurrent WAL transaction
+    /// without a pointer map: the EOF loop's page and a lease page. It is
+    /// false for a page reused from the freelist (even one above the committed
+    /// size), and for any page of a non-concurrent transaction, of a
+    /// rollback-journal transaction, or of a transaction with a pointer map.
+    /// Mutants: "lease pops are not private" (RED at the lease page) and "any
+    /// page this transaction allocated is private" (RED at the reused page).
+    #[test]
+    fn test_allocated_page_is_private_eof_only_for_fresh_concurrent_wal_pages_bd_emim5() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+
+            // Concurrent + WAL: EOF-loop pages and a lease page are private.
+            let (pager, _frames) = wal_pager().await;
+            let mut holder = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let mut written = Vec::new();
+            for (step, fill) in [0x61_u8, 0x62, 0x63].into_iter().enumerate() {
+                let page = holder.allocate_page(&cx).await.unwrap();
+                match step {
+                    0 => assert!(
+                        holder.page_lease.is_empty(),
+                        "vacuity: the first allocation takes one EOF page"
+                    ),
+                    1 => assert!(
+                        !holder.page_lease.is_empty(),
+                        "vacuity: the second allocation takes a batch lease"
+                    ),
+                    _ => {}
+                }
+                assert!(
+                    holder.allocated_page_is_private_eof(page),
+                    "bd-emim5 step 1: allocation {step} (page {page:?}) is a fresh end-of-file \
+                     page of a concurrent WAL transaction, so it is private"
+                );
+                holder
+                    .write_page(&cx, page, &sample_page(fill))
+                    .await
+                    .unwrap();
+                written.push(page);
+            }
+
+            // A second live transaction keeps the unused lease tail on the
+            // pre-existing path (the volatile freelist, above the committed
+            // size); a later transaction then reuses it from the freelist.
+            let mut peer = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            holder.commit(&cx).await.unwrap();
+            drop(holder);
+            peer.rollback(&cx).await.unwrap();
+            drop(peer);
+            let mut reuser = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let reused = reuser.allocate_page(&cx).await.unwrap();
+            assert!(
+                reuser.allocated_from_freelist == [reused] && reuser.allocated_from_eof.is_empty(),
+                "vacuity: the page comes from the freelist (from_freelist {:?}, from_eof {:?})",
+                reuser.allocated_from_freelist,
+                reuser.allocated_from_eof
+            );
+            assert!(
+                !reuser.allocated_page_is_private_eof(reused),
+                "bd-emim5 step 1: a page reused from the freelist ({reused:?}, written \
+                 {written:?}) is never private"
+            );
+            reuser.rollback(&cx).await.unwrap();
+            drop(reuser);
+
+            // Not concurrent: an EOF page of an IMMEDIATE transaction.
+            let (pager, _frames) = wal_pager().await;
+            let mut immediate = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = immediate.allocate_page(&cx).await.unwrap();
+            assert_eq!(immediate.allocated_from_eof, [page], "vacuity: an EOF page");
+            assert!(
+                !immediate.allocated_page_is_private_eof(page),
+                "bd-emim5 step 1: only concurrent transactions have private pages"
+            );
+            immediate.rollback(&cx).await.unwrap();
+            drop(immediate);
+
+            // A pointer map (auto_vacuum): never private.
+            let mut vacuumed = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            vacuumed.set_auto_vacuum_state(AutoVacuumMode::Full, 1);
+            let page = vacuumed.allocate_page(&cx).await.unwrap();
+            assert_eq!(vacuumed.allocated_from_eof.last(), Some(&page), "vacuity: an EOF page");
+            assert!(
+                !vacuumed.allocated_page_is_private_eof(page),
+                "bd-emim5 step 1: a transaction with a pointer map has no private pages"
+            );
+            vacuumed.rollback(&cx).await.unwrap();
+            drop(vacuumed);
+
+            // Rollback journal: never private.
+            let (pager, _) = test_pager().await;
+            let mut journaled = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let page = journaled.allocate_page(&cx).await.unwrap();
+            assert_eq!(journaled.allocated_from_eof, [page], "vacuity: an EOF page");
+            assert!(
+                !journaled.allocated_page_is_private_eof(page),
+                "bd-emim5 step 1: only WAL transactions have private pages"
+            );
+            journaled.rollback(&cx).await.unwrap();
         });
     }
 
