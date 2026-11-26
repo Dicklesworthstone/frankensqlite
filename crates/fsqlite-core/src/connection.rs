@@ -45888,7 +45888,7 @@ impl Connection {
                 // scopes while letting the existing compound executor stop
                 // before an unreachable arm (bd-ct8zm).
                 let limited_source_owner;
-                let select = match push_down_union_all_source_limit(select, params)? {
+                let select = match push_down_union_all_source_limit(self, select, params)? {
                     Some(limited) => {
                         limited_source_owner = limited;
                         &limited_source_owner
@@ -88148,6 +88148,17 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        self.execute_with_materialized_sqlite_schema_and_offset_progress(select, params, false)
+            .await
+            .map(|(rows, _)| rows)
+    }
+
+    async fn execute_with_materialized_sqlite_schema_and_offset_progress(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+        capture_offset_progress: bool,
+    ) -> Result<(Vec<Row>, Option<usize>)> {
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "select",
             "sqlite_schema_virtual_materialization",
@@ -88164,8 +88175,18 @@ impl Connection {
             let select = &normalized_select;
             let referenced = self.collect_sqlite_schema_references(select);
             if referenced.is_empty() {
+                if capture_offset_progress {
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
+                    return self
+                        .execute_join_select_with_offset_progress(&bound, None)
+                        .await;
+                }
                 let statement = Statement::Select(select.clone());
-                return lean_future(|| self.execute_statement(&statement, params)).await;
+                return lean_future(|| self.execute_statement(&statement, params))
+                    .await
+                    .map(|rows| (rows, None));
             }
 
             let main_rows = self.build_sqlite_master_rows();
@@ -88233,10 +88254,17 @@ impl Connection {
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
+                    if capture_offset_progress {
+                        return lean_future(|| {
+                            self.execute_join_select_with_offset_progress(&bound, None)
+                        })
+                        .await;
+                    }
                     lean_future(|| {
                         self.execute_interpreted_select_by_shape(&cx, rewritten.as_ref(), &bound)
                     })
                     .await
+                    .map(|rows| (rows, None))
                 })
                 .await
             })
@@ -111983,6 +112011,156 @@ impl Connection {
         Ok(result)
     }
 
+    /// Execute a supported arm once and retain the OFFSET counter that its
+    /// result rows actually consumed. Counting its input in another statement
+    /// would replay WHERE expressions and mistake aggregate input cardinality
+    /// for the number of output rows (bd-ct8zm).
+    async fn try_execute_compound_arm_with_offset(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<(Vec<Row>, usize)>> {
+        if !matches!(
+            &select.body.select,
+            SelectCore::Select {
+                distinct: Distinctness::All,
+                from: Some(_),
+                ..
+            }
+        ) || select_contains_rewritable_in_table_name(select)
+            || extract_temporal_clause(select).is_some()
+            || self.prepared_select_requires_dispatch(&Statement::Select(select.clone()))
+        {
+            return Ok(None);
+        }
+        let program = match self.compile_table_select(select).await {
+            Ok(program) => program,
+            Err(FrankenError::NotImplemented(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        // Decide before running the arm: a successful execution must never
+        // fall back to a second execution of volatile predicates or functions.
+        if program.result_offset_register().is_none() {
+            return Ok(None);
+        }
+        let execution_cx = self.op_cx()?;
+        self.sync_change_tracking_context();
+        let (rows, _, _, remaining_offset) = self
+            .execute_table_program_with_cx_and_result_offset(
+                &program,
+                params,
+                false,
+                TableExecutionRuntimeRequirements::read_path(),
+                &execution_cx,
+                false,
+                Vec::new(),
+                None,
+                false,
+            )
+            .await?;
+        let remaining_offset = remaining_offset
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| {
+                FrankenError::internal("compound arm did not retain its result OFFSET counter")
+            })?;
+        Ok(Some((rows, remaining_offset)))
+    }
+
+    /// Preserve the interpreted join and correlated-projection lanes without
+    /// a count probe. Their filtered rows already supply exact OFFSET progress
+    /// before the existing projection-skipping slice runs.
+    async fn try_execute_compound_arm_with_fallback_offset(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<(Vec<Row>, usize)>> {
+        let SelectCore::Select {
+            distinct: Distinctness::All,
+            from: Some(_),
+            group_by,
+            having: None,
+            windows,
+            ..
+        } = &select.body.select
+        else {
+            return Ok(None);
+        };
+        if select.with.is_some()
+            || !select.body.compounds.is_empty()
+            || !select.order_by.is_empty()
+            || !group_by.is_empty()
+            || !windows.is_empty()
+            || has_window_functions(select)
+            || self.has_implicit_aggregation_with_registry(select)
+            || self.select_owned_subquery_aggregates(select)?.any()
+            || self.has_view_references(select)
+            || select_references_non_main_schema(select)
+            || extract_temporal_clause(select).is_some()
+        {
+            return Ok(None);
+        }
+        if self.has_sqlite_schema_references(select) {
+            let execution_cx = self.op_cx()?;
+            self.admit_select_mem_fallback(&execution_cx, "sqlite_schema_virtual_materialization")
+                .await?;
+            let (rows, remaining_offset) = self
+                .execute_with_materialized_sqlite_schema_and_offset_progress(select, params, true)
+                .await?;
+            let remaining_offset = remaining_offset.ok_or_else(|| {
+                FrankenError::internal("catalog compound arm did not retain OFFSET progress")
+            })?;
+            return Ok(Some((rows, remaining_offset)));
+        }
+        let correlated_fallback = self.select_correlated_exists_where_requires_fallback(select)
+            || select_has_unsupported_correlated_scalar_subquery(select, self)
+            || select_has_unsupported_correlated_exists_subquery(select, self)
+            || select_has_in_subquery_operand_requiring_semantic_fallback(select, self)
+            || select_has_correlated_in_subquery(select, self)
+            || select_contains_rewritable_in_table_name(select);
+        let live_vtab_fallback = !correlated_fallback && self.has_primary_live_vtab_source(select);
+        let join_fallback = !correlated_fallback
+            && !live_vtab_fallback
+            && (has_joins(select) || has_subquery_source(select))
+            && (!self.select_join_runs_in_vdbe(select)
+                || self.prefer_memdb_hash_join_dispatch(select))
+            && !self.select_grouped_inner_join_count_sum_is_vdbe_eligible(select);
+        let table_function_fallback = !correlated_fallback
+            && !live_vtab_fallback
+            && !join_fallback
+            && has_table_function_source(select);
+        if !correlated_fallback && !live_vtab_fallback && !join_fallback && !table_function_fallback
+        {
+            return Ok(None);
+        }
+        let execution_cx = self.op_cx()?;
+        if !join_fallback {
+            let reason = if live_vtab_fallback {
+                "live_vtab_select_fallback"
+            } else if table_function_fallback {
+                "join_or_subquery_fallback"
+            } else {
+                "compound_offset_correlated_fallback"
+            };
+            self.admit_select_mem_fallback(&execution_cx, reason)
+                .await?;
+        }
+        // Match the ordinary join/correlated fallback's rewrite, admission,
+        // and binding sequence, without evaluating a projection any earlier.
+        let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+        if join_fallback && !self.can_execute_join_select_on_real_backend(rewritten.as_ref()) {
+            self.admit_select_mem_fallback(&execution_cx, "join_or_subquery_fallback")
+                .await?;
+        }
+        let bound = bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
+        let (rows, remaining_offset) = self
+            .execute_join_select_with_offset_progress(&bound, None)
+            .await?;
+        let remaining_offset = remaining_offset.ok_or_else(|| {
+            FrankenError::internal("interpreted compound arm did not retain OFFSET progress")
+        })?;
+        Ok(Some((rows, remaining_offset)))
+    }
+
     /// Execute a compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT).
     ///
     /// Mirrors SQLite 3.54.1 `multiSelect` / `computeLimitRegisters` /
@@ -112134,86 +112312,43 @@ impl Connection {
                     break;
                 }
                 let arm_with = (arm_idx == 0).then(|| select.with.clone()).flatten();
-                if remaining_offset > 0
-                    && !self.scalar_function_overridden.get()
-                    && let SelectCore::Select {
-                        distinct: Distinctness::All,
-                        from: Some(from),
-                        where_clause,
-                        group_by,
-                        having: None,
-                        windows,
-                        ..
-                    } = core
-                    && group_by.is_empty()
-                    && windows.is_empty()
-                    && where_clause
-                        .as_deref()
-                        .is_none_or(|expr| !expr_has_any_subquery(expr))
-                {
-                    let count_select = SelectStatement {
+                if remaining_offset > 0 {
+                    let arm_select = SelectStatement {
                         with: arm_with.clone(),
                         body: SelectBody {
-                            select: SelectCore::Select {
-                                distinct: Distinctness::All,
-                                columns: vec![ResultColumn::Expr {
-                                    expr: Expr::FunctionCall {
-                                        name: "count".to_owned(),
-                                        args: FunctionArgs::Star,
-                                        distinct: false,
-                                        order_by: Vec::new(),
-                                        filter: None,
-                                        over: None,
-                                        span: Span::ZERO,
-                                    },
-                                    alias: None,
-                                }],
-                                from: Some(from.clone()),
-                                where_clause: where_clause.clone(),
-                                group_by: Vec::new(),
-                                having: None,
-                                windows: Vec::new(),
-                            },
+                            select: core.clone(),
                             compounds: Vec::new(),
                         },
                         order_by: Vec::new(),
-                        limit: None,
+                        limit: Some(fsqlite_ast::LimitClause {
+                            limit: Expr::Literal(
+                                Literal::Integer(
+                                    remaining_limit
+                                        .and_then(|count| i64::try_from(count).ok())
+                                        .unwrap_or(-1),
+                                ),
+                                Span::ZERO,
+                            ),
+                            offset: Some(Expr::Literal(
+                                Literal::Integer(
+                                    i64::try_from(remaining_offset).unwrap_or(i64::MAX),
+                                ),
+                                Span::ZERO,
+                            )),
+                        }),
                     };
-                    let count_rows = self
-                        .execute_statement(&Statement::Select(count_select), params)
-                        .await?;
-                    if let Some(arm_count) = count_rows
-                        .first()
-                        .and_then(|row| row.values().first())
-                        .and_then(SqliteValue::as_integer)
-                        .and_then(|count| usize::try_from(count).ok())
+                    let arm_result = match self
+                        .try_execute_compound_arm_with_offset(&arm_select, params)
+                        .await?
                     {
-                        if arm_count <= remaining_offset {
-                            remaining_offset -= arm_count;
-                            continue;
+                        Some(result) => Some(result),
+                        None => {
+                            self.try_execute_compound_arm_with_fallback_offset(&arm_select, params)
+                                .await?
                         }
-                        let arm_limit_i64 = remaining_limit
-                            .and_then(|rem| i64::try_from(rem).ok())
-                            .unwrap_or(-1);
-                        let arm_offset_i64 = i64::try_from(remaining_offset).ok();
-                        let arm_select = SelectStatement {
-                            with: arm_with,
-                            body: SelectBody {
-                                select: core.clone(),
-                                compounds: Vec::new(),
-                            },
-                            order_by: Vec::new(),
-                            limit: Some(fsqlite_ast::LimitClause {
-                                limit: Expr::Literal(Literal::Integer(arm_limit_i64), Span::ZERO),
-                                offset: arm_offset_i64.map(|off| {
-                                    Expr::Literal(Literal::Integer(off), Span::ZERO)
-                                }),
-                            }),
-                        };
-                        let arm_rows = self
-                            .execute_statement(&Statement::Select(arm_select), params)
-                            .await?;
-                        remaining_offset = 0;
+                    };
+                    if let Some((arm_rows, offset_left)) = arm_result {
+                        remaining_offset = offset_left;
                         if let Some(rem) = remaining_limit.as_mut() {
                             *rem = rem.saturating_sub(arm_rows.len());
                         }
@@ -117035,12 +117170,22 @@ impl Connection {
     /// Loads each table's rows independently, then combines them according to
     /// the join type and constraint. WHERE, ORDER BY, LIMIT/OFFSET, and column
     /// projection are applied to the combined result.
-    #[allow(clippy::too_many_lines)]
     async fn execute_join_select(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        self.execute_join_select_with_offset_progress(select, params)
+            .await
+            .map(|(rows, _)| rows)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_join_select_with_offset_progress(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<(Vec<Row>, Option<usize>)> {
         let bound_select = bind_placeholders_in_select_for_fallback(select, params)?;
         let select = &bound_select;
         let params = None;
@@ -117062,7 +117207,7 @@ impl Connection {
             .map_or_else(Vec::new, |with| with.ctes.clone());
         if let Some(reordered) = self.reorder_forward_table_function_sources(select, &visible_ctes)
         {
-            return Box::pin(self.execute_join_select(&reordered, None)).await;
+            return Box::pin(self.execute_join_select_with_offset_progress(&reordered, None)).await;
         }
 
         // ── 1. Resolve all table sources (primary + joined tables) ──
@@ -117420,7 +117565,7 @@ impl Connection {
                     TableOrSubquery::ParenJoin(inner) => {
                         if limit_is_zero {
                             self.validate_select_before_limit_zero_short_circuit(select)?;
-                            return Ok(Vec::new());
+                            return Ok((Vec::new(), None));
                         }
                         let unwrapped = unwrap_single_item_paren_join(inner);
                         let (meta, rows) = Box::pin(self.materialize_paren_join_from(
@@ -118576,6 +118721,14 @@ impl Connection {
         // (or negative LIMIT with positive OFFSET), slice OFFSET..OFFSET+LIMIT
         // before Step 7 projection so unreturned rows never evaluate projection
         // expressions (e.g. `abs(INT64_MIN)`).
+        let remaining_offset = resolved_limit
+            .as_ref()
+            .filter(|_| select.order_by.is_empty() && !is_distinct)
+            .map(|resolved| {
+                usize::try_from(resolved.offset.max(0))
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(combined.len())
+            });
         if !order_by_applied && select.order_by.is_empty() && !is_distinct {
             if let Some((limit_count, offset_count)) = finite_limit {
                 if offset_count >= combined.len() {
@@ -118849,7 +119002,7 @@ impl Connection {
             apply_resolved_expression_limit(&mut result, resolved_limit);
         }
 
-        Ok(result)
+        Ok((result, remaining_offset))
     }
 
     /// Connection-aware nested-loop JOIN with per-pair subquery inlining.
@@ -121289,6 +121442,34 @@ impl Connection {
         row_sink: Option<TableRowSink<'_, '_>>,
         stage_write_on_replace_victims: bool,
     ) -> Result<(Vec<Row>, usize, Option<i64>)> {
+        self.execute_table_program_with_cx_and_result_offset(
+            program,
+            params,
+            track_last_insert_rowid,
+            runtime_requirements,
+            execution_cx,
+            invalidate_memdb_count_shortcuts_on_success,
+            vtab_instances,
+            row_sink,
+            stage_write_on_replace_victims,
+        )
+        .await
+        .map(|(rows, changes, rowid, _)| (rows, changes, rowid))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+    async fn execute_table_program_with_cx_and_result_offset(
+        &self,
+        program: &VdbeProgram,
+        params: Option<&[SqliteValue]>,
+        track_last_insert_rowid: bool,
+        runtime_requirements: TableExecutionRuntimeRequirements,
+        execution_cx: &Cx,
+        invalidate_memdb_count_shortcuts_on_success: bool,
+        vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
+        row_sink: Option<TableRowSink<'_, '_>>,
+        stage_write_on_replace_victims: bool,
+    ) -> Result<(Vec<Row>, usize, Option<i64>, Option<i64>)> {
         self.last_replace_victims.borrow_mut().clear();
         *self.pending_staged_replace_write.borrow_mut() = None;
         let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
@@ -121363,6 +121544,11 @@ impl Connection {
             stage_write_on_replace_victims,
         )
         .await;
+        let remaining_offset = result.as_ref().ok().and_then(|_| {
+            engine_back
+                .as_ref()
+                .and_then(|engine| engine.remaining_result_offset(program))
+        });
         let memdb_count_shortcuts_safe_after_exec = engine_back
             .as_ref()
             .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
@@ -121410,6 +121596,7 @@ impl Connection {
                     } else {
                         None
                     },
+                    remaining_offset,
                 ))
             }
             Err(exec_error) => {
@@ -129053,15 +129240,37 @@ fn union_all_source_accepts_limit(query: &SelectStatement) -> bool {
             .all(|(op, _)| matches!(op, CompoundOp::UnionAll))
 }
 
-fn union_all_source_all_arms_have_from(query: &SelectStatement) -> bool {
-    let core_has_from =
-        |core: &SelectCore| matches!(core, SelectCore::Select { from: Some(_), .. });
-    core_has_from(&query.body.select)
+fn union_all_source_accepts_offset(conn: &Connection, query: &SelectStatement) -> bool {
+    let core_accepts_offset = |core: &SelectCore| {
+        let SelectCore::Select {
+            distinct: Distinctness::All,
+            columns,
+            from: Some(_),
+            group_by,
+            having: None,
+            windows,
+            ..
+        } = core
+        else {
+            return false;
+        };
+        group_by.is_empty()
+            && windows.is_empty()
+            && columns.iter().all(|column| match column {
+                ResultColumn::Expr { expr, .. } => {
+                    !conn.expr_contains_aggregate_with_registry(expr)
+                        && !expr_has_window_function(expr)
+                        && !expr_has_any_subquery(expr)
+                }
+                ResultColumn::Star | ResultColumn::TableStar(_) => true,
+            })
+    };
+    core_accepts_offset(&query.body.select)
         && query
             .body
             .compounds
             .iter()
-            .all(|(_, core)| core_has_from(core))
+            .all(|(_, core)| core_accepts_offset(core))
 }
 
 /// Bound a sole UNION ALL source when its consumer only projects columns.
@@ -129069,10 +129278,11 @@ fn union_all_source_all_arms_have_from(query: &SelectStatement) -> bool {
 /// consumer. Keep all names intact; the source's literal cap lets
 /// `execute_compound_select` stop before evaluating a later arm.
 /// When a positive OFFSET is present, push both LIMIT and OFFSET only when
-/// every UNION ALL arm has a FROM clause (matching SQLite's compound query
-/// flattener; a FROM-less arm keeps coroutine semantics where skipped rows
-/// still evaluate their source projection).
+/// every UNION ALL arm is an ungrouped, non-DISTINCT, non-window SELECT with
+/// a FROM clause. Other arms keep coroutine semantics where rows skipped by
+/// the consumer still evaluate their source projection.
 fn push_down_union_all_source_limit(
+    conn: &Connection,
     select: &SelectStatement,
     params: Option<&[SqliteValue]>,
 ) -> Result<Option<SelectStatement>> {
@@ -129159,7 +129369,7 @@ fn push_down_union_all_source_limit(
                 return Ok(None);
             };
             if value > 0 {
-                if !union_all_source_all_arms_have_from(source_query) {
+                if !union_all_source_accepts_offset(conn, source_query) {
                     return Ok(None);
                 }
                 Some(value)

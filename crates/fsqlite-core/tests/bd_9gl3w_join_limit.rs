@@ -27,6 +27,8 @@ use fsqlite_core::connection::{
     Connection, hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 use fsqlite_types::value::SqliteValue;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -568,7 +570,422 @@ fn compound_offsets_skip_unreachable_projection_rows() {
     compare_fallback_limit_cases(cases);
 }
 
+const COMPOUND_OFFSET_CARDINALITY_CASES: &[(&str, &[i64])] = &[
+    (
+        "SELECT sum(v) FROM s UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT sum(v) FROM s UNION ALL SELECT 99 UNION ALL SELECT 100 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT count(*) FROM s UNION ALL SELECT 99 LIMIT -1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT min(v) FROM s UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT sum(v) FROM s WHERE k < 0 UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT count(*) FROM s WHERE k < 0 UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT sum(v) FROM s HAVING 0 UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT sum(v) FROM s HAVING 1 UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT v FROM s WHERE k = 1 UNION ALL SELECT sum(v) FROM s \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT sum(v) FROM s GROUP BY k % 2 UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT DISTINCT 1 FROM s UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT row_number() OVER () FROM s UNION ALL SELECT 99 LIMIT 1 OFFSET 3",
+        &[],
+    ),
+    (
+        "SELECT (SELECT sum(v) FROM s) FROM s UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT v FROM s WHERE CASE WHEN k = 3 THEN abs(-9223372036854775808) \
+         ELSE v END > 0 UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT v FROM s WHERE random() IS NOT NULL AND \
+         CASE WHEN k = 3 THEN abs(-9223372036854775808) ELSE v END > 0 \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    // A larger offset, an unlimited result, and ORDER BY must still reach
+    // the failing predicate; LIMIT cannot suppress work needed for those rows.
+    (
+        "SELECT v FROM s WHERE CASE WHEN k = 3 THEN abs(-9223372036854775808) \
+         ELSE v END > 0 UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT v FROM s WHERE CASE WHEN k = 3 THEN abs(-9223372036854775808) \
+         ELSE v END > 0 UNION ALL SELECT 99 LIMIT -1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT v FROM s WHERE CASE WHEN k = 3 THEN abs(-9223372036854775808) \
+         ELSE v END > 0 UNION ALL SELECT 99 ORDER BY v LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT ? + v FROM s WHERE k >= ? UNION ALL SELECT ? LIMIT ? OFFSET ?",
+        &[10, 1, 99, 1, 1],
+    ),
+    (
+        "SELECT sum(v) FROM s UNION ALL SELECT ? LIMIT ?, ?",
+        &[99, 2, 1],
+    ),
+    (
+        "SELECT v FROM s WHERE k < 0 UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    ("SELECT v FROM s UNION ALL SELECT 99 LIMIT -1 OFFSET 2", &[]),
+    (
+        "SELECT v FROM s UNION ALL SELECT 99 LIMIT 1 OFFSET 9223372036854775807",
+        &[],
+    ),
+    (
+        "SELECT CASE WHEN x < 0 THEN abs(x) ELSE x END FROM e \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT abs(x) FROM e WHERE x IN (1, -9223372036854775808, 3) UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT abs(x) FROM e WHERE x IN e UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT abs(e.x) FROM e JOIN u ON u.a = 1 UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT s.v FROM s LEFT JOIN u ON u.a = 1 WHERE \
+         CASE WHEN s.k = 3 THEN abs(-9223372036854775808) ELSE s.v END > 0 \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT (SELECT abs(inner_e.x) FROM e AS inner_e \
+         WHERE inner_e.rowid = outer_e.rowid) FROM e AS outer_e \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT abs(x) IN (SELECT v FROM s ORDER BY v LIMIT 1 OFFSET 1) FROM e \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 4",
+        &[],
+    ),
+    // The interpreted correlated/join lanes report the same progress after
+    // filtering and before projection, including an exhausted first arm.
+    (
+        "SELECT (SELECT abs(e.x)) FROM e UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT (SELECT abs(e.x)) FROM e WHERE e.x <> 0 \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT (SELECT abs(e.x)) FROM e UNION ALL SELECT 99 LIMIT 1 OFFSET 3",
+        &[],
+    ),
+    (
+        "SELECT (SELECT abs(e.x)) FROM e UNION ALL SELECT 99 LIMIT 1 OFFSET 4",
+        &[],
+    ),
+    (
+        "SELECT (SELECT abs(e.x)) FROM e UNION ALL SELECT 99 LIMIT -1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT (SELECT abs(e.x)) FROM e NOT INDEXED \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT (SELECT abs(e.x)) FROM main.e UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT (SELECT abs(e.x)) FROM e JOIN u ON u.a = 1 \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT EXISTS(SELECT 1 FROM u WHERE abs(e.x) > 0) FROM e \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT (SELECT abs(e.x)) IN (SELECT v FROM s) FROM e \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT (SELECT abs(CASE WHEN s.k = 1 THEN -9223372036854775808 ELSE s.v END)) \
+         FROM s WHERE random() IS NOT NULL AND \
+         CASE WHEN k = 3 THEN abs(-9223372036854775808) ELSE v END > 0 \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT (SELECT abs(s.v)) FROM s WHERE \
+         CASE WHEN k = 3 THEN abs(-9223372036854775808) ELSE v END > 0 \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT abs(e.x) FROM e CROSS JOIN u UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT abs(e.x) FROM e CROSS JOIN u UNION ALL SELECT 99 LIMIT 1 OFFSET 3",
+        &[],
+    ),
+    (
+        "SELECT abs(e.x) FROM e CROSS JOIN u UNION ALL SELECT 99 LIMIT 1 OFFSET 4",
+        &[],
+    ),
+    (
+        "SELECT abs(d.x) FROM (SELECT x FROM e) AS d CROSS JOIN u \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT abs(-9223372036854775808) FROM sqlite_schema \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 100",
+        &[],
+    ),
+    (
+        "SELECT abs(-9223372036854775808) FROM main.sqlite_schema WHERE name = 'e' \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT count(*) FROM sqlite_schema UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+        &[],
+    ),
+    (
+        "SELECT count(*) FROM sqlite_schema WHERE name = 'offset_absent' \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT abs(-9223372036854775808) FROM sqlite_schema WHERE name = 'offset_absent' \
+         UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    // Aggregate state is finalized even when its output row is skipped, but
+    // a scalar wrapper used only by that output is evaluated after OFFSET.
+    (
+        "SELECT abs(sum(x)) FROM e WHERE x < 0 UNION ALL SELECT 99 FROM u \
+         LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT abs(sum(x)) AS v FROM e WHERE x < 0 HAVING 1 \
+         UNION ALL SELECT 99 FROM u LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT abs(sum(x)) AS v FROM e WHERE x < 0 HAVING v > 0 \
+         UNION ALL SELECT 99 FROM u LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT sum(abs(x)) FROM e UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    // These source shapes cannot flatten into the consumer. Its OFFSET must
+    // not suppress a source projection that SQLite evaluates in a coroutine.
+    (
+        "SELECT v FROM (SELECT abs(sum(x)) AS v FROM e WHERE x < 0 \
+         UNION ALL SELECT 99 FROM u) LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "WITH c(v) AS (SELECT abs(sum(x)) FROM e WHERE x < 0 \
+         UNION ALL SELECT 99 FROM u) SELECT v FROM c LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT v FROM (SELECT DISTINCT abs(x) AS v FROM e WHERE x < 0 \
+         UNION ALL SELECT 99 FROM u) LIMIT 1 OFFSET 1",
+        &[],
+    ),
+    (
+        "SELECT v FROM (SELECT abs(x) AS v, row_number() OVER () AS n FROM e WHERE x < 0 \
+         UNION ALL SELECT 99, 1 FROM u) LIMIT 1 OFFSET 1",
+        &[],
+    ),
+];
+
+/// OFFSET belongs to the arm's output stream. It must neither count aggregate
+/// input rows nor run a second, unbounded copy of the arm's WHERE expression.
+#[test]
+fn compound_offsets_use_output_cardinality_and_stop_predicates() {
+    compare_fallback_limit_cases(COMPOUND_OFFSET_CARDINALITY_CASES);
+}
+
+#[cfg(feature = "ext-json")]
+#[test]
+fn compound_offsets_preserve_table_function_projection_skips() {
+    let cases: &[(&str, &[i64])] = &[
+        (
+            "SELECT abs(value) FROM json_each('[1,-9223372036854775808,3]') \
+             UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+            &[],
+        ),
+        (
+            "SELECT abs(value) FROM json_each('[1,-9223372036854775808,3]') \
+             UNION ALL SELECT 99 LIMIT 1 OFFSET 4",
+            &[],
+        ),
+    ];
+    compare_fallback_limit_cases(cases);
+}
+
+#[cfg(feature = "ext-fts5")]
+#[test]
+fn compound_offsets_preserve_live_virtual_table_projection_skips() {
+    let cases: &[(&str, &[i64])] = &[
+        (
+            "SELECT abs(CAST(x AS INTEGER)) FROM offset_fts UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+            &[],
+        ),
+        (
+            "SELECT abs(CAST(x AS INTEGER)) FROM offset_fts UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+            &[],
+        ),
+        (
+            "SELECT abs(CAST(x AS INTEGER)) FROM offset_fts UNION ALL SELECT 99 LIMIT 1 OFFSET 3",
+            &[],
+        ),
+        (
+            "SELECT abs(CAST(x AS INTEGER)) FROM offset_fts UNION ALL SELECT 99 LIMIT 1 OFFSET 4",
+            &[],
+        ),
+    ];
+    compare_fallback_limit_cases_with_setup(
+        cases,
+        "CREATE VIRTUAL TABLE offset_fts USING fts5(x); \
+         INSERT INTO offset_fts VALUES ('1'), ('-9223372036854775808'), ('3');",
+    );
+}
+
+struct OffsetPredicateCalls(Arc<AtomicUsize>);
+
+impl fsqlite_func::ScalarFunction for OffsetPredicateCalls {
+    fn name(&self) -> &'static str {
+        "offset_predicate"
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn invoke(&self, args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(args[0].clone())
+    }
+}
+
+#[test]
+fn compound_offsets_preserve_single_predicate_evaluation_on_prepared_reuse() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = open_pair(file_backed, &dir).await;
+            let setup = "CREATE TABLE probe(k INTEGER, v INTEGER); \
+                         INSERT INTO probe VALUES (1, -9223372036854775808), (2, 80), (3, 30);";
+            f.execute_batch(setup).await.unwrap();
+            r.execute_batch(setup).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            f.register_nondeterministic_scalar_function(OffsetPredicateCalls(Arc::clone(&calls)));
+            // The registered function is the identity with an observable call
+            // count. Stock's equivalent predicate supplies the row/error oracle.
+            let stock_sql = "SELECT abs(v) FROM probe WHERE k > 0 \
+                             UNION ALL SELECT 99 LIMIT ? OFFSET ?";
+            for sql in [
+                "SELECT abs(v) FROM probe WHERE offset_predicate(k) > 0 \
+                 UNION ALL SELECT 99 LIMIT ? OFFSET ?",
+                "SELECT (SELECT abs(probe.v)) FROM probe WHERE offset_predicate(k) > 0 \
+                 UNION ALL SELECT 99 LIMIT ? OFFSET ?",
+            ] {
+                let prepared = f.prepare(sql).await.unwrap();
+                for (limit, offset, expected_calls) in [
+                    (1, 1, 2),
+                    (2, 1, 3),
+                    (1, 3, 3),
+                    (1, 4, 3),
+                    (0, 1, 0),
+                    (1, 0, 1),
+                    (1, 1, 2),
+                ] {
+                    let expected = rq(&r, stock_sql, &[limit, offset]);
+                    let values = [SqliteValue::Integer(limit), SqliteValue::Integer(offset)];
+                    for prepared_path in [false, true] {
+                        calls.store(0, Ordering::Relaxed);
+                        let actual = if prepared_path {
+                            prepared.query_with_params(&values).await
+                        } else {
+                            f.query_with_params(sql, &values).await
+                        }
+                        .map(|rows| tag_rows(&rows))
+                        .map_err(|error| error.to_string());
+                        assert_eq!(
+                            actual, expected,
+                            "file={file_backed} prepared={prepared_path} {limit}/{offset}: {sql}"
+                        );
+                        assert_eq!(
+                            calls.load(Ordering::Relaxed),
+                            expected_calls,
+                            "predicate replay or excess scan: {limit}/{offset}: {sql}"
+                        );
+                    }
+                }
+                drop(prepared);
+            }
+            f.close().await.unwrap();
+        }
+    });
+}
+
 fn compare_fallback_limit_cases(cases: &[(&str, &[i64])]) {
+    compare_fallback_limit_cases_with_setup(cases, "");
+}
+
+fn compare_fallback_limit_cases_with_setup(cases: &[(&str, &[i64])], extra_setup: &str) {
     let _serial = serial();
     asupersync::test_utils::run_test(|| async {
         let mut diffs = Vec::new();
@@ -583,6 +1000,10 @@ fn compare_fallback_limit_cases(cases: &[(&str, &[i64])]) {
                          DELETE FROM u; INSERT INTO u(id, a) VALUES (1, 1);";
             f.execute_batch(setup).await.unwrap();
             r.execute_batch(setup).unwrap();
+            if !extra_setup.is_empty() {
+                f.execute_batch(extra_setup).await.unwrap();
+                r.execute_batch(extra_setup).unwrap();
+            }
             for &(sql, params) in cases {
                 let values: Vec<_> = params.iter().copied().map(SqliteValue::Integer).collect();
                 let stock = rq(&r, sql, params);
