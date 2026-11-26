@@ -94,6 +94,36 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-26 - KEPT (landed as a182075c8; bd-emim5 (b) step 1, a structural step toward commit-time relocation, inside every kill line by exact instruction counts, stock SQLite 3.54.1 live; time cells VOID under the powersave governor): a concurrent transaction writes its fresh end-of-file pages without the in-process page lock until COMMIT (single-writer lane r21)
+
+- Target: not a speed row. Two in-process growers both hand out "committed size + 1" (per-connection pagers); the
+  second's first write of that page waited busy_timeout on the first's statement-time page lock (threaded: it waited
+  for the whole first transaction, then got BusySnapshot at the write).
+- Change: `TransactionHandle::allocated_page_is_private_eof` (pager: Concurrent + WAL + no pointer map + the last EOF
+  allocation + above the visible size); `ConcurrentHandle` keeps the transaction's private EOF pages outside
+  `page_states`; the engine's `write_page_internal` writes such a page with no lock and no write-time commit-index
+  check. COMMIT unchanged: the commit plan still tracks, locks and FCW-checks every page the pager writes.
+- Ledger preflight: no entry on statement-time page locks or private EOF pages. Plan, prediction and kill lines on
+  bd-emim5 (2026-11-26 19:50Z) before any code.
+- Prediction: FULL/NORMAL/txn10/point within +/-0.3%; bulk per INSERT 0 to -1%; 2-writer cell retries stay 3/3. Kill:
+  any r18 single-writer row worse than +0.5% exact Ir; any retry increase; any pinned keeper changing.
+- Result. Arms in one rch job on ovh-a from origin/main ce18cf445: P afae69f91117acc7 (step reversed), L
+  b390540720b34fa1. callgrind on thinkstation1, per unit = (N800 - N400)/400, stock 3.54.1 live:
+  - FULL INSERT L/P 1.0023 (worst pair 1.0083 from one L run 0.96% off its twin; three more pairs: mean over all runs
+    1.0006, medians 0.9990), x8.37 -> x8.39;
+  - NORMAL 0.9962, txn10 1.0004, point 0.9984 (inside their A/A nulls or +/-0.4%);
+  - bulk per INSERT 0.9684 (worst pair 0.9688; whole runs 0.9856 at N=400, 0.9777 at N=800), x1.82 -> x1.76: writes to
+    a fresh page skip the tier-0 prepare and staging per write. Better than the predicted band; a self-comparison,
+    no time claim.
+  - 2-writer separate-table BULK cell (mt-mvcc-bench, arms P L P L): fsqlite_retried 3, 3, 3, 3; committed 6000,
+    failed 0 each. The retry is (b) step 2's work.
+- Keepers: fsqlite-core `bd_emim5_private_eof_pages` (K-S1a x2 red on the parent with "insert b id 20: Busy"; K-S1b
+  and K-S1c negative cases), the pager and mvcc unit keepers; planted mutants M-lease, M-freelist, M-all, M-reset each
+  red (bead comment 20:55Z).
+- Retry / next: bd-emim5 (b) step 2 (relocation at commit for a sole growing batch: S2, S3, S4, S6) removes the
+  second grower's whole-transaction retry; the plan is on the bead. Revisit this step if step 2 is rejected: it is
+  then a bulk Ir saving with no concurrency payoff, kept or reverted on its own Ir row.
+
 ## 2026-11-26 - KEPT (landed as 92fd2d709; a structural lever for bd-emim5 (b), inside every kill line by exact instruction counts, stock SQLite 3.54.1 live; no gain claimed; time cells VOID under the powersave governor): the page lease hands out its lowest page first, and a sole concurrent WAL commit returns its unused lease tail to EOF instead of publishing it free (bd-emim5 lever B1, single-writer lane r20)
 
 - Target: not a speed row. A CONCURRENT growth that used part of its 8-page lease published the unused pages as free
