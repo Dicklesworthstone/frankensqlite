@@ -2315,7 +2315,11 @@ const SUBSTR_SCALAR_SETUP: &str = "
         (2, 'abcdef', X'0102030405', -2, 2),
         (3, 'abcdef', X'0102030405', 3, -2),
         (4, 'eclair', X'CAFEBA', 1, 2),
-        (5, NULL, NULL, 1, 2);
+        (5, NULL, NULL, 1, 2),
+        (6, 'abcdef', X'0102030405', 2, NULL),
+        (7, '', X'', 1, NULL),
+        (8, 'abcdef', X'0102030405', -2, NULL),
+        (9, 'abcdef', X'0102030405', NULL, 2);
 ";
 
 const SUBSTR_SCALAR_CASES: &[QueryCase] = &[
@@ -2340,8 +2344,28 @@ const SUBSTR_SCALAR_CASES: &[QueryCase] = &[
         sql: "SELECT substr(NULL, 1, 2), substr('abcdef', NULL, 2), typeof(substr(NULL, 1, 2)), typeof(substr('abcdef', NULL, 2))",
     },
     QueryCase {
+        name: "explicit null length propagates for text and blobs",
+        sql: "SELECT substr('abcdef', 2, NULL), substr(X'0102030405', 2, NULL), substr('', 1, NULL), substr(X'', 1, NULL), substr(12345, 2, NULL)",
+    },
+    QueryCase {
+        name: "substring alias propagates null length",
+        sql: "SELECT substring('abcdef', -2, NULL), substring(X'0102030405', 2, NULL), typeof(substring('abcdef', 2, NULL)), typeof(substring(X'0102030405', 2, NULL))",
+    },
+    QueryCase {
+        name: "computed null length propagates",
+        sql: "SELECT substr('abcdef', 2, NULLIF(1, 1)), substring('abcdef', 2, (SELECT NULL)), substr(X'0102030405', 2, CASE WHEN 0 THEN 2 END)",
+    },
+    QueryCase {
+        name: "omitted zero and null lengths remain distinct",
+        sql: "SELECT substr('abcdef', 2), substr('abcdef', 2, 0), substr('abcdef', 2, NULL), hex(substr(X'0102030405', 2)), hex(substr(X'0102030405', 2, 0)), typeof(substr(X'0102030405', 2, NULL))",
+    },
+    QueryCase {
         name: "column driven substr",
         sql: "SELECT id, substr(txt, start_at, take_len), hex(substr(payload, start_at, take_len)), typeof(substr(payload, start_at, take_len)) FROM substr_values ORDER BY id",
+    },
+    QueryCase {
+        name: "column driven substring null propagation",
+        sql: "SELECT id, substring(txt, start_at, take_len), substring(txt, start_at, take_len) IS NULL, substring(payload, start_at, take_len) IS NULL, typeof(substring(payload, start_at, take_len)) FROM substr_values ORDER BY id",
     },
 ];
 
@@ -2384,7 +2408,17 @@ const TRIM_SCALAR_SETUP: &str = "
         (3, 'xyxmiddleyxx', 'xy'),
         (4, 12321, '12'),
         (5, '', 'x'),
-        (6, NULL, 'x');
+        (6, NULL, 'x'),
+        (7, '  padded  ', NULL),
+        (8, '', NULL),
+        (9, 12321, NULL),
+        (10, x'20FF20', NULL),
+        (11, CAST(x'20FF20' AS TEXT), NULL),
+        (12, NULL, NULL),
+        (13, ' x ', char(0) || ' '),
+        (14, ' x ', 'x' || char(0) || ' '),
+        (15, x'20FF0020', x'2000FF'),
+        (16, CAST(x'20FF0020' AS TEXT), CAST(x'2000FF' AS TEXT));
 ";
 
 const TRIM_SCALAR_CASES: &[QueryCase] = &[
@@ -2409,8 +2443,44 @@ const TRIM_SCALAR_CASES: &[QueryCase] = &[
         sql: "SELECT trim(NULL), ltrim(NULL, 'x'), rtrim(NULL, 'x'), typeof(trim(NULL, 'x'))",
     },
     QueryCase {
+        name: "explicit null character sets propagate",
+        sql: "SELECT trim(' x ', NULL), ltrim(' x ', NULL), rtrim(' x ', NULL), trim('', NULL), ltrim(12321, NULL), rtrim(NULL, NULL)",
+    },
+    QueryCase {
+        name: "computed null character sets propagate",
+        sql: "SELECT trim(' x ', NULLIF('x', 'x')), ltrim(' x ', (SELECT NULL)), rtrim(' x ', CASE WHEN 0 THEN ' ' END)",
+    },
+    QueryCase {
+        name: "raw input with null character sets propagates",
+        sql: "SELECT trim(x'20FF20', NULL), ltrim(x'20FF20', NULL), rtrim(x'20FF20', NULL), trim(CAST(x'20FF20' AS TEXT), NULL), ltrim(CAST(x'20FF20' AS TEXT), NULL), rtrim(CAST(x'20FF20' AS TEXT), NULL)",
+    },
+    QueryCase {
+        name: "empty character sets preserve padded input",
+        sql: "SELECT trim(' x ', ''), ltrim(' x ', ''), rtrim(' x ', ''), hex(trim(x'20FF20', x'')), hex(ltrim(x'20FF20', x'')), hex(rtrim(x'20FF20', x''))",
+    },
+    QueryCase {
+        name: "text character sets stop at embedded nul",
+        sql: "SELECT hex(trim(' x ', 'x' || char(0) || ' ')), hex(ltrim(' x ', 'x' || char(0) || ' ')), hex(rtrim(' x ', 'x' || char(0) || ' '))",
+    },
+    QueryCase {
+        name: "leading nul makes the character set empty",
+        sql: "SELECT hex(trim(' x ', char(0) || ' ')), hex(ltrim(' x ', x'0020')), hex(rtrim(x'20FF20', x'00FF20'))",
+    },
+    QueryCase {
+        name: "input nuls survive text character set truncation",
+        sql: "SELECT hex(trim(CAST(x'2000780020' AS TEXT), CAST(x'200078' AS TEXT))), hex(ltrim(CAST(x'2000780020' AS TEXT), CAST(x'200078' AS TEXT))), hex(rtrim(CAST(x'2000780020' AS TEXT), CAST(x'200078' AS TEXT)))",
+    },
+    QueryCase {
+        name: "raw character sets stop at nul without losing input bytes",
+        sql: "SELECT hex(trim(x'20FF0020', x'2000FF')), hex(ltrim(x'20FF0020', x'2000FF')), hex(rtrim(x'20FF0020', x'2000FF'))",
+    },
+    QueryCase {
         name: "column driven trim functions",
         sql: "SELECT id, length(trim(raw)), length(trim(raw, cut)), length(ltrim(raw, cut)), length(rtrim(raw, cut)), typeof(trim(raw, cut)) FROM trim_values ORDER BY id",
+    },
+    QueryCase {
+        name: "column driven null sets and raw results",
+        sql: "SELECT id, trim(raw, cut) IS NULL, ltrim(raw, cut) IS NULL, rtrim(raw, cut) IS NULL, hex(trim(raw, cut)), hex(ltrim(raw, cut)), hex(rtrim(raw, cut)) FROM trim_values ORDER BY id",
     },
 ];
 
@@ -2428,6 +2498,17 @@ const LENGTH_INSTR_NUL_SETUP: &str = "
         (3, char(0) || 'abc', X'00616263', 'a', X'00'),
         (4, '', X'', '', X''),
         (5, NULL, NULL, NULL, NULL);
+    CREATE TABLE raw_length_values (
+        id INTEGER PRIMARY KEY,
+        txt TEXT,
+        payload BLOB
+    );
+    INSERT INTO raw_length_values (id, txt, payload) VALUES
+        (1, CAST(X'C080' AS TEXT), X'C080'),
+        (2, CAST(X'F0808080' AS TEXT), X'F0808080'),
+        (3, CAST(X'8080' AS TEXT), X'8080'),
+        (4, CAST(X'C08000FF' AS TEXT), X'C08000FF'),
+        (5, CAST(X'00FF' AS TEXT), X'00FF');
 ";
 
 const LENGTH_INSTR_NUL_CASES: &[QueryCase] = &[
@@ -2450,6 +2531,22 @@ const LENGTH_INSTR_NUL_CASES: &[QueryCase] = &[
     QueryCase {
         name: "column driven nul and blob length instr",
         sql: "SELECT id, length(txt), octet_length(txt), instr(txt, needle_text), length(payload), octet_length(payload), instr(payload, needle_blob) FROM length_instr_values ORDER BY id",
+    },
+    QueryCase {
+        name: "malformed utf8 text keeps sqlite character boundaries",
+        sql: "SELECT length(CAST(X'C080' AS TEXT)), length(CAST(X'F0808080' AS TEXT)), length(CAST(X'FF8080' AS TEXT)), length(CAST(X'EDA080' AS TEXT))",
+    },
+    QueryCase {
+        name: "continuation byte runs use sqlite character boundaries",
+        sql: "SELECT length(CAST(X'8080' AS TEXT)), length(CAST(X'C24180' AS TEXT)), length(CAST(X'41C0805A' AS TEXT)), length(CAST(X'80C080' AS TEXT))",
+    },
+    QueryCase {
+        name: "raw text stops at nul while blob length preserves bytes",
+        sql: "SELECT length(CAST(X'C08000FF' AS TEXT)), length(CAST(X'00FF' AS TEXT)), length(X'C08000FF'), length(X'00FF')",
+    },
+    QueryCase {
+        name: "stored raw text and blob lengths",
+        sql: "SELECT id, length(txt), length(payload), hex(txt), hex(payload) FROM raw_length_values ORDER BY id",
     },
 ];
 

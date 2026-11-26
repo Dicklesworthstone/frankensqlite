@@ -623,12 +623,23 @@ impl ScalarFunction for LengthFunc {
                 }
             }
             SqliteValue::Text(s) => {
-                let text = sqlite_text_until_nul(s.as_str());
-                if text.is_ascii() {
-                    text.len()
-                } else {
-                    text.chars().count()
+                // Match bundled SQLite 3.54: a non-ASCII byte starts a
+                // character and consumes any following continuation bytes.
+                // Count stored bytes without lossy replacement characters.
+                let text = text_bytes_until_nul(s.as_bytes_direct());
+                let mut length = 0;
+                let mut index = 0;
+                while index < text.len() {
+                    let first = text[index];
+                    index += 1;
+                    length += 1;
+                    if first >= 0x80 {
+                        while index < text.len() && text[index] & 0xC0 == 0x80 {
+                            index += 1;
+                        }
+                    }
                 }
+                length
             }
             SqliteValue::Blob(b) => b.len(),
             other => {
@@ -747,17 +758,17 @@ pub struct LtrimFunc;
 pub struct RtrimFunc;
 
 fn trim_chars<'a>(s: &'a str, chars: &str) -> &'a str {
-    let char_set: Vec<char> = chars.chars().collect();
+    let char_set: Vec<char> = sqlite_text_until_nul(chars).chars().collect();
     s.trim_matches(|c: char| char_set.contains(&c))
 }
 
 fn ltrim_chars<'a>(s: &'a str, chars: &str) -> &'a str {
-    let char_set: Vec<char> = chars.chars().collect();
+    let char_set: Vec<char> = sqlite_text_until_nul(chars).chars().collect();
     s.trim_start_matches(|c: char| char_set.contains(&c))
 }
 
 fn rtrim_chars<'a>(s: &'a str, chars: &str) -> &'a str {
-    let char_set: Vec<char> = chars.chars().collect();
+    let char_set: Vec<char> = sqlite_text_until_nul(chars).chars().collect();
     s.trim_end_matches(|c: char| char_set.contains(&c))
 }
 
@@ -768,12 +779,13 @@ fn rtrim_chars<'a>(s: &'a str, chars: &str) -> &'a str {
 /// whole character byte sequences are stripped from the chosen ends. Returns
 /// `None` when both are ordinary UTF-8, so the `str` path stays in charge.
 fn trim_raw_bytes(args: &[SqliteValue], left: bool, right: bool) -> Option<SqliteValue> {
-    let set_arg = args.get(1).filter(|set| !set.is_null());
+    let set_arg = args.get(1);
     if !text_needs_bytes(&args[0]) && !set_arg.is_some_and(text_needs_bytes) {
         return None;
     }
     let input = args[0].text_bytes();
     let set_bytes = set_arg.map_or(Cow::Borrowed(&b" "[..]), SqliteValue::text_bytes);
+    let set_bytes = text_bytes_until_nul(&set_bytes);
     let mut set: Vec<&[u8]> = Vec::new();
     let mut i = 0;
     while i < set_bytes.len() {
@@ -802,14 +814,14 @@ fn trim_raw_bytes(args: &[SqliteValue], left: bool, right: bool) -> Option<Sqlit
 
 impl ScalarFunction for TrimFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args[0].is_null() {
+        if args.iter().any(SqliteValue::is_null) {
             return Ok(SqliteValue::Null);
         }
         if let Some(trimmed) = trim_raw_bytes(args, true, true) {
             return Ok(trimmed);
         }
         let s = text_arg(&args[0]);
-        let chars = if args.len() > 1 && !args[1].is_null() {
+        let chars = if args.len() > 1 {
             text_arg(&args[1])
         } else {
             Cow::Borrowed(" ")
@@ -839,14 +851,14 @@ impl ScalarFunction for TrimFunc {
 
 impl ScalarFunction for LtrimFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args[0].is_null() {
+        if args.iter().any(SqliteValue::is_null) {
             return Ok(SqliteValue::Null);
         }
         if let Some(trimmed) = trim_raw_bytes(args, true, false) {
             return Ok(trimmed);
         }
         let s = text_arg(&args[0]);
-        let chars = if args.len() > 1 && !args[1].is_null() {
+        let chars = if args.len() > 1 {
             text_arg(&args[1])
         } else {
             Cow::Borrowed(" ")
@@ -876,14 +888,14 @@ impl ScalarFunction for LtrimFunc {
 
 impl ScalarFunction for RtrimFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args[0].is_null() {
+        if args.iter().any(SqliteValue::is_null) {
             return Ok(SqliteValue::Null);
         }
         if let Some(trimmed) = trim_raw_bytes(args, false, true) {
             return Ok(trimmed);
         }
         let s = text_arg(&args[0]);
-        let chars = if args.len() > 1 && !args[1].is_null() {
+        let chars = if args.len() > 1 {
             text_arg(&args[1])
         } else {
             Cow::Borrowed(" ")
@@ -1666,7 +1678,7 @@ pub struct SubstrFunc;
 impl ScalarFunction for SubstrFunc {
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args[0].is_null() || args[1].is_null() {
+        if args.iter().any(SqliteValue::is_null) {
             return Ok(SqliteValue::Null);
         }
         let is_blob = matches!(&args[0], SqliteValue::Blob(_));
@@ -1687,7 +1699,7 @@ impl ScalarFunction for SubstrFunc {
         } else {
             s.chars().count() as i64
         };
-        let has_length = args.len() > 2 && !args[2].is_null();
+        let has_length = args.len() > 2;
 
         // bd-substr-i32-truncate-t3tbx: C SQLite reads substr's position/length
         // via sqlite3_value_int, i.e. TRUNCATED to i32 (low 32 bits), before the
@@ -1777,7 +1789,7 @@ impl SubstrFunc {
             _ => return Ok(SqliteValue::Null),
         };
         let len = blob.len() as i64;
-        let has_length = args.len() > 2 && !args[2].is_null();
+        let has_length = args.len() > 2;
 
         // bd-substr-i32-truncate-t3tbx: C SQLite reads substr's position/length
         // via sqlite3_value_int, i.e. TRUNCATED to i32 (low 32 bits), before the
@@ -4882,10 +4894,39 @@ mod tests {
         for (text, expected) in cases {
             assert_eq!(length(text), SqliteValue::Integer(expected));
         }
-        // Invalid UTF-8 keeps its own path: the lossy text it already counted.
+        // Invalid UTF-8 also counts characters from the stored bytes.
         let raw = SmallText::from_bytes(&[0xFF, b'a', b'b']);
         assert!(!raw.is_valid_utf8());
         assert_eq!(length(raw), SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_length_preserves_sqlite_malformed_utf8_character_boundaries() {
+        let cases: &[(&[u8], i64)] = &[
+            (b"", 0),
+            (b"\x80\x80", 1),
+            (b"\xC0\x80", 1),
+            (b"\xF0\x80\x80\x80", 1),
+            (b"\xFF\x80\x80", 1),
+            (b"\xED\xA0\x80", 1),
+            (b"a\xC0\x80z", 3),
+            (b"\x80\xC0\x80", 2),
+            (b"\xC2A\x80", 3),
+            (b"\xC0\x80\0\xFF", 1),
+            (b"\0\xFF", 0),
+        ];
+        for &(bytes, expected) in cases {
+            assert_eq!(
+                invoke1(&LengthFunc, raw_text(bytes)).unwrap(),
+                SqliteValue::Integer(expected),
+                "TEXT bytes: {bytes:?}"
+            );
+            assert_eq!(
+                invoke1(&LengthFunc, raw_blob(bytes)).unwrap(),
+                SqliteValue::Integer(i64::try_from(bytes.len()).unwrap()),
+                "BLOB bytes: {bytes:?}"
+            );
+        }
     }
 
     #[test]
@@ -5033,6 +5074,103 @@ mod tests {
             .unwrap(),
             SqliteValue::Text(SmallText::from_string("hello"))
         );
+    }
+
+    #[test]
+    fn test_trim_family_propagates_explicit_null_charset() {
+        let functions: [&dyn ScalarFunction; 3] = [&TrimFunc, &LtrimFunc, &RtrimFunc];
+        let inputs = [
+            SqliteValue::Null,
+            SqliteValue::Integer(12321),
+            SqliteValue::Float(12.5),
+            raw_text(b"  value  "),
+            raw_text(b""),
+            raw_blob(b""),
+            raw_blob(b" \xFF "),
+            raw_text(b" \xFF "),
+        ];
+        for function in functions {
+            for input in &inputs {
+                assert_eq!(
+                    function
+                        .invoke(&[input.clone(), SqliteValue::Null])
+                        .unwrap(),
+                    SqliteValue::Null,
+                    "{}({input:?}, NULL)",
+                    function.name()
+                );
+            }
+            assert_eq!(
+                function.invoke(&[SqliteValue::Null]).unwrap(),
+                SqliteValue::Null
+            );
+            assert_eq!(
+                function
+                    .invoke(&[SqliteValue::Null, raw_text(b"x")])
+                    .unwrap(),
+                SqliteValue::Null
+            );
+        }
+    }
+
+    #[test]
+    fn test_trim_family_distinguishes_omitted_and_empty_charsets() {
+        let functions: [(&dyn ScalarFunction, usize, usize); 3] =
+            [(&TrimFunc, 1, 2), (&LtrimFunc, 1, 3), (&RtrimFunc, 0, 2)];
+        for (function, start, end) in functions {
+            for bytes in [b" x ".as_slice(), b" \xFF ".as_slice()] {
+                for input in [raw_text(bytes), raw_blob(bytes)] {
+                    let result = function.invoke(std::slice::from_ref(&input)).unwrap();
+                    assert_eq!(
+                        out_bytes(&result),
+                        &bytes[start..end],
+                        "{}({input:?})",
+                        function.name()
+                    );
+                    for charset in [
+                        raw_text(b""),
+                        raw_blob(b""),
+                        raw_text(b"\0x "),
+                        raw_blob(b"\0\xFF "),
+                    ] {
+                        let result = function.invoke(&[input.clone(), charset.clone()]).unwrap();
+                        assert_eq!(
+                            out_bytes(&result),
+                            bytes,
+                            "{}({input:?}, {charset:?})",
+                            function.name()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_trim_family_stops_charset_at_nul_and_preserves_input_nuls() {
+        let functions: [(&dyn ScalarFunction, &[u8]); 3] = [
+            (&TrimFunc, b"\0x\0"),
+            (&LtrimFunc, b"\0x\0 "),
+            (&RtrimFunc, b" \0x\0"),
+        ];
+        for (function, expected) in functions {
+            for input in [raw_text(b" \0x\0 "), raw_blob(b" \0x\0 ")] {
+                for charset in [
+                    raw_text(b" \0x"),
+                    raw_blob(b" \0x"),
+                    raw_text(b" \0\xFFx"),
+                    raw_blob(b" \0\xFFx"),
+                ] {
+                    let result = function.invoke(&[input.clone(), charset.clone()]).unwrap();
+                    assert_eq!(
+                        out_bytes(&result),
+                        expected,
+                        "{}({input:?}, {charset:?})",
+                        function.name()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -6226,6 +6364,66 @@ mod tests {
             .unwrap(),
             SqliteValue::Text(SmallText::from_string("ell"))
         );
+    }
+
+    #[test]
+    fn test_substr_propagates_explicit_null_length() {
+        let inputs = [
+            SqliteValue::Null,
+            SqliteValue::Integer(12345),
+            raw_text(b"hello"),
+            raw_text("héllo".as_bytes()),
+            raw_text(b"\xFFvalue"),
+            raw_blob(&[0, 1, 255]),
+            raw_text(b""),
+            raw_blob(b""),
+        ];
+        for input in inputs {
+            for start in [-10, -1, 0, 1, 2, 10] {
+                assert_eq!(
+                    SubstrFunc
+                        .invoke(&[
+                            input.clone(),
+                            SqliteValue::Integer(start),
+                            SqliteValue::Null,
+                        ])
+                        .unwrap(),
+                    SqliteValue::Null,
+                    "substr({input:?}, {start}, NULL)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_substr_distinguishes_omitted_zero_and_null_lengths() {
+        for (input, suffix, empty) in [
+            (raw_text(b"hello"), raw_text(b"ello"), raw_text(b"")),
+            (raw_blob(&[0, 1, 2]), raw_blob(&[1, 2]), raw_blob(b"")),
+        ] {
+            assert_eq!(
+                SubstrFunc
+                    .invoke(&[input.clone(), SqliteValue::Integer(2)])
+                    .unwrap(),
+                suffix
+            );
+            assert_eq!(
+                SubstrFunc
+                    .invoke(&[
+                        input.clone(),
+                        SqliteValue::Integer(2),
+                        SqliteValue::Integer(0),
+                    ])
+                    .unwrap(),
+                empty
+            );
+            assert_eq!(
+                SubstrFunc
+                    .invoke(&[input, SqliteValue::Integer(2), SqliteValue::Null])
+                    .unwrap(),
+                SqliteValue::Null
+            );
+        }
     }
 
     #[test]
