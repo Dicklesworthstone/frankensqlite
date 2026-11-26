@@ -4233,29 +4233,10 @@ impl<P: PageReader> BtCursor<P> {
     /// only reads page headers. Still O(pages) but with a much smaller
     /// constant factor than the `first()/while next()` row-by-row scan.
     ///
+    /// The walk uses its own traversal stack, so a positioned cursor can
+    /// continue its scan even if counting is cancelled or a page read fails.
     /// bd-wwqen.1 (B1.1): direct COUNT(*) fast path.
     pub async fn count_all_rows(&mut self, cx: &Cx) -> Result<i64> {
-        // Save and restore cursor state so this doesn't disturb
-        // any in-progress iteration.
-        let saved_eof = self.at_eof;
-        self.stack.clear();
-        self.at_eof = true;
-
-        // bd-wwqen.1: iterative B-tree walk — no recursion overhead.
-        let result = self.count_all_rows_iterative(cx).await;
-
-        // Restore cursor state.
-        self.stack.clear();
-        self.at_eof = saved_eof;
-
-        result
-    }
-
-    /// bd-wwqen.1: Iterative B-tree count matching SQLite's sqlite3BtreeCount
-    /// pattern. Walks every page exactly once without recursion, extracting
-    /// child page numbers directly from raw cell bytes (4-byte BE at cell
-    /// offset) to avoid full parse_cell_at overhead.
-    async fn count_all_rows_iterative(&mut self, cx: &Cx) -> Result<i64> {
         // Pending child pages for a depth-first walk. Interior pages are read
         // once: all child page numbers are extracted from their cell-pointer
         // array up front instead of rereading the parent for each child.
@@ -4310,7 +4291,7 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// bd-wwqen.1: Read a 4-byte BE child page number directly from raw page
-    /// bytes at the given cell offset. Used by count_all_rows_iterative to
+    /// bytes at the given cell offset. Used by count_all_rows to
     /// avoid needing the allocated cell_pointers Vec.
     fn read_child_at_offset(page: &[u8], cell_offset: usize) -> Result<PageNumber> {
         if cell_offset + 4 > page.len() {
@@ -7620,7 +7601,7 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         let root_entry = self.reload_page_fresh(cx, self.root_page).await?;
-        if root_entry.header.page_type.is_leaf() || self.count_all_rows_iterative(cx).await? != 0 {
+        if root_entry.header.page_type.is_leaf() || self.count_all_rows(cx).await? != 0 {
             return Ok(());
         }
 
@@ -18875,7 +18856,13 @@ mod tests {
 
             let cx = Cx::new();
             let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            assert!(cursor.first(&cx).await.unwrap());
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"b");
             assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 6);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"b");
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"c");
         });
     }
 
@@ -27994,22 +27981,21 @@ mod tests {
                     .await
                     .expect("insert should succeed");
             }
-            let count = cursor.count_all_rows(&cx).await.unwrap();
-            assert_eq!(
-                count, n,
-                "bd-wwqen.1: multi-leaf table with {n} rows must return count {n}, got {count}"
-            );
+            assert!(cursor.table_move_to(&cx, 250).await.unwrap().is_found());
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), n);
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 250);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 251);
 
-            // ── count_all_rows preserves cursor usability ──
-            // After count, cursor should still be usable for a seek.
-            assert!(
-                cursor
-                    .table_move_to(&cx, 1)
-                    .await
-                    .expect("seek after count should succeed")
-                    .is_found(),
-                "bd-wwqen.1: cursor must remain usable after count_all_rows"
-            );
+            let cancelled = Cx::new();
+            cancelled.cancel();
+            assert!(matches!(
+                cursor.count_all_rows(&cancelled).await,
+                Err(FrankenError::Abort)
+            ));
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 251);
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 250);
         });
     }
 
