@@ -280,3 +280,252 @@ fn schema_only_cte_keeps_strict_fallback_denial() {
         conn.close_without_checkpoint().await.unwrap();
     });
 }
+
+/// bd-yk032: an ORDINARY connection on a small (<8 MiB, where GH#492 does NOT
+/// defer MemDB hydration) file-backed database must NOT re-hydrate unrelated
+/// persistent tables when executing WITH statements that read persistent tables,
+/// views, WITHOUT ROWID tables, or recursive joins — across both DELETE and WAL
+/// journal modes, autocommit and explicit transactions/savepoints, SELECT and
+/// DML, direct and prepared execution.
+#[test]
+fn bd_yk032_ordinary_connection_with_persistent_reads_never_hydrates_unrelated_tables() {
+    asupersync::test_utils::run_test(|| async {
+        for journal_mode in ["DELETE", "WAL"] {
+            let dir = tempfile::tempdir().unwrap();
+            let frank_path = dir.path().join(format!("yk032-frank-{journal_mode}.db"));
+            let stock_path = dir.path().join(format!("yk032-stock-{journal_mode}.db"));
+            let setup = "
+                CREATE TABLE unrelated(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+                CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
+                CREATE VIEW tv AS SELECT id, v FROM t;
+                CREATE TABLE wr(k TEXT PRIMARY KEY, v INTEGER NOT NULL) WITHOUT ROWID;
+                INSERT INTO wr VALUES ('a', 10), ('b', 20), ('c', 30);
+            ";
+
+            let frank = Connection::open(frank_path.to_string_lossy().as_ref())
+                .await
+                .unwrap();
+            let stock = rusqlite::Connection::open(&stock_path).unwrap();
+            frank
+                .execute(&format!("PRAGMA journal_mode={journal_mode}"))
+                .await
+                .unwrap();
+            stock
+                .execute_batch(&format!("PRAGMA journal_mode={journal_mode};"))
+                .unwrap();
+            frank.execute_batch(setup).await.unwrap();
+            stock.execute_batch(setup).unwrap();
+
+            // Seed 1,500 rows in `unrelated` (~250 KiB, well under GH#492's
+            // 8 MiB hydration deferral cap so `defer_memdb_row_hydration()` is
+            // guaranteed false on this ordinary connection).
+            let seed_unrelated = "WITH RECURSIVE u(i) AS ( \
+                SELECT 1 UNION ALL SELECT i + 1 FROM u WHERE i < 1500 \
+            ) INSERT INTO unrelated(id, payload) SELECT i, 'payload_' || i FROM u";
+            frank.execute(seed_unrelated).await.unwrap();
+            stock.execute(seed_unrelated, []).unwrap();
+            let db_bytes = std::fs::metadata(&frank_path).unwrap().len();
+            assert!(
+                db_bytes < 4 * 1024 * 1024,
+                "{journal_mode}: fixture must stay under GH#492 8 MiB cap (got {db_bytes} bytes)"
+            );
+            assert_eq!(
+                frank.memdb_row_hydration_count(),
+                0,
+                "{journal_mode}: CTE-only seed should not hydrate"
+            );
+
+            // Seed initial rows in `t`, leaving `memdb_requires_active_txn_reload`
+            // set on an ordinary connection.
+            let cte_insert = "WITH RECURSIVE s(i) AS ( \
+                SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 20 \
+            ) INSERT INTO t(v) SELECT i FROM s";
+            frank.execute(cte_insert).await.unwrap();
+            stock.execute(cte_insert, []).unwrap();
+
+            let read_queries = [
+                "WITH c(k) AS (SELECT 1) SELECT count(*), sum(t.v) FROM t, c",
+                "WITH c(k) AS (SELECT 2) SELECT count(*) * max(k), sum(tv.v) FROM tv, c",
+                "WITH RECURSIVE r(n) AS ( \
+                     SELECT 1 UNION ALL \
+                     SELECT n + 1 FROM r, t WHERE t.id = r.n AND n < 10 \
+                 ) SELECT count(*), max(n) FROM r",
+                "WITH c(k) AS (SELECT 'b') SELECT wr.k, wr.v FROM wr JOIN c ON wr.k = c.k",
+            ];
+
+            for sql in read_queries {
+                let expected = stock_query(&stock_path, sql);
+                let direct = query(&frank, sql).await;
+                assert_eq!(direct, expected, "{journal_mode} direct: {sql}");
+                let prepared: Vec<Vec<SqliteValue>> = frank
+                    .prepare(sql)
+                    .await
+                    .unwrap()
+                    .query()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect();
+                assert_eq!(prepared, expected, "{journal_mode} prepared: {sql}");
+            }
+            assert_eq!(
+                frank.memdb_row_hydration_count(),
+                0,
+                "{journal_mode}: WITH reads over persistent tables/views/WITHOUT ROWID must hydrate 0 rows"
+            );
+
+            // Explicit transaction + uncommitted writes + savepoint rollback +
+            // WITH UPDATE / WITH DELETE / WITH INSERT reading persistent `t`.
+            frank.execute("BEGIN IMMEDIATE").await.unwrap();
+            stock.execute("BEGIN IMMEDIATE", []).unwrap();
+            for dml in [
+                "WITH c AS (SELECT id FROM t WHERE id <= 5) \
+                 UPDATE t SET v = v + 100 WHERE id IN (SELECT id FROM c)",
+                "WITH c AS (SELECT id FROM t WHERE id = 1) \
+                 DELETE FROM t WHERE id IN (SELECT id FROM c)",
+                "WITH c AS (SELECT v FROM t WHERE id <= 3) \
+                 INSERT INTO t(v) SELECT v + 1000 FROM c",
+            ] {
+                frank.execute(dml).await.unwrap();
+                stock.execute(dml, []).unwrap();
+            }
+            frank.execute("SAVEPOINT sp").await.unwrap();
+            stock.execute("SAVEPOINT sp", []).unwrap();
+            frank
+                .execute("INSERT INTO t(v) VALUES (9999)")
+                .await
+                .unwrap();
+            stock
+                .execute("INSERT INTO t(v) VALUES (9999)", [])
+                .unwrap();
+            let check_in_sp = "WITH c(k) AS (SELECT 1) SELECT count(*), sum(t.v) FROM t, c";
+            let sp_actual = query(&frank, check_in_sp).await;
+            let sp_expected: Vec<Vec<SqliteValue>> = {
+                let mut stmt = stock.prepare(check_in_sp).unwrap();
+                stmt.query_map([], |row| {
+                    Ok(vec![
+                        SqliteValue::Integer(row.get(0)?),
+                        SqliteValue::Integer(row.get(1)?),
+                    ])
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+            };
+            assert_eq!(sp_actual, sp_expected, "{journal_mode} in-savepoint WITH");
+
+            frank.execute("ROLLBACK TO sp").await.unwrap();
+            stock.execute("ROLLBACK TO sp", []).unwrap();
+            frank.execute("RELEASE sp").await.unwrap();
+            stock.execute("RELEASE sp", []).unwrap();
+            frank.execute("COMMIT").await.unwrap();
+            stock.execute("COMMIT", []).unwrap();
+
+            for sql in read_queries {
+                assert_eq!(
+                    query(&frank, sql).await,
+                    stock_query(&stock_path, sql),
+                    "{journal_mode} post-commit: {sql}"
+                );
+            }
+            assert_eq!(
+                frank.memdb_row_hydration_count(),
+                0,
+                "{journal_mode}: full mixed WITH SELECT/INSERT/UPDATE/DELETE + savepoint sequence must hydrate 0 persistent rows"
+            );
+            frank.close().await.unwrap();
+        }
+    });
+}
+
+/// bd-yk032 gate: mixed workload (CTE insert + WITH read of the same table +
+/// mixed persistent/working-table recursive join) at N=20/40/80 alongside an
+/// unrelated table on an ordinary <8 MiB file-backed connection. Must hydrate
+/// 0 MemDatabase rows at every scale and match live stock rusqlite 3.54.1.
+#[test]
+fn bd_yk032_mixed_cte_insert_and_with_read_scaling_n20_n40_n80() {
+    use std::time::Instant;
+
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut report = Vec::new();
+        for n in [20_usize, 40, 80] {
+            let frank_path = dir.path().join(format!("yk032-scale-frank-{n}.db"));
+            let stock_path = dir.path().join(format!("yk032-scale-stock-{n}.db"));
+            let frank = Connection::open(frank_path.to_string_lossy().as_ref())
+                .await
+                .unwrap();
+            let stock = rusqlite::Connection::open(&stock_path).unwrap();
+            let schema = "
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE unrelated(id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+                CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
+            ";
+            frank.execute_batch(schema).await.unwrap();
+            stock.execute_batch(schema).unwrap();
+
+            let seed_unrelated = "WITH RECURSIVE u(i) AS ( \
+                SELECT 1 UNION ALL SELECT i + 1 FROM u WHERE i < 1500 \
+            ) INSERT INTO unrelated(id, body) SELECT i, 'unrelated_row_' || i FROM u";
+            frank.execute(seed_unrelated).await.unwrap();
+            stock.execute(seed_unrelated, []).unwrap();
+
+            let insert_sql = "WITH RECURSIVE s(i) AS ( \
+                SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 10 \
+            ) INSERT INTO t(v) SELECT i FROM s";
+            let read_join_sql = "WITH c(k) AS (SELECT 2) SELECT count(*) * max(k) FROM t, c";
+            let read_rec_sql = "WITH RECURSIVE r(n) AS ( \
+                SELECT 1 UNION ALL \
+                SELECT n + 1 FROM r, t WHERE t.id = r.n AND n < 5 \
+            ) SELECT count(*) FROM r";
+
+            let hydrated_before = frank.memdb_row_hydration_count();
+            let f_start = Instant::now();
+            for step in 1..=n {
+                frank.execute(insert_sql).await.unwrap();
+                let count_rows = query(&frank, read_join_sql).await;
+                let expected_double = i64::try_from(step).unwrap() * 10 * 2;
+                assert_eq!(
+                    count_rows,
+                    vec![vec![SqliteValue::Integer(expected_double)]],
+                    "N={n} step={step}: join count"
+                );
+                let rec_rows = query(&frank, read_rec_sql).await;
+                assert_eq!(
+                    rec_rows,
+                    vec![vec![SqliteValue::Integer(5)]],
+                    "N={n} step={step}: recursive join count"
+                );
+            }
+            let f_ms = f_start.elapsed().as_secs_f64() * 1000.0;
+            let hydrated_delta = frank.memdb_row_hydration_count() - hydrated_before;
+            assert_eq!(
+                hydrated_delta, 0,
+                "N={n}: mixed CTE insert + WITH persistent read hydrated {hydrated_delta} rows (expected 0)"
+            );
+
+            let s_start = Instant::now();
+            for _ in 1..=n {
+                stock.execute(insert_sql, []).unwrap();
+                let _: i64 = stock
+                    .query_row(read_join_sql, [], |row| row.get(0))
+                    .unwrap();
+                let _: i64 = stock
+                    .query_row(read_rec_sql, [], |row| row.get(0))
+                    .unwrap();
+            }
+            let s_ms = s_start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(
+                query(&frank, "SELECT count(*), sum(v) FROM t").await,
+                stock_query(&stock_path, "SELECT count(*), sum(v) FROM t"),
+                "N={n}: final table state must match stock 3.54.1"
+            );
+            report.push(format!(
+                "N={n}: frank={f_ms:.1}ms stock={s_ms:.1}ms hydrated={hydrated_delta}"
+            ));
+            frank.close().await.unwrap();
+        }
+        eprintln!("bd-yk032 scaling receipt: {}", report.join(" | "));
+    });
+}

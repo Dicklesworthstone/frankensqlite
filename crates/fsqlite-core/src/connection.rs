@@ -29870,10 +29870,9 @@ impl Connection {
     }
 
     fn should_eagerly_hydrate_memdb_rows(&self) -> bool {
-        self.path == ":memory:"
-            || (!self.defer_memdb_row_hydration()
-                && !*self.reject_mem_fallback.borrow()
-                && self.memdb_row_hydration_suppressed.get() == 0)
+        self.memdb_row_hydration_suppressed.get() == 0
+            && (self.path == ":memory:"
+                || (!self.defer_memdb_row_hydration() && !*self.reject_mem_fallback.borrow()))
     }
 
     /// PR#401 / GH#492: schema-only connections never opt into whole-file row
@@ -70783,6 +70782,14 @@ impl Connection {
         result
     }
 
+    #[inline]
+    fn has_pending_direct_write_runs(&self) -> bool {
+        self.pending_direct_update_leaf_patch_run.borrow().is_some()
+            || self.pending_direct_delete_leaf_run.borrow().is_some()
+            || !self.pending_direct_delete_leaf_runs.borrow().is_empty()
+            || self.pending_direct_insert_page_run.borrow().is_some()
+    }
+
     async fn flush_pending_direct_write_runs(&self, cx: &Cx) -> Result<()> {
         let profile_flush = hot_path_profile_enabled();
         if profile_flush {
@@ -70794,11 +70801,7 @@ impl Connection {
         // samples. Return before constructing the staged flush future when
         // all three pending slots are empty. Call counting above is kept so
         // profile counters retain their meaning (a call is a call).
-        if self.pending_direct_update_leaf_patch_run.borrow().is_none()
-            && self.pending_direct_delete_leaf_run.borrow().is_none()
-            && self.pending_direct_delete_leaf_runs.borrow().is_empty()
-            && self.pending_direct_insert_page_run.borrow().is_none()
-        {
+        if !self.has_pending_direct_write_runs() {
             return Ok(());
         }
         let flush_start = profile_flush.then(Instant::now);
@@ -108581,12 +108584,24 @@ impl Connection {
         src: &JoinTableSource,
         keep: Option<&[bool]>,
     ) -> Option<Result<Vec<Vec<SqliteValue>>>> {
-        if !self.pager.is_file_backed() || self.local_transaction_scope_is_active() {
+        // Real historical time-travel snapshots pin reads to the hydrated
+        // MemDatabase image (memdb_rows_loaded == true); never read live pager
+        // pages under them. Pending local write overlays fall back to SQL scan
+        // so the statement boundary flushes them first.
+        if !self.pager.is_file_backed()
+            || (self.time_travel_active.get() && self.memdb_rows_loaded.get())
+            || self.has_pending_direct_write_runs()
+            || !self.pending_memdb_direct_upserts.borrow().is_empty()
+            || self.retained_autocommit_txn.borrow().is_some()
+        {
             return None;
         }
         let binding_name = src.local_table_binding()?;
         let (table_schema, rowid_alias_column_index) =
             self.local_join_binding_table(binding_name)?;
+        if table_schema.without_rowid || self.table_name_is_virtual(&table_schema.name) {
+            return None;
+        }
         // A generated column is computed from the stored ones; keep them all.
         let keep = keep.filter(|_| {
             table_schema
@@ -108598,55 +108613,113 @@ impl Connection {
         if self.is_memdb_only_root_page(root_page_num) {
             return None;
         }
-        let cx = &self.root_cx;
-        let result: Result<Vec<Vec<SqliteValue>>> = async {
-            let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
-            let page_no = PageNumber::new(u32::try_from(root_page_num).unwrap_or(1))
-                .unwrap_or(PageNumber::ONE);
-            let mut cursor = Self::new_pager_btree_cursor(cx, &mut txn, page_no, true).await?;
-            let mut rows = Vec::new();
-            if cursor.first(cx).await? {
-                loop {
-                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
-                    let payload_values = parse_record_with_encoding(
-                        payload.as_ref(),
-                        self.db_text_encoding.get(),
-                    )
-                    .ok_or_else(|| {
-                        FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "join pager scan: table `{}` rowid {rowid} has invalid record",
-                                binding_name.name
-                            ),
-                        }
-                    })?;
-                    let mut values = Self::inflate_table_row_values_for_storage_reload(
-                        &table_schema,
-                        rowid,
-                        &payload_values,
-                        rowid_alias_column_index,
-                    )?;
-                    if let Some(keep) = keep {
-                        prune_join_source_row(&mut values, keep);
-                    }
-                    if src.hidden_rowid_projection.is_some() {
-                        values.push(SqliteValue::Integer(rowid));
-                    }
-                    rows.push(values);
-                    if !cursor.next(cx).await? {
-                        break;
-                    }
-                }
+        let page_no = PageNumber::new(u32::try_from(root_page_num).ok()?)?;
+        let cx = self.op_cx_after_background_status();
+        // bd-yk032: borrow the parked active transaction when one is open (for
+        // example inside WITH statements or explicit BEGIN scopes) so fallback
+        // joins and recursive CTE arms scan only the referenced persistent
+        // table directly from the active transaction's B-tree without hydrating
+        // unrelated tables into MemDatabase or re-entering SQL compilation.
+        let parked_txn = match self.active_txn.try_borrow_mut() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => return None,
+        };
+        let result: Result<Vec<Vec<SqliteValue>>> = if let Some(mut txn_kind) = parked_txn {
+            if matches!(txn_kind, TransactionKind::Drained) {
+                *self.active_txn.borrow_mut() = Some(txn_kind);
+                return None;
             }
-            drop(cursor);
-            txn.commit(cx).await?;
-            Ok(rows)
-        }
-        .await;
+            let scan_result = self
+                .scan_join_source_rows_in_txn(
+                    &cx,
+                    &mut txn_kind,
+                    page_no,
+                    &table_schema,
+                    rowid_alias_column_index,
+                    keep,
+                    src.hidden_rowid_projection.is_some(),
+                    &binding_name.name,
+                )
+                .await;
+            *self.active_txn.borrow_mut() = Some(txn_kind);
+            scan_result
+        } else if !self.local_transaction_scope_is_active() {
+            async {
+                let mut txn = self.pager.begin(&cx, TransactionMode::ReadOnly).await?;
+                let rows = self
+                    .scan_join_source_rows_in_txn(
+                        &cx,
+                        &mut txn,
+                        page_no,
+                        &table_schema,
+                        rowid_alias_column_index,
+                        keep,
+                        src.hidden_rowid_projection.is_some(),
+                        &binding_name.name,
+                    )
+                    .await?;
+                txn.commit(&cx).await?;
+                Ok(rows)
+            }
+            .await
+        } else {
+            return None;
+        };
         if result.is_ok() && hot_path_profile_enabled() {
             FSQLITE_JOIN_PAGER_SCAN_FAST_PATH_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         Some(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_join_source_rows_in_txn<T>(
+        &self,
+        cx: &Cx,
+        txn: &mut T,
+        page_no: PageNumber,
+        table_schema: &TableSchema,
+        rowid_alias_column_index: Option<usize>,
+        keep: Option<&[bool]>,
+        push_hidden_rowid: bool,
+        table_label: &str,
+    ) -> Result<Vec<Vec<SqliteValue>>>
+    where
+        T: TransactionHandle + ?Sized,
+    {
+        let mut cursor = Self::new_pager_btree_cursor(cx, txn, page_no, true).await?;
+        let mut rows = Vec::new();
+        if cursor.first(cx).await? {
+            loop {
+                let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
+                let payload_values =
+                    parse_record_with_encoding(payload.as_ref(), self.db_text_encoding.get())
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "join pager scan: table `{table_label}` rowid {rowid} has invalid record",
+                            ),
+                        })?;
+                let mut values = self.with_fallback_function_registry(|| {
+                    Self::inflate_table_row_values_for_storage_reload(
+                        table_schema,
+                        rowid,
+                        &payload_values,
+                        rowid_alias_column_index,
+                    )
+                })?;
+                if let Some(keep) = keep {
+                    prune_join_source_row(&mut values, keep);
+                }
+                if push_hidden_rowid {
+                    values.push(SqliteValue::Integer(rowid));
+                }
+                rows.push(values);
+                if !cursor.next(cx).await? {
+                    break;
+                }
+            }
+        }
+        drop(cursor);
+        Ok(rows)
     }
 
     /// GH#386: streaming keyset LIMIT-pushdown lane for the two-table INNER
@@ -112007,13 +112080,19 @@ impl Connection {
         let inlined_not_materialized = inline_not_materialized_ctes(select);
         let select = inlined_not_materialized.as_ref().unwrap_or(select);
 
+        // bd-yk032: disabling mem-fallback rejection for CTE materialization
+        // exists only so VDBE/fallback paths can read CTE roots from MemDB;
+        // persistent tables are read directly from the pager/active_txn. Do
+        // not let the temporary policy flip re-hydrate the whole MemDatabase
+        // image (O(database) per WITH after any write).
+        let suppress_hydration = *self.reject_mem_fallback.borrow()
+            || self.memdb_row_hydration_suppressed.get() > 0
+            || self.cte_statement_reads_only_own_ctes(CteConsumer::Select(select));
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "select",
             "with_clause_materialization",
         )?;
-        let _hydration_suppression = self
-            .cte_statement_reads_only_own_ctes(CteConsumer::Select(select))
-            .then(|| self.suppress_memdb_row_hydration());
+        let _hydration_suppression = suppress_hydration.then(|| self.suppress_memdb_row_hydration());
         match self
             .execute_recursive_cte_direct_sum_consumer(select, params)
             .await
@@ -113626,10 +113705,13 @@ impl Connection {
             return Ok(rows);
         }
 
+        let suppress_hydration =
+            *self.reject_mem_fallback.borrow() || self.memdb_row_hydration_suppressed.get() > 0;
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "delete",
             "with_clause_materialization",
         )?;
+        let _hydration_suppression = suppress_hydration.then(|| self.suppress_memdb_row_hydration());
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
         self.materialize_with_clause(delete.with.as_ref(), params, &mut temp_tables.tables, None)
             .await?;
@@ -113718,10 +113800,13 @@ impl Connection {
             };
         }
 
+        let suppress_hydration =
+            *self.reject_mem_fallback.borrow() || self.memdb_row_hydration_suppressed.get() > 0;
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "update",
             "with_clause_materialization",
         )?;
+        let _hydration_suppression = suppress_hydration.then(|| self.suppress_memdb_row_hydration());
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
         self.materialize_with_clause(update.with.as_ref(), params, &mut temp_tables.tables, None)
             .await?;
@@ -113811,15 +113896,16 @@ impl Connection {
             };
         }
 
+        let suppress_hydration = *self.reject_mem_fallback.borrow()
+            || self.memdb_row_hydration_suppressed.get() > 0
+            || self.cte_statement_reads_only_own_ctes(CteConsumer::Insert(insert));
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "insert",
             "with_clause_materialization",
         )?;
         // Dynamic roots must not reuse programs from another WITH scope.
         let _compiled_cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
-        let _hydration_suppression = self
-            .cte_statement_reads_only_own_ctes(CteConsumer::Insert(insert))
-            .then(|| self.suppress_memdb_row_hydration());
+        let _hydration_suppression = suppress_hydration.then(|| self.suppress_memdb_row_hydration());
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
         self.materialize_with_clause(insert.with.as_ref(), params, &mut temp_tables.tables, None)
             .await?;
@@ -113836,6 +113922,7 @@ impl Connection {
                 .await?;
             // The source is now owned. Restore the caller's normal policy
             // before trigger replay so each row does not reload every table.
+            drop(_hydration_suppression);
             drop(_mem_fallback_guard);
             if source_rows.is_empty() {
                 self.reset_statement_change_count();
@@ -113995,10 +114082,13 @@ impl Connection {
         with: Option<&fsqlite_ast::WithClause>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<MaterializedTempTable>> {
+        let suppress_hydration =
+            *self.reject_mem_fallback.borrow() || self.memdb_row_hydration_suppressed.get() > 0;
         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
             "statement",
             "with_clause_materialization",
         )?;
+        let _hydration_suppression = suppress_hydration.then(|| self.suppress_memdb_row_hydration());
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
         self.materialize_with_clause(with, params, &mut temp_tables.tables, None)
             .await?;
