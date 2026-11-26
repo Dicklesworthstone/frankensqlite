@@ -1774,6 +1774,67 @@ pub unsafe extern "C" fn sqlite3_total_changes(db: *mut Sqlite3) -> c_int {
     usize_to_c_int_saturating((&*db).conn.total_change_count())
 }
 
+/// Return the rowid of the most recent successful INSERT on this connection.
+///
+/// A rolled-back INSERT still sets this value, as in SQLite. Reading it does
+/// not execute SQL or change the connection's error state.
+///
+/// # Safety
+/// `db` must be a live handle from `sqlite3_open`, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_last_insert_rowid(db: *mut Sqlite3) -> i64 {
+    if db.is_null() {
+        return 0;
+    }
+    (&*db).conn.last_insert_rowid()
+}
+
+/// Return nonzero when the connection is in autocommit mode.
+///
+/// Explicit transactions and outermost SAVEPOINTs disable autocommit until
+/// they end. Reading this flag does not execute SQL or change error state.
+///
+/// # Safety
+/// `db` must be a live handle from `sqlite3_open`, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_get_autocommit(db: *mut Sqlite3) -> c_int {
+    if db.is_null() {
+        return 0;
+    }
+    c_int::from(!(&*db).conn.in_transaction())
+}
+
+/// Set the connection's busy timeout in milliseconds.
+///
+/// A nonpositive timeout disables waiting. Successful configuration preserves
+/// the most recent C API error, matching SQLite's configuration API.
+///
+/// # Safety
+/// `db` must be a live handle from `sqlite3_open`, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_busy_timeout(db: *mut Sqlite3, ms: c_int) -> c_int {
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let handle = &*db;
+    let sql = format!("PRAGMA busy_timeout = {}", ms.max(0));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(handle.conn.execute(&sql))
+    }));
+    match result {
+        Ok(Ok(_)) => SQLITE_OK,
+        Ok(Err(error)) => {
+            handle.set_error(&error);
+            error_to_code(&error)
+        }
+        Err(_) => {
+            let error = FrankenError::Internal("Rust panic during sqlite3_busy_timeout".to_owned());
+            handle.set_error(&error);
+            error_to_code(&error)
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1790,6 +1851,86 @@ mod tests {
         assert_eq!(rc, SQLITE_OK);
         assert!(!db.is_null());
         db
+    }
+
+    #[test]
+    fn test_connection_state_getters_preserve_errors_and_track_transactions() {
+        unsafe {
+            let db = open_memory();
+            let other = open_memory();
+            assert_eq!(sqlite3_last_insert_rowid(db), 0);
+            assert_eq!(sqlite3_get_autocommit(db), 1);
+            schema_exec_ok(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT UNIQUE)");
+            schema_exec_ok(db, "INSERT INTO t VALUES (7, 'first')");
+            assert_eq!(sqlite3_last_insert_rowid(db), 7);
+            let duplicate = CString::new("INSERT INTO t VALUES (8, 'first')").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, duplicate.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_CONSTRAINT
+            );
+            let message = CStr::from_ptr(sqlite3_errmsg(db)).to_bytes().to_vec();
+            assert_eq!(sqlite3_last_insert_rowid(db), 7);
+            assert_eq!(sqlite3_get_autocommit(db), 1);
+            assert_eq!(sqlite3_busy_timeout(db, 250), SQLITE_OK);
+            assert_eq!(sqlite3_errcode(db), SQLITE_CONSTRAINT);
+            assert_eq!(CStr::from_ptr(sqlite3_errmsg(db)).to_bytes(), message);
+            assert_eq!(sqlite3_total_changes(db), 1);
+
+            schema_exec_ok(db, "BEGIN; INSERT INTO t VALUES (42, 'rolled back')");
+            assert_eq!(sqlite3_get_autocommit(db), 0);
+            assert_eq!(sqlite3_last_insert_rowid(db), 42);
+            let changes = sqlite3_changes(db);
+            let total = sqlite3_total_changes(db);
+            assert_eq!(sqlite3_busy_timeout(db, 0), SQLITE_OK);
+            assert_eq!(sqlite3_get_autocommit(db), 0);
+            assert_eq!(sqlite3_last_insert_rowid(db), 42);
+            assert_eq!(sqlite3_changes(db), changes);
+            assert_eq!(sqlite3_total_changes(db), total);
+            schema_exec_ok(db, "ROLLBACK");
+            assert_eq!(sqlite3_get_autocommit(db), 1);
+            assert_eq!(sqlite3_last_insert_rowid(db), 42);
+            assert_eq!(schema_query_int(db, "SELECT count(*) FROM t"), 1);
+
+            schema_exec_ok(db, "SAVEPOINT outer_savepoint; SAVEPOINT inner_savepoint");
+            assert_eq!(sqlite3_get_autocommit(db), 0);
+            schema_exec_ok(db, "ROLLBACK TO inner_savepoint; RELEASE inner_savepoint");
+            assert_eq!(sqlite3_get_autocommit(db), 0);
+            schema_exec_ok(db, "RELEASE outer_savepoint");
+            assert_eq!(sqlite3_get_autocommit(db), 1);
+
+            schema_exec_ok(db, "BEGIN");
+            let rollback =
+                CString::new("INSERT OR ROLLBACK INTO t VALUES (7, 'duplicate')").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, rollback.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_CONSTRAINT
+            );
+            assert_eq!(sqlite3_get_autocommit(db), 1);
+            assert_eq!(sqlite3_last_insert_rowid(db), 42);
+            assert_eq!(sqlite3_errcode(db), SQLITE_CONSTRAINT);
+            assert_eq!(sqlite3_get_autocommit(other), 1);
+            assert_eq!(sqlite3_last_insert_rowid(other), 0);
+            assert_eq!(sqlite3_close(other), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_busy_timeout_configuration_boundaries_and_null_handles() {
+        unsafe {
+            let db = open_memory();
+            for timeout in [250, 0, -1, c_int::MIN, c_int::MAX] {
+                assert_eq!(sqlite3_busy_timeout(db, timeout), SQLITE_OK);
+                assert_eq!(
+                    schema_query_int(db, "PRAGMA busy_timeout"),
+                    i64::from(timeout.max(0))
+                );
+            }
+            assert_eq!(sqlite3_last_insert_rowid(ptr::null_mut()), 0);
+            assert_eq!(sqlite3_get_autocommit(ptr::null_mut()), 0);
+            assert_eq!(sqlite3_busy_timeout(ptr::null_mut(), 100), SQLITE_MISUSE);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
     }
 
     #[test]
@@ -1838,7 +1979,7 @@ mod tests {
                 ),
             ] {
                 assert_eq!(
-                    exec(writer, &format!("PRAGMA busy_timeout={timeout_ms};")),
+                    sqlite3_busy_timeout(writer, c_int::try_from(timeout_ms).unwrap()),
                     SQLITE_OK
                 );
                 let started = std::time::Instant::now();

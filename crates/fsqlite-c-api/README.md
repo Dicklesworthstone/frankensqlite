@@ -55,6 +55,10 @@ workspace forbids it.
 - `sqlite3_errmsg` -- Last error message.
 - `sqlite3_errcode` -- Last error code.
 - `sqlite3_changes` -- Number of rows changed by the last DML statement.
+- `sqlite3_total_changes` -- Number of rows changed since the connection opened.
+- `sqlite3_last_insert_rowid` -- Rowid of the last successful INSERT.
+- `sqlite3_get_autocommit` -- Whether no explicit transaction or outer SAVEPOINT is open.
+- `sqlite3_busy_timeout` -- Configure how long to wait for a busy database.
 
 ## Key Types
 
