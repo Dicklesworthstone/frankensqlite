@@ -94,6 +94,53 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-26 - KEPT (landed as 92fd2d709; a structural lever for bd-emim5 (b), inside every kill line by exact instruction counts, stock SQLite 3.54.1 live; no gain claimed; time cells VOID under the powersave governor): the page lease hands out its lowest page first, and a sole concurrent WAL commit returns its unused lease tail to EOF instead of publishing it free (bd-emim5 lever B1, single-writer lane r20)
+
+- Target: not a speed row. A CONCURRENT growth that used part of its 8-page lease published the unused pages as free
+  (the lease popped its highest page first, so they sat inside the commit's db size). Two concurrent growers then both
+  publish freelists and the second publication erases the first under the append gate: r19's blocker for bd-emim5 (b).
+- Change (`crates/fsqlite-pager/src/pager.rs`): `allocate_page` stores a new lease descending (pop gives the lowest
+  page); `return_unused_lease_tail_to_eof`, in `commit()` Phase A under `inner`'s lock, rewinds `next_page` to the tail
+  when Concurrent + WAL + the pager's only active transaction + no savepoint/quarantine/shrink/VACUUM override + the
+  tail above both db sizes + its top exactly `next_page - 1`. Otherwise the existing path.
+- Ledger preflight: no entry on the lease order or the tail. The coordinator decision of 2026-11-26 set the kill lines.
+- Prediction (bead, before the build): FULL/NORMAL +/-0.2%, txn10 +/-0.3%, point +/-0.1%, bulk 0 to -0.2% per INSERT;
+  churn orphans and double grants equal. Kill: any single-writer row worse than +0.5% exact Ir; any churn orphan or
+  double-grant increase; any pinned keeper changing beyond the named expectations.
+- Result. Arms in one rch job on hz4 from origin/main afe322ac2: P 1a13e0e24fc5f2ba (fix reversed), L e8d2aa61917a8218.
+  callgrind on thinkstation1, per unit = (N800 - N400)/400, stock 3.54.1 live:
+  - FULL INSERT L/P 0.9966 (worst pair 1.0005; A/A +0.59%), x8.38 -> x8.35;
+  - NORMAL INSERT 0.9891 (A/A -1.23%: noise, not claimed);
+  - txn10 1.0006 (worst pair 1.0029); point 0.9996 (worst pair 1.0024);
+  - bulk per INSERT 1.0010 (worst pair 1.0012; A/A +0.009%), 0.1 point above its predicted band: the parent's one-off
+    freelist publication at the single commit is larger at N=400, so the per-unit formula shows +84 Ir. Whole runs:
+    L/P 0.9957 (N=400), 0.9982 (N=800).
+  - The landed code is that L minus one debug `alloc_ledger` call (inert unless FSQLITE_ALLOC_LEDGER_PATH is set),
+    removed after bd-ivhow's e2e test read the event as an allocation; arms on the landed code (job a2) were still
+    queued at landing.
+  - Churn A/B (churn_acceptance_corruption_family, FSQLITE_CHURN_SCALE=large, both arms built and run in one job on
+    ovh-a, 8 + 8 runs, stock 3.54.1 integrity_check per file): never_used 0 and 0, "2nd reference" 0 and 0, other
+    complaints 0 and 0, all rows on every run.
+- Keepers: two pager-lib keepers and fsqlite-core `bd_emim5_b1_lease_tail` (stock reads the file); red on the parent
+  afe322ac2, green on the lever, red on planted mutants: tail never returned; lease dropped without the next_page
+  rewind (stock "never used"); no `next_page - 1` guard; no single-active check; descending pop with the lease dropped
+  inside db_size (stock "never used").
+- Named expectation changes (test-only setup; each original body is red on the lever at its setup line):
+  `test_freelist_dirty_after_lease_return_keeps_durable_lease_holes`,
+  `test_live_reserved_pages_keep_lease_and_savepoint_ownership_private`,
+  `test_savepoint_quarantine_is_reusable_after_transaction_end_pywfi` (pager lib);
+  `a_writer_rereads_the_freelist_after_a_peer_took_free_pages_before_its_commit` (e2e, bd-iay3d);
+  `test_live_reservations_do_not_hide_orphans_or_aliases_pywfi` (core lib).
+- Gate (ovh-a, on afe322ac2 + the change; rebased onto df45a92fd without pager.rs changes): clippy -D warnings
+  fsqlite-pager and fsqlite-core all targets rc 0; pager lib 1159/0; core keepers (B1, bd_ioq6x_hole_reclaim 7/7,
+  bd_ih8ak_flush_floor_after_peer_growth, bulk_import_upsert_text_pk_phantom_pk) 0 failed; e2e cross-process
+  targets 3/3, 12/0, 17/0; core lib 4212/22, the same 22 tests failing with the same messages on the parent in the
+  same job.
+- What green does not cover: the fsqlite crate suites (only concurrent_freelist_churn ran), the e2e suite beyond the
+  cross-process targets, and time.
+- Retry / next: bd-emim5 (b) (relocation at commit, S1-S7 on the bead) builds on this. Re-measure the 2-writer bulk
+  cell only once (b) lands: B1 alone leaves the page-4 collision, so retries stay 3/3.
+
 ## 2026-11-26 - KEPT (landed as 522d56872; exact instruction counts, stock SQLite 3.54.1 live; time cells VOID under the powersave governor): the checkpoint digests only each page's last frame in its window (bd-fuwx0 lever C3, row 3b-i, single-writer lane r14-r18)
 
 - Target: `read_checkpoint_frame_headers` (fsqlite-wal) validated every frame of the backfill window and computed an
