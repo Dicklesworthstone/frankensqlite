@@ -55,6 +55,26 @@ fn sqlite_ord(c: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
 async fn has_sorter(c: &Connection, sql: &str) -> bool {
     c.query(&format!("EXPLAIN {sql}")).await.unwrap().iter().any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.to_string().starts_with("Sorter")))
 }
+async fn has_op(c: &Connection, sql: &str, want: &str) -> bool {
+    c.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.as_ref() == want))
+}
+async fn opens_index(c: &Connection, sql: &str, idx_name: &str) -> bool {
+    c.query(&format!("EXPLAIN {sql}")).await.unwrap().iter().any(|row| {
+        matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.as_ref() == "OpenRead")
+            && matches!(row.values().get(5), Some(SqliteValue::Text(p4)) if p4.as_ref() == idx_name)
+    })
+}
+fn sqlite_eqp_details(c: &rusqlite::Connection, sql: &str) -> Vec<String> {
+    let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
 async fn setup(ddl: &[&str]) -> (Connection, rusqlite::Connection) {
     let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
@@ -119,7 +139,7 @@ fn nonagg_rowid_order_scan_matches_sqlite() {
             "SELECT * FROM t WHERE c = 5 ORDER BY id", // eq on an indexed column
             "SELECT * FROM t WHERE x = 'v3' ORDER BY id LIMIT 20", // eq on a non-indexed column
             "SELECT id FROM t WHERE a > 10 AND c < 8 ORDER BY id LIMIT 5", // AND
-            "SELECT * FROM t WHERE c IN (1,3,5) ORDER BY id", // IN (value list)
+            "SELECT * FROM t WHERE a IN (1,3,5) ORDER BY id", // IN on unindexed column -> full rowid scan, no sorter
             "SELECT * FROM t WHERE a BETWEEN 3 AND 9 ORDER BY id LIMIT 10",
             "SELECT * FROM t WHERE x IS NOT NULL ORDER BY id LIMIT 15",
             "SELECT c FROM t WHERE x LIKE 'v%' ORDER BY id LIMIT 7", // LIKE (not MATCH)
@@ -137,6 +157,31 @@ fn nonagg_rowid_order_scan_matches_sqlite() {
                 "ORDER BY rowid (scan-safe) must NOT open a sorter: `{sql}`"
             );
         }
+        // bd-05el4: since a6108e78b (bd-odxzh / bd-mdnfh), a constant IN list on an
+        // indexed column (`idx_c` on `t(c)`) with `ORDER BY id` probes `idx_c` and
+        // sorts the matched rows by rowid, matching stock SQLite 3.54.1's own plan:
+        //   SEARCH t USING INDEX idx_c (c=?)
+        //   USE TEMP B-TREE FOR ORDER BY
+        let indexed_in = "SELECT * FROM t WHERE c IN (1,3,5) ORDER BY id";
+        cmp_ord(&f, &r, indexed_in, "indexed-in-probe-sort").await;
+        let stock_eqp = sqlite_eqp_details(&r, indexed_in);
+        assert!(
+            stock_eqp
+                .iter()
+                .any(|d| d.contains("SEARCH t USING INDEX idx_c"))
+                && stock_eqp
+                    .iter()
+                    .any(|d| d.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "premise: stock SQLite 3.54.1 probes idx_c and sorts for `{indexed_in}`, got {stock_eqp:?}"
+        );
+        assert!(
+            opens_index(&f, indexed_in, "idx_c").await && has_op(&f, indexed_in, "SeekGE").await,
+            "fsqlite must probe idx_c via SeekGE for `{indexed_in}`"
+        );
+        assert!(
+            has_sorter(&f, indexed_in).await,
+            "fsqlite must sort probed IN-list matches for `{indexed_in}` (matching stock)"
+        );
         // NOT bypassed (still correct via the sorter): a subquery filter (declined by
         // where_is_plain_scan_safe) in either direction, or a non-rowid ORDER BY.
         let sorted = [
