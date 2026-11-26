@@ -1151,7 +1151,14 @@ impl SqliteValue {
             TypeAffinity::Numeric | TypeAffinity::Integer => {
                 matches!(self, Self::Null | Self::Integer(_) | Self::Blob(_))
             }
-            TypeAffinity::Real => matches!(self, Self::Null | Self::Float(_) | Self::Blob(_)),
+            // bd-kqb76: REAL affinity normalizes -0.0 to +0.0 (matching stock's
+            // sqlite3VdbeIntegerAffinity / MEM_IntReal storage rule), so -0.0 is
+            // NOT a no-op under REAL affinity.
+            TypeAffinity::Real => match self {
+                Self::Null | Self::Blob(_) => true,
+                Self::Float(f) => f.to_bits() != (-0.0_f64).to_bits(),
+                Self::Integer(_) | Self::Text(_) => false,
+            },
         }
     }
 
@@ -1191,10 +1198,16 @@ impl SqliteValue {
                 Self::Text(s) => try_coerce_text_to_numeric(s.as_str())
                     .map(|v| match v {
                         Self::Integer(i) => Self::Float(i as f64),
+                        Self::Float(f) if f.to_bits() == (-0.0_f64).to_bits() => Self::Float(0.0),
                         other => other,
                     })
                     .unwrap_or(self),
                 Self::Integer(i) => Self::Float(*i as f64),
+                // bd-kqb76: stock applies REAL storage affinity through
+                // sqlite3VdbeIntegerAffinity so -0.0 never retains its sign
+                // bit in a REAL column (reads back as +0.0). CAST AS REAL uses
+                // its own path and keeps -0.0.
+                Self::Float(f) if f.to_bits() == (-0.0_f64).to_bits() => Self::Float(0.0),
                 _ => self,
             },
         }
@@ -1244,12 +1257,16 @@ impl SqliteValue {
                 }),
             },
             StrictColumnType::Real => match self {
+                Self::Float(f) if f.to_bits() == (-0.0_f64).to_bits() => Ok(Self::Float(0.0)),
                 Self::Float(_) => Ok(self),
                 Self::Integer(i) => Ok(Self::Float(i as f64)),
                 // GH #163: numeric-looking TEXT losslessly converts into a REAL
                 // column (integer text promotes to float).
                 Self::Text(s) => match try_coerce_text_to_numeric(s.as_str()) {
                     Some(Self::Integer(i)) => Ok(Self::Float(i as f64)),
+                    Some(Self::Float(f)) if f.to_bits() == (-0.0_f64).to_bits() => {
+                        Ok(Self::Float(0.0))
+                    }
                     Some(v @ Self::Float(_)) => Ok(v),
                     _ => Err(StrictTypeError {
                         expected: col_type,
@@ -4578,6 +4595,7 @@ mod tests {
             (SqliteValue::Float(1.5), TypeAffinity::Text),
             (SqliteValue::Float(3.0), TypeAffinity::Integer),
             (SqliteValue::Float(3.0), TypeAffinity::Numeric),
+            (SqliteValue::Float(-0.0), TypeAffinity::Real),
             (SqliteValue::Integer(7), TypeAffinity::Real),
             (SqliteValue::Text("5".into()), TypeAffinity::Integer),
             (SqliteValue::Text("5".into()), TypeAffinity::Numeric),

@@ -41408,6 +41408,11 @@ impl Connection {
                 PreparedDirectInsertRecordValue::Integer(integer) => {
                     Some(PreparedDirectInsertRecordValue::Float(integer as f64))
                 }
+                PreparedDirectInsertRecordValue::Float(float)
+                    if float.to_bits() == (-0.0_f64).to_bits() =>
+                {
+                    Some(PreparedDirectInsertRecordValue::Float(0.0))
+                }
                 _ => Some(value),
             },
         }
@@ -159534,8 +159539,10 @@ fn coerce_child_fk_value_cow(raw: &SqliteValue, affinity: TypeAffinity) -> Cow<'
     match (affinity, raw) {
         (TypeAffinity::Blob, _)
         | (TypeAffinity::Integer | TypeAffinity::Numeric, SqliteValue::Integer(_))
-        | (TypeAffinity::Text, SqliteValue::Text(_))
-        | (TypeAffinity::Real, SqliteValue::Float(_)) => Cow::Borrowed(raw),
+        | (TypeAffinity::Text, SqliteValue::Text(_)) => Cow::Borrowed(raw),
+        (TypeAffinity::Real, SqliteValue::Float(f)) if f.to_bits() != (-0.0_f64).to_bits() => {
+            Cow::Borrowed(raw)
+        }
         _ => Cow::Owned(raw.clone().apply_affinity(affinity)),
     }
 }

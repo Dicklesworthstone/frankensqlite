@@ -29,11 +29,10 @@
 //! `series_route_matches_the_interpreted_scan`.
 //!
 //! Not covered, as fsqlite differs from stock there with or without the route
-//! (checked on the replay build df65b45b3): a negative zero stored in a REAL
-//! column keeps its sign (stock stores it as the integer 0, bd-kqb76); after a
-//! statement that inserted explicit rowids above the table's largest fails,
-//! the next automatic rowid of a file-backed table (or in an explicit
-//! transaction) skips past them (bd-u65rh).
+//! (checked on the replay build df65b45b3): after a statement that inserted
+//! explicit rowids above the table's largest fails, the next automatic rowid of
+//! a file-backed table (or in an explicit transaction) skips past them
+//! (bd-u65rh). Negative zero in REAL columns (bd-kqb76) is now covered below.
 //!
 //! bd-jlbrk: the dedicated conflict-order oracles below cover a rowid REPLACE
 //! competing with secondary UNIQUE constraints, including conflicts on the
@@ -177,7 +176,7 @@ const SCENARIOS: &[Scenario] = &[
             "CREATE TABLE v(v)",
             "INSERT INTO v VALUES (1), (1.0), (2.5), ('3'), ('3.0'), ('4.5'), (' 5 '), \
              ('abc'), (x'0102'), (NULL), (9223372036854775807), (1e20), ('1e3'), \
-             ('0x10'), (0.0), (''), (-7.25), ('-12')",
+             ('0x10'), (0.0), (-0.0), ('-0.0'), (''), (-7.25), ('-12')",
             "CREATE TABLE t(i INTEGER, r REAL, n NUMERIC, x TEXT, b BLOB, u, \
              vc VARCHAR(10), d DOUBLE)",
             "INSERT INTO t SELECT v, v, v, v, v, v, v, v FROM v",
@@ -1243,6 +1242,165 @@ fn rowid_replace_preflight_preserves_autoincrement_sequence() {
                 }
                 f.close().await.unwrap();
             }
+        }
+    });
+}
+
+/// bd-kqb76: REAL columns must normalize -0.0 to +0.0 across UPDATE, single-
+/// and multi-row VALUES, prepared bindings, INSERT ... SELECT, UPSERT DO
+/// UPDATE, ALTER TABLE ADD COLUMN DEFAULT, indexed/unindexed, WITHOUT ROWID,
+/// and STRICT REAL tables, while CAST(-0.0 AS REAL), bare -0.0, BLOB/untyped
+/// columns, and STRICT ANY columns keep -0.0 — matching live rusqlite 3.54.1.
+#[test]
+fn bd_kqb76_real_negative_zero_affinity_oracle() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = open_pair(file_backed, &dir).await;
+            let ctx = format!("bd-kqb76 file_backed={file_backed}");
+
+            // 1. Exact bead repros (UPDATE, multi-row VALUES, 1-row & multi-row
+            //    INSERT ... SELECT), plus indexed, WITHOUT ROWID, STRICT, UPSERT,
+            //    and ALTER TABLE ADD COLUMN DEFAULT.
+            let script = [
+                "CREATE TABLE v(v)",
+                "INSERT INTO v VALUES (-0.0)",
+                "CREATE TABLE r(id INTEGER PRIMARY KEY, r REAL)",
+                "INSERT INTO r VALUES (1, 1.5)",
+                "UPDATE r SET r = -0.0",
+                "INSERT INTO r(r) VALUES (-0.0), (-0.0)",
+                "INSERT INTO r(r) VALUES (-0.0)",
+                "CREATE TABLE r2(r REAL)",
+                "INSERT INTO r2 SELECT v FROM v",
+                "INSERT INTO v VALUES (-0.0), (3.0), (1e20)",
+                "INSERT INTO r2 SELECT v FROM v",
+                "CREATE TABLE r_idx(id INTEGER PRIMARY KEY, r REAL)",
+                "CREATE INDEX idx_r ON r_idx(r)",
+                "INSERT INTO r_idx VALUES (1, -0.0), (2, 3.0), (3, 1e20), (4, '-0.0')",
+                "UPDATE r_idx SET r = -0.0 WHERE id = 2",
+                "INSERT INTO r_idx VALUES (3, 9.0) ON CONFLICT(id) DO UPDATE SET r = -0.0",
+                "CREATE TABLE wr(id INTEGER PRIMARY KEY, r REAL) WITHOUT ROWID",
+                "INSERT INTO wr VALUES (1, -0.0), (2, 3.0), (3, 1e20)",
+                "UPDATE wr SET r = -0.0 WHERE id = 2",
+                "CREATE TABLE st(id INTEGER PRIMARY KEY, r REAL, i INT, a ANY) STRICT",
+                "INSERT INTO st VALUES (1, -0.0, -0.0, -0.0), (2, 3.0, 3.0, 3.0), (3, 1e20, 0, 1e20)",
+                "UPDATE st SET r = -0.0, a = -0.0 WHERE id = 2",
+                "CREATE TABLE alt(id INTEGER PRIMARY KEY)",
+                "INSERT INTO alt VALUES (1)",
+                "ALTER TABLE alt ADD COLUMN r REAL DEFAULT -0.0",
+                "INSERT INTO alt(id) VALUES (2)",
+                // Full affinity matrix over REAL / NUMERIC / INTEGER / TEXT / BLOB / untyped
+                // with -0.0, 0.0, 3.0, -3.0, 1.5, 1e20, '-0.0', '3.0', '1e20', 0, 3.
+                "CREATE TABLE mat(id INTEGER PRIMARY KEY, r REAL, n NUMERIC, i INTEGER, t TEXT, b BLOB, u)",
+                "INSERT INTO mat(r, n, i, t, b, u) VALUES \
+                 (-0.0, -0.0, -0.0, -0.0, -0.0, -0.0), \
+                 (0.0, 0.0, 0.0, 0.0, 0.0, 0.0), \
+                 (3.0, 3.0, 3.0, 3.0, 3.0, 3.0), \
+                 (-3.0, -3.0, -3.0, -3.0, -3.0, -3.0), \
+                 (1.5, 1.5, 1.5, 1.5, 1.5, 1.5), \
+                 (1e20, 1e20, 1e20, 1e20, 1e20, 1e20), \
+                 ('-0.0', '-0.0', '-0.0', '-0.0', '-0.0', '-0.0'), \
+                 ('3.0', '3.0', '3.0', '3.0', '3.0', '3.0'), \
+                 ('1e20', '1e20', '1e20', '1e20', '1e20', '1e20'), \
+                 (0, 0, 0, 0, 0, 0), \
+                 (3, 3, 3, 3, 3, 3)",
+            ];
+            for sql in script {
+                f.execute(sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("{ctx}: fsqlite failed `{sql}`: {e}"));
+                r.execute(sql, [])
+                    .unwrap_or_else(|e| panic!("{ctx}: stock failed `{sql}`: {e}"));
+            }
+
+            // 2. Prepared single-row direct-insert and UPDATE binding -0.0, 3.0, 1e20.
+            let f_ins = f.prepare("INSERT INTO r(r) VALUES (?1)").await.unwrap();
+            let mut r_ins = r.prepare("INSERT INTO r(r) VALUES (?1)").unwrap();
+            let f_upd = f
+                .prepare("UPDATE r_idx SET r = ?1 WHERE id = ?2")
+                .await
+                .unwrap();
+            let mut r_upd = r
+                .prepare("UPDATE r_idx SET r = ?1 WHERE id = ?2")
+                .unwrap();
+            for (idx, val) in [-0.0_f64, 3.0_f64, 1e20_f64].into_iter().enumerate() {
+                f_ins
+                    .execute_with_params(&[SqliteValue::Float(val)])
+                    .await
+                    .unwrap();
+                r_ins.execute([val]).unwrap();
+                let id = (idx + 1) as i64;
+                f_upd
+                    .execute_with_params(&[SqliteValue::Float(val), SqliteValue::Integer(id)])
+                    .await
+                    .unwrap();
+                r_upd.execute(rusqlite::params![val, id]).unwrap();
+            }
+            drop(f_ins);
+            drop(r_ins);
+            drop(f_upd);
+            drop(r_upd);
+
+            // 3. Verify every table, atan2 sign probe, typeof(), CAST preservation,
+            //    and bare -0.0 preservation against live rusqlite 3.54.1.
+            let queries = [
+                "SELECT id, typeof(r), r, atan2(r, -1.0) FROM r ORDER BY id",
+                "SELECT rowid, typeof(r), r, atan2(r, -1.0) FROM r2 ORDER BY rowid",
+                "SELECT id, typeof(r), r, atan2(r, -1.0) FROM r_idx ORDER BY id",
+                "SELECT id, typeof(r), r, atan2(r, -1.0) FROM wr ORDER BY id",
+                "SELECT id, typeof(r), r, atan2(r, -1.0), typeof(i), i, typeof(a), a, atan2(a, -1.0) FROM st ORDER BY id",
+                "SELECT id, typeof(r), r, atan2(r, -1.0) FROM alt ORDER BY id",
+                "SELECT id, typeof(r), r, atan2(r, -1.0), typeof(n), n, typeof(i), i, \
+                 typeof(t), t, typeof(b), b, typeof(u), u, \
+                 CASE WHEN typeof(u) = 'real' THEN atan2(u, -1.0) END \
+                 FROM mat ORDER BY id",
+                // Negative controls: CAST(-0.0 AS REAL) and bare -0.0 MUST keep -0.0!
+                "SELECT atan2(-0.0, -1.0), atan2(CAST(-0.0 AS REAL), -1.0), \
+                 atan2(CAST('-0.0' AS REAL), -1.0), typeof(CAST(-0.0 AS REAL))",
+                "PRAGMA integrity_check",
+            ];
+            for q in queries {
+                assert_eq!(
+                    fq(&f, q).await,
+                    rq(&r, q),
+                    "{ctx}: mismatch on `{q}`"
+                );
+            }
+
+            // Also assert raw IEEE-754 sign bit directly on REAL columns (must be +0.0,
+            // never -0.0) and on CAST(-0.0 AS REAL) (must keep -0.0 sign bit).
+            for (table_q, expect_neg_zero) in [
+                ("SELECT r FROM r WHERE id = 1", false),
+                ("SELECT r FROM r2 WHERE rowid = 1", false),
+                ("SELECT r FROM r_idx WHERE id = 1", false),
+                ("SELECT r FROM wr WHERE id = 1", false),
+                ("SELECT r FROM st WHERE id = 1", false),
+                ("SELECT r FROM alt WHERE id = 1", false),
+                ("SELECT r FROM mat WHERE id = 1", false),
+                ("SELECT CAST(-0.0 AS REAL)", true),
+                ("SELECT -0.0", true),
+            ] {
+                let f_rows = f.query(table_q).await.unwrap();
+                let f_val = match f_rows[0].values()[0] {
+                    SqliteValue::Float(x) => x,
+                    ref other => panic!("{ctx}: expected Float for `{table_q}`, got {other:?}"),
+                };
+                let r_val: f64 = r.query_row(table_q, [], |row| row.get(0)).unwrap();
+                assert_eq!(
+                    f_val.to_bits(),
+                    r_val.to_bits(),
+                    "{ctx}: IEEE-754 bit mismatch on `{table_q}`: fsqlite={f_val:?} ({:#018x}) stock={r_val:?} ({:#018x})",
+                    f_val.to_bits(),
+                    r_val.to_bits()
+                );
+                assert_eq!(
+                    f_val.is_sign_negative(),
+                    expect_neg_zero,
+                    "{ctx}: sign bit mismatch on `{table_q}`"
+                );
+            }
+
+            f.close().await.unwrap();
         }
     });
 }
