@@ -28,10 +28,11 @@
 //! transactions and nested [`Savepoint`]s with [`TransactionBehavior`] and
 //! [`DropBehavior`], pragmas,
 //! `busy_timeout`, `changes`, `last_insert_rowid`, [`OptionalExtension`],
-//! user-defined scalar functions ([`Connection::create_scalar_function`]),
+//! user-defined scalar and aggregate functions ([`Connection::create_scalar_function`],
+//! [`Connection::create_aggregate_function`]),
 //! custom collations ([`Connection::create_collation`]),
 //! and an [`Error`] whose variants and [`ErrorCode`]s match rusqlite's. Not
-//! yet: aggregate and window functions, online backup, blob I/O, hooks, and
+//! yet: window functions, online backup, blob I/O, hooks, and
 //! the `chrono`/`uuid`/`serde_json` conversions.
 
 use std::cell::RefCell;
@@ -1066,7 +1067,8 @@ fn value_ref(value: &SqliteValue) -> ValueRef<'_> {
 }
 
 /// User-defined SQL functions, as rusqlite's `functions` module: register a
-/// closure with [`Connection::create_scalar_function`].
+/// closure with [`Connection::create_scalar_function`] or an aggregate with
+/// [`Connection::create_aggregate_function`].
 pub mod functions {
     use std::marker::PhantomData;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -1082,7 +1084,7 @@ pub mod functions {
         /// SQLite's function flags, with their `SQLITE_*` names and values.
         /// Text always reaches a function as UTF-8, and of the rest only
         /// [`FunctionFlags::SQLITE_DETERMINISTIC`] changes anything here:
-        /// without it the function cannot appear in an index expression.
+        /// without it a scalar function cannot appear in an index expression.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub struct FunctionFlags: i32 {
             const SQLITE_UTF8 = 1;
@@ -1152,6 +1154,174 @@ pub mod functions {
         }
     }
 
+    /// Callbacks for a user-defined aggregate registered with
+    /// [`Connection::create_aggregate_function`](super::Connection::create_aggregate_function).
+    ///
+    /// Each SQL group owns a separate accumulator of type `A`. The function
+    /// object is shared between groups; keep per-group data in the accumulator.
+    pub trait Aggregate<A, T>
+    where
+        A: std::panic::RefUnwindSafe + std::panic::UnwindSafe,
+        T: ToSql,
+    {
+        /// Create an accumulator immediately before the first step.
+        ///
+        /// The context contains that first row's arguments. This is not called
+        /// for an empty group.
+        fn init(&self, ctx: &mut Context<'_>) -> Result<A>;
+
+        /// Consume one row's arguments and update its group's accumulator.
+        fn step(&self, ctx: &mut Context<'_>, acc: &mut A) -> Result<()>;
+
+        /// Finish a group, including cleanup after an initialization or step
+        /// error. The context has no arguments. An empty group, or a failed
+        /// initialization, supplies `None`; otherwise it supplies the group's
+        /// accumulator. This callback is invoked once for each started group.
+        fn finalize(&self, ctx: &mut Context<'_>, acc: Option<A>) -> Result<T>;
+    }
+
+    /// Adapts rusqlite's lazy, fallible initialization to the engine's state
+    /// factory. A state keeps its callback alive even if registration changes.
+    pub(super) struct AggregateAdapter<A, D, T> {
+        name: String,
+        n_arg: i32,
+        aggregate: std::sync::Arc<Mutex<D>>,
+        state: PhantomData<fn() -> (A, T)>,
+    }
+
+    impl<A, D, T> AggregateAdapter<A, D, T> {
+        pub(super) fn new(name: &str, n_arg: i32, aggregate: D) -> Self {
+            Self {
+                name: name.to_owned(),
+                n_arg,
+                aggregate: std::sync::Arc::new(Mutex::new(aggregate)),
+                state: PhantomData,
+            }
+        }
+    }
+
+    pub(super) struct AggregateState<A, D, T>
+    where
+        A: std::panic::RefUnwindSafe + std::panic::UnwindSafe,
+        D: Aggregate<A, T>,
+        T: ToSql,
+    {
+        accumulator: Option<A>,
+        aggregate: std::sync::Arc<Mutex<D>>,
+        /// Set before entering init/step, so errors and panics still finalize.
+        /// An unstarted state discarded by the engine needs no callback.
+        pending_finalization: bool,
+        /// Preserve the step error if an engine later attempts normal finalize.
+        failure: Option<String>,
+        output: PhantomData<fn() -> T>,
+    }
+
+    impl<A, D, T> AggregateState<A, D, T>
+    where
+        A: std::panic::RefUnwindSafe + std::panic::UnwindSafe,
+        D: Aggregate<A, T>,
+        T: ToSql,
+    {
+        fn finish(&mut self) -> Result<SqliteValue> {
+            // Disarm before calling user code: an error or panic must not
+            // invoke finalize a second time when this state is dropped.
+            self.pending_finalization = false;
+            let accumulator = self.accumulator.take();
+            let aggregate = self.aggregate.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut context = Context { args: &[] };
+            catch_unwind(AssertUnwindSafe(|| {
+                let value = aggregate.finalize(&mut context, accumulator)?;
+                value.to_sql().map(engine_value)
+            }))
+            .unwrap_or(Err(Error::UnwindingPanic))
+        }
+    }
+
+    impl<A, D, T> Drop for AggregateState<A, D, T>
+    where
+        A: std::panic::RefUnwindSafe + std::panic::UnwindSafe,
+        D: Aggregate<A, T>,
+        T: ToSql,
+    {
+        fn drop(&mut self) {
+            if self.pending_finalization {
+                // Abandoning execution can discard a state without AggFinal.
+                // Preserve cleanup; its result cannot replace the caller's
+                // original error or cancellation.
+                let _ = self.finish();
+            }
+        }
+    }
+
+    impl<A, D, T> fsqlite_func::AggregateFunction for AggregateAdapter<A, D, T>
+    where
+        A: std::panic::RefUnwindSafe + std::panic::UnwindSafe + Send,
+        D: Aggregate<A, T> + Send,
+        T: ToSql,
+    {
+        type State = AggregateState<A, D, T>;
+
+        fn initial_state(&self) -> Self::State {
+            AggregateState {
+                accumulator: None,
+                aggregate: std::sync::Arc::clone(&self.aggregate),
+                pending_finalization: false,
+                failure: None,
+                output: PhantomData,
+            }
+        }
+
+        fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> fsqlite_error::Result<()> {
+            if let Some(error) = &state.failure {
+                return Err(FrankenError::FunctionError(error.clone()));
+            }
+            state.pending_finalization = true;
+            let result = {
+                let aggregate = state
+                    .aggregate
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let mut context = Context { args };
+                catch_unwind(AssertUnwindSafe(|| {
+                    if state.accumulator.is_none() {
+                        state.accumulator = Some(aggregate.init(&mut context)?);
+                    }
+                    aggregate.step(
+                        &mut context,
+                        state.accumulator.as_mut().expect("initialized aggregate"),
+                    )
+                }))
+                .unwrap_or(Err(Error::UnwindingPanic))
+            };
+            if let Err(error) = result {
+                let message = error.to_string();
+                state.failure = Some(message.clone());
+                // The VM may retain failed states until its next reset. Run
+                // finalization now, after releasing the callback lock.
+                let _ = state.finish();
+                return Err(FrankenError::FunctionError(message));
+            }
+            Ok(())
+        }
+
+        fn finalize(&self, mut state: Self::State) -> fsqlite_error::Result<SqliteValue> {
+            if let Some(error) = state.failure.take() {
+                return Err(FrankenError::FunctionError(error));
+            }
+            state
+                .finish()
+                .map_err(|error| FrankenError::FunctionError(error.to_string()))
+        }
+
+        fn num_args(&self) -> i32 {
+            self.n_arg
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
     /// A closure registered as a scalar SQL function.
     pub(super) struct ScalarClosure<F, T> {
         name: String,
@@ -1190,12 +1360,14 @@ pub mod functions {
             // A panic in an earlier call poisons the lock; the closure stays
             // callable, as it does in rusqlite after an `UnwindingPanic`.
             let mut func = self.func.lock().unwrap_or_else(PoisonError::into_inner);
-            catch_unwind(AssertUnwindSafe(|| (*func)(&context)))
-                .unwrap_or(Err(Error::UnwindingPanic))
-                .and_then(|value| value.to_sql().map(engine_value))
-                // SQLite reports a function's error as SQLITE_ERROR with the
-                // error's text (`sqlite3_result_error`), and so does rusqlite.
-                .map_err(|error| FrankenError::FunctionError(error.to_string()))
+            catch_unwind(AssertUnwindSafe(|| {
+                let value = (*func)(&context)?;
+                value.to_sql().map(engine_value)
+            }))
+            .unwrap_or(Err(Error::UnwindingPanic))
+            // SQLite reports a function's error as SQLITE_ERROR with the
+            // error's text (`sqlite3_result_error`), and so does rusqlite.
+            .map_err(|error| FrankenError::FunctionError(error.to_string()))
         }
 
         fn is_deterministic(&self) -> bool {
@@ -1435,6 +1607,18 @@ fn sql_literal(value: &dyn ToSql) -> Result<String> {
 
 /// Entries kept in a connection's parameter-layout cache before it is reset.
 const PARAMETER_CACHE_LIMIT: usize = 512;
+
+fn validate_function_name_arity(name: &str, n_arg: i32) -> Result<()> {
+    let _validated_name = std::ffi::CString::new(name)?;
+    let max_args = i32::from(fsqlite_types::limits::MAX_FUNCTION_ARG);
+    if !(-1..=max_args).contains(&n_arg) || name.len() > 255 {
+        return Err(Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_MISUSE),
+            Some("bad parameter or other API misuse".to_owned()),
+        ));
+    }
+    Ok(())
+}
 
 /// A mutex accepts Send callbacks with interior state that is not Sync,
 /// preserving rusqlite's public callback bound.
@@ -1773,14 +1957,7 @@ impl Connection {
         F: FnMut(&functions::Context<'_>) -> Result<T> + Send + 'static,
         T: ToSql + 'static,
     {
-        // The arguments `sqlite3_create_function` refuses as misuse.
-        let max_args = i32::from(fsqlite_types::limits::MAX_FUNCTION_ARG);
-        if !(-1..=max_args).contains(&n_arg) || fn_name.is_empty() || fn_name.len() > 255 {
-            return Err(Error::SqliteFailure(
-                ffi::Error::new(ffi::SQLITE_MISUSE),
-                Some("bad parameter or other API misuse".to_owned()),
-            ));
-        }
+        validate_function_name_arity(fn_name, n_arg)?;
         let function = functions::ScalarClosure::new(fn_name, n_arg, flags, x_func);
         if function.deterministic() {
             self.as_async()
@@ -1789,6 +1966,38 @@ impl Connection {
             self.as_async()
                 .register_nondeterministic_scalar_function(function);
         }
+        Ok(())
+    }
+
+    /// Add or replace an aggregate SQL function, with a separate accumulator
+    /// for each group. `n_arg` is its argument count, or `-1` for variadic.
+    ///
+    /// Initialization is lazy, and finalization receives `None` for empty
+    /// input. Started accumulators are finalized once even if a step fails
+    /// or execution is abandoned. Callback errors and panics fail the
+    /// statement as in [`Connection::create_scalar_function`].
+    ///
+    /// Text arguments use UTF-8. Flags are accepted for source compatibility
+    /// but do not currently change aggregate execution; in particular,
+    /// `SQLITE_DIRECTONLY`, `SQLITE_INNOCUOUS`, and subtype flags are not
+    /// enforced by this adapter.
+    pub fn create_aggregate_function<A, D, T>(
+        &self,
+        fn_name: &str,
+        n_arg: i32,
+        _flags: functions::FunctionFlags,
+        aggregate: D,
+    ) -> Result<()>
+    where
+        A: std::panic::RefUnwindSafe + std::panic::UnwindSafe + Send + 'static,
+        D: functions::Aggregate<A, T> + Send + 'static,
+        T: ToSql + 'static,
+    {
+        validate_function_name_arity(fn_name, n_arg)?;
+        self.as_async()
+            .register_aggregate_function(functions::AggregateAdapter::<A, D, T>::new(
+                fn_name, n_arg, aggregate,
+            ));
         Ok(())
     }
 
@@ -3043,6 +3252,542 @@ mod tests {
                 "the scenario must reach {needle:?}: {theirs:?}"
             );
         }
+    }
+
+    macro_rules! aggregate_scenario {
+        ($m:ident) => {{
+            use $m::functions::{Aggregate, Context, FunctionFlags};
+
+            struct Sum {
+                factor: i64,
+            }
+
+            impl Aggregate<i64, Option<i64>> for Sum {
+                fn init(&self, ctx: &mut Context<'_>) -> $m::Result<i64> {
+                    // Initialization sees the same arguments as the first step.
+                    for index in 0..ctx.len() {
+                        let _: Option<i64> = ctx.get(index)?;
+                    }
+                    Ok(0)
+                }
+
+                fn step(&self, ctx: &mut Context<'_>, acc: &mut i64) -> $m::Result<()> {
+                    for index in 0..ctx.len() {
+                        if let Some(value) = ctx.get::<Option<i64>>(index)? {
+                            *acc += value * self.factor;
+                        }
+                    }
+                    Ok(())
+                }
+
+                fn finalize(
+                    &self,
+                    ctx: &mut Context<'_>,
+                    acc: Option<i64>,
+                ) -> $m::Result<Option<i64>> {
+                    assert!(ctx.is_empty());
+                    Ok(acc)
+                }
+            }
+
+            struct Calls;
+
+            impl Aggregate<i64, i64> for Calls {
+                fn init(&self, _ctx: &mut Context<'_>) -> $m::Result<i64> {
+                    Ok(0)
+                }
+
+                fn step(&self, _ctx: &mut Context<'_>, acc: &mut i64) -> $m::Result<()> {
+                    *acc += 1;
+                    Ok(())
+                }
+
+                fn finalize(&self, ctx: &mut Context<'_>, acc: Option<i64>) -> $m::Result<i64> {
+                    assert!(ctx.is_empty());
+                    Ok(acc.unwrap_or(0))
+                }
+            }
+
+            fn value(conn: &$m::Connection, sql: &str) -> Option<i64> {
+                conn.query_row(sql, [], |row| row.get(0)).unwrap()
+            }
+
+            let conn = $m::Connection::open_in_memory().unwrap();
+            let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+            conn.create_aggregate_function("custom_sum", 1, flags, Sum { factor: 1 })
+                .unwrap();
+            conn.create_aggregate_function("variadic_sum", -1, flags, Sum { factor: 1 })
+                .unwrap();
+            conn.create_aggregate_function("count_callbacks", 1, flags, Calls)
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE aggregate_data(grp TEXT, value INTEGER);
+                 INSERT INTO aggregate_data VALUES
+                     ('a', 1), ('a', 2), ('a', 2), ('b', 3), ('b', NULL);",
+            )
+            .unwrap();
+            for (sql, expected) in [
+                ("SELECT custom_sum(value) FROM aggregate_data", Some(8)),
+                (
+                    "SELECT custom_sum(DISTINCT value) FROM aggregate_data",
+                    Some(6),
+                ),
+                (
+                    "SELECT custom_sum(value) FILTER (WHERE value > 1) FROM aggregate_data",
+                    Some(7),
+                ),
+                (
+                    "SELECT custom_sum(value) FILTER (WHERE 0) FROM aggregate_data",
+                    None,
+                ),
+                (
+                    "SELECT custom_sum(value) FROM aggregate_data WHERE 0",
+                    None,
+                ),
+                ("SELECT variadic_sum(value, 10) FROM aggregate_data", Some(58)),
+                ("SELECT variadic_sum() FROM aggregate_data", Some(0)),
+                (
+                    "SELECT count_callbacks(DISTINCT value) FROM aggregate_data",
+                    Some(4),
+                ),
+                (
+                    "SELECT count_callbacks(DISTINCT NULL) FROM aggregate_data",
+                    Some(1),
+                ),
+                ("SELECT count_callbacks(NULL) FROM aggregate_data", Some(5)),
+            ] {
+                assert_eq!(value(&conn, sql), expected, "{sql}");
+            }
+            let grouped: Vec<(String, Option<i64>)> = conn
+                .prepare(
+                    "SELECT grp, custom_sum(value) FROM aggregate_data
+                     GROUP BY grp ORDER BY grp",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<$m::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                grouped,
+                [("a".to_owned(), Some(5)), ("b".to_owned(), Some(3))]
+            );
+            let mut held = conn
+                .prepare("SELECT custom_sum(value * ?1) FROM aggregate_data WHERE value >= ?2")
+                .unwrap();
+            assert_eq!(
+                held.query_row([2_i64, 2], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                14
+            );
+            conn.create_aggregate_function("CUSTOM_SUM", 1, flags, Sum { factor: 10 })
+                .unwrap();
+            assert_eq!(
+                held.query_row([2_i64, 2], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                140
+            );
+
+            // Built-in names, including collated arguments and indexed
+            // inputs, must still invoke the registered implementation.
+            conn.execute_batch("CREATE INDEX aggregate_values ON aggregate_data(value)")
+                .unwrap();
+            for name in ["min", "max"] {
+                conn.create_aggregate_function(name, 1, flags, Sum { factor: 1 })
+                    .unwrap();
+                for argument in ["value", "value COLLATE NOCASE"] {
+                    let sql = format!("SELECT {name}({argument}) FROM aggregate_data");
+                    assert_eq!(value(&conn, &sql), Some(8), "{sql}");
+                }
+            }
+
+            // Function names are byte-limited, and empty quoted names are legal.
+            for name in ["".to_owned(), "x".repeat(255)] {
+                conn.create_aggregate_function(name.as_str(), 1, flags, Sum { factor: 1 })
+                    .unwrap();
+                let sql = format!("SELECT \"{name}\"(value) FROM aggregate_data");
+                assert_eq!(value(&conn, &sql), Some(8));
+                conn.create_scalar_function(name.as_str(), 1, flags, |ctx| ctx.get::<i64>(0))
+                    .unwrap();
+                assert_eq!(value(&conn, &format!("SELECT \"{name}\"(7)")), Some(7));
+            }
+            for name in ["x".repeat(256), "é".repeat(128)] {
+                assert_eq!(
+                    conn.create_aggregate_function(name.as_str(), 1, flags, Sum { factor: 1 })
+                        .unwrap_err()
+                        .sqlite_error_code(),
+                    Some($m::ErrorCode::ApiMisuse)
+                );
+                assert_eq!(
+                    conn.create_scalar_function(name.as_str(), 1, flags, |_ctx| Ok(0_i64))
+                        .unwrap_err()
+                        .sqlite_error_code(),
+                    Some($m::ErrorCode::ApiMisuse)
+                );
+            }
+            for n_arg in [-2, i32::MAX] {
+                assert_eq!(
+                    conn.create_aggregate_function("bad_arity", n_arg, flags, Calls)
+                        .unwrap_err()
+                        .sqlite_error_code(),
+                    Some($m::ErrorCode::ApiMisuse)
+                );
+                assert_eq!(
+                    conn.create_scalar_function("bad_arity", n_arg, flags, |_ctx| Ok(0_i64))
+                        .unwrap_err()
+                        .sqlite_error_code(),
+                    Some($m::ErrorCode::ApiMisuse)
+                );
+            }
+            assert!(matches!(
+                conn.create_aggregate_function("bad\0name", 1, flags, Calls),
+                Err($m::Error::NulError(_))
+            ));
+            assert!(matches!(
+                conn.create_scalar_function("bad\0name", 1, flags, |_ctx| Ok(0_i64)),
+                Err($m::Error::NulError(_))
+            ));
+        }};
+    }
+
+    #[test]
+    fn user_aggregates_behave_like_rusqlite() {
+        aggregate_scenario!(stock);
+        aggregate_scenario!(ours);
+    }
+
+    macro_rules! aggregate_lifecycle_scenario {
+        ($m:ident) => {{
+            use $m::functions::{Aggregate, Context, FunctionFlags};
+            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+            use std::sync::{Arc, Mutex};
+
+            struct Accumulator {
+                value: i64,
+                drops: Arc<AtomicUsize>,
+            }
+
+            impl Drop for Accumulator {
+                fn drop(&mut self) {
+                    self.drops.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+            }
+
+            struct FinalValue {
+                value: i64,
+                fail: bool,
+            }
+
+            impl $m::types::ToSql for FinalValue {
+                fn to_sql(&self) -> $m::Result<$m::types::ToSqlOutput<'_>> {
+                    if self.fail {
+                        return Err($m::Error::ToSqlConversionFailure(Box::new(
+                            std::io::Error::other("output failure"),
+                        )));
+                    }
+                    Ok($m::types::ToSqlOutput::Owned($m::types::Value::Integer(
+                        self.value,
+                    )))
+                }
+            }
+
+            struct Recorder {
+                mode: &'static str,
+                events: Arc<Mutex<Vec<String>>>,
+                drops: Arc<AtomicUsize>,
+                // Send but not Sync, just like a valid rusqlite implementation.
+                initializations: std::cell::Cell<usize>,
+            }
+
+            fn failure(message: &str) -> $m::Error {
+                $m::Error::UserFunctionError(Box::new(std::io::Error::other(message.to_owned())))
+            }
+
+            impl Aggregate<Accumulator, FinalValue> for Recorder {
+                fn init(&self, ctx: &mut Context<'_>) -> $m::Result<Accumulator> {
+                    self.initializations.set(self.initializations.get() + 1);
+                    assert_eq!(ctx.len(), 1);
+                    self.events
+                        .lock()
+                        .unwrap()
+                        .push(format!("init:{}", ctx.get::<i64>(0)?));
+                    if self.mode == "init_error" {
+                        return Err(failure("init failure"));
+                    }
+                    assert_ne!(self.mode, "init_panic", "initialization panic");
+                    Ok(Accumulator {
+                        value: 0,
+                        drops: Arc::clone(&self.drops),
+                    })
+                }
+
+                fn step(&self, ctx: &mut Context<'_>, acc: &mut Accumulator) -> $m::Result<()> {
+                    let value: i64 = ctx.get(0)?;
+                    self.events.lock().unwrap().push(format!("step:{value}"));
+                    acc.value += value;
+                    if value == 2 {
+                        if matches!(self.mode, "step_error" | "step_and_final_error") {
+                            return Err(failure("step failure"));
+                        }
+                        assert_ne!(self.mode, "step_panic", "step panic");
+                    }
+                    Ok(())
+                }
+
+                fn finalize(
+                    &self,
+                    ctx: &mut Context<'_>,
+                    acc: Option<Accumulator>,
+                ) -> $m::Result<FinalValue> {
+                    assert!(ctx.is_empty());
+                    let value = acc.as_ref().map(|acc| acc.value);
+                    self.events.lock().unwrap().push(format!("final:{value:?}"));
+                    if matches!(self.mode, "final_error" | "step_and_final_error") {
+                        return Err(failure("final failure"));
+                    }
+                    assert_ne!(self.mode, "final_panic", "finalization panic");
+                    Ok(FinalValue {
+                        value: value.unwrap_or(0),
+                        fail: self.mode == "output_error",
+                    })
+                }
+            }
+
+            let flags = FunctionFlags::SQLITE_UTF8;
+            for mode in [
+                "success",
+                "init_error",
+                "init_panic",
+                "step_error",
+                "step_panic",
+                "step_and_final_error",
+                "final_error",
+                "final_panic",
+                "output_error",
+                "external_error",
+                "empty",
+            ] {
+                let conn = $m::Connection::open_in_memory().unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE lifecycle_data(value INTEGER);
+                     INSERT INTO lifecycle_data VALUES (1), (2), (3);",
+                )
+                .unwrap();
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let drops = Arc::new(AtomicUsize::new(0));
+                conn.create_aggregate_function(
+                    "record",
+                    1,
+                    flags,
+                    Recorder {
+                        mode,
+                        events: Arc::clone(&events),
+                        drops: Arc::clone(&drops),
+                        initializations: std::cell::Cell::new(0),
+                    },
+                )
+                .unwrap();
+                conn.create_scalar_function("check_row", 1, flags, |ctx| {
+                    let value: i64 = ctx.get(0)?;
+                    if value == 2 {
+                        return Err(failure("external failure"));
+                    }
+                    Ok(value)
+                })
+                .unwrap();
+                let sql = match mode {
+                    "external_error" => "SELECT record(check_row(value)) FROM lifecycle_data",
+                    "empty" => "SELECT record(value) FROM lifecycle_data WHERE 0",
+                    _ => "SELECT record(value) FROM lifecycle_data",
+                };
+                let mut held = conn.prepare(sql).unwrap();
+                let result = held.query_row([], |row| row.get::<_, i64>(0));
+                if mode == "success" {
+                    assert_eq!(result.unwrap(), 6);
+                } else if mode == "empty" {
+                    assert_eq!(result.unwrap(), 0);
+                } else {
+                    let error = result.unwrap_err();
+                    let expected = if mode.ends_with("panic") {
+                        "unwinding panic"
+                    } else if mode.starts_with("init") {
+                        "init failure"
+                    } else if mode.starts_with("step") {
+                        "step failure"
+                    } else if mode == "output_error" {
+                        "output failure"
+                    } else if mode == "external_error" {
+                        "external failure"
+                    } else {
+                        "final failure"
+                    };
+                    assert!(
+                        error.to_string().contains(expected),
+                        "{mode}: expected {expected:?}, got {error}"
+                    );
+                }
+
+                // Check before reusing or dropping the prepared statement:
+                // finalization cannot be deferred to a future execution.
+                let expected: Vec<&str> = match mode {
+                    "empty" => vec!["final:None"],
+                    "init_error" | "init_panic" => vec!["init:1", "final:None"],
+                    "external_error" => vec!["init:1", "step:1", "final:Some(1)"],
+                    "step_error" | "step_panic" | "step_and_final_error" => {
+                        vec!["init:1", "step:1", "step:2", "final:Some(3)"]
+                    }
+                    _ => vec!["init:1", "step:1", "step:2", "step:3", "final:Some(6)"],
+                };
+                assert_eq!(*events.lock().unwrap(), expected, "{mode}");
+                let expected_drops =
+                    usize::from(!matches!(mode, "empty" | "init_error" | "init_panic"));
+                assert_eq!(drops.load(AtomicOrdering::SeqCst), expected_drops, "{mode}");
+                drop(held);
+                assert_eq!(*events.lock().unwrap(), expected, "after drop: {mode}");
+                assert_eq!(drops.load(AtomicOrdering::SeqCst), expected_drops, "{mode}");
+            }
+        }};
+    }
+
+    #[test]
+    fn user_aggregate_lifecycles_behave_like_rusqlite() {
+        aggregate_lifecycle_scenario!(stock);
+        aggregate_lifecycle_scenario!(ours);
+    }
+
+    #[test]
+    fn aggregate_state_drop_preserves_callback_lifetime_and_finalizes_once() {
+        use fsqlite_func::AggregateFunction as _;
+        use std::sync::atomic::AtomicUsize;
+
+        struct Cleanup {
+            finalized: Arc<AtomicUsize>,
+        }
+
+        impl functions::Aggregate<i64, i64> for Cleanup {
+            fn init(&self, _ctx: &mut functions::Context<'_>) -> Result<i64> {
+                Ok(0)
+            }
+
+            fn step(&self, ctx: &mut functions::Context<'_>, acc: &mut i64) -> Result<()> {
+                *acc += ctx.get::<i64>(0)?;
+                Ok(())
+            }
+
+            fn finalize(&self, ctx: &mut functions::Context<'_>, acc: Option<i64>) -> Result<i64> {
+                assert!(ctx.is_empty());
+                self.finalized.fetch_add(1, Ordering::SeqCst);
+                Ok(acc.unwrap_or(0))
+            }
+        }
+
+        let finalized = Arc::new(AtomicUsize::new(0));
+        let adapter = functions::AggregateAdapter::<i64, _, i64>::new(
+            "cleanup",
+            1,
+            Cleanup {
+                finalized: Arc::clone(&finalized),
+            },
+        );
+        // Speculative allocation without any callback must do nothing.
+        drop(adapter.initial_state());
+        assert_eq!(finalized.load(Ordering::SeqCst), 0);
+
+        let mut completed = adapter.initial_state();
+        adapter
+            .step(&mut completed, &[SqliteValue::Integer(4)])
+            .unwrap();
+        assert_eq!(adapter.finalize(completed).unwrap(), SqliteValue::Integer(4));
+        assert_eq!(finalized.load(Ordering::SeqCst), 1);
+
+        let mut abandoned = adapter.initial_state();
+        adapter
+            .step(&mut abandoned, &[SqliteValue::Integer(7)])
+            .unwrap();
+        drop(adapter);
+        // The state owns the callback until cleanup, even after replacement
+        // or destruction of the registry's adapter.
+        drop(abandoned);
+        assert_eq!(finalized.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn user_function_output_panics_are_contained_during_result_and_cleanup() {
+        use fsqlite_func::AggregateFunction as _;
+        use std::sync::atomic::AtomicUsize;
+
+        // Outputs need not be Send: conversion and destruction happen on the
+        // callback's thread. Keep this regression ours-only because stock's
+        // ToSql conversion runs outside its callback panic boundary.
+        struct PanickingOutput(Rc<()>);
+
+        impl ToSql for PanickingOutput {
+            fn to_sql(&self) -> Result<types::ToSqlOutput<'_>> {
+                assert_eq!(Rc::strong_count(&self.0), 1);
+                panic!("output conversion panic");
+            }
+        }
+
+        struct OutputAggregate {
+            finalized: Arc<AtomicUsize>,
+        }
+
+        impl functions::Aggregate<(), PanickingOutput> for OutputAggregate {
+            fn init(&self, _ctx: &mut functions::Context<'_>) -> Result<()> {
+                Ok(())
+            }
+
+            fn step(&self, _ctx: &mut functions::Context<'_>, _acc: &mut ()) -> Result<()> {
+                Ok(())
+            }
+
+            fn finalize(
+                &self,
+                _ctx: &mut functions::Context<'_>,
+                _acc: Option<()>,
+            ) -> Result<PanickingOutput> {
+                self.finalized.fetch_add(1, Ordering::SeqCst);
+                Ok(PanickingOutput(Rc::new(())))
+            }
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        let flags = functions::FunctionFlags::SQLITE_UTF8;
+        conn.create_scalar_function("output_panic", 0, flags, |_ctx| {
+            Ok(PanickingOutput(Rc::new(())))
+        })
+        .unwrap();
+        let finalized = Arc::new(AtomicUsize::new(0));
+        conn.create_aggregate_function(
+            "aggregate_output_panic",
+            1,
+            flags,
+            OutputAggregate {
+                finalized: Arc::clone(&finalized),
+            },
+        )
+        .unwrap();
+        for sql in ["SELECT output_panic()", "SELECT aggregate_output_panic(1)"] {
+            let error = conn
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap_err();
+            assert!(error.to_string().contains("unwinding panic"), "{error}");
+        }
+        assert_eq!(finalized.load(Ordering::SeqCst), 1);
+
+        let adapter = functions::AggregateAdapter::<(), _, PanickingOutput>::new(
+            "cleanup_output_panic",
+            1,
+            OutputAggregate {
+                finalized: Arc::clone(&finalized),
+            },
+        );
+        let mut abandoned = adapter.initial_state();
+        adapter
+            .step(&mut abandoned, &[SqliteValue::Integer(1)])
+            .unwrap();
+        drop(abandoned);
+        assert_eq!(finalized.load(Ordering::SeqCst), 2);
     }
 
     /// The same caller code exercises collation binding in scalar expressions,
