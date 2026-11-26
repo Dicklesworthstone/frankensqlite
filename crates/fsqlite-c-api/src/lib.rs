@@ -1216,6 +1216,9 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
             s.last_step_code = SQLITE_ROW;
             SQLITE_ROW
         } else {
+            // The next step after DONE starts a fresh execution with the same
+            // bindings. Release the exhausted result, including for DML.
+            s.rows = None;
             s.active_row = false;
             s.last_step_code = SQLITE_DONE;
             s.text_cache.clear();
@@ -3868,6 +3871,35 @@ mod tests {
         );
         assert!(!stmt.is_null());
         stmt
+    }
+
+    #[test]
+    fn step_after_done_reexecutes_with_retained_bindings() {
+        unsafe {
+            let db = open_memory();
+            schema_exec_ok(db, "CREATE TABLE t(v INTEGER)");
+            let insert = prepare(db, "INSERT INTO t VALUES (?1)");
+            let select = prepare(db, "SELECT v FROM t ORDER BY rowid");
+
+            // The empty SELECT reaches DONE immediately. Its next execution
+            // must see subsequent writes.
+            assert_eq!(sqlite3_step(select), SQLITE_DONE);
+            assert_eq!(sqlite3_bind_int(insert, 1, 42), SQLITE_OK);
+            assert_eq!(sqlite3_step(insert), SQLITE_DONE);
+            assert_eq!(sqlite3_step(insert), SQLITE_DONE);
+            assert_eq!(sqlite3_total_changes(db), 2);
+
+            for _ in 0..2 {
+                assert_eq!(sqlite3_step(select), SQLITE_ROW);
+                assert_eq!(sqlite3_column_int(select, 0), 42);
+            }
+            assert_eq!(sqlite3_step(select), SQLITE_DONE);
+            schema_exec_ok(db, "DELETE FROM t");
+            assert_eq!(sqlite3_step(select), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(select), SQLITE_OK);
+            assert_eq!(sqlite3_finalize(insert), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
     }
 
     #[test]
