@@ -36145,3 +36145,43 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   probe 4 (+0.5%, layout-averaged) and probe 3 (no wait past busy_timeout
   + 1 s in 60 churn loops). If no construction keeps the uncontended path
   instruction-neutral, bounding the wait is a design question for the owner.
+
+## 2026-11-26 — A 5 s io_uring read deadline and late-write report in the shared ring driver (bd-2sf0f): killed by a replicated cold-scan cycles LOSE (re-judge under bd-j0jc0/bd-gvews)
+
+- What: crates/fsqlite-vfs/src/uring.rs, a robustness change, not a perf lever.
+  - The shared ring driver stamps each SQE when it stages it, and checks its in-flight requests once the earliest can
+    have passed 5 s.
+  - A read past 5 s is answered TimedOut, reread through the Unix path, and the ring is disabled.
+  - A write past 5 s is reported once and still waited for.
+  - The patch, with its keepers, is kept as the corruption lane's round-9 landing patch (local commit 1765b6e41 on
+    a1630c3f6); it was never pushed.
+- Correctness was green:
+  - the pipe keeper is red on main;
+  - the mutant is red on four keepers;
+  - the lever passes 5/5 keepers three times, and the vfs lib 546/0;
+  - clippy is clean;
+  - the core cross-process battery and gh534 fault-injection pass;
+  - the e2e cross-process keepers pass, except bd-ze4zu's flake, which is identically red on the parent.
+- The rows never run the changed code. strace of the release-perf CLI shows io_uring_enter 0, because no native Cx is
+  attached on Connection::open -> execute (bd-fo6xw).
+- Setup: arms built as a pair on hz4 (-j 2, K=6). Measured on thinkstation1 (governor powersave) under judge v2b's
+  copies, with stock SQLite 3.54.1 live.
+- judge v2b reads half, two runs, both valid: every row a replicated TIE.
+  - Instructions L/P were 0.9996-1.0007 across all ten rows.
+  - rowid_lookups_200k: Ir 0.9997 / 0.9997, cpu TIE. Against stock, fsqlite is at Ir x4.80 and cpu x1.68-1.73,
+    the same as its parent.
+- cr9_rd_probe, two runs, both valid:
+  - point_lookup_20k (hot): Ir 1.0000 / 0.9999, cpu and cyc TIE; Ir x4.56 against stock.
+  - cold_scan (page cache dropped before each run): Ir 0.9999 / 1.0000, cpu TIE (0.988 / 1.013).
+    cycles:u were 1.0175 / 1.0199 against T 1.49% / 1.43%: a replicated LOSE above 1%, which is the posted kill line.
+    The row's own A/A drifted too (Q/P 1.006 / 1.010).
+- Verdict: killed by the posted line. The instructions are identical and the code is not on the path, so this looks
+  like the known layout/history class (bd-j0jc0/bd-gvews). The rule still applies with no loosening: re-judge under
+  bd-j0jc0/bd-gvews.
+- Retry condition, any of:
+  - a judge whose A/A on cold_scan passes once the host's governor is fixed (bd-j0jc0/bd-gvews), re-run with the
+    same two rows;
+  - an owner decision that a robustness fix whose code the measured rows never execute is judged on instructions
+    only;
+  - a variant that adds less text to the binary (the deadline scan out of line, #[cold]), judged the same way.
+
