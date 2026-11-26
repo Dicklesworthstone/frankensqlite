@@ -733,3 +733,366 @@ fn bd_6tmuj_alternating_view_chain_matches_stock_on_2mib_stack() {
         assert_eq!(frank_rows(runtime, conn, &answered), expected);
     });
 }
+
+// ---------------------------------------------------------------------------
+// bd-5iud6: nested scalar/EXISTS/IN/CASE subqueries and view chains nesting
+// multiple scalar subqueries per view level must neither overflow the native
+// stack nor hit exponential validation blowup.
+// ---------------------------------------------------------------------------
+
+fn nested_scalar_subquery(depth: usize, leaf: &str) -> String {
+    let mut sql = leaf.to_owned();
+    for _ in 0..depth {
+        sql = format!("(SELECT {sql})");
+    }
+    format!("SELECT {sql};")
+}
+
+fn nested_exists_subquery(depth: usize) -> String {
+    let mut sql = "SELECT 1".to_owned();
+    for _ in 0..depth {
+        sql = format!("SELECT 1 WHERE EXISTS ({sql})");
+    }
+    format!("SELECT EXISTS ({sql});")
+}
+
+fn nested_in_subquery(depth: usize) -> String {
+    let mut sql = "SELECT 1".to_owned();
+    for _ in 0..depth {
+        sql = format!("SELECT 1 WHERE 1 IN ({sql})");
+    }
+    format!("SELECT 1 IN ({sql});")
+}
+
+fn nested_case_subquery(depth: usize) -> String {
+    let mut sql = "1".to_owned();
+    for _ in 0..depth {
+        sql = format!("(SELECT CASE {sql} WHEN 1 THEN 1 ELSE 0 END)");
+    }
+    format!("SELECT {sql};")
+}
+
+fn nested_derived_table(depth: usize) -> String {
+    let mut sql = "SELECT 1 AS x".to_owned();
+    for _ in 0..depth {
+        sql = format!("SELECT x FROM ({sql})");
+    }
+    format!("{sql};")
+}
+
+fn frank_prepared_rows(
+    runtime: &asupersync::runtime::Runtime,
+    conn: &Connection,
+    sql: &str,
+) -> Vec<Vec<String>> {
+    let stmt = runtime
+        .block_on(conn.prepare(sql))
+        .unwrap_or_else(|error| panic!("fsqlite failed to prepare `{sql}`: {error:?}"));
+    let rows = runtime
+        .block_on(stmt.query())
+        .unwrap_or_else(|error| panic!("fsqlite prepared query failed `{sql}`: {error:?}"));
+    rows.iter()
+        .map(|row| row.values().iter().map(frank_value).collect())
+        .collect()
+}
+
+fn assert_direct_and_prepared_match_stock(
+    runtime: &asupersync::runtime::Runtime,
+    conn: &Connection,
+    stock: &rusqlite::Connection,
+    sql: &str,
+) {
+    let expected = stock_rows(stock, sql);
+    let direct = frank_rows(runtime, conn, sql);
+    let prepared = frank_prepared_rows(runtime, conn, sql);
+    assert_eq!(direct, expected, "direct query mismatch on `{sql}`");
+    assert_eq!(prepared, expected, "prepared query mismatch on `{sql}`");
+}
+
+fn on_pinned_stack<F>(stack_bytes: usize, label: &str, workload: F)
+where
+    F: FnOnce(&asupersync::runtime::Runtime) + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(label.to_owned())
+        .stack_size(stack_bytes)
+        .spawn(move || {
+            let dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            tracing::dispatcher::with_default(&dispatch, || {
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("current-thread runtime should build");
+                workload(&runtime);
+            });
+        })
+        .unwrap_or_else(|error| panic!("spawn {stack_bytes}-byte `{label}` thread: {error}"))
+        .join()
+        .unwrap_or_else(|panic| panic!("{stack_bytes}-byte `{label}` thread panicked: {panic:?}"));
+}
+
+/// Without views, `SELECT (SELECT (... (SELECT 1) ...))` used to abort a 2 MiB
+/// thread at depth 12, take 29 s at depth 24, and fail to finish within 10 min
+/// at depth 32 because collation validation re-walked subqueries
+/// `O((1 + sqrt(2))^d)` times and nested subquery execution had no stack
+/// checkpoint. Both `:memory:` and file-backed, direct and prepared, must
+/// agree with live stock SQLite cleanly and fast on a 2 MiB thread.
+#[test]
+fn bd_5iud6_nested_scalar_subqueries_on_2mib_stack() {
+    const NAME: &str = "bd_5iud6_nested_scalar_subqueries_on_2mib_stack";
+    if !is_helper_for(NAME) {
+        run_in_helper_process(NAME);
+        return;
+    }
+    on_pinned_stack(SMALL_STACK_BYTES, "bd-5iud6-2mib", |runtime| {
+        let tmp = tempfile::tempdir().expect("tempdir for file-backed bd-5iud6 check");
+        let file_db_path = tmp.path().join("bd_5iud6.db");
+        let file_db_str = file_db_path.to_str().expect("utf-8 tempdir path");
+
+        for (mode, path) in [("memory", ":memory:"), ("file", file_db_str)] {
+            let conn = runtime
+                .block_on(Connection::open(path))
+                .unwrap_or_else(|error| panic!("open {mode} fsqlite connection: {error:?}"));
+            let stock = rusqlite::Connection::open_in_memory().expect("open stock SQLite");
+
+            // Plain nested scalar subqueries across the bead's failure depths
+            // and up to stock SQLite's own expression-depth threshold (stock
+            // refuses depth 45+ with "Expression tree is too large"), including
+            // a timing guard against O(2.414^d) regression.
+            for depth in [12_usize, 20, 24, 32, 40] {
+                let sql = nested_scalar_subquery(depth, "1");
+                let started = Instant::now();
+                assert_direct_and_prepared_match_stock(runtime, &conn, &stock, &sql);
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed < Duration::from_secs(15),
+                    "{mode}: depth-{depth} nested scalar subquery took {elapsed:?} \
+                     (expected sub-second; exponential validation regression?)"
+                );
+            }
+            // Also verify depth 64 directly on fsqlite without overflowing the
+            // 2 MiB thread or regressing into exponential validation time.
+            {
+                let sql = nested_scalar_subquery(64, "1");
+                let started = Instant::now();
+                assert_eq!(
+                    frank_rows(runtime, &conn, &sql),
+                    vec![vec!["int:1".to_owned()]]
+                );
+                assert_eq!(
+                    frank_prepared_rows(runtime, &conn, &sql),
+                    vec![vec!["int:1".to_owned()]]
+                );
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed < Duration::from_secs(15),
+                    "{mode}: depth-64 nested scalar subquery took {elapsed:?}"
+                );
+            }
+
+            // Nested EXISTS, IN, CASE, and derived tables at depth 24.
+            for sql in [
+                nested_exists_subquery(24),
+                nested_in_subquery(24),
+                nested_case_subquery(24),
+                nested_derived_table(24),
+            ] {
+                assert_direct_and_prepared_match_stock(runtime, &conn, &stock, &sql);
+            }
+
+            // Table-backed correlated nested scalar subqueries (20 deep).
+            let setup = [
+                "CREATE TABLE t_nested(k INTEGER PRIMARY KEY, v INTEGER);".to_owned(),
+                "INSERT INTO t_nested(k, v) VALUES (1, 10), (2, 20), (3, 30);".to_owned(),
+            ];
+            apply_to_both(runtime, &conn, &stock, &setup);
+            let mut correlated = "v + k".to_owned();
+            for _ in 0..20 {
+                correlated = format!("(SELECT {correlated})");
+            }
+            let correlated_sql = format!("SELECT k, {correlated} FROM t_nested ORDER BY k;");
+            assert_direct_and_prepared_match_stock(runtime, &conn, &stock, &correlated_sql);
+
+            // Memoizing collation consumer visits must preserve error
+            // reporting for an unresolved collation buried deep inside nested
+            // scalar subqueries.
+            let bad_collation_sql =
+                nested_scalar_subquery(24, "'a' = 'b' COLLATE bd_5iud6_missing_collation");
+            let expected_msg = stock_refusal(&stock, &bad_collation_sql);
+            let actual_err = runtime
+                .block_on(conn.query(&bad_collation_sql))
+                .expect_err("deep invalid collation must still be rejected");
+            assert_eq!(
+                actual_err.to_string(),
+                expected_msg,
+                "{mode}: deep invalid collation diagnostic mismatch"
+            );
+
+            // Connection stays healthy after both deep queries and deep error.
+            assert_eq!(
+                frank_rows(runtime, &conn, "SELECT 41 + 1;"),
+                vec![vec!["int:42".to_owned()]]
+            );
+        }
+    });
+    println!("{HELPER_DONE_MARKER}");
+}
+
+/// Exact `bd-5iud6` view-chain repro: 16 view levels where each level nests
+/// three scalar subqueries (`CREATE VIEW v{i} AS SELECT (SELECT (SELECT
+/// (SELECT x FROM v{i-1}) AS x) AS x) AS x`). Swept across all 62 thread stack
+/// sizes from 768 KiB to 16 MiB in 256 KiB steps (12/62 including 8 MiB used
+/// to abort with only a view-boundary stack checkpoint), plus a file-backed
+/// check on a 2 MiB stack.
+#[test]
+fn bd_5iud6_view_chain_nesting_three_subqueries_across_stack_sweep() {
+    const NAME: &str = "bd_5iud6_view_chain_nesting_three_subqueries_across_stack_sweep";
+    if !is_helper_for(NAME) {
+        run_in_helper_process(NAME);
+        return;
+    }
+
+    let mut setup = vec!["CREATE VIEW v0 AS SELECT 1 AS x;".to_owned()];
+    setup.extend((1..=16_usize).map(|level| {
+        let prev = level - 1;
+        format!(
+            "CREATE VIEW v{level} AS SELECT (SELECT (SELECT (SELECT x FROM v{prev}) AS x) AS x) AS x;"
+        )
+    }));
+    let query = "SELECT * FROM v16;";
+
+    let stock = rusqlite::Connection::open_in_memory().expect("open stock SQLite");
+    for statement in &setup {
+        stock
+            .execute_batch(statement)
+            .unwrap_or_else(|error| panic!("stock SQLite failed `{statement}`: {error}"));
+    }
+    let expected = stock_rows(&stock, query);
+    assert_eq!(expected, vec![vec!["int:1".to_owned()]]);
+
+    // Sweep 768 KiB ..= 16 MiB in 256 KiB steps (62 sizes).
+    for step in 3..=64_usize {
+        let stack_bytes = step * 256 * 1024;
+        let setup_clone = setup.clone();
+        let expected_clone = expected.clone();
+        let check_prepared = matches!(step, 3 | 8 | 32);
+        on_pinned_stack(stack_bytes, &format!("bd-5iud6-sweep-{step}"), move |runtime| {
+            let conn = runtime
+                .block_on(Connection::open(":memory:"))
+                .expect("open in-memory connection");
+            for statement in &setup_clone {
+                runtime
+                    .block_on(conn.execute(statement))
+                    .unwrap_or_else(|error| {
+                        panic!("stack={stack_bytes}: failed `{statement}`: {error:?}")
+                    });
+            }
+            let actual = frank_rows(runtime, &conn, query);
+            assert_eq!(
+                actual, expected_clone,
+                "stack={stack_bytes}: direct `{query}` differed from stock"
+            );
+            if check_prepared {
+                let prepared = frank_prepared_rows(runtime, &conn, query);
+                assert_eq!(
+                    prepared, expected_clone,
+                    "stack={stack_bytes}: prepared `{query}` differed from stock"
+                );
+            }
+        });
+    }
+
+    // Also verify the exact same 16-level 3-subquery view chain on a
+    // file-backed database on a 2 MiB stack (direct + prepared).
+    let setup_file = setup;
+    let expected_file = expected;
+    on_pinned_stack(SMALL_STACK_BYTES, "bd-5iud6-file-2mib", move |runtime| {
+        let tmp = tempfile::tempdir().expect("tempdir for file-backed view sweep");
+        let db_path = tmp.path().join("bd_5iud6_views.db");
+        let conn = runtime
+            .block_on(Connection::open(db_path.to_str().expect("utf-8 path")))
+            .expect("open file-backed connection");
+        for statement in &setup_file {
+            runtime
+                .block_on(conn.execute(statement))
+                .unwrap_or_else(|error| panic!("file-backed failed `{statement}`: {error:?}"));
+        }
+        assert_eq!(frank_rows(runtime, &conn, query), expected_file);
+        assert_eq!(frank_prepared_rows(runtime, &conn, query), expected_file);
+    });
+
+    println!("{HELPER_DONE_MARKER}");
+}
+
+/// GH#414 preservation check for `bd-5iud6`: adding a native-stack checkpoint
+/// to `Statement::Select` execution must NOT shift trigger/FK DML recursion
+/// off the caller's thread stack, so `ensure_native_stack_headroom` and the
+/// configured `MAX_TRIGGER_DEPTH` cap still fire cleanly with
+/// `FrankenError::TriggerRecursionDepthExceeded` on pinned 4 MiB and 1 MiB
+/// stacks — both for plain ping-pong triggers and for triggers whose bodies
+/// evaluate nested scalar subqueries.
+#[test]
+fn bd_5iud6_preserves_gh414_recursive_trigger_depth_limit() {
+    const NAME: &str = "bd_5iud6_preserves_gh414_recursive_trigger_depth_limit";
+    if !is_helper_for(NAME) {
+        run_in_helper_process(NAME);
+        return;
+    }
+
+    for (label, stack_bytes, delta_expr) in [
+        ("gh414-plain-4mib", 4 * 1024 * 1024, "1"),
+        ("gh414-tight-1mib", 1024 * 1024, "1"),
+        (
+            "gh414-subquery-4mib",
+            4 * 1024 * 1024,
+            "(SELECT (SELECT (SELECT (SELECT 1))))",
+        ),
+    ] {
+        on_pinned_stack(stack_bytes, label, move |runtime| {
+            let conn = runtime
+                .block_on(Connection::open(":memory:"))
+                .expect("open in-memory connection");
+            for stmt in [
+                "PRAGMA recursive_triggers = ON;",
+                "CREATE TABLE a (n INTEGER);",
+                "CREATE TABLE b (n INTEGER);",
+                "INSERT INTO a VALUES (0);",
+                "INSERT INTO b VALUES (0);",
+                &format!(
+                    "CREATE TRIGGER trg_a AFTER UPDATE ON a \
+                     BEGIN UPDATE b SET n = NEW.n + {delta_expr}; END;"
+                ),
+                &format!(
+                    "CREATE TRIGGER trg_b AFTER UPDATE ON b \
+                     BEGIN UPDATE a SET n = NEW.n + {delta_expr}; END;"
+                ),
+            ] {
+                runtime
+                    .block_on(conn.execute(stmt))
+                    .unwrap_or_else(|error| panic!("{label}: setup `{stmt}` failed: {error:?}"));
+            }
+            let error = runtime
+                .block_on(conn.execute("UPDATE a SET n = 1;"))
+                .expect_err("recursive trigger cap must fire");
+            assert!(
+                matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                "{label}: expected TriggerRecursionDepthExceeded, got {error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "too many levels of trigger recursion",
+                "{label}: unexpected trigger-depth error message"
+            );
+            assert!(
+                !conn.in_transaction(),
+                "{label}: failed autocommit trigger statement must leave no transaction open"
+            );
+            assert_eq!(
+                frank_rows(runtime, &conn, "SELECT (SELECT n FROM a), (SELECT n FROM b);"),
+                vec![vec!["int:0".to_owned(), "int:0".to_owned()]],
+                "{label}: failed recursive trigger must roll back all nested writes"
+            );
+        });
+    }
+
+    println!("{HELPER_DONE_MARKER}");
+}

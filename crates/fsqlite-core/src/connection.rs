@@ -967,37 +967,44 @@ fn run_with_native_stack_reserve<R>(
     run()
 }
 
-/// Polls the statement future of one materialized view body with at least
-/// [`VIEW_BODY_EXECUTION_STACK_RED_ZONE_BYTES`] of native stack, moving each
-/// poll to a heap-allocated stack segment when the thread's own stack is
-/// shorter than that (bd-5haia). The future's state already lives on the
-/// heap; only the poll frames are placed. This is what keeps view chains
-/// linked through WITH clauses, derived tables or subqueries — which still
-/// re-enter statement execution once per view — from overflowing the
-/// caller's stack before the nesting cap stops them.
+/// Polls a nested `SELECT` fallback future that bypasses
+/// `FallbackStatementFuture` (such as direct `execute_select_via_memdb_fallback`
+/// calls) with at least [`VIEW_BODY_EXECUTION_STACK_RED_ZONE_BYTES`] of native
+/// stack, moving each poll to a heap-allocated stack segment when the thread's
+/// own stack is shorter than that (bd-5haia, bd-5iud6).
 ///
-/// That holds only while the work between two view boundaries fits in the
-/// red zone. A view level whose body nests several scalar subqueries
-/// re-enters statement execution once per subquery and can exceed it,
-/// because nested subqueries themselves have no stack checkpoint (bd-5iud6).
-struct ViewBodyExecution<'a> {
-    statement: Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>>,
+/// Ordinary `Statement::Select` executions (top-level and nested) already get
+/// the same checkpoint directly inside `FallbackStatementFuture::poll`, while
+/// trigger and FK-cascade DML stay directly on the caller's stack so GH#414's
+/// `ensure_native_stack_headroom` measures real per-level stack consumption.
+struct StackReservedFuture<'a, T> {
+    future: Pin<Box<dyn Future<Output = T> + 'a>>,
 }
 
-impl Future for ViewBodyExecution<'_> {
-    type Output = Result<Vec<Row>>;
+impl<T> Future for StackReservedFuture<'_, T> {
+    type Output = T;
 
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let statement = &mut self.get_mut().statement;
+        let future = &mut self.get_mut().future;
         run_with_native_stack_reserve(
             VIEW_BODY_EXECUTION_STACK_RED_ZONE_BYTES,
             VIEW_BODY_EXECUTION_STACK_SEGMENT_BYTES,
-            || statement.as_mut().poll(cx),
+            || future.as_mut().poll(cx),
         )
     }
+}
+
+/// Poll `future` through [`StackReservedFuture`] so nested SELECT / subquery
+/// execution gets its own native-stack checkpoint per statement level
+/// (bd-5haia, bd-5iud6).
+#[inline]
+fn with_statement_stack_reserve<'a, T>(
+    future: Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> StackReservedFuture<'a, T> {
+    StackReservedFuture { future }
 }
 
 thread_local! {
@@ -15329,7 +15336,15 @@ impl Drop for FallbackStatementGuard<'_> {
 struct FallbackStatementFuture<'a, T> {
     conn: &'a Connection,
     statement_id: Option<u64>,
+    reserve_native_stack: bool,
     inner: Pin<Box<dyn Future<Output = T> + 'a>>,
+}
+
+impl<T> FallbackStatementFuture<'_, T> {
+    const fn with_native_stack_reserve(mut self, reserve_native_stack: bool) -> Self {
+        self.reserve_native_stack = reserve_native_stack;
+        self
+    }
 }
 
 impl<T> Future for FallbackStatementFuture<'_, T> {
@@ -15348,7 +15363,15 @@ impl<T> Future for FallbackStatementFuture<'_, T> {
             slot: &this.conn.fallback_statement_id,
             previous,
         };
-        this.inner.as_mut().poll(cx)
+        if this.reserve_native_stack {
+            run_with_native_stack_reserve(
+                VIEW_BODY_EXECUTION_STACK_RED_ZONE_BYTES,
+                VIEW_BODY_EXECUTION_STACK_SEGMENT_BYTES,
+                || this.inner.as_mut().poll(cx),
+            )
+        } else {
+            this.inner.as_mut().poll(cx)
+        }
     }
 }
 
@@ -27902,6 +27925,7 @@ impl Connection {
         FallbackStatementFuture {
             conn: self,
             statement_id: None,
+            reserve_native_stack: false,
             inner,
         }
     }
@@ -32520,7 +32544,7 @@ impl Connection {
         let _replay = self.txn_replay_enter_neutral();
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
-        self.prepare_after_background_status(sql).await
+        with_statement_stack_reserve(Box::pin(self.prepare_after_background_status(sql))).await
     }
 
     async fn prepare_after_background_status(&self, sql: &str) -> Result<PreparedStatement<'_>> {
@@ -33130,7 +33154,7 @@ impl Connection {
                 None => break 'dqs Err(first),
             };
             loop {
-                match self.query_impl(&cur).await {
+                match boxed_future(|| self.query_impl(&cur)).await {
                     Ok(v) => break 'dqs Ok(v),
                     Err(e) => {
                         cur = match self.dqs_rewrite_once(&cur, &e, &mut rewritten) {
@@ -33644,7 +33668,7 @@ impl Connection {
                 None => break 'dqs Err(first),
             };
             loop {
-                match self.execute_impl(&cur).await {
+                match boxed_future(|| self.execute_impl(&cur)).await {
                     Ok(v) => break 'dqs Ok(v),
                     Err(e) => {
                         cur = match self.dqs_rewrite_once(&cur, &e, &mut rewritten) {
@@ -33755,17 +33779,20 @@ impl Connection {
             if let Statement::Select(select) = statements[0].as_ref() {
                 self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
             }
-            let prepared = self.prepare_after_background_status(sql).await?;
+            let prepared =
+                with_statement_stack_reserve(Box::pin(self.prepare_after_background_status(sql)))
+                    .await?;
             // A peer's DDL can land between this prepare and the execution's
             // schema refresh; re-prepare like `PreparedStatement::execute` and
             // stock's sqlite3_exec instead of surfacing SchemaChanged.
-            return prepared
-                .with_same_connection_schema_reprepare(async |stmt| {
+            return boxed_future(|| {
+                prepared.with_same_connection_schema_reprepare(async |stmt| {
                     stmt.conn
                         .execute_prepared_autocommit_with_conflict_retry(stmt, &[])
                         .await
                 })
-                .await;
+            })
+            .await;
         }
         // Preserve the verbatim text of every top-level CREATE so it persists
         // into sqlite_master exactly as written (matching stock SQLite), rather
@@ -35028,6 +35055,7 @@ impl Connection {
             self.note_connection_statement_execution_count(1);
             Ok(rows)
         }))
+        .with_native_stack_reserve(stmt.dml_dispatch.is_none())
         .await
     }
 
@@ -35178,6 +35206,7 @@ impl Connection {
                 (Err(err), Some(_)) => Err(err),
             }
         }))
+        .with_native_stack_reserve(stmt.dml_dispatch.is_none())
         .await
     }
 
@@ -35437,6 +35466,7 @@ impl Connection {
             }
             row_result
         }))
+        .with_native_stack_reserve(stmt.dml_dispatch.is_none())
         .await
     }
 
@@ -44127,6 +44157,19 @@ impl Connection {
         statement: &'a Statement,
         params: Option<&'a [SqliteValue]>,
     ) -> FallbackStatementFuture<'a, Result<Vec<Row>>> {
+        // bd-5haia / bd-5iud6: every SELECT execution (top-level or nested via
+        // view flattening/materialization, scalar/EXISTS/IN subqueries, derived
+        // tables, CTEs, or compound arms) polls with at least
+        // VIEW_BODY_EXECUTION_STACK_RED_ZONE_BYTES of native stack so nested
+        // SELECT re-entry never overflows the caller's thread stack. Trigger
+        // and FK-cascade DML (`INSERT`/`UPDATE`/`DELETE`) keep
+        // `reserve_native_stack = false` so GH#414's
+        // `ensure_native_stack_headroom` measures real per-level native stack
+        // consumption on the caller's thread.
+        let reserve_native_stack = matches!(
+            statement,
+            Statement::Select(_) | Statement::CreateView(_)
+        );
         self.with_fallback_statement(Box::pin(async move {
             // bd-q4o7z: a statement a replay may not re-run ends the
             // transaction's replay record.
@@ -44357,6 +44400,7 @@ impl Connection {
             }
             result
         }))
+        .with_native_stack_reserve(reserve_native_stack)
     }
 
     /// One attempt of a statement. Awaited inline (through `lean_future`) by
@@ -45780,9 +45824,10 @@ impl Connection {
                         || expression_only_limit_requires_dynamic_evaluation(select)
                         || select_has_in_subquery_operand_requiring_semantic_fallback(select, self))
                 {
-                    return self
-                        .execute_expression_only_with_subqueries(select, params)
-                        .await;
+                    return boxed_future(|| {
+                        self.execute_expression_only_with_subqueries(select, params)
+                    })
+                    .await;
                 }
                 // bd-k66zh: a core that owns an aggregate call of its subqueries
                 // is an aggregate the compiled lanes would read as a plain scan,
@@ -87538,11 +87583,9 @@ impl Connection {
                             &mut Vec::new(),
                         ))
                     });
-                    let view_rows = ViewBodyExecution {
-                        statement: self
-                            .execute_statement(&Statement::Select(executable_view_query), None),
-                    }
-                    .await?;
+                    let view_rows = self
+                        .execute_statement(&Statement::Select(executable_view_query), None)
+                        .await?;
                     // bd-ws183: an explicit `CREATE VIEW v(c1, c2, ...)` column
                     // list renames the view's output columns; only fall back to
                     // the SELECT's own result names when no list was declared.
@@ -104935,7 +104978,10 @@ impl Connection {
                         SelectCore::Select { from: Some(_), .. }
                     )
                 {
-                    Box::pin(self.execute_select_via_memdb_fallback(&select, params)).await
+                    with_statement_stack_reserve(Box::pin(
+                        self.execute_select_via_memdb_fallback(&select, params),
+                    ))
+                    .await
                 } else {
                     self.execute_statement(&Statement::Select(select), params)
                         .await
@@ -111687,9 +111733,10 @@ impl Connection {
             };
             if let Some(target_schema) = attached_schema {
                 if select_references_allowed_local_tables(&stripped, &cte_names) {
-                    return self
-                        .execute_select_via_memdb_fallback(&stripped, params)
-                        .await;
+                    return with_statement_stack_reserve(Box::pin(
+                        self.execute_select_via_memdb_fallback(&stripped, params),
+                    ))
+                    .await;
                 }
                 // T1.5: the stripped query references ONLY the attached
                 // schema (proved by the branch above returning false).
@@ -114333,7 +114380,10 @@ impl Connection {
                     .await
             }
             RecursiveCteArmExecutionPlan::Statement(select) => {
-                self.execute_select_via_memdb_fallback(select, params).await
+                with_statement_stack_reserve(Box::pin(
+                    self.execute_select_via_memdb_fallback(select, params),
+                ))
+                .await
             }
         }
     }
@@ -114589,74 +114639,85 @@ impl Connection {
         select: &SelectStatement,
         outer_ctes: &[fsqlite_ast::Cte],
     ) -> Result<()> {
-        let mut visible_ctes = outer_ctes.to_vec();
-        if let Some(with) = &select.with {
-            for cte in &with.ctes {
-                visible_ctes.push(cte.clone());
+        with_view_expansion_stack(|| {
+            let mut visible_ctes = outer_ctes.to_vec();
+            if let Some(with) = &select.with {
+                for cte in &with.ctes {
+                    visible_ctes.push(cte.clone());
+                }
+                for cte in &with.ctes {
+                    self.validate_select_table_function_forward_refs(&cte.query, &visible_ctes)?;
+                }
             }
-            for cte in &with.ctes {
-                self.validate_select_table_function_forward_refs(&cte.query, &visible_ctes)?;
-            }
-        }
-        for core in std::iter::once(&select.body.select)
-            .chain(select.body.compounds.iter().map(|(_, core)| core))
-        {
-            match core {
-                SelectCore::Select {
-                    columns,
-                    from,
-                    where_clause,
-                    group_by,
-                    having,
-                    windows,
-                    ..
-                } => {
-                    if let Some(from) = from {
-                        self.validate_from_clause_table_function_forward_refs(from, &visible_ctes)?;
-                    }
-                    for column in columns {
-                        if let ResultColumn::Expr { expr, .. } = column {
-                            self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
-                        }
-                    }
-                    if let Some(expr) = where_clause {
-                        self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
-                    }
-                    for expr in group_by {
-                        self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
-                    }
-                    if let Some(expr) = having {
-                        self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
-                    }
-                    for window in windows {
-                        for expr in &window.spec.partition_by {
-                            self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
-                        }
-                        for term in &window.spec.order_by {
-                            self.validate_expr_table_function_forward_refs(
-                                &term.expr,
+            for core in std::iter::once(&select.body.select)
+                .chain(select.body.compounds.iter().map(|(_, core)| core))
+            {
+                match core {
+                    SelectCore::Select {
+                        columns,
+                        from,
+                        where_clause,
+                        group_by,
+                        having,
+                        windows,
+                        ..
+                    } => {
+                        if let Some(from) = from {
+                            self.validate_from_clause_table_function_forward_refs(
+                                from,
                                 &visible_ctes,
                             )?;
                         }
+                        for column in columns {
+                            if let ResultColumn::Expr { expr, .. } = column {
+                                self.validate_expr_table_function_forward_refs(
+                                    expr,
+                                    &visible_ctes,
+                                )?;
+                            }
+                        }
+                        if let Some(expr) = where_clause {
+                            self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
+                        }
+                        for expr in group_by {
+                            self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
+                        }
+                        if let Some(expr) = having {
+                            self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
+                        }
+                        for window in windows {
+                            for expr in &window.spec.partition_by {
+                                self.validate_expr_table_function_forward_refs(
+                                    expr,
+                                    &visible_ctes,
+                                )?;
+                            }
+                            for term in &window.spec.order_by {
+                                self.validate_expr_table_function_forward_refs(
+                                    &term.expr,
+                                    &visible_ctes,
+                                )?;
+                            }
+                        }
                     }
-                }
-                SelectCore::Values(rows) => {
-                    for expr in rows.iter().flatten() {
-                        self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
+                    SelectCore::Values(rows) => {
+                        for expr in rows.iter().flatten() {
+                            self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
+                        }
                     }
                 }
             }
-        }
-        for term in &select.order_by {
-            self.validate_expr_table_function_forward_refs(&term.expr, &visible_ctes)?;
-        }
-        if let Some(limit) = &select.limit {
-            self.validate_expr_table_function_forward_refs(&limit.limit, &visible_ctes)?;
-            if let Some(offset) = &limit.offset {
-                self.validate_expr_table_function_forward_refs(offset, &visible_ctes)?;
+            for term in &select.order_by {
+                self.validate_expr_table_function_forward_refs(&term.expr, &visible_ctes)?;
             }
-        }
-        Ok(())
+            if let Some(limit) = &select.limit {
+                self.validate_expr_table_function_forward_refs(&limit.limit, &visible_ctes)?;
+                if let Some(offset) = &limit.offset {
+                    self.validate_expr_table_function_forward_refs(offset, &visible_ctes)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn validate_expr_table_function_forward_refs(
@@ -145793,81 +145854,63 @@ fn substitute_outer_refs_in_select_scoped(
     ancestor_unqualified_columns: Option<&HashSet<String>>,
     outer_cte_scopes: &CteScopes,
 ) {
-    // Derived before the walk below substitutes into the CTE queries, so an
-    // outer column a CTE projects bare keeps its name.
-    let visible_ctes = match &select.with {
-        Some(with) => cte_scopes_with(with, lookup, outer_cte_scopes),
-        None => outer_cte_scopes.clone(),
-    };
-    if let Some(with) = &mut select.with {
-        for cte in &mut with.ctes {
-            substitute_outer_refs_in_select_scoped(
-                &mut cte.query,
+    with_view_expansion_stack(|| {
+        // Derived before the walk below substitutes into the CTE queries, so an
+        // outer column a CTE projects bare keeps its name.
+        let visible_ctes = match &select.with {
+            Some(with) => cte_scopes_with(with, lookup, outer_cte_scopes),
+            None => outer_cte_scopes.clone(),
+        };
+        if let Some(with) = &mut select.with {
+            for cte in &mut with.ctes {
+                substitute_outer_refs_in_select_scoped(
+                    &mut cte.query,
+                    lookup,
+                    ancestor_tables,
+                    ancestor_unqualified_columns,
+                    &visible_ctes,
+                );
+            }
+        }
+        substitute_outer_refs_in_select_core(
+            &mut select.body.select,
+            lookup,
+            ancestor_tables,
+            ancestor_unqualified_columns,
+            &visible_ctes,
+        );
+        for (_, core) in &mut select.body.compounds {
+            substitute_outer_refs_in_select_core(
+                core,
                 lookup,
                 ancestor_tables,
                 ancestor_unqualified_columns,
                 &visible_ctes,
             );
         }
-    }
-    substitute_outer_refs_in_select_core(
-        &mut select.body.select,
-        lookup,
-        ancestor_tables,
-        ancestor_unqualified_columns,
-        &visible_ctes,
-    );
-    for (_, core) in &mut select.body.compounds {
-        substitute_outer_refs_in_select_core(
-            core,
-            lookup,
-            ancestor_tables,
-            ancestor_unqualified_columns,
-            &visible_ctes,
-        );
-    }
-    // bd-2fong: statement-level ORDER BY and LIMIT resolve in the primary
-    // core's scope, so correlated outer references there must substitute
-    // exactly like WHERE/HAVING do. Previously only the cores were walked and
-    // `... ORDER BY abs(y - outer.x) LIMIT 1` failed with NoSuchColumn on the
-    // outer-qualified name. Output aliases stay local (not substituted),
-    // matching WHERE/HAVING alias handling.
-    if !select.order_by.is_empty() || select.limit.is_some() {
-        let (protected_tables, protected_unqualified_columns, local_output_names) = {
-            let core = &select.body.select;
-            (
-                protected_tables_for_core(core, ancestor_tables),
-                protected_unqualified_columns_for_core(
-                    core,
-                    lookup,
-                    &visible_ctes,
-                    ancestor_unqualified_columns,
-                ),
-                collect_select_core_result_aliases(core),
-            )
-        };
-        for term in &mut select.order_by {
-            term.expr = substitute_outer_refs_in_expr(
-                &term.expr,
-                lookup,
-                &protected_tables,
-                protected_unqualified_columns.as_ref(),
-                &local_output_names,
-                &visible_ctes,
-            );
-        }
-        if let Some(limit) = &mut select.limit {
-            limit.limit = substitute_outer_refs_in_expr(
-                &limit.limit,
-                lookup,
-                &protected_tables,
-                protected_unqualified_columns.as_ref(),
-                &local_output_names,
-                &visible_ctes,
-            );
-            if let Some(offset) = &mut limit.offset {
-                *offset = substitute_outer_refs_in_expr(
-                    offset,
+        // bd-2fong: statement-level ORDER BY and LIMIT resolve in the primary
+        // core's scope, so correlated outer references there must substitute
+        // exactly like WHERE/HAVING do. Previously only the cores were walked and
+        // `... ORDER BY abs(y - outer.x) LIMIT 1` failed with NoSuchColumn on the
+        // outer-qualified name. Output aliases stay local (not substituted),
+        // matching WHERE/HAVING alias handling.
+        if !select.order_by.is_empty() || select.limit.is_some() {
+            let (protected_tables, protected_unqualified_columns, local_output_names) = {
+                let core = &select.body.select;
+                (
+                    protected_tables_for_core(core, ancestor_tables),
+                    protected_unqualified_columns_for_core(
+                        core,
+                        lookup,
+                        &visible_ctes,
+                        ancestor_unqualified_columns,
+                    ),
+                    collect_select_core_result_aliases(core),
+                )
+            };
+            for term in &mut select.order_by {
+                term.expr = substitute_outer_refs_in_expr(
+                    &term.expr,
                     lookup,
                     &protected_tables,
                     protected_unqualified_columns.as_ref(),
@@ -145875,8 +145918,28 @@ fn substitute_outer_refs_in_select_scoped(
                     &visible_ctes,
                 );
             }
+            if let Some(limit) = &mut select.limit {
+                limit.limit = substitute_outer_refs_in_expr(
+                    &limit.limit,
+                    lookup,
+                    &protected_tables,
+                    protected_unqualified_columns.as_ref(),
+                    &local_output_names,
+                    &visible_ctes,
+                );
+                if let Some(offset) = &mut limit.offset {
+                    *offset = substitute_outer_refs_in_expr(
+                        offset,
+                        lookup,
+                        &protected_tables,
+                        protected_unqualified_columns.as_ref(),
+                        &local_output_names,
+                        &visible_ctes,
+                    );
+                }
+            }
         }
-    }
+    });
 }
 
 fn substitute_outer_refs_in_select_core(
@@ -163637,9 +163700,10 @@ fn validate_fromless_used_window_scopes(
     collation_registry: &CollationRegistry,
 ) -> Result<()> {
     let validate_expr = |expr: &Expr, visible_windows: &NamedWindowSpecs<'_>| -> Result<()> {
-        if expr_folds_to_integer_zero_via_and(expr) {
+        if expr_folds_to_integer_zero_via_and(expr) || !expr_has_window_function(expr) {
             return Ok(());
         }
+        let mut cache = CollationConsumerVisitCache::default();
         let mut remaining = expr.clone();
         while expr_has_window_function(&remaining) {
             let ExtractedWindowFunction {
@@ -163660,17 +163724,37 @@ fn validate_fromless_used_window_scopes(
                 ));
             }
             if let Some(filter) = &filter {
-                validate_window_key_expr_collations(connection, filter, collation_registry)?;
+                validate_window_key_expr_collations_cached(
+                    connection,
+                    filter,
+                    collation_registry,
+                    &mut cache,
+                )?;
             }
             if let FunctionArgs::List(values) = &args {
                 for value in values.iter().rev() {
-                    validate_window_key_expr_collations(connection, value, collation_registry)?;
+                    validate_window_key_expr_collations_cached(
+                        connection,
+                        value,
+                        collation_registry,
+                        &mut cache,
+                    )?;
                 }
             }
             for term in call_order_by.iter().rev() {
-                validate_window_key_expr_collations(connection, &term.expr, collation_registry)?;
+                validate_window_key_expr_collations_cached(
+                    connection,
+                    &term.expr,
+                    collation_registry,
+                    &mut cache,
+                )?;
             }
-            validate_used_window_key_collations(connection, &resolved, collation_registry)?;
+            validate_used_window_key_collations_cached(
+                connection,
+                &resolved,
+                collation_registry,
+                &mut cache,
+            )?;
             let mut replaced = false;
             remaining =
                 replace_first_window_with_literal(&remaining, &SqliteValue::Null, &mut replaced);
@@ -163797,16 +163881,17 @@ fn validate_fromless_used_window_scopes(
 /// scalar subqueries, or ordinary non-window expressions intentionally remain
 /// deferred. Operations inside frame offsets and subqueries still consume
 /// collations during preparation and are validated below.
-fn validate_used_window_key_collations(
+fn validate_used_window_key_collations_cached(
     connection: &Connection,
     window: &WindowSpec,
     registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
     for term in window.order_by.iter().rev() {
-        validate_window_key_expr_collations(connection, &term.expr, registry)?;
+        validate_window_key_expr_collations_cached(connection, &term.expr, registry, cache)?;
     }
     for expr in window.partition_by.iter().rev() {
-        validate_window_key_expr_collations(connection, expr, registry)?;
+        validate_window_key_expr_collations_cached(connection, expr, registry, cache)?;
     }
     if let Some(frame) = &window.frame {
         validate_window_frame_collation_consumers(frame, registry)?;
@@ -163814,12 +163899,13 @@ fn validate_used_window_key_collations(
     Ok(())
 }
 
-fn validate_window_key_expr_collations(
+fn validate_window_key_expr_collations_cached(
     connection: &Connection,
     expr: &Expr,
     registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
-    validate_expr_collation_boundary(connection, expr, registry)
+    validate_expr_collation_boundary_cached(connection, expr, registry, cache)
 }
 
 fn validate_registered_collation(collation: &str, registry: &CollationRegistry) -> Result<()> {
@@ -165496,8 +165582,18 @@ fn validate_expr_collation_boundary(
     expr: &Expr,
     registry: &CollationRegistry,
 ) -> Result<()> {
+    let mut cache = CollationConsumerVisitCache::default();
+    validate_expr_collation_boundary_cached(connection, expr, registry, &mut cache)
+}
+
+fn validate_expr_collation_boundary_cached(
+    connection: &Connection,
+    expr: &Expr,
+    registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
+) -> Result<()> {
     validate_expr_collation_winner(expr, registry)?;
-    validate_expr_collation_consumers(connection, expr, registry)
+    validate_expr_collation_consumers_cached(connection, expr, registry, cache)
 }
 
 /// Validate every collation dependency that VDBE codegen can inherit from the
@@ -166060,11 +166156,21 @@ fn function_consumes_argument_collation(
         .unwrap_or(false)
 }
 
-#[allow(clippy::too_many_lines)]
 fn validate_expr_collation_consumers(
     connection: &Connection,
     expr: &Expr,
     registry: &CollationRegistry,
+) -> Result<()> {
+    let mut cache = CollationConsumerVisitCache::default();
+    validate_expr_collation_consumers_cached(connection, expr, registry, &mut cache)
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_expr_collation_consumers_cached(
+    connection: &Connection,
+    expr: &Expr,
+    registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
     if expr_folds_to_integer_zero_via_and(expr) {
         return Ok(());
@@ -166079,31 +166185,35 @@ fn validate_expr_collation_consumers(
             left, op, right, ..
         } => {
             if binary_op_consumes_collation(*op) && op.truth_test(right).is_none() {
-                validate_direct_subquery_collation_consumers(connection, left, registry)?;
-                validate_direct_subquery_collation_consumers(connection, right, registry)?;
+                validate_direct_subquery_collation_consumers_cached(
+                    connection, left, registry, cache,
+                )?;
+                validate_direct_subquery_collation_consumers_cached(
+                    connection, right, registry, cache,
+                )?;
                 validate_binary_comparison_collation(left, right, registry)?;
             }
-            validate_expr_collation_consumers(connection, left, registry)?;
-            validate_expr_collation_consumers(connection, right, registry)?;
+            validate_expr_collation_consumers_cached(connection, left, registry, cache)?;
+            validate_expr_collation_consumers_cached(connection, right, registry, cache)?;
             Ok(())
         }
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::Collate { expr, .. } => {
-            validate_expr_collation_consumers(connection, expr, registry)
+            validate_expr_collation_consumers_cached(connection, expr, registry, cache)
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            validate_direct_subquery_collation_consumers(connection, expr, registry)?;
-            validate_direct_subquery_collation_consumers(connection, low, registry)?;
+            validate_direct_subquery_collation_consumers_cached(connection, expr, registry, cache)?;
+            validate_direct_subquery_collation_consumers_cached(connection, low, registry, cache)?;
             validate_binary_comparison_collation(expr, low, registry)?;
-            validate_expr_collation_consumers(connection, expr, registry)?;
-            validate_expr_collation_consumers(connection, low, registry)?;
-            validate_direct_subquery_collation_consumers(connection, high, registry)?;
+            validate_expr_collation_consumers_cached(connection, expr, registry, cache)?;
+            validate_expr_collation_consumers_cached(connection, low, registry, cache)?;
+            validate_direct_subquery_collation_consumers_cached(connection, high, registry, cache)?;
             validate_binary_comparison_collation(expr, high, registry)?;
-            validate_expr_collation_consumers(connection, high, registry)?;
+            validate_expr_collation_consumers_cached(connection, high, registry, cache)?;
             Ok(())
         }
         Expr::In { expr, set, .. } => {
@@ -166115,9 +166225,11 @@ fn validate_expr_collation_consumers(
             match set {
                 InSet::List(values) => {
                     validate_in_list_membership_collations(connection, expr, values, registry)?;
-                    validate_expr_collation_consumers(connection, expr, registry)?;
+                    validate_expr_collation_consumers_cached(connection, expr, registry, cache)?;
                     for value in values {
-                        validate_expr_collation_consumers(connection, value, registry)?;
+                        validate_expr_collation_consumers_cached(
+                            connection, value, registry, cache,
+                        )?;
                     }
                 }
                 InSet::Subquery(subquery) => {
@@ -166126,26 +166238,28 @@ fn validate_expr_collation_consumers(
                         SelectCore::Values(rows) if rows.len() > 1
                     );
                     if multirow_values {
-                        validate_select_collation_consumers(
+                        validate_select_collation_consumers_cached(
                             connection,
                             subquery,
                             SubqueryCollationUse::InRhs,
                             registry,
+                            cache,
                         )?;
                     }
-                    validate_expr_collation_consumers(connection, expr, registry)?;
+                    validate_expr_collation_consumers_cached(connection, expr, registry, cache)?;
                     if !multirow_values {
-                        validate_select_collation_consumers(
+                        validate_select_collation_consumers_cached(
                             connection,
                             subquery,
                             SubqueryCollationUse::InRhs,
                             registry,
+                            cache,
                         )?;
                     }
                     validate_in_subquery_comparison_collations(expr, subquery, registry)?;
                 }
                 InSet::Table(_) => {
-                    validate_expr_collation_consumers(connection, expr, registry)?;
+                    validate_expr_collation_consumers_cached(connection, expr, registry, cache)?;
                 }
             }
             Ok(())
@@ -166156,10 +166270,10 @@ fn validate_expr_collation_consumers(
             escape,
             ..
         } => {
-            validate_expr_collation_consumers(connection, pattern, registry)?;
-            validate_expr_collation_consumers(connection, expr, registry)?;
+            validate_expr_collation_consumers_cached(connection, pattern, registry, cache)?;
+            validate_expr_collation_consumers_cached(connection, expr, registry, cache)?;
             if let Some(escape) = escape {
-                validate_expr_collation_consumers(connection, escape, registry)?;
+                validate_expr_collation_consumers_cached(connection, escape, registry, cache)?;
             }
             Ok(())
         }
@@ -166171,33 +166285,40 @@ fn validate_expr_collation_consumers(
         } => {
             if let Some(operand) = operand {
                 if let Some((first_condition, _)) = whens.first() {
-                    validate_direct_subquery_collation_consumers(connection, operand, registry)?;
-                    validate_direct_subquery_collation_consumers(
+                    validate_direct_subquery_collation_consumers_cached(
+                        connection, operand, registry, cache,
+                    )?;
+                    validate_direct_subquery_collation_consumers_cached(
                         connection,
                         first_condition,
                         registry,
+                        cache,
                     )?;
                     validate_binary_comparison_collation(operand, first_condition, registry)?;
                 }
-                validate_expr_collation_consumers(connection, operand, registry)?;
+                validate_expr_collation_consumers_cached(connection, operand, registry, cache)?;
                 for (index, (condition, value)) in whens.iter().enumerate() {
                     if index != 0 {
-                        validate_direct_subquery_collation_consumers(
-                            connection, condition, registry,
+                        validate_direct_subquery_collation_consumers_cached(
+                            connection, condition, registry, cache,
                         )?;
                         validate_binary_comparison_collation(operand, condition, registry)?;
                     }
-                    validate_expr_collation_consumers(connection, condition, registry)?;
-                    validate_expr_collation_consumers(connection, value, registry)?;
+                    validate_expr_collation_consumers_cached(
+                        connection, condition, registry, cache,
+                    )?;
+                    validate_expr_collation_consumers_cached(connection, value, registry, cache)?;
                 }
             } else {
                 for (condition, value) in whens {
-                    validate_expr_collation_consumers(connection, condition, registry)?;
-                    validate_expr_collation_consumers(connection, value, registry)?;
+                    validate_expr_collation_consumers_cached(
+                        connection, condition, registry, cache,
+                    )?;
+                    validate_expr_collation_consumers_cached(connection, value, registry, cache)?;
                 }
             }
             if let Some(else_expr) = else_expr {
-                validate_expr_collation_consumers(connection, else_expr, registry)?;
+                validate_expr_collation_consumers_cached(connection, else_expr, registry, cache)?;
             }
             Ok(())
         }
@@ -166215,13 +166336,15 @@ fn validate_expr_collation_consumers(
                 && selected_function_is_builtin(connection, name, args, over.as_ref());
             if !unary_min_or_max {
                 for term in order_by.iter().rev() {
-                    validate_expr_collation_boundary(connection, &term.expr, registry)?;
+                    validate_expr_collation_boundary_cached(
+                        connection, &term.expr, registry, cache,
+                    )?;
                 }
             }
             if let FunctionArgs::List(values) = args {
                 if *distinct {
                     for value in values {
-                        validate_expr_collation_boundary(connection, value, registry)?;
+                        validate_expr_collation_boundary_cached(connection, value, registry, cache)?;
                     }
                 }
                 if function_consumes_argument_collation(connection, name, args, over.as_ref()) {
@@ -166229,26 +166352,28 @@ fn validate_expr_collation_consumers(
                 }
             }
             if let Some(filter) = filter {
-                validate_expr_collation_consumers(connection, filter, registry)?;
+                validate_expr_collation_consumers_cached(connection, filter, registry, cache)?;
             }
             if let FunctionArgs::List(values) = args {
                 for value in values {
-                    validate_expr_collation_consumers(connection, value, registry)?;
+                    validate_expr_collation_consumers_cached(connection, value, registry, cache)?;
                 }
             }
             Ok(())
         }
-        Expr::Subquery(subquery, _) => validate_select_collation_consumers(
+        Expr::Subquery(subquery, _) => validate_select_collation_consumers_cached(
             connection,
             subquery,
             SubqueryCollationUse::Scalar,
             registry,
+            cache,
         ),
-        Expr::Exists { subquery, .. } => validate_select_collation_consumers(
+        Expr::Exists { subquery, .. } => validate_select_collation_consumers_cached(
             connection,
             subquery,
             SubqueryCollationUse::Exists,
             registry,
+            cache,
         ),
         Expr::JsonAccess {
             expr, path, arrow, ..
@@ -166261,35 +166386,38 @@ fn validate_expr_collation_consumers(
             {
                 validate_function_argument_collation([expr.as_ref(), path.as_ref()], registry)?;
             }
-            validate_expr_collation_consumers(connection, expr, registry)?;
-            validate_expr_collation_consumers(connection, path, registry)
+            validate_expr_collation_consumers_cached(connection, expr, registry, cache)?;
+            validate_expr_collation_consumers_cached(connection, path, registry, cache)
         }
         Expr::RowValue(values, _) => {
             for value in values {
-                validate_expr_collation_consumers(connection, value, registry)?;
+                validate_expr_collation_consumers_cached(connection, value, registry, cache)?;
             }
             Ok(())
         }
     }
 }
 
-fn validate_direct_subquery_collation_consumers(
+fn validate_direct_subquery_collation_consumers_cached(
     connection: &Connection,
     expr: &Expr,
     registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
     match expr {
-        Expr::Subquery(select, _) => validate_select_collation_consumers(
+        Expr::Subquery(select, _) => validate_select_collation_consumers_cached(
             connection,
             select,
             SubqueryCollationUse::Scalar,
             registry,
+            cache,
         ),
-        Expr::Exists { subquery, .. } => validate_select_collation_consumers(
+        Expr::Exists { subquery, .. } => validate_select_collation_consumers_cached(
             connection,
             subquery,
             SubqueryCollationUse::Exists,
             registry,
+            cache,
         ),
         _ => Ok(()),
     }
@@ -166489,11 +166617,23 @@ fn validate_function_argument_collation<'expr>(
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum SubqueryCollationUse {
     Scalar,
     Exists,
     InRhs,
+}
+
+/// Memoizes already-validated `SelectStatement` subtrees within one
+/// `validate_select_collation_consumers` / `validate_expr_collation_consumers`
+/// pass (bd-5iud6). Without this cache, `CteCollationResolver` and
+/// `validate_select_collation_consumers_body` mutually re-entered every nested
+/// subquery (`O((1 + sqrt(2))^d)`), turning depth-24 nested scalar subqueries
+/// into a 29-second stall and depth-32 into a >10-minute hang.
+#[derive(Default)]
+struct CollationConsumerVisitCache {
+    cte_validated: HashSet<*const SelectStatement>,
+    body_validated: HashSet<(*const SelectStatement, SubqueryCollationUse)>,
 }
 
 fn sqlite_ordinal(position: usize) -> String {
@@ -167175,46 +167315,48 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
     }
 
     fn validate_select(&mut self, select: &'select SelectStatement) -> Result<()> {
-        let scope_depth = self.scopes.len();
-        if let Some(with) = &select.with {
-            self.scopes.push(&with.ctes);
-        }
-
-        let rightmost_index = select.body.compounds.len();
-        let result: Result<()> = (|| {
-            for index in (0..=rightmost_index).rev() {
-                let core = if index == 0 {
-                    &select.body.select
-                } else {
-                    &select.body.compounds[index - 1].1
-                };
-                self.validate_named_window_definition_legality(core)?;
-                self.validate_core_early(core)?;
-                if index == rightmost_index {
-                    let window_scope_depth = self.named_window_scopes.len();
-                    self.named_window_scopes
-                        .push(select_core_named_windows(core));
-                    let top_level_result: Result<()> = (|| {
-                        for term in &select.order_by {
-                            self.validate_expr(&term.expr)?;
-                        }
-                        if let Some(limit) = &select.limit {
-                            self.validate_expr(&limit.limit)?;
-                            if let Some(offset) = &limit.offset {
-                                self.validate_expr(offset)?;
-                            }
-                        }
-                        Ok(())
-                    })();
-                    self.named_window_scopes.truncate(window_scope_depth);
-                    top_level_result?;
-                }
-                self.validate_core_late(core)?;
+        with_view_expansion_stack(|| {
+            let scope_depth = self.scopes.len();
+            if let Some(with) = &select.with {
+                self.scopes.push(&with.ctes);
             }
-            Ok(())
-        })();
-        self.scopes.truncate(scope_depth);
-        result
+
+            let rightmost_index = select.body.compounds.len();
+            let result: Result<()> = (|| {
+                for index in (0..=rightmost_index).rev() {
+                    let core = if index == 0 {
+                        &select.body.select
+                    } else {
+                        &select.body.compounds[index - 1].1
+                    };
+                    self.validate_named_window_definition_legality(core)?;
+                    self.validate_core_early(core)?;
+                    if index == rightmost_index {
+                        let window_scope_depth = self.named_window_scopes.len();
+                        self.named_window_scopes
+                            .push(select_core_named_windows(core));
+                        let top_level_result: Result<()> = (|| {
+                            for term in &select.order_by {
+                                self.validate_expr(&term.expr)?;
+                            }
+                            if let Some(limit) = &select.limit {
+                                self.validate_expr(&limit.limit)?;
+                                if let Some(offset) = &limit.offset {
+                                    self.validate_expr(offset)?;
+                                }
+                            }
+                            Ok(())
+                        })();
+                        self.named_window_scopes.truncate(window_scope_depth);
+                        top_level_result?;
+                    }
+                    self.validate_core_late(core)?;
+                }
+                Ok(())
+            })();
+            self.scopes.truncate(scope_depth);
+            result
+        })
     }
 
     /// bd-w78tx: the relations one trigger body statement names, in stock's
@@ -168959,85 +169101,87 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
     }
 
     fn validate_select(&mut self, select: &'select SelectStatement) -> Result<()> {
-        let cte_scope_depth = self.cte_scopes.len();
-        if let Some(with) = &select.with {
-            self.cte_scopes.push(&with.ctes);
-        }
-        let result: Result<()> = (|| {
-            if select.body.compounds.is_empty() {
-                // SQLite establishes source layout before resolving LIMIT. This
-                // exposes non-semantic shape errors (CTE declared-column arity,
-                // malformed VALUES rows, star expansion, and JOIN USING) first,
-                // while expressions inside those sources still wait until after
-                // LIMIT/OFFSET name resolution.
-                let scope = self.prepare_core_scope(&select.body.select)?;
-                self.validate_limit(select)?;
-                self.validate_core_before_order(&select.body.select, &scope)?;
-                // bd-r9dhv: SQLite 3.53 (the bundled oracle) resolves an ORDER BY
-                // name against the enclosing queries after this SELECT's own
-                // aliases and sources, so a subquery may order by an outer
-                // column (3.51 and earlier report it missing). The outer scopes
-                // stay visible here; LIMIT/OFFSET still see none.
-                self.named_window_scopes
-                    .push(select_core_named_windows(&select.body.select));
-                let order_result: Result<()> = (|| {
-                    for term in &select.order_by {
-                        if let Expr::Column(column, _) = strip_collate_wrappers(&term.expr)
-                            && column.table.is_none()
-                            && scope.output_alias(&column.column).is_some()
-                        {
-                            continue;
-                        }
-                        // bd-rwaxp: an ORDER BY term embedding a sub-SELECT must
-                        // resolve its operands strictly left-to-right against BOTH
-                        // name and compound-arity errors. That unified depth-first
-                        // walk lives in SelectStructureResolver::validate_order_expr.
-                        // This name-only preflight would otherwise resolve a sibling
-                        // name before a LEADING subquery's arity error — e.g.
-                        // `(SELECT 1 UNION SELECT 2,3) + nope` must yield the UNION
-                        // ParseError (left operand first), not NoSuchColumn(nope).
-                        // Defer subquery-bearing terms to the structure resolver
-                        // (test_select_structure_follows_sqlite_depth_first_precedence).
-                        if expr_contains_subquery_matching_deep(
-                            &term.expr,
-                            self.connection,
-                            &|_, _| true,
-                        ) {
-                            continue;
-                        }
-                        self.validate_expr(&term.expr, &scope, SelectOutputAliasUse::OrderBy)?;
-                    }
-                    Ok(())
-                })();
-                self.named_window_scopes.pop();
-                order_result?;
-                self.validate_core_after_order(&select.body.select, &scope)?;
-                return Ok(());
+        with_view_expansion_stack(|| {
+            let cte_scope_depth = self.cte_scopes.len();
+            if let Some(with) = &select.with {
+                self.cte_scopes.push(&with.ctes);
             }
+            let result: Result<()> = (|| {
+                if select.body.compounds.is_empty() {
+                    // SQLite establishes source layout before resolving LIMIT. This
+                    // exposes non-semantic shape errors (CTE declared-column arity,
+                    // malformed VALUES rows, star expansion, and JOIN USING) first,
+                    // while expressions inside those sources still wait until after
+                    // LIMIT/OFFSET name resolution.
+                    let scope = self.prepare_core_scope(&select.body.select)?;
+                    self.validate_limit(select)?;
+                    self.validate_core_before_order(&select.body.select, &scope)?;
+                    // bd-r9dhv: SQLite 3.53 (the bundled oracle) resolves an ORDER BY
+                    // name against the enclosing queries after this SELECT's own
+                    // aliases and sources, so a subquery may order by an outer
+                    // column (3.51 and earlier report it missing). The outer scopes
+                    // stay visible here; LIMIT/OFFSET still see none.
+                    self.named_window_scopes
+                        .push(select_core_named_windows(&select.body.select));
+                    let order_result: Result<()> = (|| {
+                        for term in &select.order_by {
+                            if let Expr::Column(column, _) = strip_collate_wrappers(&term.expr)
+                                && column.table.is_none()
+                                && scope.output_alias(&column.column).is_some()
+                            {
+                                continue;
+                            }
+                            // bd-rwaxp: an ORDER BY term embedding a sub-SELECT must
+                            // resolve its operands strictly left-to-right against BOTH
+                            // name and compound-arity errors. That unified depth-first
+                            // walk lives in SelectStructureResolver::validate_order_expr.
+                            // This name-only preflight would otherwise resolve a sibling
+                            // name before a LEADING subquery's arity error — e.g.
+                            // `(SELECT 1 UNION SELECT 2,3) + nope` must yield the UNION
+                            // ParseError (left operand first), not NoSuchColumn(nope).
+                            // Defer subquery-bearing terms to the structure resolver
+                            // (test_select_structure_follows_sqlite_depth_first_precedence).
+                            if expr_contains_subquery_matching_deep(
+                                &term.expr,
+                                self.connection,
+                                &|_, _| true,
+                            ) {
+                                continue;
+                            }
+                            self.validate_expr(&term.expr, &scope, SelectOutputAliasUse::OrderBy)?;
+                        }
+                        Ok(())
+                    })();
+                    self.named_window_scopes.pop();
+                    order_result?;
+                    self.validate_core_after_order(&select.body.select, &scope)?;
+                    return Ok(());
+                }
 
-            let mut prepared_cores = Vec::with_capacity(select.body.compounds.len() + 1);
-            for index in (0..=select.body.compounds.len()).rev() {
-                let core = if index == 0 {
-                    &select.body.select
-                } else {
-                    &select.body.compounds[index - 1].1
-                };
-                let scope = self.prepare_core_scope(core)?;
-                prepared_cores.push((core, scope));
-            }
-            self.validate_limit(select)?;
-            for (core, scope) in &prepared_cores {
-                self.validate_core_before_order(core, scope)?;
-                self.validate_core_after_order(core, scope)?;
-            }
-            // Compound ORDER BY terms resolve against the output expressions of
-            // every core rather than the primary core's FROM scope. The structure
-            // resolver performs that authoritative cross-core match after this
-            // lexical pass has already walked each projected expression.
-            Ok(())
-        })();
-        self.cte_scopes.truncate(cte_scope_depth);
-        result
+                let mut prepared_cores = Vec::with_capacity(select.body.compounds.len() + 1);
+                for index in (0..=select.body.compounds.len()).rev() {
+                    let core = if index == 0 {
+                        &select.body.select
+                    } else {
+                        &select.body.compounds[index - 1].1
+                    };
+                    let scope = self.prepare_core_scope(core)?;
+                    prepared_cores.push((core, scope));
+                }
+                self.validate_limit(select)?;
+                for (core, scope) in &prepared_cores {
+                    self.validate_core_before_order(core, scope)?;
+                    self.validate_core_after_order(core, scope)?;
+                }
+                // Compound ORDER BY terms resolve against the output expressions of
+                // every core rather than the primary core's FROM scope. The structure
+                // resolver performs that authoritative cross-core match after this
+                // lexical pass has already walked each projected expression.
+                Ok(())
+            })();
+            self.cte_scopes.truncate(cte_scope_depth);
+            result
+        })
     }
 
     fn validate_limit(&mut self, select: &'select SelectStatement) -> Result<()> {
@@ -170686,122 +170830,125 @@ impl<'a> SelectStructureResolver<'a> {
         self.validate_select_semantics(select)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate_select_semantics(&mut self, select: &'a SelectStatement) -> Result<()> {
-        let semantic_depth = self.semantic_depth;
-        self.semantic_depth = self.semantic_depth.saturating_add(1);
-        let scope_depth = self.scopes.len();
-        let enclosing_depth = self.enclosing_selects.len();
-        self.enclosing_selects.push(select);
-        let outer_ctes = (!select.body.compounds.is_empty() || !select.order_by.is_empty())
-            .then(|| self.visible_ctes());
-        if let Some(with) = &select.with {
-            self.scopes.push(&with.ctes);
-        }
+        with_view_expansion_stack(|| {
+            let semantic_depth = self.semantic_depth;
+            self.semantic_depth = self.semantic_depth.saturating_add(1);
+            let scope_depth = self.scopes.len();
+            let enclosing_depth = self.enclosing_selects.len();
+            self.enclosing_selects.push(select);
+            let outer_ctes = (!select.body.compounds.is_empty() || !select.order_by.is_empty())
+                .then(|| self.visible_ctes());
+            if let Some(with) = &select.with {
+                self.scopes.push(&with.ctes);
+            }
 
-        let result = (|| {
-            if !self.view_definition_mode
-                && !self.column_reference_preflight_completed
-                && select.limit.is_some()
-                && (select_requires_layout_preflight_before_limit(select)
-                    || select_references_view_for_layout(select, self.connection)?)
-            {
-                SelectColumnReferenceResolver::new(self.connection)
-                    .validate_select_layout(select)?;
-            }
-            for index in (0..=select.body.compounds.len()).rev() {
-                let core = if index == 0 {
-                    &select.body.select
-                } else {
-                    &select.body.compounds[index - 1].1
-                };
-                Self::validate_core_shape_before_limit(core)?;
-            }
-            let top_windows = select_core_named_windows(&select.body.select);
-            if let Some(limit) = &select.limit {
-                self.validate_expr(&limit.limit, top_windows)?;
-                if let Some(offset) = &limit.offset {
-                    self.validate_expr(offset, top_windows)?;
+            let result = (|| {
+                if !self.view_definition_mode
+                    && !self.column_reference_preflight_completed
+                    && select.limit.is_some()
+                    && (select_requires_layout_preflight_before_limit(select)
+                        || select_references_view_for_layout(select, self.connection)?)
+                {
+                    SelectColumnReferenceResolver::new(self.connection)
+                        .validate_select_layout(select)?;
                 }
-            }
+                for index in (0..=select.body.compounds.len()).rev() {
+                    let core = if index == 0 {
+                        &select.body.select
+                    } else {
+                        &select.body.compounds[index - 1].1
+                    };
+                    Self::validate_core_shape_before_limit(core)?;
+                }
+                let top_windows = select_core_named_windows(&select.body.select);
+                if let Some(limit) = &select.limit {
+                    self.validate_expr(&limit.limit, top_windows)?;
+                    if let Some(offset) = &limit.offset {
+                        self.validate_expr(offset, top_windows)?;
+                    }
+                }
 
-            if select.body.compounds.is_empty() {
-                self.validate_core_before_order(&select.body.select, top_windows)?;
+                if select.body.compounds.is_empty() {
+                    self.validate_core_before_order(&select.body.select, top_windows)?;
+                    if self.view_definition_mode {
+                        for term in &select.order_by {
+                            self.validate_expr(&term.expr, top_windows)?;
+                        }
+                    } else {
+                        self.validate_noncompound_order_terms(
+                            select,
+                            top_windows,
+                            outer_ctes.as_deref().unwrap_or_default(),
+                        )?;
+                    }
+                    self.validate_core_after_order(&select.body.select, top_windows)?;
+                    return Ok(());
+                }
+
+                let mut right_width = None;
+                for index in (0..=select.body.compounds.len()).rev() {
+                    let core = if index == 0 {
+                        &select.body.select
+                    } else {
+                        &select.body.compounds[index - 1].1
+                    };
+                    let windows = select_core_named_windows(core);
+                    self.validate_core_before_order(core, windows)?;
+                    self.validate_core_after_order(core, windows)?;
+
+                    let width = self
+                        .connection
+                        .compound_select_core_column_count_with_outer_ctes(
+                            select,
+                            core,
+                            outer_ctes.as_deref().unwrap_or_default(),
+                        );
+                    if !self.view_definition_mode
+                        && let Some(right_width) = right_width
+                        && width != right_width
+                    {
+                        let (op, right_core) = &select.body.compounds[index];
+                        // bd-65jog: stock names the arm on the right of the
+                        // mismatch (sqlite3SelectWrongNumTermsError): a one-row
+                        // VALUES there keeps its VALUES flag. A multi-row VALUES
+                        // is a co-routine to stock by then and is named by its
+                        // operator, like a SELECT.
+                        if matches!(right_core, SelectCore::Values(rows) if rows.len() == 1) {
+                            return Err(FrankenError::FunctionError(
+                                "all VALUES must have the same number of terms".to_owned(),
+                            ));
+                        }
+                        // Stock SQLite reports this as a bare SQLITE_ERROR message with no
+                        // byte-offset prefix (same class as the VALUES-arity fix); ParseError's
+                        // Display would prepend "SQL error at offset 0: ". Emit verbatim.
+                        return Err(FrankenError::FunctionError(format!(
+                            "SELECTs to the left and right of {} do not have the same number of result columns",
+                            compound_op_error_name(*op)
+                        )));
+                    }
+                    right_width = Some(width);
+                }
+
                 if self.view_definition_mode {
                     for term in &select.order_by {
                         self.validate_expr(&term.expr, top_windows)?;
                     }
                 } else {
-                    self.validate_noncompound_order_terms(
+                    resolve_compound_order_output_indices(
+                        self.connection,
                         select,
-                        top_windows,
                         outer_ctes.as_deref().unwrap_or_default(),
                     )?;
                 }
-                self.validate_core_after_order(&select.body.select, top_windows)?;
-                return Ok(());
-            }
-
-            let mut right_width = None;
-            for index in (0..=select.body.compounds.len()).rev() {
-                let core = if index == 0 {
-                    &select.body.select
-                } else {
-                    &select.body.compounds[index - 1].1
-                };
-                let windows = select_core_named_windows(core);
-                self.validate_core_before_order(core, windows)?;
-                self.validate_core_after_order(core, windows)?;
-
-                let width = self
-                    .connection
-                    .compound_select_core_column_count_with_outer_ctes(
-                        select,
-                        core,
-                        outer_ctes.as_deref().unwrap_or_default(),
-                    );
-                if !self.view_definition_mode
-                    && let Some(right_width) = right_width
-                    && width != right_width
-                {
-                    let (op, right_core) = &select.body.compounds[index];
-                    // bd-65jog: stock names the arm on the right of the
-                    // mismatch (sqlite3SelectWrongNumTermsError): a one-row
-                    // VALUES there keeps its VALUES flag. A multi-row VALUES
-                    // is a co-routine to stock by then and is named by its
-                    // operator, like a SELECT.
-                    if matches!(right_core, SelectCore::Values(rows) if rows.len() == 1) {
-                        return Err(FrankenError::FunctionError(
-                            "all VALUES must have the same number of terms".to_owned(),
-                        ));
-                    }
-                    // Stock SQLite reports this as a bare SQLITE_ERROR message with no
-                    // byte-offset prefix (same class as the VALUES-arity fix); ParseError's
-                    // Display would prepend "SQL error at offset 0: ". Emit verbatim.
-                    return Err(FrankenError::FunctionError(format!(
-                        "SELECTs to the left and right of {} do not have the same number of result columns",
-                        compound_op_error_name(*op)
-                    )));
-                }
-                right_width = Some(width);
-            }
-
-            if self.view_definition_mode {
-                for term in &select.order_by {
-                    self.validate_expr(&term.expr, top_windows)?;
-                }
-            } else {
-                resolve_compound_order_output_indices(
-                    self.connection,
-                    select,
-                    outer_ctes.as_deref().unwrap_or_default(),
-                )?;
-            }
-            Ok(())
-        })();
-        self.scopes.truncate(scope_depth);
-        self.enclosing_selects.truncate(enclosing_depth);
-        self.semantic_depth = semantic_depth;
-        result
+                Ok(())
+            })();
+            self.scopes.truncate(scope_depth);
+            self.enclosing_selects.truncate(enclosing_depth);
+            self.semantic_depth = semantic_depth;
+            result
+        })
     }
 
     fn validate_core_shape_before_limit(core: &SelectCore) -> Result<()> {
@@ -171878,46 +172025,57 @@ fn select_core_named_windows(core: &SelectCore) -> &[fsqlite_ast::WindowDef] {
     }
 }
 
-struct CteCollationResolver<'a, 'r> {
+struct CteCollationResolver<'a, 'r, 'c> {
     connection: &'a Connection,
     registry: &'r CollationRegistry,
     scopes: Vec<&'a [fsqlite_ast::Cte]>,
     visits: HashMap<*const fsqlite_ast::Cte, CteCollationVisit>,
+    cache: &'c mut CollationConsumerVisitCache,
 }
 
-impl<'a, 'r> CteCollationResolver<'a, 'r> {
-    fn new(connection: &'a Connection, registry: &'r CollationRegistry) -> Self {
+impl<'a, 'r, 'c> CteCollationResolver<'a, 'r, 'c> {
+    fn new(
+        connection: &'a Connection,
+        registry: &'r CollationRegistry,
+        cache: &'c mut CollationConsumerVisitCache,
+    ) -> Self {
         Self {
             connection,
             registry,
             scopes: Vec::new(),
             visits: HashMap::new(),
+            cache,
         }
     }
 
     fn validate_select(&mut self, select: &'a SelectStatement) -> Result<()> {
-        let scope_depth = self.scopes.len();
-        if let Some(with) = &select.with {
-            self.scopes.push(&with.ctes);
+        if !self.cache.cte_validated.insert(std::ptr::from_ref(select)) {
+            return Ok(());
         }
-        let result = (|| {
-            self.validate_core(&select.body.select)?;
-            for (_, core) in &select.body.compounds {
-                self.validate_core(core)?;
+        with_view_expansion_stack(|| {
+            let scope_depth = self.scopes.len();
+            if let Some(with) = &select.with {
+                self.scopes.push(&with.ctes);
             }
-            for term in &select.order_by {
-                self.validate_expr(&term.expr)?;
-            }
-            if let Some(limit) = &select.limit {
-                self.validate_expr(&limit.limit)?;
-                if let Some(offset) = &limit.offset {
-                    self.validate_expr(offset)?;
+            let result = (|| {
+                self.validate_core(&select.body.select)?;
+                for (_, core) in &select.body.compounds {
+                    self.validate_core(core)?;
                 }
-            }
-            Ok(())
-        })();
-        self.scopes.truncate(scope_depth);
-        result
+                for term in &select.order_by {
+                    self.validate_expr(&term.expr)?;
+                }
+                if let Some(limit) = &select.limit {
+                    self.validate_expr(&limit.limit)?;
+                    if let Some(offset) = &limit.offset {
+                        self.validate_expr(offset)?;
+                    }
+                }
+                Ok(())
+            })();
+            self.scopes.truncate(scope_depth);
+            result
+        })
     }
 
     fn validate_core(&mut self, core: &'a SelectCore) -> Result<()> {
@@ -171980,11 +172138,12 @@ impl<'a, 'r> CteCollationResolver<'a, 'r> {
             TableOrSubquery::Subquery { query, .. } => {
                 validate_select_result_collation_metadata(self.connection, query, self.registry)?;
                 self.validate_select(query)?;
-                validate_select_collation_consumers_body(
+                validate_select_collation_consumers_body_cached(
                     self.connection,
                     query,
                     SubqueryCollationUse::Scalar,
                     self.registry,
+                    self.cache,
                 )
             }
             TableOrSubquery::TableFunction { args, .. } => {
@@ -172041,11 +172200,12 @@ impl<'a, 'r> CteCollationResolver<'a, 'r> {
                     }
                     InSet::Subquery(query) => {
                         self.validate_select(query)?;
-                        validate_select_collation_consumers_body(
+                        validate_select_collation_consumers_body_cached(
                             self.connection,
                             query,
                             SubqueryCollationUse::InRhs,
                             self.registry,
+                            self.cache,
                         )?;
                         Ok(())
                     }
@@ -172085,21 +172245,23 @@ impl<'a, 'r> CteCollationResolver<'a, 'r> {
             }
             Expr::Subquery(query, _) => {
                 self.validate_select(query)?;
-                validate_select_collation_consumers_body(
+                validate_select_collation_consumers_body_cached(
                     self.connection,
                     query,
                     SubqueryCollationUse::Scalar,
                     self.registry,
+                    self.cache,
                 )?;
                 Ok(())
             }
             Expr::Exists { subquery, .. } => {
                 self.validate_select(subquery)?;
-                validate_select_collation_consumers_body(
+                validate_select_collation_consumers_body_cached(
                     self.connection,
                     subquery,
                     SubqueryCollationUse::Exists,
                     self.registry,
+                    self.cache,
                 )?;
                 Ok(())
             }
@@ -172205,11 +172367,12 @@ impl<'a, 'r> CteCollationResolver<'a, 'r> {
             validate_select_result_collation_metadata(self.connection, &cte.query, self.registry)
         })?;
         with_view_expansion_stack(|| self.validate_select(&cte.query))?;
-        validate_select_collation_consumers_body(
+        validate_select_collation_consumers_body_cached(
             self.connection,
             &cte.query,
             SubqueryCollationUse::Scalar,
             self.registry,
+            self.cache,
         )?;
         self.visits.insert(key, CteCollationVisit::Done);
         Ok(())
@@ -172222,107 +172385,150 @@ fn validate_select_collation_consumers(
     use_kind: SubqueryCollationUse,
     registry: &CollationRegistry,
 ) -> Result<()> {
-    let mut resolver = CteCollationResolver::new(connection, registry);
-    resolver.validate_select(select)?;
-    validate_select_collation_consumers_body(connection, select, use_kind, registry)
+    let mut cache = CollationConsumerVisitCache::default();
+    validate_select_collation_consumers_cached(connection, select, use_kind, registry, &mut cache)
 }
 
-fn validate_select_collation_consumers_body(
+fn validate_select_collation_consumers_cached(
     connection: &Connection,
     select: &SelectStatement,
     use_kind: SubqueryCollationUse,
     registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
-    validate_select_core_collation_boundaries(connection, &select.body.select, use_kind, registry)?;
-    for (_, core) in &select.body.compounds {
-        validate_select_core_collation_boundaries(connection, core, use_kind, registry)?;
+    if !cache.cte_validated.contains(&std::ptr::from_ref(select)) {
+        let mut resolver = CteCollationResolver::new(connection, registry, cache);
+        resolver.validate_select(select)?;
     }
-    validate_compound_set_collations(connection, select, registry)?;
+    validate_select_collation_consumers_body_cached(connection, select, use_kind, registry, cache)
+}
 
-    let compound_order_validated = !select.body.compounds.is_empty()
-        && matches!(
+#[allow(clippy::too_many_lines)]
+fn validate_select_collation_consumers_body_cached(
+    connection: &Connection,
+    select: &SelectStatement,
+    use_kind: SubqueryCollationUse,
+    registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
+) -> Result<()> {
+    if !cache
+        .body_validated
+        .insert((std::ptr::from_ref(select), use_kind))
+    {
+        return Ok(());
+    }
+    with_view_expansion_stack(|| {
+        validate_select_core_collation_boundaries(
+            connection,
+            &select.body.select,
             use_kind,
-            SubqueryCollationUse::Scalar | SubqueryCollationUse::InRhs
-        );
-    if compound_order_validated {
-        validate_compound_order_collations(connection, select, registry)?;
-    }
+            registry,
+            cache,
+        )?;
+        for (_, core) in &select.body.compounds {
+            validate_select_core_collation_boundaries(connection, core, use_kind, registry, cache)?;
+        }
+        validate_compound_set_collations(connection, select, registry)?;
 
-    match (&select.body.select, use_kind) {
-        (
-            SelectCore::Select {
-                columns,
-                from,
-                windows,
-                ..
-            },
-            SubqueryCollationUse::Scalar | SubqueryCollationUse::InRhs,
-        ) if !compound_order_validated => {
-            let named_windows = windows
-                .iter()
-                .map(|window| (window.name.to_ascii_uppercase(), &window.spec))
-                .collect::<Vec<_>>();
-            for term in select.order_by.iter().rev() {
-                let resolved_expr;
-                let expr = if from.is_none() {
-                    resolved_expr = connection
-                        .resolve_fromless_aliases(&term.expr, columns, false, "ORDER BY")?;
-                    &resolved_expr
-                } else {
-                    select_order_collation_expr(&term.expr, columns)
-                };
-                validate_expr_collation_boundary(connection, expr, registry)?;
-                validate_used_window_collation_boundaries(
-                    connection,
-                    expr,
-                    &named_windows,
-                    registry,
-                )?;
+        let compound_order_validated = !select.body.compounds.is_empty()
+            && matches!(
+                use_kind,
+                SubqueryCollationUse::Scalar | SubqueryCollationUse::InRhs
+            );
+        if compound_order_validated {
+            validate_compound_order_collations(connection, select, registry, cache)?;
+        }
+
+        match (&select.body.select, use_kind) {
+            (
+                SelectCore::Select {
+                    columns,
+                    from,
+                    windows,
+                    ..
+                },
+                SubqueryCollationUse::Scalar | SubqueryCollationUse::InRhs,
+            ) if !compound_order_validated => {
+                let named_windows = windows
+                    .iter()
+                    .map(|window| (window.name.to_ascii_uppercase(), &window.spec))
+                    .collect::<Vec<_>>();
+                for term in select.order_by.iter().rev() {
+                    let resolved_expr;
+                    let expr = if from.is_none() {
+                        resolved_expr = connection
+                            .resolve_fromless_aliases(&term.expr, columns, false, "ORDER BY")?;
+                        &resolved_expr
+                    } else {
+                        select_order_collation_expr(&term.expr, columns)
+                    };
+                    validate_expr_collation_boundary_cached(connection, expr, registry, cache)?;
+                    validate_used_window_collation_boundaries(
+                        connection,
+                        expr,
+                        &named_windows,
+                        registry,
+                        cache,
+                    )?;
+                }
+            }
+            (SelectCore::Values(_), SubqueryCollationUse::Scalar | SubqueryCollationUse::InRhs)
+                if !compound_order_validated =>
+            {
+                for term in select.order_by.iter().rev() {
+                    validate_expr_collation_boundary_cached(
+                        connection, &term.expr, registry, cache,
+                    )?;
+                    validate_used_window_collation_boundaries(
+                        connection, &term.expr, &[], registry, cache,
+                    )?;
+                }
+            }
+            (SelectCore::Select { windows, .. }, SubqueryCollationUse::Exists) => {
+                let named_windows = windows
+                    .iter()
+                    .map(|window| (window.name.to_ascii_uppercase(), &window.spec))
+                    .collect::<Vec<_>>();
+                for term in &select.order_by {
+                    validate_used_window_collation_boundaries(
+                        connection,
+                        &term.expr,
+                        &named_windows,
+                        registry,
+                        cache,
+                    )?;
+                }
+            }
+            (SelectCore::Values(_), SubqueryCollationUse::Exists) => {
+                for term in &select.order_by {
+                    validate_used_window_collation_boundaries(
+                        connection, &term.expr, &[], registry, cache,
+                    )?;
+                }
+            }
+            (
+                SelectCore::Select { .. } | SelectCore::Values(_),
+                SubqueryCollationUse::Scalar | SubqueryCollationUse::InRhs,
+            ) => {}
+        }
+        validate_select_core_collation_consumers(
+            connection,
+            &select.body.select,
+            use_kind,
+            registry,
+            cache,
+        )?;
+        for (_, core) in &select.body.compounds {
+            validate_select_core_collation_consumers(connection, core, use_kind, registry, cache)?;
+        }
+        if let Some(limit) = &select.limit {
+            validate_expr_collation_consumers_cached(connection, &limit.limit, registry, cache)?;
+            if let Some(offset) = &limit.offset {
+                validate_expr_collation_consumers_cached(connection, offset, registry, cache)?;
             }
         }
-        (SelectCore::Values(_), SubqueryCollationUse::Scalar | SubqueryCollationUse::InRhs)
-            if !compound_order_validated =>
-        {
-            for term in select.order_by.iter().rev() {
-                validate_expr_collation_boundary(connection, &term.expr, registry)?;
-                validate_used_window_collation_boundaries(connection, &term.expr, &[], registry)?;
-            }
-        }
-        (SelectCore::Select { windows, .. }, SubqueryCollationUse::Exists) => {
-            let named_windows = windows
-                .iter()
-                .map(|window| (window.name.to_ascii_uppercase(), &window.spec))
-                .collect::<Vec<_>>();
-            for term in &select.order_by {
-                validate_used_window_collation_boundaries(
-                    connection,
-                    &term.expr,
-                    &named_windows,
-                    registry,
-                )?;
-            }
-        }
-        (SelectCore::Values(_), SubqueryCollationUse::Exists) => {
-            for term in &select.order_by {
-                validate_used_window_collation_boundaries(connection, &term.expr, &[], registry)?;
-            }
-        }
-        (
-            SelectCore::Select { .. } | SelectCore::Values(_),
-            SubqueryCollationUse::Scalar | SubqueryCollationUse::InRhs,
-        ) => {}
-    }
-    validate_select_core_collation_consumers(connection, &select.body.select, use_kind, registry)?;
-    for (_, core) in &select.body.compounds {
-        validate_select_core_collation_consumers(connection, core, use_kind, registry)?;
-    }
-    if let Some(limit) = &select.limit {
-        validate_expr_collation_consumers(connection, &limit.limit, registry)?;
-        if let Some(offset) = &limit.offset {
-            validate_expr_collation_consumers(connection, offset, registry)?;
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn validate_select_core_collation_boundaries(
@@ -172330,6 +172536,7 @@ fn validate_select_core_collation_boundaries(
     core: &SelectCore,
     use_kind: SubqueryCollationUse,
     registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
     match core {
         SelectCore::Values(rows) => {
@@ -172340,6 +172547,7 @@ fn validate_select_core_collation_boundaries(
                         expr,
                         &[],
                         registry,
+                        cache,
                     )?;
                 }
             }
@@ -172360,7 +172568,7 @@ fn validate_select_core_collation_boundaries(
                 .collect::<Vec<_>>();
 
             if let Some(from) = from {
-                validate_from_clause_collation_consumers(connection, from, registry)?;
+                validate_from_clause_collation_consumers(connection, from, registry, cache)?;
             }
             for expr in group_by.iter().rev() {
                 let resolved_expr;
@@ -172376,8 +172584,9 @@ fn validate_select_core_collation_boundaries(
                     expr,
                     &named_windows,
                     registry,
+                    cache,
                 )?;
-                validate_expr_collation_boundary(connection, expr, registry)?;
+                validate_expr_collation_boundary_cached(connection, expr, registry, cache)?;
             }
             if let Some(predicate) = where_clause {
                 validate_used_window_collation_boundaries(
@@ -172385,6 +172594,7 @@ fn validate_select_core_collation_boundaries(
                     predicate,
                     &named_windows,
                     registry,
+                    cache,
                 )?;
             }
             if use_kind == SubqueryCollationUse::Exists {
@@ -172395,6 +172605,7 @@ fn validate_select_core_collation_boundaries(
                             expr,
                             &named_windows,
                             registry,
+                            cache,
                         )?;
                     }
                 }
@@ -172407,6 +172618,7 @@ fn validate_select_core_collation_boundaries(
                             expr,
                             &named_windows,
                             registry,
+                            cache,
                         )?;
                     }
                 }
@@ -172417,6 +172629,7 @@ fn validate_select_core_collation_boundaries(
                     predicate,
                     &named_windows,
                     registry,
+                    cache,
                 )?;
             }
             Ok(())
@@ -172429,9 +172642,10 @@ fn validate_exists_projection_collation_machinery(
     expr: &Expr,
     named_windows: &NamedWindowSpecs<'_>,
     registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
-    validate_used_window_collation_boundaries(connection, expr, named_windows, registry)?;
-    validate_exists_projection_aggregate_collations(connection, expr, registry)
+    validate_used_window_collation_boundaries(connection, expr, named_windows, registry, cache)?;
+    validate_exists_projection_aggregate_collations(connection, expr, registry, cache)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -172439,6 +172653,7 @@ fn validate_exists_projection_aggregate_collations(
     connection: &Connection,
     expr: &Expr,
     registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
     if expr_folds_to_integer_zero_via_and(expr) {
         return Ok(());
@@ -172456,18 +172671,24 @@ fn validate_exists_projection_aggregate_collations(
                 && is_current_aggregate_or_json_fn(name, args)
                 && !is_scalar_max_min(name, args);
             if is_aggregate {
-                return validate_expr_collation_consumers(connection, expr, registry);
+                return validate_expr_collation_consumers_cached(connection, expr, registry, cache);
             }
             if let FunctionArgs::List(values) = args {
                 for value in values {
-                    validate_exists_projection_aggregate_collations(connection, value, registry)?;
+                    validate_exists_projection_aggregate_collations(
+                        connection, value, registry, cache,
+                    )?;
                 }
             }
             for term in order_by {
-                validate_exists_projection_aggregate_collations(connection, &term.expr, registry)?;
+                validate_exists_projection_aggregate_collations(
+                    connection, &term.expr, registry, cache,
+                )?;
             }
             if let Some(filter) = filter {
-                validate_exists_projection_aggregate_collations(connection, filter, registry)?;
+                validate_exists_projection_aggregate_collations(
+                    connection, filter, registry, cache,
+                )?;
             }
             Ok(())
         }
@@ -172477,30 +172698,32 @@ fn validate_exists_projection_aggregate_collations(
             path: right,
             ..
         } => {
-            validate_exists_projection_aggregate_collations(connection, left, registry)?;
-            validate_exists_projection_aggregate_collations(connection, right, registry)
+            validate_exists_projection_aggregate_collations(connection, left, registry, cache)?;
+            validate_exists_projection_aggregate_collations(connection, right, registry, cache)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::Collate { expr, .. } => {
-            validate_exists_projection_aggregate_collations(connection, expr, registry)
+            validate_exists_projection_aggregate_collations(connection, expr, registry, cache)
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            validate_exists_projection_aggregate_collations(connection, expr, registry)?;
-            validate_exists_projection_aggregate_collations(connection, low, registry)?;
-            validate_exists_projection_aggregate_collations(connection, high, registry)
+            validate_exists_projection_aggregate_collations(connection, expr, registry, cache)?;
+            validate_exists_projection_aggregate_collations(connection, low, registry, cache)?;
+            validate_exists_projection_aggregate_collations(connection, high, registry, cache)
         }
         Expr::In { expr, set, .. } => {
             if matches!(set, InSet::List(values) if values.is_empty()) {
                 return Ok(());
             }
-            validate_exists_projection_aggregate_collations(connection, expr, registry)?;
+            validate_exists_projection_aggregate_collations(connection, expr, registry, cache)?;
             if let InSet::List(values) = set {
                 for value in values {
-                    validate_exists_projection_aggregate_collations(connection, value, registry)?;
+                    validate_exists_projection_aggregate_collations(
+                        connection, value, registry, cache,
+                    )?;
                 }
             }
             Ok(())
@@ -172511,10 +172734,12 @@ fn validate_exists_projection_aggregate_collations(
             escape,
             ..
         } => {
-            validate_exists_projection_aggregate_collations(connection, pattern, registry)?;
-            validate_exists_projection_aggregate_collations(connection, expr, registry)?;
+            validate_exists_projection_aggregate_collations(connection, pattern, registry, cache)?;
+            validate_exists_projection_aggregate_collations(connection, expr, registry, cache)?;
             if let Some(escape) = escape {
-                validate_exists_projection_aggregate_collations(connection, escape, registry)?;
+                validate_exists_projection_aggregate_collations(
+                    connection, escape, registry, cache,
+                )?;
             }
             Ok(())
         }
@@ -172525,20 +172750,30 @@ fn validate_exists_projection_aggregate_collations(
             ..
         } => {
             if let Some(operand) = operand {
-                validate_exists_projection_aggregate_collations(connection, operand, registry)?;
+                validate_exists_projection_aggregate_collations(
+                    connection, operand, registry, cache,
+                )?;
             }
             for (condition, value) in whens {
-                validate_exists_projection_aggregate_collations(connection, condition, registry)?;
-                validate_exists_projection_aggregate_collations(connection, value, registry)?;
+                validate_exists_projection_aggregate_collations(
+                    connection, condition, registry, cache,
+                )?;
+                validate_exists_projection_aggregate_collations(
+                    connection, value, registry, cache,
+                )?;
             }
             if let Some(else_expr) = else_expr {
-                validate_exists_projection_aggregate_collations(connection, else_expr, registry)?;
+                validate_exists_projection_aggregate_collations(
+                    connection, else_expr, registry, cache,
+                )?;
             }
             Ok(())
         }
         Expr::RowValue(values, _) => {
             for value in values {
-                validate_exists_projection_aggregate_collations(connection, value, registry)?;
+                validate_exists_projection_aggregate_collations(
+                    connection, value, registry, cache,
+                )?;
             }
             Ok(())
         }
@@ -172557,13 +172792,16 @@ fn validate_select_core_collation_consumers(
     core: &SelectCore,
     use_kind: SubqueryCollationUse,
     registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
     match core {
         SelectCore::Values(rows) => {
             if use_kind != SubqueryCollationUse::Exists {
                 for expr in rows.iter().flatten() {
-                    validate_used_window_collation_boundaries(connection, expr, &[], registry)?;
-                    validate_expr_collation_consumers(connection, expr, registry)?;
+                    validate_used_window_collation_boundaries(
+                        connection, expr, &[], registry, cache,
+                    )?;
+                    validate_expr_collation_consumers_cached(connection, expr, registry, cache)?;
                 }
                 if rows.len() > 1
                     && let Some(first_row) = rows.first()
@@ -172595,22 +172833,25 @@ fn validate_select_core_collation_consumers(
                             expr,
                             &named_windows,
                             registry,
+                            cache,
                         )?;
                     }
                 }
             }
             if let Some(predicate) = where_clause {
-                validate_expr_collation_consumers(connection, predicate, registry)?;
+                validate_expr_collation_consumers_cached(connection, predicate, registry, cache)?;
             }
             if use_kind != SubqueryCollationUse::Exists {
                 for column in columns {
                     if let ResultColumn::Expr { expr, .. } = column {
-                        validate_expr_collation_consumers(connection, expr, registry)?;
+                        validate_expr_collation_consumers_cached(
+                            connection, expr, registry, cache,
+                        )?;
                     }
                 }
             }
             if let Some(predicate) = having {
-                validate_expr_collation_consumers(connection, predicate, registry)?;
+                validate_expr_collation_consumers_cached(connection, predicate, registry, cache)?;
             }
             Ok(())
         }
@@ -172621,14 +172862,15 @@ fn validate_from_clause_collation_consumers(
     connection: &Connection,
     from: &FromClause,
     registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
     for join in from.joins.iter().rev() {
-        validate_table_or_subquery_collation_consumers(connection, &join.table, registry)?;
+        validate_table_or_subquery_collation_consumers(connection, &join.table, registry, cache)?;
     }
-    validate_table_or_subquery_collation_consumers(connection, &from.source, registry)?;
+    validate_table_or_subquery_collation_consumers(connection, &from.source, registry, cache)?;
     for join in &from.joins {
         if let Some(JoinConstraint::On(expr)) = &join.constraint {
-            validate_expr_collation_consumers(connection, expr, registry)?;
+            validate_expr_collation_consumers_cached(connection, expr, registry, cache)?;
         }
     }
     Ok(())
@@ -172638,26 +172880,28 @@ fn validate_table_or_subquery_collation_consumers(
     connection: &Connection,
     source: &TableOrSubquery,
     registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
     match source {
         TableOrSubquery::Table { .. } => Ok(()),
         TableOrSubquery::Subquery { query, .. } => {
             validate_select_result_collation_metadata(connection, query, registry)?;
-            validate_select_collation_consumers(
+            validate_select_collation_consumers_cached(
                 connection,
                 query,
                 SubqueryCollationUse::Scalar,
                 registry,
+                cache,
             )
         }
         TableOrSubquery::TableFunction { args, .. } => {
             for arg in args {
-                validate_expr_collation_consumers(connection, arg, registry)?;
+                validate_expr_collation_consumers_cached(connection, arg, registry, cache)?;
             }
             Ok(())
         }
         TableOrSubquery::ParenJoin(from) => {
-            validate_from_clause_collation_consumers(connection, from, registry)
+            validate_from_clause_collation_consumers(connection, from, registry, cache)
         }
     }
 }
@@ -172721,6 +172965,7 @@ fn validate_compound_order_collations(
     connection: &Connection,
     select: &SelectStatement,
     registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
     let resolved_indices = resolve_compound_order_output_indices(connection, select, &[])?;
     let mut cores = Vec::with_capacity(select.body.compounds.len() + 1);
@@ -172743,7 +172988,7 @@ fn validate_compound_order_collations(
     };
     for (term, index) in select.order_by.iter().zip(resolved_indices).rev() {
         if matches!(&term.expr, Expr::Collate { .. }) {
-            validate_expr_collation_boundary(connection, &term.expr, registry)?;
+            validate_expr_collation_boundary_cached(connection, &term.expr, registry, cache)?;
         } else {
             let _ = resolve_compound_column_collation_candidate(&candidate_rows, index, registry)?;
         }
@@ -172752,6 +172997,7 @@ fn validate_compound_order_collations(
             &term.expr,
             &named_windows,
             registry,
+            cache,
         )?;
     }
     Ok(())
@@ -172809,8 +173055,9 @@ fn validate_used_window_collation_boundaries(
     expr: &Expr,
     visible_windows: &NamedWindowSpecs<'_>,
     registry: &CollationRegistry,
+    cache: &mut CollationConsumerVisitCache,
 ) -> Result<()> {
-    if expr_folds_to_integer_zero_via_and(expr) {
+    if expr_folds_to_integer_zero_via_and(expr) || !expr_has_window_function(expr) {
         return Ok(());
     }
     let mut remaining = expr.clone();
@@ -172828,17 +173075,17 @@ fn validate_used_window_collation_boundaries(
         })?;
         let resolved = resolve_used_window_spec(&window, visible_windows)?;
         if let Some(filter) = &filter {
-            validate_expr_collation_boundary(connection, filter, registry)?;
+            validate_expr_collation_boundary_cached(connection, filter, registry, cache)?;
         }
         if let FunctionArgs::List(values) = &args {
             for value in values.iter().rev() {
-                validate_expr_collation_boundary(connection, value, registry)?;
+                validate_expr_collation_boundary_cached(connection, value, registry, cache)?;
             }
         }
         for term in call_order_by.iter().rev() {
-            validate_expr_collation_boundary(connection, &term.expr, registry)?;
+            validate_expr_collation_boundary_cached(connection, &term.expr, registry, cache)?;
         }
-        validate_used_window_key_collations(connection, &resolved, registry)?;
+        validate_used_window_key_collations_cached(connection, &resolved, registry, cache)?;
 
         let mut replaced = false;
         remaining =
