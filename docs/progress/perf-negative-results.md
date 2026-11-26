@@ -94,6 +94,50 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-26 - KEPT (landed as 522d56872; exact instruction counts, stock SQLite 3.54.1 live; time cells VOID under the powersave governor): the checkpoint digests only each page's last frame in its window (bd-fuwx0 lever C3, row 3b-i, single-writer lane r14-r18)
+
+- Target: `read_checkpoint_frame_headers` (fsqlite-wal) validated every frame of the backfill window and computed an
+  XXH3-128 of each frame's 4,120 bytes for the copy pass, about 2.9k Ir per frame. The copy pass keeps one
+  expectation per page, the window's last frame of it, so in a run of one-row commits almost every digest was
+  never read (r13's profile: 806 of 814 frames at N=800).
+- Touched (`crates/fsqlite-wal/src/`):
+  - `wal.rs`: `WalFile::recorded_frame_page_number`, the page number this handle recorded for a frame, from memory.
+  - `checkpoint_validation.rs`: the superseded set comes from the recorded page numbers. The validating pass is
+    unchanged (seed, rolling checksum, salts, page 0 and tail), except that a superseded frame gets no digest and
+    each valid frame's on-disk page number must equal its recorded one. Any missing header or difference reruns
+    today's pass, digesting every frame.
+  - `checkpoint_executor_impl.rs`: expectations from the window's last frame per page; a missing digest there is
+    an internal error, unreachable by construction.
+  - Keepers in `checkpoint_integrity_tests.rs`: the digest sits exactly on each page's last frame (RED on the
+    parent); recorded/on-disk page numbers that differ fall back to a digest on every frame (RED on mutant M1, the
+    page-number check skipped); the copy pass refuses a rewritten last frame before writing (RED on M2, the
+    digest on the FIRST frame).
+  - No stored byte changes: not the WAL, the certificate (v5), the database file or the -shm.
+- Measurement. Setup: callgrind on thinkstation1 (whole process, io_uring refused, database on the ext4 scratch
+  disk); release-perf CLI arms built in ONE rch job on vmi1153651 from origin/main 6f5aa6fb1: P
+  162677853de1e4e3, L de1e5a2bd62d58ac (the lever diff applied, files touched, wal compiled once per arm); Q a
+  byte-identical copy of P; stock 3.54.1 (84a5d033384e09ed) live in the same invocation. Per unit = (N800 -
+  N400)/400.
+  - FULL autocommit INSERT, 5 pairs: L-P median -3,043, mean -2,602 Ir (min -1,529, max -3,418); 179,868 ->
+    177,266 (L/P 0.9855); A/A nulls -772 and -96. Stock 21,236: x8.47 -> x8.35.
+  - NORMAL INSERT, 2 pairs: -3,368 (L/P 0.9809, worst pair 0.9837), x8.32 -> x8.17.
+  - txn10, 2 pairs: -1,982 per transaction (L/P 0.9965), x3.83 -> x3.82.
+  - Point SELECT: +130 (+0.18%; its A/A null +0.88%), x3.81 both.
+  - One-transaction bulk load of ~1000-byte rows (distinct pages, nothing superseded): +0.4 Ir per INSERT, whole
+    run L/P 1.0013 and 1.0007, x1.81 both.
+  - Prediction -2.6k to -3.0k per FULL INSERT, gain kill line -1.5k: the mean sits on the band's low end, and
+    every pair is past the kill line. txn10 beat its -0.3k to -1.0k prediction. No row is above +0.5%.
+- Time: not judged. The host runs the powersave governor, so time cells are VOID (coordinator decision,
+  2026-11-26); mt-mvcc-bench 4/8/16 writers was not run for the same reason. Re-judge under bd-j0jc0/bd-gvews.
+- Gate (rch, perf-sl3ab, the lever commit on 709fd5122): clippy -D warnings fsqlite-wal all targets rc 0; fsqlite-wal
+  lib 1195 passed on hz4 (a first run on a loaded vmi1153651 failed recovery_fence's 20 ms head-start timing test
+  once; 20 reruns each on the lever and the parent were green); core checkpoint oracles (10 targets) ok except
+  wal_cert_sidecar_compaction `every_crash_image_of_the_compaction_reopens_with_all_rows` (sidecar records 2, not 1),
+  identical on the parent 3 of 3, so red on main without this change; e2e checkpoint/recovery targets 36/0; fsqlite
+  checkpoint targets 138/0.
+- Retry condition: none for this mechanism. The remaining checkpoint validation cost is the rolling checksum over
+  every frame; a later lever that drops it needs a different proof than recorded page numbers.
+
 ## 2026-11-26 - WIN (probe met: 11.60x -> 7.85x stock steady-state Ir, -32.3%, <= 11x probe): a lookup join whose outer index covers all outer reads skips OpenRead + SeekRowid on the outer table and evaluates outer-only WHERE once per outer row (bd-obpoh)
 
 - Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` on the 200,000-row `t` (`t_a(a)`, 200 rows at `a = 5`) / 50,000-row `p` (`p_tid(tid)`) fixture with `ANALYZE`. Previously `emit_outer_loop_start` (`OuterEqualitySeek::Index`) emitted `IdxRowid` + `SeekRowid` into `t` for every outer entry even when the join only read `t.id` and `t.a`, opened unused `left_cursor`/`right_cursor`, and re-evaluated outer-only `WHERE` conjuncts inside the inner loop.
