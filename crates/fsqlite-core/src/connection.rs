@@ -121674,6 +121674,21 @@ impl Connection {
                     // actually performs.
                     if let Ok(program) = self.compile_table_select(select).await {
                         let temp_btrees = select_program_temp_btrees(select, &program);
+                        // bd-r39kx: check for an index skip-scan before rowid
+                        // or plain index seek so an `IdxRowid -> SeekRowid` leg
+                        // reports `ANY(prefix) AND col=?` instead of falling
+                        // through to a misleading seek or `SCAN t`.
+                        if let Some(skip_scan) = crate::explain::program_index_skip_scan(&program)
+                            && let Some(detail) = index_skip_scan_eqp_detail(
+                                select,
+                                &skip_scan,
+                                &self.schema.borrow(),
+                            )
+                        {
+                            let mut rows = vec![emit_row(detail)];
+                            push_temp_btree_eqp_rows(&mut rows, temp_btrees, &mut emit_row);
+                            return rows;
+                        }
                         if crate::explain::program_seeks_rowid_on_table(
                             &program,
                             &directive.table_name,
@@ -121807,16 +121822,37 @@ impl Connection {
                             .as_deref()
                             .map(|label| format!("{label}=?"))
                     }),
-                    PlannerSelectAccessKind::IndexRange => source
-                        .zip(directive.index_key_label.as_deref())
-                        .and_then(|((table, alias, where_clause), key_column)| {
-                            index_seek_eqp_range_key_terms(
-                                where_clause,
-                                &table.name,
-                                alias,
-                                key_column,
-                            )
-                        }),
+                    PlannerSelectAccessKind::IndexRange => source.and_then(
+                        |(table, alias, where_clause)| {
+                            let index = directive.index_name.as_deref().and_then(|name| {
+                                table
+                                    .indexes
+                                    .iter()
+                                    .find(|cand| cand.name.eq_ignore_ascii_case(name))
+                            });
+                            index
+                                .and_then(|idx| {
+                                    index_seek_eqp_composite_key_terms(
+                                        where_clause,
+                                        &[],
+                                        &table.name,
+                                        alias,
+                                        idx,
+                                        directive_seek_key_columns,
+                                    )
+                                })
+                                .or_else(|| {
+                                    directive.index_key_label.as_deref().and_then(|key_column| {
+                                        index_seek_eqp_range_key_terms(
+                                            where_clause,
+                                            &table.name,
+                                            alias,
+                                            key_column,
+                                        )
+                                    })
+                                })
+                        },
+                    ),
                     PlannerSelectAccessKind::FullTableScan
                     | PlannerSelectAccessKind::RowidLookup => None,
                 };
@@ -121850,6 +121886,22 @@ impl Connection {
             let plain_single_core = select.with.is_none() && select.body.compounds.is_empty();
             let simple_top_level_select = plain_single_core
                 && !select_contains_subquery_matching(select, self, &|_, _| true);
+            // bd-r39kx: check for an index skip-scan before plain `IndexSeek`
+            // so a skip-scan under an aggregate or ORDER BY reports
+            // `ANY(prefix) AND col=?` instead of `(prefix=?)`.
+            if (simple_top_level_select || (plain_single_core && has_direct_subqueries))
+                && let Some(skip_scan) = crate::explain::program_index_skip_scan(&program)
+                && let Some(detail) =
+                    index_skip_scan_eqp_detail(select, &skip_scan, &self.schema.borrow())
+            {
+                let mut rows = vec![emit_row(detail)];
+                push_temp_btree_eqp_rows(
+                    &mut rows,
+                    select_program_temp_btrees(select, &program),
+                    &mut emit_row,
+                );
+                return rows;
+            }
             let aggregate = select_core_is_aggregate(&select.body.select);
             let index_seek = if aggregate {
                 crate::explain::aggregate_index_seek_facts(&program)
@@ -121949,6 +122001,27 @@ impl Connection {
                 && let Some(detail) = index_walk_eqp_detail(select, &walk, &self.schema.borrow())
             {
                 let mut rows = vec![emit_row(detail)];
+                push_temp_btree_eqp_rows(
+                    &mut rows,
+                    select_program_temp_btrees(select, &program),
+                    &mut emit_row,
+                );
+                return rows;
+            }
+
+            // bd-r39kx: multi-table joins — report each driving loop in
+            // execution order directly from the emitted bytecode, using aliases
+            // and stock's SEARCH/SCAN/LEFT-JOIN/AUTOMATIC INDEX vocabulary.
+            if simple_top_level_select
+                && let Some(join_steps) = crate::explain::program_join_plan(&program)
+                && let Some(details) = join_plan_eqp_details(
+                    select,
+                    &program,
+                    &join_steps,
+                    &self.schema.borrow(),
+                )
+            {
+                let mut rows: Vec<Row> = details.into_iter().map(&mut emit_row).collect();
                 push_temp_btree_eqp_rows(
                     &mut rows,
                     select_program_temp_btrees(select, &program),
@@ -164291,6 +164364,569 @@ fn index_seek_eqp_equality_key_terms(
         })
 }
 
+/// bd-r39kx: stock-style composite key terms (`b=? AND c>?`, `b=? AND c>? AND c<?`,
+/// `a=? AND b=?`, `a>?`) for a seek that binds `seek_key_columns` leading columns
+/// of `index`, reading constraints from top-level `AND` conjuncts (WHERE + ON)
+/// and `USING` column equalities while ignoring residual predicates on other
+/// columns.
+fn eqp_column_matches_target(
+    expr: &Expr,
+    table_name: &str,
+    table_alias: Option<&str>,
+    target_column: &str,
+) -> bool {
+    let Expr::Column(column, _) = expr else {
+        return false;
+    };
+    column.column.eq_ignore_ascii_case(target_column)
+        && column.table.as_deref().is_none_or(|qualifier| {
+            table_alias.map_or_else(
+                || qualifier.eq_ignore_ascii_case(table_name),
+                |alias| qualifier.eq_ignore_ascii_case(alias),
+            )
+        })
+}
+
+fn eqp_key_terms_for_columns(
+    conjuncts: &[&Expr],
+    using_eq_columns: &[&str],
+    table_name: &str,
+    table_alias: Option<&str>,
+    columns: &[String],
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for key_column in columns {
+        let has_eq = using_eq_columns
+            .iter()
+            .any(|col| col.eq_ignore_ascii_case(key_column))
+            || conjuncts.iter().any(|term| match term {
+                Expr::BinaryOp {
+                    left,
+                    op: BinaryOp::Eq,
+                    right,
+                    ..
+                } => {
+                    eqp_column_matches_target(left, table_name, table_alias, key_column)
+                        || eqp_column_matches_target(right, table_name, table_alias, key_column)
+                }
+                Expr::In {
+                    expr, not: false, ..
+                } => eqp_column_matches_target(expr, table_name, table_alias, key_column),
+                _ => false,
+            });
+        if has_eq {
+            parts.push(format!("{key_column}=?"));
+            continue;
+        }
+
+        let (mut lower, mut upper) = (false, false);
+        for term in conjuncts {
+            match term {
+                Expr::BinaryOp {
+                    left, op, right, ..
+                } => {
+                    let bounds_below = match op {
+                        BinaryOp::Gt | BinaryOp::Ge => true,
+                        BinaryOp::Lt | BinaryOp::Le => false,
+                        _ => continue,
+                    };
+                    if eqp_column_matches_target(left, table_name, table_alias, key_column) {
+                        lower |= bounds_below;
+                        upper |= !bounds_below;
+                    } else if eqp_column_matches_target(right, table_name, table_alias, key_column)
+                    {
+                        lower |= !bounds_below;
+                        upper |= bounds_below;
+                    }
+                }
+                Expr::Between {
+                    expr, not: false, ..
+                } if eqp_column_matches_target(expr, table_name, table_alias, key_column) => {
+                    lower = true;
+                    upper = true;
+                }
+                Expr::IsNull {
+                    expr, not: true, ..
+                } if eqp_column_matches_target(expr, table_name, table_alias, key_column) => {
+                    lower = true;
+                }
+                _ => {}
+            }
+        }
+        match (lower, upper) {
+            (true, true) => parts.push(format!("{key_column}>? AND {key_column}<?")),
+            (true, false) => parts.push(format!("{key_column}>?")),
+            (false, true) => parts.push(format!("{key_column}<?")),
+            (false, false) => {}
+        }
+        // Only one trailing range column can follow an equality prefix.
+        break;
+    }
+    (!parts.is_empty()).then(|| parts.join(" AND "))
+}
+
+fn index_seek_eqp_composite_key_terms(
+    where_clause: Option<&Expr>,
+    extra_conjuncts: &[&Expr],
+    table_name: &str,
+    table_alias: Option<&str>,
+    index: &IndexSchema,
+    seek_key_columns: Option<usize>,
+) -> Option<String> {
+    if index.columns.len() != index.key_term_count() {
+        return None;
+    }
+    let bound = seek_key_columns.unwrap_or(1).min(index.columns.len());
+    if bound == 0 {
+        return None;
+    }
+    let mut conjuncts: Vec<&Expr> = Vec::new();
+    if let Some(where_expr) = where_clause {
+        conjuncts.extend(decompose_where(where_expr));
+    }
+    for extra in extra_conjuncts {
+        conjuncts.extend(decompose_where(extra));
+    }
+    eqp_key_terms_for_columns(
+        &conjuncts,
+        &[],
+        table_name,
+        table_alias,
+        &index.columns[..bound],
+    )
+}
+
+/// bd-r39kx: stock-vocabulary EQP detail for a bytecode-verified index skip-scan
+/// (`SEARCH <disp> USING [COVERING ]INDEX <idx> (ANY(col0) AND col1=?)`).
+fn index_skip_scan_eqp_detail(
+    select: &SelectStatement,
+    skip_scan: &crate::explain::IndexSkipScan,
+    schema: &[TableSchema],
+) -> Option<String> {
+    let (table, alias, where_clause) = single_table_select_source(select, schema)?;
+    if table.without_rowid {
+        return None;
+    }
+    let index = table
+        .indexes
+        .iter()
+        .find(|candidate| candidate.name.eq_ignore_ascii_case(&skip_scan.index_name))?;
+    if index.columns.len() != index.key_term_count()
+        || skip_scan.skip_prefix_cols >= index.columns.len()
+    {
+        return None;
+    }
+    let bound = skip_scan.seek_key_cols.min(index.columns.len());
+    if bound <= skip_scan.skip_prefix_cols {
+        return None;
+    }
+    let conjuncts: Vec<&Expr> = where_clause.map(decompose_where).unwrap_or_default();
+    let mut terms: Vec<String> = index.columns[..skip_scan.skip_prefix_cols]
+        .iter()
+        .map(|col| format!("ANY({col})"))
+        .collect();
+    if let Some(suffix) = eqp_key_terms_for_columns(
+        &conjuncts,
+        &[],
+        &table.name,
+        alias,
+        &index.columns[skip_scan.skip_prefix_cols..bound],
+    ) {
+        terms.push(suffix);
+    } else {
+        for col in &index.columns[skip_scan.skip_prefix_cols..bound] {
+            terms.push(format!("{col}=?"));
+        }
+    }
+    let displayed = alias.unwrap_or(&table.name);
+    let using = if skip_scan.covering {
+        "COVERING INDEX"
+    } else {
+        "INDEX"
+    };
+    Some(format!(
+        "SEARCH {displayed} USING {using} {} ({})",
+        index.name,
+        terms.join(" AND ")
+    ))
+}
+
+struct EqpJoinTableSource<'a> {
+    table: &'a TableSchema,
+    alias: Option<&'a str>,
+}
+
+fn collect_plain_join_sources<'a>(
+    from: &'a FromClause,
+    schema: &'a [TableSchema],
+    sources: &mut Vec<EqpJoinTableSource<'a>>,
+    on_exprs: &mut Vec<&'a Expr>,
+    using_cols: &mut Vec<&'a str>,
+) -> bool {
+    fn push_source<'a>(
+        item: &'a TableOrSubquery,
+        schema: &'a [TableSchema],
+        sources: &mut Vec<EqpJoinTableSource<'a>>,
+        on_exprs: &mut Vec<&'a Expr>,
+        using_cols: &mut Vec<&'a str>,
+    ) -> bool {
+        match item {
+            TableOrSubquery::Table { name, alias, .. } => {
+                let Some(table) = schema
+                    .iter()
+                    .find(|candidate| candidate.name.eq_ignore_ascii_case(&name.name))
+                else {
+                    return false;
+                };
+                sources.push(EqpJoinTableSource {
+                    table,
+                    alias: alias.as_deref(),
+                });
+                true
+            }
+            TableOrSubquery::ParenJoin(inner) => {
+                collect_plain_join_sources(inner, schema, sources, on_exprs, using_cols)
+            }
+            TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => false,
+        }
+    }
+
+    if !push_source(&from.source, schema, sources, on_exprs, using_cols) {
+        return false;
+    }
+    for join in &from.joins {
+        if !push_source(&join.table, schema, sources, on_exprs, using_cols) {
+            return false;
+        }
+        match &join.constraint {
+            Some(JoinConstraint::On(expr)) => on_exprs.push(expr),
+            Some(JoinConstraint::Using(cols)) => {
+                using_cols.extend(cols.iter().map(String::as_str));
+            }
+            None => {}
+        }
+    }
+    true
+}
+
+/// bd-r39kx: render multi-table join steps from `explain::program_join_plan`
+/// using the FROM clause's aliases and stock SQLite's `SEARCH`/`SCAN`/`LEFT-JOIN`/
+/// `AUTOMATIC INDEX` wording.
+#[allow(clippy::too_many_lines)]
+fn join_plan_eqp_details(
+    select: &SelectStatement,
+    program: &VdbeProgram,
+    steps: &[crate::explain::ProgramJoinStep],
+    schema: &[TableSchema],
+) -> Option<Vec<String>> {
+    use crate::explain::ProgramJoinStepKind;
+
+    let SelectCore::Select {
+        from, where_clause, ..
+    } = &select.body.select
+    else {
+        return None;
+    };
+    let from = from.as_ref()?;
+    if from.joins.is_empty() {
+        return None;
+    }
+
+    let mut sources: Vec<EqpJoinTableSource<'_>> = Vec::new();
+    let mut on_exprs: Vec<&Expr> = Vec::new();
+    let mut using_cols: Vec<&str> = Vec::new();
+    if !collect_plain_join_sources(from, schema, &mut sources, &mut on_exprs, &mut using_cols) {
+        return None;
+    }
+
+    let step_table_cursors: std::collections::HashSet<i32> =
+        steps.iter().filter_map(|step| step.table_cursor).collect();
+    // Bind opened outer table cursors (in program open order) to FROM sources by table name.
+    let mut cursor_to_source: HashMap<i32, usize> = HashMap::new();
+    let mut matched_sources = vec![false; sources.len()];
+    for op in program.ops() {
+        if op.opcode == Opcode::OpenRead
+            && step_table_cursors.contains(&op.p1)
+            && let P4::Table(tbl_name) = &op.p4
+            && !cursor_to_source.contains_key(&op.p1)
+            && let Some(idx) = sources.iter().enumerate().position(|(i, src)| {
+                !matched_sources[i] && src.table.name.eq_ignore_ascii_case(tbl_name)
+            })
+        {
+            cursor_to_source.insert(op.p1, idx);
+            matched_sources[idx] = true;
+        }
+    }
+
+    let mut conjuncts: Vec<&Expr> = Vec::new();
+    if let Some(where_expr) = where_clause.as_deref() {
+        conjuncts.extend(decompose_where(where_expr));
+    }
+    for on_expr in &on_exprs {
+        conjuncts.extend(decompose_where(on_expr));
+    }
+
+    let mut details = Vec::with_capacity(steps.len());
+
+    for step in steps {
+        let source_idx = if let Some(tbl_cur) = step.table_cursor {
+            cursor_to_source.get(&tbl_cur).copied()
+        } else {
+            let idx_name = match &step.kind {
+                ProgramJoinStepKind::IndexSeek { index_name, .. }
+                | ProgramJoinStepKind::IndexSkipScan { index_name, .. }
+                | ProgramJoinStepKind::IndexScan { index_name, .. } => Some(index_name.as_str()),
+                _ => None,
+            };
+            idx_name.and_then(|name| {
+                let found = sources
+                    .iter()
+                    .enumerate()
+                    .position(|(i, src)| {
+                        !matched_sources[i]
+                            && src
+                                .table
+                                .indexes
+                                .iter()
+                                .any(|idx| idx.name.eq_ignore_ascii_case(name))
+                    })
+                    .or_else(|| {
+                        sources.iter().position(|src| {
+                            src.table
+                                .indexes
+                                .iter()
+                                .any(|idx| idx.name.eq_ignore_ascii_case(name))
+                        })
+                    });
+                if let Some(i) = found {
+                    matched_sources[i] = true;
+                }
+                found
+            })
+        };
+
+        let src = sources.get(source_idx?)?;
+        let displayed = src.alias.unwrap_or(&src.table.name);
+        let left_suffix = if step.left_join { " LEFT-JOIN" } else { "" };
+
+        let detail = match &step.kind {
+            ProgramJoinStepKind::TableScan => format!("SCAN {displayed}{left_suffix}"),
+            ProgramJoinStepKind::RowidPoint => {
+                format!("SEARCH {displayed} USING INTEGER PRIMARY KEY (rowid=?){left_suffix}")
+            }
+            ProgramJoinStepKind::RowidRange => {
+                let names_rowid = |expr: &Expr| {
+                    let Expr::Column(column, _) = expr else {
+                        return false;
+                    };
+                    let name = &column.column;
+                    column
+                        .table
+                        .as_deref()
+                        .is_none_or(|q| q.eq_ignore_ascii_case(displayed))
+                        && (src
+                            .table
+                            .columns
+                            .iter()
+                            .any(|c| c.is_ipk && c.name.eq_ignore_ascii_case(name))
+                            || (["rowid", "_rowid_", "oid"]
+                                .iter()
+                                .any(|a| a.eq_ignore_ascii_case(name))
+                                && !src
+                                    .table
+                                    .columns
+                                    .iter()
+                                    .any(|c| c.name.eq_ignore_ascii_case(name))))
+                };
+                let (mut lower, mut upper) = (false, false);
+                for term in &conjuncts {
+                    match term {
+                        Expr::BinaryOp {
+                            left, op, right, ..
+                        } => {
+                            let bounds_below = match op {
+                                BinaryOp::Gt | BinaryOp::Ge => true,
+                                BinaryOp::Lt | BinaryOp::Le => false,
+                                _ => continue,
+                            };
+                            if names_rowid(left) {
+                                lower |= bounds_below;
+                                upper |= !bounds_below;
+                            } else if names_rowid(right) {
+                                lower |= !bounds_below;
+                                upper |= bounds_below;
+                            }
+                        }
+                        Expr::Between {
+                            expr, not: false, ..
+                        } if names_rowid(expr) => {
+                            lower = true;
+                            upper = true;
+                        }
+                        _ => {}
+                    }
+                }
+                let terms = match (lower, upper) {
+                    (true, true) => "rowid>? AND rowid<?",
+                    (true, false) => "rowid>?",
+                    (false, true) => "rowid<?",
+                    (false, false) => return None,
+                };
+                format!("SEARCH {displayed} USING INTEGER PRIMARY KEY ({terms}){left_suffix}")
+            }
+            ProgramJoinStepKind::WithoutRowidPk => {
+                let pk_columns = src.table.primary_key_constraints.first()?;
+                if pk_columns.is_empty() {
+                    return None;
+                }
+                let key_terms = pk_columns
+                    .iter()
+                    .map(|col| format!("{col}=?"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                format!("SEARCH {displayed} USING PRIMARY KEY ({key_terms}){left_suffix}")
+            }
+            ProgramJoinStepKind::IndexSeek {
+                index_name,
+                covering,
+                seek_key_columns,
+            } => {
+                let index = src
+                    .table
+                    .indexes
+                    .iter()
+                    .find(|cand| cand.name.eq_ignore_ascii_case(index_name))?;
+                let bound = seek_key_columns.unwrap_or(1).min(index.columns.len());
+                if bound == 0 {
+                    return None;
+                }
+                let key_terms = if index.columns.len() == index.key_term_count() {
+                    eqp_key_terms_for_columns(
+                        &conjuncts,
+                        &using_cols,
+                        &src.table.name,
+                        src.alias,
+                        &index.columns[..bound],
+                    )
+                    .unwrap_or_else(|| {
+                        index.columns[..bound]
+                            .iter()
+                            .map(|c| format!("{c}=?"))
+                            .collect::<Vec<_>>()
+                            .join(" AND ")
+                    })
+                } else {
+                    "<expr>=?".to_owned()
+                };
+                let using = if *covering && !src.table.without_rowid {
+                    "COVERING INDEX"
+                } else {
+                    "INDEX"
+                };
+                format!(
+                    "SEARCH {displayed} USING {using} {} ({key_terms}){left_suffix}",
+                    index.name
+                )
+            }
+            ProgramJoinStepKind::IndexSkipScan {
+                index_name,
+                covering,
+                skip_prefix_cols,
+                seek_key_cols,
+            } => {
+                let index = src
+                    .table
+                    .indexes
+                    .iter()
+                    .find(|cand| cand.name.eq_ignore_ascii_case(index_name))?;
+                let bound = (*seek_key_cols).min(index.columns.len());
+                if *skip_prefix_cols >= bound || index.columns.len() != index.key_term_count() {
+                    return None;
+                }
+                let mut terms: Vec<String> = index.columns[..*skip_prefix_cols]
+                    .iter()
+                    .map(|c| format!("ANY({c})"))
+                    .collect();
+                if let Some(suffix) = eqp_key_terms_for_columns(
+                    &conjuncts,
+                    &using_cols,
+                    &src.table.name,
+                    src.alias,
+                    &index.columns[*skip_prefix_cols..bound],
+                ) {
+                    terms.push(suffix);
+                } else {
+                    for col in &index.columns[*skip_prefix_cols..bound] {
+                        terms.push(format!("{col}=?"));
+                    }
+                }
+                let using = if *covering && !src.table.without_rowid {
+                    "COVERING INDEX"
+                } else {
+                    "INDEX"
+                };
+                format!(
+                    "SEARCH {displayed} USING {using} {} ({}){left_suffix}",
+                    index.name,
+                    terms.join(" AND ")
+                )
+            }
+            ProgramJoinStepKind::IndexScan {
+                index_name,
+                covering,
+                bounded_above,
+            } => {
+                let index = src
+                    .table
+                    .indexes
+                    .iter()
+                    .find(|cand| cand.name.eq_ignore_ascii_case(index_name))?;
+                let using = if *covering && !src.table.without_rowid {
+                    "COVERING INDEX"
+                } else {
+                    "INDEX"
+                };
+                if *bounded_above
+                    && let Some(first_col) = index.columns.first()
+                {
+                    format!(
+                        "SEARCH {displayed} USING {using} {} ({first_col}<?){left_suffix}",
+                        index.name
+                    )
+                } else {
+                    format!("SCAN {displayed} USING {using} {}{left_suffix}", index.name)
+                }
+            }
+            ProgramJoinStepKind::AutoIndex {
+                col_indices,
+                covering,
+            } => {
+                let key_terms: Vec<String> = col_indices
+                    .iter()
+                    .filter_map(|&idx| src.table.columns.get(idx))
+                    .map(|col| format!("{}=?", col.name))
+                    .collect();
+                if key_terms.is_empty() {
+                    return None;
+                }
+                let kind = if *covering {
+                    "AUTOMATIC COVERING INDEX"
+                } else {
+                    "AUTOMATIC INDEX"
+                };
+                format!(
+                    "SEARCH {displayed} USING {kind} ({}){left_suffix}",
+                    key_terms.join(" AND ")
+                )
+            }
+        };
+
+        details.push(detail);
+    }
+
+    (!details.is_empty()).then_some(details)
+}
+
 /// bd-zgbhb: the key terms stock prints for a seek that bounds the index's
 /// leading column instead of pinning it, as a COUNT(*) counted from the
 /// b-tree does: `k>?` for a lower bound (`>`, `>=`, `IS NOT NULL`), `k<?` for
@@ -164643,6 +165279,16 @@ fn index_seek_eqp_detail(
         index,
         seek_key_columns,
     )
+    .or_else(|| {
+        index_seek_eqp_composite_key_terms(
+            where_clause.as_deref(),
+            &[],
+            &table.name,
+            alias.as_deref(),
+            index,
+            seek_key_columns,
+        )
+    })
     .or_else(|| {
         index_seek_eqp_range_key_terms(
             where_clause.as_deref(),

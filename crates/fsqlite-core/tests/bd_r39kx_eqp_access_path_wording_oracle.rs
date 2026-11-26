@@ -26,8 +26,11 @@ const SETUP: &[&str] = &[
     "CREATE INDEX tbc ON t(b, c)",
     "CREATE TABLE n(x, y)",
     "CREATE INDEX nx ON n(x)",
+    "CREATE TABLE u(id INTEGER PRIMARY KEY, tid INTEGER, v TEXT)",
+    "CREATE INDEX utid ON u(tid)",
     "INSERT INTO t VALUES (1, 10, 'x', 1), (2, 20, 'y', 2), (3, 30, 'x', 3)",
     "INSERT INTO n VALUES (4, 'p'), (6, 'q')",
+    "INSERT INTO u VALUES (10, 1, 'u1'), (20, 2, 'u2')",
 ];
 
 /// Statements whose `EXPLAIN QUERY PLAN` rows must equal stock's.
@@ -77,6 +80,23 @@ const SHAPES: &[&str] = &[
     "SELECT * FROM t ORDER BY a",
     "SELECT * FROM t AS q ORDER BY a",
     "SELECT a, count(*) FROM t GROUP BY a",
+    // Final bd-r39kx closure slice: count(DISTINCT), composite prefix+range
+    // bounds, and joins whose plan order agrees with stock SQLite 3.54.1.
+    "SELECT count(DISTINCT a) FROM t",
+    "SELECT count(DISTINCT a) FROM t AS q",
+    "SELECT * FROM t WHERE b = 'x' AND c > 1",
+    "SELECT id FROM t WHERE b = 'x' AND c > 1",
+    "SELECT * FROM t AS q WHERE q.b = 'x' AND q.c > 1",
+    "SELECT * FROM t WHERE b = 'x' AND c < 5",
+    "SELECT * FROM t WHERE b = 'x' AND c >= 1 AND c < 5",
+    "SELECT * FROM t WHERE b = 'x' AND c BETWEEN 1 AND 5",
+    "SELECT * FROM t JOIN u ON u.id = t.a",
+    "SELECT * FROM t LEFT JOIN u ON u.id = t.a",
+    "SELECT * FROM t LEFT JOIN u ON u.tid = t.id",
+    "SELECT * FROM t LEFT JOIN u ON u.v > t.b",
+    "SELECT * FROM t JOIN u ON u.tid = t.id WHERE t.a = 10",
+    "SELECT * FROM t AS t1 JOIN u AS u1 ON u1.tid = t1.id WHERE t1.a = 10",
+    "SELECT * FROM t AS t1 JOIN t AS t2 ON t2.id = t1.a",
 ];
 
 /// Stock's text for the slice, pinned so a change in the oracle shows here.
@@ -116,6 +136,42 @@ const PINNED: &[(&str, &[&str])] = &[
     ("SELECT count(*) FROM t", &["SCAN t USING COVERING INDEX ta"]),
     ("SELECT a FROM t AS q ORDER BY a DESC", &["SCAN q USING COVERING INDEX ta"]),
     ("SELECT * FROM t ORDER BY a", &["SCAN t USING INDEX ta"]),
+    ("SELECT count(DISTINCT a) FROM t", &["SCAN t USING COVERING INDEX ta"]),
+    (
+        "SELECT * FROM t WHERE b = 'x' AND c > 1",
+        &["SEARCH t USING INDEX tbc (b=? AND c>?)"],
+    ),
+    (
+        "SELECT id FROM t WHERE b = 'x' AND c > 1",
+        &["SEARCH t USING COVERING INDEX tbc (b=? AND c>?)"],
+    ),
+    (
+        "SELECT * FROM t WHERE b = 'x' AND c < 5",
+        &["SEARCH t USING INDEX tbc (b=? AND c<?)"],
+    ),
+    (
+        "SELECT * FROM t WHERE b = 'x' AND c BETWEEN 1 AND 5",
+        &["SEARCH t USING INDEX tbc (b=? AND c>? AND c<?)"],
+    ),
+    (
+        "SELECT * FROM t JOIN u ON u.id = t.a",
+        &["SCAN t", "SEARCH u USING INTEGER PRIMARY KEY (rowid=?)"],
+    ),
+    (
+        "SELECT * FROM t LEFT JOIN u ON u.tid = t.id",
+        &["SCAN t", "SEARCH u USING INDEX utid (tid=?) LEFT-JOIN"],
+    ),
+    (
+        "SELECT * FROM t LEFT JOIN u ON u.v > t.b",
+        &["SCAN t", "SCAN u LEFT-JOIN"],
+    ),
+    (
+        "SELECT * FROM t AS t1 JOIN u AS u1 ON u1.tid = t1.id WHERE t1.a = 10",
+        &[
+            "SEARCH t1 USING INDEX ta (a=?)",
+            "SEARCH u1 USING INDEX utid (tid=?)",
+        ],
+    ),
 ];
 
 async fn frank_eqp(conn: &Connection, sql: &str) -> Vec<String> {
@@ -640,6 +696,89 @@ fn bd_oi8tv_eqp_reports_scalar_list_and_correlated_subqueries() {
                 }
             }
 
+            conn.close().await.expect("fsqlite close");
+        }
+    });
+}
+
+/// Shapes where fsqlite's emitted VDBE plan legitimately differs from stock
+/// SQLite 3.54.1 (skip-scan without ANALYZE stats, t-outer join order,
+/// non-covering autoindex, or 1-column join index seek): EQP must honestly
+/// report the access path fsqlite actually executes in stock's vocabulary,
+/// and the returned rows must still match stock SQLite 3.54.1.
+#[test]
+fn eqp_names_fsqlite_own_skip_scan_and_join_order_honestly() {
+    const OWN_PLAN_SHAPES: &[(&str, &[&str])] = &[
+        (
+            "SELECT * FROM t WHERE c = 3",
+            &["SEARCH t USING INDEX tbc (ANY(b) AND c=?)"],
+        ),
+        (
+            "SELECT id FROM t WHERE c = 3",
+            &["SEARCH t USING COVERING INDEX tbc (ANY(b) AND c=?)"],
+        ),
+        (
+            "SELECT * FROM t AS q WHERE q.c = 3",
+            &["SEARCH q USING INDEX tbc (ANY(b) AND c=?)"],
+        ),
+        (
+            "SELECT * FROM t JOIN u ON u.tid = t.id",
+            &["SCAN t", "SEARCH u USING INDEX utid (tid=?)"],
+        ),
+        (
+            "SELECT t.id, u.id FROM t JOIN u ON u.tid = t.id WHERE t.a = 10",
+            &[
+                "SEARCH t USING COVERING INDEX ta (a=?)",
+                "SEARCH u USING INDEX utid (tid=?)",
+            ],
+        ),
+        (
+            "SELECT * FROM t LEFT JOIN u ON u.v = t.b",
+            &["SCAN t", "SEARCH u USING AUTOMATIC INDEX (v=?) LEFT-JOIN"],
+        ),
+        (
+            "SELECT * FROM t JOIN u ON u.tid = t.id ORDER BY u.v",
+            &[
+                "SCAN t",
+                "SEARCH u USING INDEX utid (tid=?)",
+                "USE TEMP B-TREE FOR ORDER BY",
+            ],
+        ),
+        (
+            "SELECT * FROM t JOIN u ON u.id = t.a WHERE t.b = 'x' AND t.c > 1",
+            &[
+                "SEARCH t USING INDEX tbc (b=?)",
+                "SEARCH u USING INTEGER PRIMARY KEY (rowid=?)",
+            ],
+        ),
+    ];
+
+    asupersync::test_utils::run_test(|| async {
+        let stock = rusqlite::Connection::open_in_memory().expect("stock");
+        for sql in SETUP {
+            stock.execute_batch(sql).expect("stock setup");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("eqp_own.db");
+        for path in [":memory:", file.to_str().expect("utf-8 path")] {
+            let conn = Connection::open(path).await.expect("fsqlite open");
+            for sql in SETUP {
+                conn.execute(sql).await.expect("fsqlite setup");
+            }
+            for &(sql, expected_eqp) in OWN_PLAN_SHAPES {
+                assert_eq!(
+                    frank_eqp(&conn, sql).await,
+                    expected_eqp,
+                    "{path}: honest EQP `{sql}`"
+                );
+                let mut frank = frank_rows(&conn, sql).await;
+                let mut oracle = stock_rows(&stock, sql);
+                if !sql.contains("ORDER BY") {
+                    frank.sort();
+                    oracle.sort();
+                }
+                assert_eq!(frank, oracle, "{path}: rows of `{sql}`");
+            }
             conn.close().await.expect("fsqlite close");
         }
     });

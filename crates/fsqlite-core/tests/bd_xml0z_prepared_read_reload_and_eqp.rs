@@ -230,17 +230,24 @@ fn explain_query_plan_names_every_equality_bound_seek_column() {
             assert_eq!(ours, stock_detail(sql), "EXPLAIN QUERY PLAN {sql}");
         }
 
-        // A range on the second column must not be reported as an equality.
+        // A range on the second column must render as a range bound (matching
+        // live stock SQLite's `tenant_id=? AND id>?`), never as `id=?`.
+        let range_sql = "SELECT v FROM r WHERE tenant_id = 't' AND id > 'x'";
         let rows = conn
-            .query("EXPLAIN QUERY PLAN SELECT v FROM r WHERE tenant_id = 't' AND id > 'x'")
+            .query(&format!("EXPLAIN QUERY PLAN {range_sql}"))
             .await
             .expect("range eqp");
-        for row in &rows {
-            let SqliteValue::Text(detail) = &row.values()[3] else {
-                panic!("expected text detail");
-            };
+        let ours: Vec<String> = rows
+            .iter()
+            .map(|row| match &row.values()[3] {
+                SqliteValue::Text(detail) => detail.to_string(),
+                other => panic!("expected text detail, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(ours, stock_detail(range_sql), "EXPLAIN QUERY PLAN {range_sql}");
+        for detail in &ours {
             assert!(
-                !detail.contains("id=?"),
+                !detail.contains("AND id=?") && !detail.contains("(id=?)"),
                 "a range bound must not render as `id=?`: {detail}"
             );
         }

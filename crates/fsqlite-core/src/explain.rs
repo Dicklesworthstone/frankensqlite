@@ -561,6 +561,35 @@ pub fn program_seeks_named_index(program: &VdbeProgram, index_name: &str) -> boo
     })
 }
 
+/// Extract the number of bound key columns from the `MakeRecord` feeding
+/// `key_reg` immediately before `seek_addr`, stopping before any trailing
+/// rowid floor/ceiling sentinel (`i64::MIN`/`i64::MAX`).
+fn seek_make_record_key_width(ops: &[VdbeOp], seek_addr: usize, key_reg: i32) -> Option<usize> {
+    let (record_addr, record) = ops[..seek_addr]
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, candidate)| candidate.opcode == Opcode::MakeRecord && candidate.p3 == key_reg)?;
+    let first_field = record.p1;
+    let field_count = usize::try_from(record.p2).ok()?;
+    let mut key_columns = 0;
+    for field in 0..field_count {
+        let register = first_field + i32::try_from(field).ok()?;
+        let is_rowid_sentinel = ops[..record_addr]
+            .iter()
+            .rev()
+            .find(|writer| writer.opcode == Opcode::Int64 && writer.p2 == register)
+            .is_some_and(|writer| {
+                matches!(writer.p4, P4::Int64(value) if value == i64::MIN || value == i64::MAX)
+            });
+        if is_rowid_sentinel {
+            break;
+        }
+        key_columns += 1;
+    }
+    Some(key_columns)
+}
+
 /// How many leading key columns of `index_name` every range seek on it binds.
 ///
 /// bd-xml0z: `EXPLAIN QUERY PLAN` named only an index's first column even when
@@ -592,31 +621,7 @@ pub fn program_index_seek_key_width(program: &VdbeProgram, index_name: &str) -> 
         {
             continue;
         }
-        let (record_addr, record) =
-            ops[..seek_addr]
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, candidate)| {
-                    candidate.opcode == Opcode::MakeRecord && candidate.p3 == op.p3
-                })?;
-        let first_field = record.p1;
-        let field_count = usize::try_from(record.p2).ok()?;
-        let mut key_columns = 0;
-        for field in 0..field_count {
-            let register = first_field + i32::try_from(field).ok()?;
-            let is_rowid_sentinel = ops[..record_addr]
-                .iter()
-                .rev()
-                .find(|writer| writer.opcode == Opcode::Int64 && writer.p2 == register)
-                .is_some_and(|writer| {
-                    matches!(writer.p4, P4::Int64(value) if value == i64::MIN || value == i64::MAX)
-                });
-            if is_rowid_sentinel {
-                break;
-            }
-            key_columns += 1;
-        }
+        let key_columns = seek_make_record_key_width(ops, seek_addr, op.p3)?;
         bound = Some(bound.map_or(key_columns, |current| current.min(key_columns)));
     }
     bound
@@ -628,17 +633,17 @@ pub fn program_index_seek_key_width(program: &VdbeProgram, index_name: &str) -> 
 /// bd-jyyae companion to [`program_seeks_named_index`] for the
 /// `SEARCH ... USING INTEGER PRIMARY KEY (rowid=?)` directive claim. The
 /// probe must target a cursor opened on the named table and must NOT be the
-/// `IdxRowid -> SeekRowid` table-lookup leg of a secondary index seek, so an
-/// index lookup (e.g. `repo IN (SELECT ...)` seeking `idx_ev_repo` then
-/// fetching the table row) or a subquery probe cannot vouch for an IPK claim.
+/// `IdxRowid -> SeekRowid` table-lookup leg of a secondary or automatic index
+/// (bd-oi8tv / bd-r39kx: otherwise an index lookup such as `repo IN (SELECT ...)`
+/// or an index skip-scan falsely vouches for an IPK seek).
 #[must_use]
 pub fn program_seeks_rowid_on_table(program: &VdbeProgram, table_name: &str) -> bool {
     let ops = program.ops();
     let mut table_cursors: HashSet<i32> = HashSet::new();
     let mut index_cursors: HashSet<i32> = HashSet::new();
     for op in ops {
-        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite) {
-            match &op.p4 {
+        match op.opcode {
+            Opcode::OpenRead | Opcode::OpenWrite => match &op.p4 {
                 P4::Table(name) if name == table_name => {
                     table_cursors.insert(op.p1);
                 }
@@ -646,7 +651,11 @@ pub fn program_seeks_rowid_on_table(program: &VdbeProgram, table_name: &str) -> 
                     index_cursors.insert(op.p1);
                 }
                 _ => {}
+            },
+            Opcode::OpenAutoindex => {
+                index_cursors.insert(op.p1);
             }
+            _ => {}
         }
     }
     if table_cursors.is_empty() {
@@ -1011,10 +1020,47 @@ pub struct IndexWalk {
     pub kind: IndexWalkKind,
 }
 
+/// True when the first `SeekGT` on `cursor` positions past NULLs via a
+/// single-column `Null -> MakeRecord -> SeekGT` key (the loose-index distinct
+/// scan emitted for `SELECT count(DISTINCT col) FROM t`, bd-r39kx).
+fn first_seek_gt_starts_from_null(ops: &[VdbeOp], cursor: i32) -> bool {
+    let Some((seek_addr, seek_op)) = ops
+        .iter()
+        .enumerate()
+        .find(|(_, op)| op.opcode == Opcode::SeekGT && op.p1 == cursor)
+    else {
+        return false;
+    };
+    let Some((record_addr, record)) = ops[..seek_addr]
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, op)| op.opcode == Opcode::MakeRecord && op.p3 == seek_op.p3)
+    else {
+        return false;
+    };
+    if record.p2 != 1 {
+        return false;
+    }
+    let key_reg = record.p1;
+    ops[..record_addr]
+        .iter()
+        .rev()
+        .find(|op| match op.opcode {
+            Opcode::Null | Opcode::Integer | Opcode::Int64 | Opcode::Real | Opcode::String8 => {
+                op.p2 == key_reg
+            }
+            Opcode::Column | Opcode::Copy | Opcode::SCopy | Opcode::Move => op.p3 == key_reg,
+            _ => false,
+        })
+        .is_some_and(|op| op.opcode == Opcode::Null)
+}
+
 /// bd-r39kx: the one index a program walks rather than seeks, if any.
 ///
 /// The program opens one index and positions it only with a `Rewind` or
-/// `Last` (or counts it with `Count`), and reaches its table, if at all, only
+/// `Last` (or counts it with `Count`, or walks distinct non-NULL values via
+/// `Null -> MakeRecord -> SeekGT`), and reaches its table, if at all, only
 /// by `IdxRowid` + `SeekRowid`. Stock describes
 /// that as one row for the source: `SCAN t USING [COVERING] INDEX i`, `SEARCH
 /// t USING [COVERING] INDEX i (a<?)` for a walk that stops at an upper bound
@@ -1062,12 +1108,16 @@ fn program_index_walk_filtered(
     }
     let (cursor, index_name) = index?;
     // The table is only looked up by the rowids the index yields, and the
-    // index is never seeked.
+    // index is never range-seeked (except the NULL-skipping `SeekGT` of a
+    // loose-index distinct scan).
     let mut rowid_from_index = false;
     let mut table_lookup = false;
+    let mut saw_seek_gt = false;
     for op in ops {
         if op.opcode == Opcode::SeekRowid && Some(op.p1) == table_cursor {
             table_lookup |= rowid_from_index;
+        } else if op.opcode == Opcode::SeekGT && op.p1 == cursor {
+            saw_seek_gt = true;
         } else if positions_cursor(op.opcode)
             && (Some(op.p1) == table_cursor
                 || (op.p1 == cursor
@@ -1089,6 +1139,16 @@ fn program_index_walk_filtered(
         })
         .map(|(addr, op)| (addr, op.opcode))
         .collect();
+    if positions.is_empty() && saw_seek_gt {
+        return first_seek_gt_starts_from_null(ops, cursor).then(|| IndexWalk {
+            index_name: index_name.to_owned(),
+            covering,
+            kind: IndexWalkKind::Whole,
+        });
+    }
+    if saw_seek_gt {
+        return None;
+    }
     let [(position_addr, position)] = positions[..] else {
         return None;
     };
@@ -1120,6 +1180,538 @@ fn program_index_walk_filtered(
         covering,
         kind,
     })
+}
+
+/// An index skip-scan executed by the emitted VDBE program (bd-r39kx).
+///
+/// The index cursor starts with `Rewind`, probes each distinct leading prefix
+/// with `SeekGE` (binding `seek_key_cols` columns), and advances past the
+/// prefix with `SeekGT` (binding `skip_prefix_cols` columns).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexSkipScan {
+    /// Name of the skip-scanned index.
+    pub index_name: String,
+    /// True when no `IdxRowid` on the index feeds a `SeekRowid` into the table.
+    pub covering: bool,
+    /// Number of leading key columns skipped (`ANY(col)`).
+    pub skip_prefix_cols: usize,
+    /// Total leading key columns bound by the inner `SeekGE` probe.
+    pub seek_key_cols: usize,
+}
+
+/// Detect a single-table index skip-scan in `program` (bd-r39kx).
+///
+/// Ignores inline subquery cursors (`>= INLINE_SUBQUERY_CURSOR_MIN` or
+/// `P4::Int(_)`) so an outer skip-scan with a correlated/scalar subquery is
+/// still recognized cleanly.
+#[must_use]
+pub fn program_index_skip_scan(program: &VdbeProgram) -> Option<IndexSkipScan> {
+    let ops = program.ops();
+    let mut index: Option<(i32, &str)> = None;
+    let mut table_cursor: Option<i32> = None;
+    for op in ops {
+        if !matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite)
+            || op.p1 >= INLINE_SUBQUERY_CURSOR_MIN
+            || matches!(op.p4, P4::Int(_))
+        {
+            continue;
+        }
+        match &op.p4 {
+            P4::Index(name) if index.is_none() => index = Some((op.p1, name.as_str())),
+            P4::Table(_) if table_cursor.is_none() => table_cursor = Some(op.p1),
+            P4::Index(_) | P4::Table(_) => return None,
+            _ => {}
+        }
+    }
+    let (cursor, index_name) = index?;
+
+    let mut rowid_from_index = false;
+    let mut table_lookup = false;
+    let mut saw_rewind = false;
+    let mut seek_ge_width: Option<usize> = None;
+    let mut seek_gt_width: Option<usize> = None;
+
+    for (addr, op) in ops.iter().enumerate() {
+        if op.opcode == Opcode::SeekRowid && Some(op.p1) == table_cursor {
+            if !rowid_from_index {
+                return None;
+            }
+            table_lookup = true;
+        } else if Some(op.p1) == table_cursor && positions_cursor(op.opcode) {
+            return None;
+        } else if op.p1 == cursor {
+            match op.opcode {
+                Opcode::Rewind => saw_rewind = true,
+                Opcode::SeekGE => {
+                    let width = seek_make_record_key_width(ops, addr, op.p3)?;
+                    seek_ge_width = Some(seek_ge_width.map_or(width, |cur| cur.max(width)));
+                }
+                Opcode::SeekGT => {
+                    let width = seek_make_record_key_width(ops, addr, op.p3)?;
+                    seek_gt_width = Some(seek_gt_width.map_or(width, |cur| cur.min(width)));
+                }
+                Opcode::Last | Opcode::Count => return None,
+                _ => {}
+            }
+        }
+        rowid_from_index = op.opcode == Opcode::IdxRowid && op.p1 == cursor;
+    }
+
+    let skip_prefix_cols = seek_gt_width?;
+    let seek_key_cols = seek_ge_width?;
+    if !saw_rewind || skip_prefix_cols == 0 || seek_key_cols <= skip_prefix_cols {
+        return None;
+    }
+
+    Some(IndexSkipScan {
+        index_name: index_name.to_owned(),
+        covering: !table_lookup,
+        skip_prefix_cols,
+        seek_key_cols,
+    })
+}
+
+/// Access method for one driving loop in a multi-table VDBE join program (bd-r39kx).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgramJoinStepKind {
+    /// Full table scan (`Rewind`/`Last` + `Next`/`Prev`).
+    TableScan,
+    /// Direct rowid point probe (`SeekRowid`/`NotExists`).
+    RowidPoint,
+    /// Direct rowid range seek (`SeekGE`/`SeekGT`/`SeekLE`/`SeekLT` or upper-bounded walk).
+    RowidRange,
+    /// WITHOUT ROWID primary-key probe (`NoConflict`/`NotFound`).
+    WithoutRowidPk,
+    /// Named secondary/unique index seek (`Seek*` / `NoConflict` / `NotFound`).
+    IndexSeek {
+        index_name: String,
+        covering: bool,
+        seek_key_columns: Option<usize>,
+    },
+    /// Named index skip-scan (`Rewind` + `SeekGE` + `SeekGT`).
+    IndexSkipScan {
+        index_name: String,
+        covering: bool,
+        skip_prefix_cols: usize,
+        seek_key_cols: usize,
+    },
+    /// Whole or upper-bounded walk of a named index (`Rewind`/`Last`).
+    IndexScan {
+        index_name: String,
+        covering: bool,
+        bounded_above: bool,
+    },
+    /// Ephemeral automatic index populated from a table and probed via `Seek*`.
+    AutoIndex {
+        col_indices: Vec<usize>,
+        covering: bool,
+    },
+}
+
+/// One loop step in outer-to-inner execution order of a multi-table VDBE program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramJoinStep {
+    /// Table cursor (`OpenRead` `P4::Table`), or `None` for a covering index
+    /// whose base table cursor was never opened.
+    pub table_cursor: Option<i32>,
+    /// Table name from `OpenRead P4::Table`, if opened.
+    pub table_name: Option<String>,
+    /// True when `NullRow` is emitted on the loop's cursor (`LEFT JOIN`).
+    pub left_join: bool,
+    /// Bytecode-verified access path executed for this loop.
+    pub kind: ProgramJoinStepKind,
+}
+
+/// Bytecode-verified multi-table join plan in outer-to-inner execution order (bd-r39kx).
+///
+/// Reads table/index/autoindex opens, `IdxRowid -> SeekRowid` lookup legs,
+/// `NullRow` LEFT-JOIN markers, and loop-entry addresses purely from `program`
+/// so `EXPLAIN QUERY PLAN` reports the exact loop order and access paths
+/// fsqlite executes. Returns `None` for single-table programs or shapes that
+/// cannot be mapped cleanly to per-loop steps.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn program_join_plan(program: &VdbeProgram) -> Option<Vec<ProgramJoinStep>> {
+    let ops = program.ops();
+
+    let mut once_ranges: Vec<(usize, usize)> = Vec::new();
+    for (addr, op) in ops.iter().enumerate() {
+        if op.opcode == Opcode::Once
+            && let Ok(target) = usize::try_from(op.p2)
+            && target > addr
+        {
+            once_ranges.push((addr, target));
+        }
+    }
+    let in_once = |addr: usize| -> bool {
+        once_ranges
+            .iter()
+            .any(|&(start, end)| addr > start && addr < end)
+    };
+
+    let mut table_name_by_cursor: HashMap<i32, String> = HashMap::new();
+    let mut index_name_by_cursor: HashMap<i32, String> = HashMap::new();
+    let mut autoindex_cursors: Vec<i32> = Vec::new();
+
+    for (addr, op) in ops.iter().enumerate() {
+        if in_once(addr) {
+            continue;
+        }
+        match op.opcode {
+            Opcode::OpenRead => match &op.p4 {
+                P4::Table(name) => {
+                    table_name_by_cursor.insert(op.p1, name.clone());
+                }
+                P4::Index(name) => {
+                    index_name_by_cursor.insert(op.p1, name.clone());
+                }
+                _ => {}
+            },
+            Opcode::OpenAutoindex if !autoindex_cursors.contains(&op.p1) => {
+                autoindex_cursors.push(op.p1);
+            }
+            _ => {}
+        }
+    }
+
+    // Identify automatic-index build loops (`Rewind(src) .. MakeRecord .. IdxInsert(auto) .. Next(src)`
+    // with no `ResultRow` inside) so the build scan is not mistaken for a main-query table scan.
+    let mut autoindex_info: HashMap<i32, (i32, Vec<usize>)> = HashMap::new();
+    let mut autoindex_build_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut autoindex_source_tables: HashSet<i32> = HashSet::new();
+
+    for &auto_cur in &autoindex_cursors {
+        let Some(insert_addr) = ops
+            .iter()
+            .enumerate()
+            .position(|(addr, op)| !in_once(addr) && op.opcode == Opcode::IdxInsert && op.p1 == auto_cur)
+        else {
+            continue;
+        };
+        let Some((rewind_addr, rewind_op)) = ops[..insert_addr]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|&(addr, op)| {
+                !in_once(addr)
+                    && op.opcode == Opcode::Rewind
+                    && table_name_by_cursor.contains_key(&op.p1)
+            })
+        else {
+            continue;
+        };
+        let src_tbl_cur = rewind_op.p1;
+        let Some(next_offset) = ops[insert_addr + 1..]
+            .iter()
+            .position(|op| op.opcode == Opcode::Next && op.p1 == src_tbl_cur)
+        else {
+            continue;
+        };
+        let next_addr = insert_addr + 1 + next_offset;
+        if ops[rewind_addr..=next_addr]
+            .iter()
+            .any(|op| op.opcode == Opcode::ResultRow)
+        {
+            continue;
+        }
+        // Only treat this autoindex as a join lookup index if it is actually
+        // seeked later in the program (distinguishes it from DISTINCT dedup).
+        let is_seeked = ops[next_addr + 1..].iter().any(|op| {
+            op.p1 == auto_cur
+                && matches!(
+                    op.opcode,
+                    Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT
+                )
+        });
+        if !is_seeked {
+            continue;
+        }
+
+        let rec_reg = ops[insert_addr].p2;
+        let mut col_indices = Vec::new();
+        if let Some((mr_addr, mr)) = ops[rewind_addr..insert_addr]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, op)| op.opcode == Opcode::MakeRecord && op.p3 == rec_reg)
+        {
+            let mr_abs = rewind_addr + mr_addr;
+            let count = usize::try_from(mr.p2).unwrap_or(0);
+            for field in 0..count {
+                let reg = mr.p1 + i32::try_from(field).unwrap_or(0);
+                if let Some(col_op) = ops[rewind_addr..mr_abs]
+                    .iter()
+                    .rev()
+                    .find(|op| match op.opcode {
+                        Opcode::Column => op.p1 == src_tbl_cur && op.p3 == reg,
+                        Opcode::Rowid => op.p1 == src_tbl_cur && op.p2 == reg,
+                        _ => false,
+                    })
+                    && col_op.opcode == Opcode::Column
+                    && let Ok(col_idx) = usize::try_from(col_op.p2)
+                {
+                    col_indices.push(col_idx);
+                }
+            }
+        }
+
+        autoindex_info.insert(auto_cur, (src_tbl_cur, col_indices));
+        autoindex_build_ranges.push((rewind_addr, next_addr));
+        autoindex_source_tables.insert(src_tbl_cur);
+    }
+
+    let in_build_loop = |addr: usize| -> bool {
+        autoindex_build_ranges
+            .iter()
+            .any(|&(start, end)| addr >= start && addr <= end)
+    };
+
+    const SAW_LAST: u8 = 1 << 0;
+    const SAW_DIRECT_ROWID: u8 = 1 << 1;
+    const SAW_RANGE_SEEK: u8 = 1 << 2;
+    const SAW_RECORD_PROBE: u8 = 1 << 3;
+
+    #[derive(Default)]
+    struct CursorAccess {
+        first_addr: Option<usize>,
+        first_rewind_addr: Option<usize>,
+        flags: u8,
+        saw_seek_ge_width: Option<usize>,
+        saw_seek_gt_width: Option<usize>,
+        saw_min_seek_width: Option<usize>,
+    }
+
+    impl CursorAccess {
+        const fn saw_rewind(&self) -> bool {
+            self.first_rewind_addr.is_some()
+        }
+
+        const fn has(&self, flag: u8) -> bool {
+            (self.flags & flag) != 0
+        }
+    }
+
+    let mut null_row_cursors: HashSet<i32> = HashSet::new();
+    let mut lookup_target_by_index: HashMap<i32, i32> = HashMap::new();
+    let mut index_driven_tables: HashSet<i32> = HashSet::new();
+    let mut access_by_cursor: HashMap<i32, CursorAccess> = HashMap::new();
+
+    let mut last_idxrowid_cursor: Option<i32> = None;
+
+    for (addr, op) in ops.iter().enumerate() {
+        if in_once(addr) || in_build_loop(addr) {
+            last_idxrowid_cursor = None;
+            continue;
+        }
+
+        if op.opcode == Opcode::NullRow {
+            null_row_cursors.insert(op.p1);
+            last_idxrowid_cursor = None;
+            continue;
+        }
+
+        if op.opcode == Opcode::IdxRowid
+            && (index_name_by_cursor.contains_key(&op.p1) || autoindex_info.contains_key(&op.p1))
+        {
+            last_idxrowid_cursor = Some(op.p1);
+            continue;
+        }
+
+        if op.opcode == Opcode::SeekRowid
+            && table_name_by_cursor.contains_key(&op.p1)
+            && let Some(idx_cur) = last_idxrowid_cursor.take()
+        {
+            lookup_target_by_index.insert(idx_cur, op.p1);
+            index_driven_tables.insert(op.p1);
+            continue;
+        }
+
+        last_idxrowid_cursor = None;
+
+        let is_tracked = table_name_by_cursor.contains_key(&op.p1)
+            || index_name_by_cursor.contains_key(&op.p1)
+            || autoindex_info.contains_key(&op.p1);
+        if !is_tracked {
+            continue;
+        }
+
+        let is_entry = matches!(
+            op.opcode,
+            Opcode::Rewind
+                | Opcode::Last
+                | Opcode::SeekRowid
+                | Opcode::NotExists
+                | Opcode::SeekGE
+                | Opcode::SeekGT
+                | Opcode::SeekLE
+                | Opcode::SeekLT
+                | Opcode::NoConflict
+                | Opcode::NotFound
+        );
+        if !is_entry {
+            continue;
+        }
+
+        let entry = access_by_cursor.entry(op.p1).or_default();
+        if entry.first_addr.is_none() {
+            entry.first_addr = Some(addr);
+        }
+        match op.opcode {
+            Opcode::Rewind => {
+                if entry.first_rewind_addr.is_none() {
+                    entry.first_rewind_addr = Some(addr);
+                }
+            }
+            Opcode::Last => entry.flags |= SAW_LAST,
+            Opcode::SeekRowid | Opcode::NotExists => entry.flags |= SAW_DIRECT_ROWID,
+            Opcode::NoConflict | Opcode::NotFound => entry.flags |= SAW_RECORD_PROBE,
+            Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT => {
+                entry.flags |= SAW_RANGE_SEEK;
+                if let Some(width) = seek_make_record_key_width(ops, addr, op.p3) {
+                    entry.saw_min_seek_width =
+                        Some(entry.saw_min_seek_width.map_or(width, |cur| cur.min(width)));
+                    if op.opcode == Opcode::SeekGE {
+                        entry.saw_seek_ge_width =
+                            Some(entry.saw_seek_ge_width.map_or(width, |cur| cur.max(width)));
+                    } else if op.opcode == Opcode::SeekGT {
+                        entry.saw_seek_gt_width =
+                            Some(entry.saw_seek_gt_width.map_or(width, |cur| cur.min(width)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut steps: Vec<(usize, ProgramJoinStep)> = Vec::new();
+
+    for (&idx_cur, idx_name) in &index_name_by_cursor {
+        let Some(acc) = access_by_cursor.get(&idx_cur) else {
+            continue;
+        };
+        let Some(first_addr) = acc.first_addr else {
+            continue;
+        };
+        let tbl_cur = lookup_target_by_index.get(&idx_cur).copied();
+        let covering = tbl_cur.is_none();
+        let left_join = null_row_cursors.contains(&idx_cur)
+            || tbl_cur.is_some_and(|c| null_row_cursors.contains(&c));
+        let table_name = tbl_cur.and_then(|c| table_name_by_cursor.get(&c).cloned());
+
+        let kind = if acc.saw_rewind()
+            && let (Some(skip_prefix_cols), Some(seek_key_cols)) =
+                (acc.saw_seek_gt_width, acc.saw_seek_ge_width)
+            && skip_prefix_cols >= 1
+            && seek_key_cols > skip_prefix_cols
+        {
+            ProgramJoinStepKind::IndexSkipScan {
+                index_name: idx_name.clone(),
+                covering,
+                skip_prefix_cols,
+                seek_key_cols,
+            }
+        } else if acc.has(SAW_RANGE_SEEK | SAW_RECORD_PROBE) {
+            ProgramJoinStepKind::IndexSeek {
+                index_name: idx_name.clone(),
+                covering,
+                seek_key_columns: acc.saw_min_seek_width,
+            }
+        } else if acc.saw_rewind() || acc.has(SAW_LAST) {
+            let bounded_above = acc.first_rewind_addr.is_some_and(|r_addr| {
+                walk_exits_at_upper_bound(ops, r_addr, idx_cur, |op| {
+                    (op.opcode == Opcode::Column && op.p2 == 0).then_some(op.p3)
+                })
+            });
+            ProgramJoinStepKind::IndexScan {
+                index_name: idx_name.clone(),
+                covering,
+                bounded_above,
+            }
+        } else {
+            continue;
+        };
+
+        steps.push((
+            first_addr,
+            ProgramJoinStep {
+                table_cursor: tbl_cur,
+                table_name,
+                left_join,
+                kind,
+            },
+        ));
+    }
+
+    for (&auto_cur, (src_tbl_cur, col_indices)) in &autoindex_info {
+        let Some(acc) = access_by_cursor.get(&auto_cur) else {
+            continue;
+        };
+        let Some(first_addr) = acc.first_addr else {
+            continue;
+        };
+        let covering = !lookup_target_by_index.contains_key(&auto_cur);
+        let left_join =
+            null_row_cursors.contains(&auto_cur) || null_row_cursors.contains(src_tbl_cur);
+        let table_name = table_name_by_cursor.get(src_tbl_cur).cloned();
+        steps.push((
+            first_addr,
+            ProgramJoinStep {
+                table_cursor: Some(*src_tbl_cur),
+                table_name,
+                left_join,
+                kind: ProgramJoinStepKind::AutoIndex {
+                    col_indices: col_indices.clone(),
+                    covering,
+                },
+            },
+        ));
+    }
+
+    for (&tbl_cur, tbl_name) in &table_name_by_cursor {
+        if index_driven_tables.contains(&tbl_cur) || autoindex_source_tables.contains(&tbl_cur) {
+            continue;
+        }
+        let Some(acc) = access_by_cursor.get(&tbl_cur) else {
+            continue;
+        };
+        let Some(first_addr) = acc.first_addr else {
+            continue;
+        };
+        let left_join = null_row_cursors.contains(&tbl_cur);
+        let kind = if acc.has(SAW_DIRECT_ROWID) && !acc.saw_rewind() && !acc.has(SAW_LAST) {
+            ProgramJoinStepKind::RowidPoint
+        } else if acc.has(SAW_RANGE_SEEK)
+            || acc.first_rewind_addr.is_some_and(|r_addr| {
+                walk_exits_at_upper_bound(ops, r_addr, tbl_cur, |op| {
+                    (op.opcode == Opcode::Rowid).then_some(op.p2)
+                })
+            })
+        {
+            ProgramJoinStepKind::RowidRange
+        } else if acc.has(SAW_RECORD_PROBE) && !acc.saw_rewind() && !acc.has(SAW_LAST) {
+            ProgramJoinStepKind::WithoutRowidPk
+        } else if acc.saw_rewind() || acc.has(SAW_LAST) {
+            ProgramJoinStepKind::TableScan
+        } else {
+            continue;
+        };
+
+        steps.push((
+            first_addr,
+            ProgramJoinStep {
+                table_cursor: Some(tbl_cur),
+                table_name: Some(tbl_name.clone()),
+                left_join,
+                kind,
+            },
+        ));
+    }
+
+    if steps.len() < 2 {
+        return None;
+    }
+    steps.sort_by_key(|(addr, _)| *addr);
+    Some(steps.into_iter().map(|(_, step)| step).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1779,6 +2371,126 @@ mod tests {
         assert_eq!(
             program_temp_btree_uses(&neg_autoindexes),
             ProgramTempBtrees::default()
+        );
+    }
+
+    #[test]
+    fn test_bd_r39kx_skip_scan_distinct_walk_and_join_plan_facts() {
+        // 1. Index skip-scan: Rewind + SeekGE (width 2) + SeekGT (width 1) + IdxRowid -> SeekRowid.
+        //    Must NOT trigger `program_seeks_rowid_on_table` and MUST report `IndexSkipScan`.
+        let skip_scan_prog = {
+            let mut b = ProgramBuilder::new();
+            let end_label = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, 2, 0, P4::Table("t".to_owned()), 0);
+            b.emit_op(Opcode::OpenRead, 1, 4, 0, P4::Index("tbc".to_owned()), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 1, 0, done, P4::None, 0);
+            b.emit_op(Opcode::Int64, 0, 3, 0, P4::Int64(i64::MIN), 0);
+            b.emit_op(Opcode::MakeRecord, 1, 3, 4, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekGE, 1, 4, done, P4::None, 0);
+            b.emit_op(Opcode::IdxRowid, 1, 5, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, 0, 5, done, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, 1, 1, 4, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekGT, 1, 4, done, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end_label);
+            b.finish().unwrap()
+        };
+        assert!(
+            !program_seeks_rowid_on_table(&skip_scan_prog, "t"),
+            "IdxRowid -> SeekRowid lookup leg must not claim direct rowid seek"
+        );
+        assert_eq!(
+            program_index_skip_scan(&skip_scan_prog),
+            Some(IndexSkipScan {
+                index_name: "tbc".to_owned(),
+                covering: false,
+                skip_prefix_cols: 1,
+                seek_key_cols: 2,
+            })
+        );
+
+        // 2. Loose-index count(DISTINCT a): Null -> MakeRecord(1) -> SeekGT.
+        let distinct_prog = {
+            let mut b = ProgramBuilder::new();
+            let end_label = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, 3, 0, P4::Index("ta".to_owned()), 0);
+            b.emit_op(Opcode::Null, 0, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, 2, 1, 4, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekGT, 0, 4, done, P4::None, 0);
+            b.emit_op(Opcode::Next, 0, 4, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end_label);
+            b.finish().unwrap()
+        };
+        assert_eq!(
+            program_index_walk(&distinct_prog),
+            Some(IndexWalk {
+                index_name: "ta".to_owned(),
+                covering: true,
+                kind: IndexWalkKind::Whole,
+            })
+        );
+
+        // 3. Multi-table LEFT JOIN with OpenAutoindex build loop + SeekGE + NullRow.
+        let join_prog = {
+            let mut b = ProgramBuilder::new();
+            let end_label = b.emit_label();
+            let build_done = b.emit_label();
+            let outer_done = b.emit_label();
+            let inner_done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, 2, 0, P4::Table("t".to_owned()), 0);
+            b.emit_op(Opcode::OpenRead, 1, 5, 0, P4::Table("u".to_owned()), 0);
+            b.emit_op(Opcode::OpenAutoindex, 2, 2, 0, P4::None, 2);
+            b.emit_jump_to_label(Opcode::Rewind, 1, 0, build_done, P4::None, 0);
+            b.emit_op(Opcode::Column, 1, 2, 2, P4::None, 0);
+            b.emit_op(Opcode::Rowid, 1, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+            b.emit_op(Opcode::IdxInsert, 2, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::Next, 1, 5, 0, P4::None, 0);
+            b.resolve_label(build_done);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, outer_done, P4::None, 0);
+            b.emit_op(Opcode::Int64, 0, 6, 0, P4::Int64(i64::MIN), 0);
+            b.emit_op(Opcode::MakeRecord, 5, 2, 7, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekGE, 2, 7, inner_done, P4::None, 0);
+            b.emit_op(Opcode::IdxRowid, 2, 8, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, 1, 8, inner_done, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::Next, 2, 14, 0, P4::None, 0);
+            b.resolve_label(inner_done);
+            b.emit_op(Opcode::NullRow, 1, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::Next, 0, 11, 0, P4::None, 0);
+            b.resolve_label(outer_done);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end_label);
+            b.finish().unwrap()
+        };
+        assert_eq!(
+            program_join_plan(&join_prog),
+            Some(vec![
+                ProgramJoinStep {
+                    table_cursor: Some(0),
+                    table_name: Some("t".to_owned()),
+                    left_join: false,
+                    kind: ProgramJoinStepKind::TableScan,
+                },
+                ProgramJoinStep {
+                    table_cursor: Some(1),
+                    table_name: Some("u".to_owned()),
+                    left_join: true,
+                    kind: ProgramJoinStepKind::AutoIndex {
+                        col_indices: vec![2],
+                        covering: false,
+                    },
+                },
+            ])
         );
     }
 }
