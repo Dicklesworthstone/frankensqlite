@@ -45842,6 +45842,31 @@ impl Connection {
                 // bd-k66zh: aggregate calls its subqueries hold for this core,
                 // with stock's misuse errors for the positions it rejects.
                 let owned_subquery_aggregates = self.select_owned_subquery_aggregates(select)?;
+                // bd-ct8zm: LIMIT 0 jumps past the entire row source in
+                // SQLite, including grouped/window input and materialized
+                // views or CTEs. Do this after static name/function/shape
+                // validation, but before a fallback can evaluate a row (or
+                // eagerly rewrite one of its subqueries). Only inspect the
+                // side-effect-free constant subset, so a volatile LIMIT is
+                // still evaluated exactly once by its executor. Binding the
+                // whole statement preserves anonymous parameter positions
+                // when the LIMIT follows parameters in other clauses.
+                if let Some(limit) = select.limit.as_ref() {
+                    let limit_is_zero = match eval_constant_limit_integer(&limit.limit) {
+                        Some(value) => value == 0,
+                        None if params.is_some_and(|values| !values.is_empty()) => {
+                            let bound = bind_placeholders_in_select_for_fallback(select, params)?;
+                            bound
+                                .limit
+                                .as_ref()
+                                .is_some_and(bound_limit_clause_is_constant_zero)
+                        }
+                        None => false,
+                    };
+                    if limit_is_zero {
+                        return Ok(Vec::new());
+                    }
+                }
                 // bd-1zc9p: a constant LIMIT/OFFSET that is not losslessly
                 // convertible to an integer (a fractional real, non-numeric
                 // text, NULL, or a blob) is a "datatype mismatch" in SQLite.
@@ -129672,8 +129697,12 @@ fn select_join_is_vdbe_eligible(select: &SelectStatement) -> bool {
 ///
 /// The join codegen compiles LIMIT/OFFSET where it emits each row, so a
 /// lookup join (a rowid or index seek per outer row) ends after its last row.
-/// A nested-loop join would rescan the inner table per outer row until then,
-/// so it keeps the materializing executor, which hashes the inner table once.
+/// An unordered nested-loop join must also stop there: the materializing
+/// executor evaluates ON, WHERE and projection expressions beyond the LIMIT,
+/// raising errors for rows SQLite never visits (bd-ct8zm). OFFSET rows pass
+/// the predicates but skip projection in the same bytecode loop.
+/// A constant negative LIMIT with no rows to skip keeps the old route: it
+/// needs no early exit, so the materializing executor may use its hash join.
 ///
 /// With an ORDER BY the LIMIT is applied to the sorted rows, so nothing stops
 /// early, but a lookup join is still cheaper than the materializing executor,
@@ -129683,6 +129712,12 @@ fn select_join_is_vdbe_eligible(select: &SelectStatement) -> bool {
 /// executor's GH#386 keyset lane once its parameters are bound, which does
 /// stop early, keeps the executor.
 fn select_limited_join_is_vdbe_eligible(select: &SelectStatement, schema: &[TableSchema]) -> bool {
+    let may_stop_or_skip_rows = select.limit.as_ref().is_some_and(|clause| {
+        eval_constant_limit_integer(&clause.limit).is_none_or(|value| value >= 0)
+            || clause.offset.as_ref().is_some_and(|offset| {
+                eval_constant_limit_integer(offset).is_none_or(|value| value > 0)
+            })
+    });
     (select.order_by.is_empty() || !join_keyset_limit_pushdown_candidate(select))
         && select.limit.as_ref().is_some_and(|clause| {
             !expr_has_any_subquery(&clause.limit)
@@ -129692,7 +129727,8 @@ fn select_limited_join_is_vdbe_eligible(select: &SelectStatement, schema: &[Tabl
                     .is_none_or(|offset| !expr_has_any_subquery(offset))
         })
         && select_join_shape_is_vdbe_eligible(select)
-        && join_select_uses_lookup(select, schema)
+        && (join_select_uses_lookup(select, schema)
+            || (select.order_by.is_empty() && may_stop_or_skip_rows))
 }
 
 fn select_join_shape_is_vdbe_eligible(select: &SelectStatement) -> bool {
