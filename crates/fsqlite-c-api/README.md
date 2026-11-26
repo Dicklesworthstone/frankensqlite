@@ -46,6 +46,7 @@ workspace forbids it.
 - `sqlite3_finalize` -- Destroy a prepared statement.
 - `sqlite3_reset` -- Reset a prepared statement for re-execution.
 - `sqlite3_column_count` -- Number of columns in the result set.
+- `sqlite3_column_name` -- UTF-8 result labels, available before stepping.
 - `sqlite3_column_type` -- Datatype of a result column.
 - `sqlite3_column_int` / `sqlite3_column_int64` -- Integer column accessors.
 - `sqlite3_column_double` -- Float column accessor.
@@ -59,6 +60,16 @@ workspace forbids it.
 - `sqlite3_last_insert_rowid` -- Rowid of the last successful INSERT.
 - `sqlite3_get_autocommit` -- Whether no explicit transaction or outer SAVEPOINT is open.
 - `sqlite3_busy_timeout` -- Configure how long to wait for a busy database.
+
+Result column names are available immediately after `sqlite3_prepare_v2`,
+including for empty queries, PRAGMAs, EXPLAIN, and DML with RETURNING. Each
+name is owned by its statement. Its pointer survives ordinary steps, value
+conversions, and resets; it expires when the statement is finalized or
+automatically reprepared after a schema change.
+
+The connection state getters read the engine's counters and transaction flag
+without executing SQL or changing the last C API error. Setting a busy timeout
+also preserves that error on success; zero or a negative value disables waiting.
 
 ## Key Types
 

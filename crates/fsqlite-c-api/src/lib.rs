@@ -294,6 +294,11 @@ pub struct Sqlite3Stmt {
     last_step_code: c_int,
     /// Column count from the most recent result set.
     column_count: c_int,
+    /// Statement-owned labels, independent of per-row conversion buffers.
+    /// Their pointers stay valid through ordinary step/reset cycles.
+    column_names: Vec<CString>,
+    /// Reprepare generation whose labels are held in `column_names`.
+    column_names_generation: u64,
     /// Cached NUL-terminated buffers for coerced text/blob accessors (kept
     /// alive until next step or finalize to satisfy C lifetime expectations,
     /// including values that contain embedded NUL bytes).
@@ -306,6 +311,24 @@ pub struct Sqlite3Stmt {
     /// for each 1-based index, or `None` for nameless `?` / `?NNN`. Parallel to
     /// `bindings`; drives `sqlite3_bind_parameter_name` / `_index`. bd-w2i2w.
     param_names: Vec<Option<CString>>,
+}
+
+impl Sqlite3Stmt {
+    fn refresh_column_metadata(&mut self) {
+        let Some(prepared) = self.prepared.as_ref() else {
+            return;
+        };
+        self.column_count = usize_to_c_int_saturating(prepared.column_count());
+        let generation = prepared.reprepare_count();
+        if generation != self.column_names_generation {
+            self.column_names = prepared
+                .column_names()
+                .iter()
+                .map(|name| c_string_truncate_on_nul(name))
+                .collect();
+            self.column_names_generation = generation;
+        }
+    }
 }
 
 type ExecCallback = unsafe extern "C" fn(
@@ -346,10 +369,17 @@ fn c_string_truncate_on_nul(value: &str) -> CString {
 }
 
 fn can_prepare_statement(statement: &Statement) -> bool {
-    // bd-b8cfq: the core now prepares schema and control statements too.
-    // Use its validation before returning a handle; execution still occurs
-    // only at sqlite3_step. PRAGMA and EXPLAIN retain their dispatch paths.
-    !matches!(statement, Statement::Pragma(_) | Statement::Explain { .. })
+    // The core prepares schema, control, and PRAGMA statements without
+    // executing them. EXPLAIN retains its connection dispatch path.
+    !matches!(statement, Statement::Explain { .. })
+}
+
+fn explain_column_names(query_plan: bool) -> &'static [&'static str] {
+    if query_plan {
+        &["id", "parent", "notused", "detail"]
+    } else {
+        &["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"]
+    }
 }
 
 fn prepared_step_mode(statement: &Statement) -> PreparedStepMode {
@@ -366,6 +396,7 @@ struct PreparedSqlInfo<'conn> {
     tail_offset: usize,
     step_mode: PreparedStepMode,
     column_count: c_int,
+    column_names: Vec<CString>,
     prepared: Option<fsqlite::PreparedStatement<'conn>>,
 }
 
@@ -383,12 +414,28 @@ fn validate_and_classify_prepared_sql<'conn>(
     };
     let consumed_sql = &sql[..tail_offset];
     let step_mode = prepared_step_mode(&statement);
-    let (column_count, prepared) = if can_prepare_statement(&statement) {
+    let (column_count, column_names, prepared) = if can_prepare_statement(&statement) {
         let prepared = block_on(conn.prepare(consumed_sql))?;
-        let column_count = c_int::try_from(prepared.column_count()).unwrap_or(c_int::MAX);
-        (column_count, Some(prepared))
+        let column_count = usize_to_c_int_saturating(prepared.column_count());
+        let column_names = prepared
+            .column_names()
+            .iter()
+            .map(|name| c_string_truncate_on_nul(name))
+            .collect();
+        (column_count, column_names, Some(prepared))
     } else {
-        (0, None)
+        let labels = explain_column_names(matches!(
+            statement,
+            Statement::Explain {
+                query_plan: true,
+                ..
+            }
+        ));
+        let column_names = labels
+            .iter()
+            .map(|name| c_string_truncate_on_nul(name))
+            .collect();
+        (usize_to_c_int_saturating(labels.len()), column_names, None)
     };
 
     Ok(Some(PreparedSqlInfo {
@@ -396,6 +443,7 @@ fn validate_and_classify_prepared_sql<'conn>(
         tail_offset,
         step_mode,
         column_count,
+        column_names,
         prepared,
     }))
 }
@@ -451,8 +499,13 @@ fn best_effort_exec_callback_column_names(conn: &Connection, sql: &str) -> Optio
     }
 
     let statement = statements.last()?;
-    if !can_prepare_statement(statement) {
-        return None;
+    if let Statement::Explain { query_plan, .. } = statement {
+        return Some(
+            explain_column_names(*query_plan)
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+        );
     }
 
     match block_on(conn.prepare(&statement.to_string())) {
@@ -975,6 +1028,10 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
             );
             handle.clear_error();
             let param_info = compute_prepared_param_info(&info.consumed_sql);
+            let column_names_generation = info
+                .prepared
+                .as_ref()
+                .map_or(0, fsqlite::PreparedStatement::reprepare_count);
             let stmt = Box::new(Sqlite3Stmt {
                 db,
                 sql: info.consumed_sql,
@@ -985,6 +1042,8 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
                 active_row: false,
                 last_step_code: SQLITE_OK,
                 column_count: info.column_count,
+                column_names: info.column_names,
+                column_names_generation,
                 text_cache: Vec::new(),
                 bindings: param_info.bindings,
                 param_names: param_info.param_names,
@@ -1050,7 +1109,7 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
         // dispatch. Unbound slots default to NULL (SQLite semantics).
         let has_params = !s.bindings.is_empty();
         let execute_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Some(ref prepared) = s.prepared {
+            let result = if let Some(ref prepared) = s.prepared {
                 match s.step_mode {
                     PreparedStepMode::Query => {
                         if has_params {
@@ -1084,16 +1143,18 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
                         }
                     }
                 }
-            }
+            };
+            s.refresh_column_metadata();
+            result
         }));
 
         match execute_result {
             Ok(Ok(Some(rows))) => {
                 db.clear_error();
-                if let Some(ref prepared) = s.prepared {
-                    s.column_count = c_int::try_from(prepared.column_count()).unwrap_or(c_int::MAX);
-                } else if let Some(first) = rows.first() {
-                    s.column_count = c_int::try_from(first.values().len()).unwrap_or(c_int::MAX);
+                if s.prepared.is_none()
+                    && let Some(first) = rows.first()
+                {
+                    s.column_count = usize_to_c_int_saturating(first.values().len());
                 }
                 s.rows = Some(rows);
                 s.cursor = 0;
@@ -1103,9 +1164,6 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
             }
             Ok(Ok(None)) => {
                 db.clear_error();
-                if let Some(ref prepared) = s.prepared {
-                    s.column_count = c_int::try_from(prepared.column_count()).unwrap_or(c_int::MAX);
-                }
                 s.rows = Some(Vec::new());
                 s.cursor = 0;
                 s.active_row = false;
@@ -1114,9 +1172,6 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
             }
             Ok(Err(ref e)) if matches!(e, FrankenError::QueryReturnedNoRows) => {
                 db.clear_error();
-                if let Some(ref prepared) = s.prepared {
-                    s.column_count = c_int::try_from(prepared.column_count()).unwrap_or(c_int::MAX);
-                }
                 s.rows = Some(Vec::new());
                 s.cursor = 0;
                 s.active_row = false;
@@ -1553,6 +1608,32 @@ pub unsafe extern "C" fn sqlite3_column_count(stmt: *mut Sqlite3Stmt) -> c_int {
     }
 
     (*stmt).column_count
+}
+
+/// UTF-8 name of result column `i_col`, available before the first step.
+///
+/// The returned string is owned by the statement. Ordinary steps, column
+/// value conversions, and resets preserve it. Automatic reprepare may replace
+/// the labels, including when a schema change alters a SELECT * result.
+///
+/// # Safety
+/// `stmt` must be a live handle from `sqlite3_prepare_v2`, or null. The
+/// returned pointer is read-only and must not be used after the statement is
+/// finalized or automatically reprepared.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_column_name(stmt: *mut Sqlite3Stmt, i_col: c_int) -> *const c_char {
+    COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
+
+    if stmt.is_null() || i_col < 0 {
+        return std::ptr::null();
+    }
+    let s = &*stmt;
+    if i_col >= s.column_count {
+        return std::ptr::null();
+    }
+    s.column_names
+        .get(i_col as usize)
+        .map_or(std::ptr::null(), |name| name.as_ptr())
 }
 
 /// Type of value in column `i_col` of the current row.
@@ -2978,12 +3059,128 @@ mod tests {
         }
     }
 
+    unsafe fn result_column_names(stmt: *mut Sqlite3Stmt) -> Vec<String> {
+        (0..sqlite3_column_count(stmt))
+            .map(|index| {
+                let name = sqlite3_column_name(stmt, index);
+                assert!(!name.is_null());
+                CStr::from_ptr(name).to_str().unwrap().to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_column_name_pointers_survive_steps_conversions_and_reset() {
+        unsafe {
+            let db = open_memory();
+            let stmt = prepare(
+                db,
+                r#"SELECT 7 AS "κόσμος", 'first' AS "spaced name" UNION ALL SELECT 8, 'next'"#,
+            );
+            assert_eq!(result_column_names(stmt), ["κόσμος", "spaced name"]);
+            let first_name = sqlite3_column_name(stmt, 0);
+            let second_name = sqlite3_column_name(stmt, 1);
+            for expected in [7, 8] {
+                assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+                assert_eq!(sqlite3_column_int64(stmt, 0), expected);
+                assert!(!sqlite3_column_text(stmt, 0).is_null());
+                assert!(!sqlite3_column_blob(stmt, 1).is_null());
+                assert_eq!(sqlite3_column_name(stmt, 0), first_name);
+                assert_eq!(sqlite3_column_name(stmt, 1), second_name);
+                assert_eq!(result_column_names(stmt), ["κόσμος", "spaced name"]);
+            }
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_column_name(stmt, 0), first_name);
+            assert_eq!(sqlite3_reset(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_column_name(stmt, 1), second_name);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_name(stmt, 0), first_name);
+            assert_eq!(sqlite3_column_name(stmt, 1), second_name);
+            for index in [-1, 2, c_int::MAX] {
+                assert!(sqlite3_column_name(stmt, index).is_null());
+            }
+            assert!(sqlite3_column_name(ptr::null_mut(), 0).is_null());
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_column_names_for_pragma_explain_and_returning_before_step() {
+        unsafe {
+            let db = open_memory();
+            schema_exec_ok(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)");
+            let cases: &[(&str, &[&str])] = &[
+                (
+                    "PRAGMA table_info(t)",
+                    &["cid", "name", "type", "notnull", "dflt_value", "pk"],
+                ),
+                (
+                    "EXPLAIN SELECT * FROM t",
+                    &["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"],
+                ),
+                (
+                    "EXPLAIN QUERY PLAN SELECT * FROM t",
+                    &["id", "parent", "notused", "detail"],
+                ),
+            ];
+            for &(sql, names) in cases {
+                let stmt = prepare(db, sql);
+                assert_eq!(result_column_names(stmt), names, "{sql}");
+                assert_eq!(sqlite3_step(stmt), SQLITE_ROW, "{sql}");
+                assert_eq!(result_column_names(stmt), names, "{sql}");
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            }
+
+            let stmt = prepare(
+                db,
+                "INSERT INTO t VALUES (41, 'new') RETURNING id AS inserted_id, value",
+            );
+            assert_eq!(result_column_names(stmt), ["inserted_id", "value"]);
+            assert_eq!(sqlite3_last_insert_rowid(db), 0);
+            assert_eq!(schema_query_int(db, "SELECT count(*) FROM t"), 0);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 41);
+            assert_eq!(sqlite3_last_insert_rowid(db), 41);
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(result_column_names(stmt), ["inserted_id", "value"]);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let ddl = prepare(db, "CREATE TABLE empty_metadata(x)");
+            assert_eq!(sqlite3_column_count(ddl), 0);
+            assert!(sqlite3_column_name(ddl, 0).is_null());
+            assert_eq!(sqlite3_step(ddl), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(ddl), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    // Preserve FrankenSQLite's existing deferred PRAGMA dispatch. SQLite applies
+    // some setters during prepare; this regression does not establish timing parity.
+    #[test]
+    fn test_prepared_pragma_metadata_does_not_execute_setter() {
+        unsafe {
+            let db = open_memory();
+            assert_eq!(sqlite3_busy_timeout(db, 123), SQLITE_OK);
+            let stmt = prepare(db, "PRAGMA busy_timeout = 456");
+            assert_eq!(result_column_names(stmt), ["timeout"]);
+            assert_eq!(schema_query_int(db, "PRAGMA busy_timeout"), 123);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(stmt, 0), 456);
+            assert_eq!(result_column_names(stmt), ["timeout"]);
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(schema_query_int(db, "PRAGMA busy_timeout"), 456);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
     #[test]
     fn test_column_count_preserved_for_empty_result_and_reset() {
         unsafe {
             let db = open_memory();
 
-            let sql = CString::new("SELECT 1 WHERE 0;").unwrap();
+            let sql = CString::new("SELECT 1 AS empty_label WHERE 0;").unwrap();
             let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
             assert_eq!(
                 sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
@@ -2992,11 +3189,14 @@ mod tests {
             assert!(!stmt.is_null());
 
             assert_eq!(sqlite3_column_count(stmt), 1);
+            assert_eq!(result_column_names(stmt), ["empty_label"]);
             assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
             assert_eq!(sqlite3_column_count(stmt), 1);
+            assert_eq!(result_column_names(stmt), ["empty_label"]);
 
             assert_eq!(sqlite3_reset(stmt), SQLITE_OK);
             assert_eq!(sqlite3_column_count(stmt), 1);
+            assert_eq!(result_column_names(stmt), ["empty_label"]);
 
             sqlite3_finalize(stmt);
             sqlite3_close(db);
@@ -3158,6 +3358,20 @@ mod tests {
                 SQLITE_OK
             );
             assert_eq!(captured_names, vec!["alpha", "beta"]);
+
+            captured_names.clear();
+            let sql = CString::new("PRAGMA busy_timeout").unwrap();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    sql.as_ptr(),
+                    Some(capture_names_cb),
+                    std::ptr::from_mut(&mut captured_names).cast(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(captured_names, ["timeout"]);
 
             sqlite3_close(db);
         }
@@ -4010,6 +4224,8 @@ mod tests {
             let empty_stmt = prepare(db_a, "SELECT * FROM empty_t ORDER BY a;");
             assert_eq!(sqlite3_column_count(stmt), 2);
             assert_eq!(sqlite3_column_count(empty_stmt), 2);
+            assert_eq!(result_column_names(stmt), ["a", "b"]);
+            assert_eq!(result_column_names(empty_stmt), ["a", "b"]);
 
             // Connection B adds column c DEFAULT 7 to both tables.
             assert_eq!(
@@ -4028,6 +4244,7 @@ mod tests {
                 3,
                 "cross-connection ALTER TABLE ADD COLUMN must widen sqlite3_column_count"
             );
+            assert_eq!(result_column_names(stmt), ["a", "b", "c"]);
             assert_eq!(sqlite3_column_int64(stmt, 0), 1);
             assert_eq!(
                 CStr::from_ptr(sqlite3_column_text(stmt, 1))
@@ -4056,6 +4273,7 @@ mod tests {
                 3,
                 "empty table cross-connection ALTER TABLE ADD COLUMN must widen sqlite3_column_count"
             );
+            assert_eq!(result_column_names(empty_stmt), ["a", "b", "c"]);
 
             // Same-connection ALTER TABLE ADD COLUMN on A itself.
             assert_eq!(
@@ -4069,6 +4287,7 @@ mod tests {
                 4,
                 "same-connection ALTER TABLE ADD COLUMN must widen sqlite3_column_count"
             );
+            assert_eq!(result_column_names(stmt), ["a", "b", "c", "d"]);
             assert_eq!(sqlite3_column_int64(stmt, 3), 9);
 
             assert_eq!(sqlite3_finalize(empty_stmt), SQLITE_OK);
