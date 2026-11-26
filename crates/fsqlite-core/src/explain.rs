@@ -109,6 +109,182 @@ pub struct EqpRow {
     pub detail: String,
 }
 
+/// Temp B-trees / sorters that an emitted VDBE program actually opens for
+/// `GROUP BY`, `DISTINCT`, or `ORDER BY` (bd-vyy1q).
+///
+/// Read purely off the emitted opcodes so `EXPLAIN QUERY PLAN` cannot diverge
+/// from execution:
+/// - An IN-list probe sorter (`SorterOpen` whose `SorterSort..SorterNext`
+///   drain drives `SeekGE`/`SeekGT`/`SeekLE`/`SeekLT` on an `OpenRead` index
+///   cursor) is NOT a temp B-tree clause.
+/// - A `GROUP BY` sorter has `AggStep` or `AggFinal` inside its drain loop.
+/// - Any other top-level sorter (outside `Once`-guarded subquery builds) is an
+///   `ORDER BY` sorter.
+/// - A top-level `DISTINCT` temp B-tree is an `OpenAutoindex` outside `Once`
+///   that is probed with `Found` and populated with `IdxInsert` and never
+///   walked (`Rewind`/`Last`/`Next`/`Prev`/`Seek*`), distinguishing it from
+///   rowid/index IN-list probe sets and join automatic indexes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProgramTempBtrees {
+    /// The program opens a sorter that feeds `GROUP BY` aggregation.
+    pub group_by: bool,
+    /// The program opens a top-level ephemeral B-tree for `DISTINCT` deduplication.
+    pub distinct: bool,
+    /// The program opens a sorter for `ORDER BY`.
+    pub order_by: bool,
+}
+
+impl ProgramTempBtrees {
+    /// Canonical SQLite `EXPLAIN QUERY PLAN` detail lines for the active clauses
+    /// (`GROUP BY`, then `DISTINCT`, then `ORDER BY`).
+    #[must_use]
+    pub fn detail_lines(self) -> Vec<&'static str> {
+        let mut lines = Vec::new();
+        if self.group_by {
+            lines.push("USE TEMP B-TREE FOR GROUP BY");
+        }
+        if self.distinct {
+            lines.push("USE TEMP B-TREE FOR DISTINCT");
+        }
+        if self.order_by {
+            lines.push("USE TEMP B-TREE FOR ORDER BY");
+        }
+        lines
+    }
+}
+
+/// Classify the temp B-trees and sorters that `program` opens (bd-vyy1q).
+#[must_use]
+pub fn program_temp_btree_uses(program: &VdbeProgram) -> ProgramTempBtrees {
+    let ops = program.ops();
+    let mut once_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut index_cursors: HashSet<i32> = HashSet::new();
+    let mut sorter_opens: Vec<i32> = Vec::new();
+    let mut autoindex_opens: Vec<i32> = Vec::new();
+
+    for (addr, op) in ops.iter().enumerate() {
+        match op.opcode {
+            Opcode::Once => {
+                if let Ok(target) = usize::try_from(op.p2)
+                    && target > addr
+                {
+                    once_ranges.push((addr, target));
+                }
+            }
+            Opcode::OpenRead | Opcode::OpenWrite => {
+                if matches!(op.p4, P4::Index(_)) {
+                    index_cursors.insert(op.p1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let in_once = |addr: usize| -> bool {
+        once_ranges
+            .iter()
+            .any(|&(start, end)| addr > start && addr < end)
+    };
+
+    for (addr, op) in ops.iter().enumerate() {
+        if in_once(addr) {
+            continue;
+        }
+        match op.opcode {
+            Opcode::SorterOpen if !sorter_opens.contains(&op.p1) => {
+                sorter_opens.push(op.p1);
+            }
+            Opcode::OpenAutoindex if !autoindex_opens.contains(&op.p1) => {
+                autoindex_opens.push(op.p1);
+            }
+            _ => {}
+        }
+    }
+
+    let mut uses = ProgramTempBtrees::default();
+
+    for &cursor in &sorter_opens {
+        let Some(sort_addr) = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SorterSort && op.p1 == cursor)
+        else {
+            // Synthetic or incomplete programs with SorterOpen but no SorterSort
+            // default to ORDER BY (preserves legacy explain_query_plan behavior).
+            uses.order_by = true;
+            continue;
+        };
+        let drain_end = ops
+            .iter()
+            .enumerate()
+            .skip(sort_addr + 1)
+            .rfind(|(_, op)| op.opcode == Opcode::SorterNext && op.p1 == cursor)
+            .map(|(idx, _)| idx + 1)
+            .or_else(|| {
+                ops.iter()
+                    .enumerate()
+                    .skip(sort_addr + 1)
+                    .find(|(_, op)| op.opcode == Opcode::Close && op.p1 == cursor)
+                    .map(|(idx, _)| idx)
+            })
+            .unwrap_or(ops.len());
+        let drain = &ops[sort_addr..drain_end.min(ops.len())];
+        let drives_index_probe = drain.iter().any(|op| {
+            matches!(
+                op.opcode,
+                Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT
+            ) && index_cursors.contains(&op.p1)
+        });
+        if drives_index_probe {
+            continue;
+        }
+        let feeds_aggregates = drain
+            .iter()
+            .any(|op| matches!(op.opcode, Opcode::AggStep | Opcode::AggFinal));
+        if feeds_aggregates {
+            uses.group_by = true;
+        } else {
+            uses.order_by = true;
+        }
+    }
+
+    if sorter_opens.is_empty()
+        && ops.iter().enumerate().any(|(addr, op)| {
+            !in_once(addr) && matches!(op.opcode, Opcode::SorterInsert | Opcode::SorterSort)
+        })
+    {
+        uses.order_by = true;
+    }
+
+    for &cursor in &autoindex_opens {
+        let mut has_found = false;
+        let mut has_insert = false;
+        let mut walked_or_seeked = false;
+        for op in ops {
+            if op.p1 != cursor {
+                continue;
+            }
+            match op.opcode {
+                Opcode::Found => has_found = true,
+                Opcode::IdxInsert => has_insert = true,
+                Opcode::Rewind
+                | Opcode::Last
+                | Opcode::Next
+                | Opcode::Prev
+                | Opcode::SeekGE
+                | Opcode::SeekGT
+                | Opcode::SeekLE
+                | Opcode::SeekLT => walked_or_seeked = true,
+                _ => {}
+            }
+        }
+        if has_found && has_insert && !walked_or_seeked {
+            uses.distinct = true;
+        }
+    }
+
+    uses
+}
+
 /// Generate EXPLAIN QUERY PLAN output for a compiled VDBE program.
 ///
 /// Returns a tree-structured plan with columns: id, parent, notused, detail
@@ -124,9 +300,8 @@ pub fn explain_query_plan(program: &VdbeProgram) -> Vec<EqpRow> {
     let mut index_used = HashSet::new();
     let mut index_with_table_lookup = HashSet::new();
     let mut last_idxrowid_cursor = None;
-    let mut saw_sorter = false;
 
-    // Scan for table/index opens and infer index/sorter usage.
+    // Scan for table/index opens and infer index usage.
     for op in ops {
         match op.opcode {
             Opcode::OpenRead | Opcode::OpenWrite => {
@@ -180,9 +355,6 @@ pub fn explain_query_plan(program: &VdbeProgram) -> Vec<EqpRow> {
                 }
                 last_idxrowid_cursor = None;
             }
-            Opcode::SorterOpen | Opcode::SorterInsert | Opcode::SorterSort => {
-                saw_sorter = true;
-            }
             _ => {
                 last_idxrowid_cursor = None;
             }
@@ -207,13 +379,14 @@ pub fn explain_query_plan(program: &VdbeProgram) -> Vec<EqpRow> {
         }
     }
 
-    if saw_sorter {
+    for detail in program_temp_btree_uses(program).detail_lines() {
         rows.push(EqpRow {
             id: next_id,
             parent: 0,
             notused: 0,
-            detail: "USE TEMP B-TREE FOR ORDER BY".to_owned(),
+            detail: detail.to_owned(),
         });
+        next_id += 1;
     }
 
     // If no table opens found, emit a minimal plan.
@@ -1226,5 +1399,183 @@ mod tests {
             &build_simple_select_program(),
             "t"
         ));
+    }
+
+    #[test]
+    fn test_program_temp_btree_uses_distinguishes_probe_group_distinct_and_order() {
+        // 1. IN-list probe sorter only (SorterSort..SeekGE index..SorterNext): no temp B-tree.
+        let probe_only = {
+            let mut b = ProgramBuilder::new();
+            let end_label = b.emit_label();
+            let done_label = b.emit_label();
+            let next_probe = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+            b.emit_op(
+                Opcode::OpenRead,
+                2,
+                3,
+                0,
+                P4::Index("idx_c".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::SorterOpen, 3, 1, 0, P4::Str("+".to_owned()), 0);
+            b.emit_op(Opcode::SorterInsert, 3, 4, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterSort, 3, 0, done_label, P4::None, 0);
+            let loop_top = b.current_addr();
+            b.emit_jump_to_label(Opcode::SeekGE, 2, 5, next_probe, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            b.resolve_label(next_probe);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(Opcode::SorterNext, 3, loop_top as i32, 0, P4::None, 0);
+            b.resolve_label(done_label);
+            b.emit_op(Opcode::Close, 3, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Close, 2, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end_label);
+            b.finish().unwrap()
+        };
+        assert_eq!(
+            program_temp_btree_uses(&probe_only),
+            ProgramTempBtrees::default()
+        );
+
+        // 2. IN-list probe sorter + ORDER BY sorter + DISTINCT autoindex:
+        //    must report DISTINCT and ORDER BY in canonical order, ignoring probe sorter.
+        let probe_distinct_order = {
+            let mut b = ProgramBuilder::new();
+            let end_label = b.emit_label();
+            let probe_done = b.emit_label();
+            let next_probe = b.emit_label();
+            let sort_done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+            b.emit_op(Opcode::SorterOpen, 1, 1, 0, P4::Str("+".to_owned()), 0);
+            b.emit_op(
+                Opcode::OpenAutoindex,
+                2,
+                1,
+                0,
+                P4::Str("BINARY".to_owned()),
+                0,
+            );
+            b.emit_op(
+                Opcode::OpenRead,
+                3,
+                4,
+                0,
+                P4::Index("idx_c".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::SorterOpen, 4, 1, 0, P4::Str("+".to_owned()), 0);
+            b.emit_jump_to_label(Opcode::SorterSort, 4, 0, probe_done, P4::None, 0);
+            let probe_top = b.current_addr();
+            b.emit_jump_to_label(Opcode::SeekGE, 3, 5, next_probe, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Found, 2, 6, next_probe, P4::None, 0);
+            b.emit_op(Opcode::IdxInsert, 2, 6, 0, P4::None, 0);
+            b.emit_op(Opcode::SorterInsert, 1, 7, 0, P4::None, 0);
+            b.resolve_label(next_probe);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(Opcode::SorterNext, 4, probe_top as i32, 0, P4::None, 0);
+            b.resolve_label(probe_done);
+            b.emit_jump_to_label(Opcode::SorterSort, 1, 0, sort_done, P4::None, 0);
+            let sort_top = b.current_addr();
+            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(Opcode::SorterNext, 1, sort_top as i32, 0, P4::None, 0);
+            b.resolve_label(sort_done);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end_label);
+            b.finish().unwrap()
+        };
+        let uses = program_temp_btree_uses(&probe_distinct_order);
+        assert_eq!(
+            uses,
+            ProgramTempBtrees {
+                group_by: false,
+                distinct: true,
+                order_by: true,
+            }
+        );
+        assert_eq!(
+            uses.detail_lines(),
+            vec!["USE TEMP B-TREE FOR DISTINCT", "USE TEMP B-TREE FOR ORDER BY"]
+        );
+
+        // 3. GROUP BY sorter (SorterSort..AggFinal/AggStep..SorterNext):
+        //    must report GROUP BY, NOT ORDER BY.
+        let group_by_prog = {
+            let mut b = ProgramBuilder::new();
+            let end_label = b.emit_label();
+            let scan_done = b.emit_label();
+            let sort_done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+            b.emit_op(Opcode::SorterOpen, 1, 1, 0, P4::Str("+".to_owned()), 0);
+            b.emit_op(Opcode::OpenRead, 0, 2, 0, P4::Table("m".to_owned()), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, scan_done, P4::None, 0);
+            b.emit_op(Opcode::SorterInsert, 1, 4, 0, P4::None, 0);
+            b.resolve_label(scan_done);
+            b.emit_jump_to_label(Opcode::SorterSort, 1, 0, sort_done, P4::None, 0);
+            let sort_top = b.current_addr();
+            b.emit_op(
+                Opcode::AggFinal,
+                7,
+                0,
+                0,
+                P4::FuncName("COUNT".to_owned()),
+                0,
+            );
+            b.emit_op(
+                Opcode::AggStep,
+                0,
+                0,
+                7,
+                P4::FuncName("COUNT".to_owned()),
+                0,
+            );
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(Opcode::SorterNext, 1, sort_top as i32, 0, P4::None, 0);
+            b.resolve_label(sort_done);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end_label);
+            b.finish().unwrap()
+        };
+        let eqp_details: Vec<String> = explain_query_plan(&group_by_prog)
+            .into_iter()
+            .map(|r| r.detail)
+            .collect();
+        assert_eq!(eqp_details, vec!["SCAN m", "USE TEMP B-TREE FOR GROUP BY"]);
+
+        // 4. Negative controls: Once-guarded subquery autoindex + walked rowid IN autoindex
+        //    must NOT be misclassified as DISTINCT or ORDER BY.
+        let neg_autoindexes = {
+            let mut b = ProgramBuilder::new();
+            let end_label = b.emit_label();
+            let once_done = b.emit_label();
+            let walk_done = b.emit_label();
+            let skip = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, 2, 0, P4::Table("m".to_owned()), 0);
+            // Once-guarded IN-subquery membership autoindex + internal sorter.
+            b.emit_jump_to_label(Opcode::Once, 0, 0, once_done, P4::None, 0);
+            b.emit_op(Opcode::OpenAutoindex, 12290, 1, 0, P4::None, 1);
+            b.emit_op(Opcode::SorterOpen, 12291, 1, 0, P4::Str("+".to_owned()), 0);
+            b.emit_op(Opcode::IdxInsert, 12290, 3, 0, P4::None, 0);
+            b.resolve_label(once_done);
+            b.emit_jump_to_label(Opcode::Found, 12290, 3, skip, P4::None, 1);
+            // Walked rowid IN-list probe autoindex (deduped via Found+IdxInsert then Rewind).
+            b.emit_op(Opcode::OpenAutoindex, 1, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Found, 1, 4, skip, P4::None, 0);
+            b.emit_op(Opcode::IdxInsert, 1, 4, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 1, 0, walk_done, P4::None, 0);
+            b.emit_op(Opcode::Next, 1, 0, 0, P4::None, 0);
+            b.resolve_label(skip);
+            b.resolve_label(walk_done);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end_label);
+            b.finish().unwrap()
+        };
+        assert_eq!(
+            program_temp_btree_uses(&neg_autoindexes),
+            ProgramTempBtrees::default()
+        );
     }
 }

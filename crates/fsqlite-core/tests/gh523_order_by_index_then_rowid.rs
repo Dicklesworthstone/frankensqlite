@@ -252,6 +252,28 @@ async fn run(file_backed: bool) -> Vec<String> {
     failures
 }
 
+async fn frank_eqp(f: &Connection, sql: &str) -> Vec<String> {
+    f.query(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .await
+        .unwrap_or_else(|e| panic!("frank EQP `{sql}`: {e}"))
+        .iter()
+        .map(|row| match row.values().get(3) {
+            Some(SqliteValue::Text(s)) => s.to_string(),
+            other => panic!("frank EQP `{sql}`: unexpected detail {other:?}"),
+        })
+        .collect()
+}
+
+fn stock_eqp(r: &rusqlite::Connection, sql: &str) -> Vec<String> {
+    let mut stmt = r
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap_or_else(|e| panic!("stock EQP `{sql}`: {e}"));
+    stmt.query_map([], |row| row.get::<_, String>(3))
+        .unwrap_or_else(|e| panic!("stock EQP `{sql}`: {e}"))
+        .map(|row| row.expect("stock EQP row"))
+        .collect()
+}
+
 #[test]
 fn order_by_index_columns_then_rowid_seeks_without_sorting() {
     asupersync::test_utils::run_test(|| async {
@@ -262,6 +284,175 @@ fn order_by_index_columns_then_rowid_seeks_without_sorting() {
         assert!(
             failures.is_empty(),
             "{} failures:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+/// bd-vyy1q: `EXPLAIN QUERY PLAN` must report `USE TEMP B-TREE FOR ORDER BY`,
+/// `USE TEMP B-TREE FOR GROUP BY`, and `USE TEMP B-TREE FOR DISTINCT` whenever
+/// the compiled program opens a temp B-tree / sorter for that clause, and must
+/// not falsely report one for an IN-list probe sorter or ephemeral membership
+/// index. Compares against live bundled SQLite across the GH#523 shapes plus
+/// IN-list ORDER BY, GROUP BY, and DISTINCT shapes on `:memory:` and file-backed
+/// databases.
+#[test]
+fn bd_vyy1q_eqp_reports_temp_btree_for_order_by_group_by_and_distinct() {
+    // Shapes whose full EXPLAIN QUERY PLAN must match bundled SQLite verbatim.
+    const STOCK_EXACT_EQP: &[&str] = &[
+        // bd-vyy1q repro and GH#523 sorting shapes (must report ORDER BY sorter).
+        "SELECT id FROM m WHERE c = 1 ORDER BY t",
+        "SELECT id FROM m INDEXED BY sqlite_autoindex_m_1 WHERE c = 1 ORDER BY t",
+        "SELECT id FROM m INDEXED BY sqlite_autoindex_m_1 WHERE c = 1 ORDER BY t, id",
+        "SELECT id FROM m INDEXED BY sqlite_autoindex_m_1 WHERE c = 2 AND t > 't4' ORDER BY id DESC",
+        // GH#523 non-sorting shapes (index satisfies ORDER BY; no temp B-tree).
+        "SELECT id FROM m INDEXED BY sqlite_autoindex_m_1 WHERE c = 1 ORDER BY i, id LIMIT 5",
+        "SELECT id, i FROM m WHERE c = 1 ORDER BY i, id",
+        "SELECT id, i FROM m WHERE c = 1 ORDER BY i DESC, id DESC",
+        "SELECT id, b FROM n WHERE a = 3 ORDER BY b DESC, id",
+        "SELECT id, b FROM n WHERE a = 3 ORDER BY b, id DESC",
+        "SELECT rowid, b FROM h WHERE a = 2 ORDER BY rowid DESC",
+        "SELECT v FROM k WHERE c = 1 ORDER BY id",
+        "SELECT v FROM k INDEXED BY k_cid WHERE c = 1 ORDER BY id DESC",
+        // Indexed IN-list with an ORDER BY sorter (probe sorter != output sorter).
+        "SELECT id FROM m WHERE c IN (1, 2) ORDER BY t",
+        "SELECT id FROM m WHERE c IN (1, 2) ORDER BY i, id",
+        // Negative controls: IN-list probe sorter only, no ORDER BY sorter.
+        "SELECT id FROM m WHERE c IN (1, 2)",
+        "SELECT id FROM m WHERE c IN (1, 2) ORDER BY c, i, id",
+        // Rowid IN-list negative control: ephemeral probe autoindex is not DISTINCT.
+        "SELECT v FROM k WHERE id IN (1, 3)",
+        // GROUP BY opening a grouping sorter (full scan, index seek, IN-list seek, HAVING).
+        "SELECT t, count(*) FROM m GROUP BY t",
+        "SELECT t, count(*) FROM m WHERE c = 1 GROUP BY t",
+        "SELECT t, count(*) FROM m WHERE c IN (1, 2) GROUP BY t",
+        "SELECT t, count(*) FROM m GROUP BY t ORDER BY t",
+        "SELECT t, count(*) FROM m WHERE c = 1 GROUP BY t ORDER BY t",
+        "SELECT t FROM m GROUP BY t HAVING count(*) > 1",
+        // Negative controls: GROUP BY streamed in index/rowid order (no grouping sorter).
+        "SELECT c, count(*) FROM m GROUP BY c",
+        "SELECT i, count(*) FROM m WHERE c = 1 GROUP BY i",
+        "SELECT c, count(*) FROM m WHERE c IN (1, 2) GROUP BY c",
+        "SELECT id, count(*) FROM m GROUP BY id",
+        // DISTINCT opening a dedup temp B-tree (alone and combined with ORDER BY).
+        "SELECT DISTINCT t FROM m",
+        "SELECT DISTINCT t FROM m ORDER BY i",
+        "SELECT DISTINCT t FROM m WHERE c = 1 ORDER BY id",
+        "SELECT DISTINCT t FROM m WHERE c IN (1, 2) ORDER BY id",
+    ];
+
+    // Shapes where fsqlite's access path or partial-sort plan differs from stock's
+    // wording (e.g. stock's `LAST TERM OF ORDER BY`, reverse-walked DISTINCT B-tree
+    // in SQLite 3.54.1, or index seek on DISTINCT), yet fsqlite's EQP must still
+    // truthfully report every temp B-tree clause that its own compiled bytecode opens.
+    const BYTECODE_TRUTH_EQP: &[(&str, &[&str])] = &[
+        (
+            "SELECT id, i FROM m WHERE c = 1 ORDER BY i, id DESC",
+            &["USE TEMP B-TREE FOR ORDER BY"],
+        ),
+        (
+            "SELECT id, i FROM m WHERE c = 1 ORDER BY i DESC, id",
+            &["USE TEMP B-TREE FOR ORDER BY"],
+        ),
+        (
+            "SELECT id, b FROM n WHERE a = 3 ORDER BY b DESC, id DESC",
+            &["USE TEMP B-TREE FOR ORDER BY"],
+        ),
+        (
+            "SELECT id, b FROM n WHERE a = 4 ORDER BY id",
+            &["USE TEMP B-TREE FOR ORDER BY"],
+        ),
+        (
+            "SELECT DISTINCT t FROM m WHERE c = 1",
+            &["USE TEMP B-TREE FOR DISTINCT"],
+        ),
+        (
+            "SELECT DISTINCT t FROM m ORDER BY id",
+            &["USE TEMP B-TREE FOR DISTINCT", "USE TEMP B-TREE FOR ORDER BY"],
+        ),
+        (
+            "SELECT DISTINCT t FROM m ORDER BY t DESC",
+            &["USE TEMP B-TREE FOR DISTINCT", "USE TEMP B-TREE FOR ORDER BY"],
+        ),
+        // Negative control: Once-guarded IN-subquery OpenAutoindex is membership,
+        // never DISTINCT or ORDER BY.
+        ("SELECT id FROM m WHERE c IN (SELECT a FROM n)", &[]),
+    ];
+
+    asupersync::test_utils::run_test(|| async {
+        let r = rusqlite::Connection::open_in_memory().expect("stock open");
+        for sql in SETUP {
+            r.execute(sql, []).expect("stock setup");
+        }
+        let mut failures = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = if file_backed {
+                dir.path()
+                    .join("bd_vyy1q.db")
+                    .to_str()
+                    .expect("utf-8 path")
+                    .to_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let f = Connection::open(&path).await.expect("open");
+            for sql in SETUP {
+                f.execute(sql).await.expect("frank setup");
+            }
+            for sql in STOCK_EXACT_EQP {
+                let frank = frank_eqp(&f, sql).await;
+                let stock = stock_eqp(&r, sql);
+                if frank != stock {
+                    failures.push(format!(
+                        "[file_backed={file_backed}] EQP `{sql}`: frank {frank:?} vs stock {stock:?}"
+                    ));
+                }
+            }
+            for (sql, expected_temp) in BYTECODE_TRUTH_EQP {
+                let frank = frank_eqp(&f, sql).await;
+                let actual_temp: Vec<&str> = frank
+                    .iter()
+                    .filter(|d| d.starts_with("USE TEMP B-TREE FOR "))
+                    .map(String::as_str)
+                    .collect();
+                if actual_temp != *expected_temp {
+                    failures.push(format!(
+                        "[file_backed={file_backed}] temp B-tree EQP `{sql}`: got {actual_temp:?} \
+                         (full {frank:?}), expected {expected_temp:?}"
+                    ));
+                }
+            }
+            // Bytecode-vs-EQP truth on a shape whose access path varies between
+            // :memory: (covering index IN-probe + ORDER BY sorter) and file-backed
+            // (rowid-ordered table scan, no sorter): EQP must report ORDER BY
+            // iff the compiled program opens an ORDER BY sorter.
+            {
+                let sql = "SELECT id FROM m WHERE c IN (1, 2) ORDER BY id";
+                let frank = frank_eqp(&f, sql).await;
+                let ops = explain_rows(&f, &format!("EXPLAIN {sql}")).await;
+                let sorter_count = ops.iter().filter(|(op, _)| op == "SorterOpen").count();
+                if file_backed {
+                    if sorter_count == 0 && frank != vec!["SCAN m".to_owned()] {
+                        failures.push(format!(
+                            "[file_backed=true] `{sql}` opened 0 sorters but EQP was {frank:?}"
+                        ));
+                    }
+                } else {
+                    let stock = stock_eqp(&r, sql);
+                    if frank != stock {
+                        failures.push(format!(
+                            "[file_backed=false] EQP `{sql}`: frank {frank:?} vs stock {stock:?}"
+                        ));
+                    }
+                }
+            }
+            f.close().await.expect("close");
+        }
+        assert!(
+            failures.is_empty(),
+            "{} EQP failures:\n{}",
             failures.len(),
             failures.join("\n")
         );

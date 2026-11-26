@@ -121192,9 +121192,9 @@ impl Connection {
                 };
                 if let Some(directive) = directive {
                     let mut directive_seek_key_columns = None;
-                    // bd-r39kx: facts of the verified index seek's program.
+                    // bd-r39kx / bd-vyy1q: facts of the verified program.
                     let mut directive_seek_covering = false;
-                    let mut directive_seek_sorts = false;
+                    let mut directive_temp_btrees = crate::explain::ProgramTempBtrees::default();
                     let verified = match directive.access_kind {
                         PlannerSelectAccessKind::FullTableScan => {
                             // bd-2fong red 3 (bd-jyyae family): a FullTableScan
@@ -121209,11 +121209,12 @@ impl Connection {
                             // access kind and report the path the program
                             // actually performs.
                             if let Ok(program) = self.compile_table_select(select).await {
+                                let temp_btrees = select_program_temp_btrees(select, &program);
                                 if crate::explain::program_seeks_rowid_on_table(
                                     &program,
                                     &directive.table_name,
                                 ) {
-                                    return vec![to_row(
+                                    let mut rows = vec![to_row(
                                         2,
                                         0,
                                         0,
@@ -121222,6 +121223,8 @@ impl Connection {
                                             directive.table_name
                                         ),
                                     )];
+                                    push_temp_btree_eqp_rows(&mut rows, temp_btrees, &to_row);
+                                    return rows;
                                 }
                                 if crate::explain::program_seeks_without_rowid_pk_on_table(
                                     &program,
@@ -121230,7 +121233,9 @@ impl Connection {
                                     &directive.table_name,
                                     &self.schema.borrow(),
                                 ) {
-                                    return vec![to_row(2, 0, 0, detail)];
+                                    let mut rows = vec![to_row(2, 0, 0, detail)];
+                                    push_temp_btree_eqp_rows(&mut rows, temp_btrees, &to_row);
+                                    return rows;
                                 }
                                 // bd-r39kx: a rowid range the program seeks,
                                 // or walks from the first row to an upper
@@ -121245,26 +121250,26 @@ impl Connection {
                                     rowid_range_eqp_detail(select, &self.schema.borrow())
                                 {
                                     let mut rows = vec![to_row(2, 0, 0, detail)];
-                                    if program_sorts_for_order_by(select, &program) {
-                                        rows.push(to_row(
-                                            3,
-                                            0,
-                                            0,
-                                            "USE TEMP B-TREE FOR ORDER BY".to_owned(),
-                                        ));
-                                    }
+                                    push_temp_btree_eqp_rows(&mut rows, temp_btrees, &to_row);
                                     return rows;
                                 }
+                                directive_temp_btrees = temp_btrees;
                             }
                             true
                         }
                         PlannerSelectAccessKind::RowidLookup => {
                             match self.compile_table_select(select).await {
-                                Ok(program) => crate::explain::program_seeks_rowid_on_table(
-                                    &program,
-                                    &directive.table_name,
-                                ),
-                                Err(_) => false,
+                                Ok(program)
+                                    if crate::explain::program_seeks_rowid_on_table(
+                                        &program,
+                                        &directive.table_name,
+                                    ) =>
+                                {
+                                    directive_temp_btrees =
+                                        select_program_temp_btrees(select, &program);
+                                    true
+                                }
+                                _ => false,
                             }
                         }
                         PlannerSelectAccessKind::IndexEquality
@@ -121290,8 +121295,8 @@ impl Connection {
                                                         .index_name
                                                         .eq_ignore_ascii_case(index_name)
                                             });
-                                    directive_seek_sorts =
-                                        program_sorts_for_order_by(select, &program);
+                                    directive_temp_btrees =
+                                        select_program_temp_btrees(select, &program);
                                     true
                                 }
                                 _ => false,
@@ -121358,9 +121363,7 @@ impl Connection {
                             _ => explain_query_plan_detail_from_directive(&directive),
                         };
                         let mut rows = vec![to_row(2, 0, 0, detail)];
-                        if directive_seek_sorts {
-                            rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
-                        }
+                        push_temp_btree_eqp_rows(&mut rows, directive_temp_btrees, &to_row);
                         return rows;
                     }
                 }
@@ -121408,15 +121411,14 @@ impl Connection {
                         )
                     {
                         let mut rows = vec![to_row(2, 0, 0, detail)];
-                        // bd-r39kx: the ORDER BY's sorter. An IN list's probe
-                        // set has a sorter of its own, and an aggregate's is
-                        // its grouping's, so those keep the single row.
-                        if !aggregate
-                            && program_sorts_for_order_by(select, &program)
-                            && !select_contains_expr_leaf(select, ExprLeaf::InPredicate)
-                        {
-                            rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
-                        }
+                        // bd-vyy1q: report GROUP BY, DISTINCT, and ORDER BY temp
+                        // B-trees directly from bytecode (IN-list probe sorters are
+                        // filtered out inside `program_temp_btree_uses`).
+                        push_temp_btree_eqp_rows(
+                            &mut rows,
+                            select_program_temp_btrees(select, &program),
+                            &to_row,
+                        );
                         return rows;
                     }
 
@@ -121441,12 +121443,11 @@ impl Connection {
                             0,
                             format!("SEARCH {table_name} USING INTEGER PRIMARY KEY (rowid=?)"),
                         )];
-                        if crate::explain::explain_query_plan(&program)
-                            .iter()
-                            .any(|row| row.detail == "USE TEMP B-TREE FOR ORDER BY")
-                        {
-                            rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
-                        }
+                        push_temp_btree_eqp_rows(
+                            &mut rows,
+                            select_program_temp_btrees(select, &program),
+                            &to_row,
+                        );
                         return rows;
                     }
 
@@ -121463,9 +121464,11 @@ impl Connection {
                         && let Some(detail) = rowid_range_eqp_detail(select, &self.schema.borrow())
                     {
                         let mut rows = vec![to_row(2, 0, 0, detail)];
-                        if program_sorts_for_order_by(select, &program) {
-                            rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
-                        }
+                        push_temp_btree_eqp_rows(
+                            &mut rows,
+                            select_program_temp_btrees(select, &program),
+                            &to_row,
+                        );
                         return rows;
                     }
 
@@ -121479,9 +121482,11 @@ impl Connection {
                             index_walk_eqp_detail(select, &walk, &self.schema.borrow())
                     {
                         let mut rows = vec![to_row(2, 0, 0, detail)];
-                        if !aggregate && program_sorts_for_order_by(select, &program) {
-                            rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
-                        }
+                        push_temp_btree_eqp_rows(
+                            &mut rows,
+                            select_program_temp_btrees(select, &program),
+                            &to_row,
+                        );
                         return rows;
                     }
 
@@ -121523,15 +121528,16 @@ impl Connection {
                         if let Some(detail) = fallback_detail.clone() {
                             let mut rows = vec![to_row(2, 0, 0, detail)];
                             let mut next_id = 3;
-                            let mut saw_temp_btree = false;
+                            let mut saw_order_by_temp_btree = false;
                             for row in explained {
-                                if row.detail == "USE TEMP B-TREE FOR ORDER BY" {
-                                    saw_temp_btree = true;
+                                if row.detail.starts_with("USE TEMP B-TREE FOR ") {
+                                    saw_order_by_temp_btree |=
+                                        row.detail == "USE TEMP B-TREE FOR ORDER BY";
                                     rows.push(to_row(next_id, 0, 0, row.detail));
                                     next_id += 1;
                                 }
                             }
-                            if !saw_temp_btree
+                            if !saw_order_by_temp_btree
                                 && select_requires_temp_btree_fallback_for_order_by(select)
                             {
                                 rows.push(to_row(
@@ -139792,8 +139798,6 @@ fn select_contains_bound_outer_value(select: &SelectStatement) -> bool {
 enum ExprLeaf {
     Placeholder,
     BoundOuterValue,
-    /// An `IN` / `NOT IN` predicate of any kind.
-    InPredicate,
 }
 
 fn select_contains_expr_leaf(select: &SelectStatement, leaf: ExprLeaf) -> bool {
@@ -139880,8 +139884,7 @@ fn select_contains_expr_leaf(select: &SelectStatement, leaf: ExprLeaf) -> bool {
             Expr::In {
                 expr: inner, set, ..
             } => {
-                leaf == ExprLeaf::InPredicate
-                    || expr(inner, leaf)
+                expr(inner, leaf)
                     || match set {
                         InSet::List(values) => values.iter().any(|e| expr(e, leaf)),
                         InSet::Subquery(query) => select_contains_expr_leaf(query, leaf),
@@ -163556,13 +163559,37 @@ fn index_walk_eqp_detail(
     }
 }
 
-/// bd-r39kx: whether the program sorts for the SELECT's ORDER BY, which stock
-/// reports as its own `USE TEMP B-TREE FOR ORDER BY` row.
-fn program_sorts_for_order_by(select: &SelectStatement, program: &VdbeProgram) -> bool {
-    !select.order_by.is_empty()
-        && crate::explain::explain_query_plan(program)
-            .iter()
-            .any(|row| row.detail == "USE TEMP B-TREE FOR ORDER BY")
+/// bd-r39kx / bd-vyy1q: temp B-tree clauses (`GROUP BY`, `DISTINCT`, `ORDER BY`)
+/// that the compiled program actually opens, gated to clauses present on
+/// `select` so a subquery's internal sorter cannot leak onto the outer query.
+fn select_program_temp_btrees(
+    select: &SelectStatement,
+    program: &VdbeProgram,
+) -> crate::explain::ProgramTempBtrees {
+    let uses = crate::explain::program_temp_btree_uses(program);
+    let (has_group_by, is_distinct) = match &select.body.select {
+        SelectCore::Select {
+            group_by, distinct, ..
+        } => (!group_by.is_empty(), *distinct == Distinctness::Distinct),
+        SelectCore::Values(_) => (false, false),
+    };
+    crate::explain::ProgramTempBtrees {
+        group_by: uses.group_by && has_group_by,
+        distinct: uses.distinct && is_distinct,
+        order_by: uses.order_by && !select.order_by.is_empty(),
+    }
+}
+
+/// Append canonical `USE TEMP B-TREE FOR ...` EQP rows onto `rows`.
+fn push_temp_btree_eqp_rows(
+    rows: &mut Vec<Row>,
+    temp_btrees: crate::explain::ProgramTempBtrees,
+    to_row: &impl Fn(i32, i32, i32, String) -> Row,
+) {
+    let start_id = i32::try_from(rows.len() + 2).unwrap_or(i32::MAX);
+    for (next_id, detail) in (start_id..).zip(temp_btrees.detail_lines()) {
+        rows.push(to_row(next_id, 0, 0, detail.to_owned()));
+    }
 }
 
 /// The single table a plain top-level SELECT reads, with its alias and WHERE.
