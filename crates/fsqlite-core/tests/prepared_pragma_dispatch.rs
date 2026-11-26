@@ -223,10 +223,12 @@ async fn assert_prepared_pragma_execute_only_parity(
         rusqlite_rows(rconn, sql)?,
         "prepared query row mismatch for {sql}"
     );
+    // bd-ecibg: `execute()` on a zero-row PRAGMA returns `sqlite3_changes()`
+    // (the connection's last DML count), matching `rusqlite::Statement::execute`.
     assert_eq!(
         fconn.prepare(sql).await?.execute().await?,
-        0,
-        "unexpected output row for {sql}"
+        rconn.prepare(sql)?.execute([])?,
+        "prepared execute count mismatch for {sql}"
     );
     assert_eq!(
         format_fsqlite_rows(fconn.query(sql).await?),

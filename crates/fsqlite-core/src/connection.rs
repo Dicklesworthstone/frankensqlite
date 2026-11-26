@@ -11597,7 +11597,19 @@ impl PreparedStatement<'_> {
                 })
                 .await;
         }
-        Ok(self.query_unrecorded().await?.len())
+        let rows = self.query_unrecorded().await?;
+        // bd-ecibg: DDL/control statements and zero-row PRAGMAs return
+        // `sqlite3_changes()` (the previous DML's count), matching rusqlite.
+        if self.prepared_schema_statement().is_some()
+            || (rows.is_empty()
+                && matches!(
+                    self.deferred_query_statement.as_deref(),
+                    Some(Statement::Pragma(_))
+                ))
+        {
+            return Ok(self.conn.last_changes.get());
+        }
+        Ok(rows.len())
     }
 
     /// Execute with bound SQL parameters and return affected/output row count.
@@ -11634,7 +11646,19 @@ impl PreparedStatement<'_> {
                 })
                 .await;
         }
-        Ok(self.query_with_params_unrecorded(params).await?.len())
+        let rows = self.query_with_params_unrecorded(params).await?;
+        // bd-ecibg: DDL/control statements and zero-row PRAGMAs return
+        // `sqlite3_changes()` (the previous DML's count), matching rusqlite.
+        if self.prepared_schema_statement().is_some()
+            || (rows.is_empty()
+                && matches!(
+                    self.deferred_query_statement.as_deref(),
+                    Some(Statement::Pragma(_))
+                ))
+        {
+            return Ok(self.conn.last_changes.get());
+        }
+        Ok(rows.len())
     }
 
     /// Return an EXPLAIN-style disassembly for the compiled program.
@@ -33844,8 +33868,12 @@ impl Connection {
             self.note_connection_statement_execution_count(1);
             last_count = if is_dml {
                 self.last_changes.get()
-            } else {
+            } else if matches!(statement.as_ref(), Statement::Select(_)) || !rows.is_empty() {
                 rows.len()
+            } else {
+                // bd-ecibg: DDL, transaction control, and zero-row PRAGMAs return
+                // `sqlite3_changes()` (the previous DML's count), matching rusqlite.
+                self.last_changes.get()
             };
         }
         Ok(last_count)
@@ -34151,8 +34179,12 @@ impl Connection {
             self.note_connection_statement_execution_count(1);
             last_count = if is_dml {
                 self.last_changes.get()
-            } else {
+            } else if matches!(statement.as_ref(), Statement::Select(_)) || !rows.is_empty() {
                 rows.len()
+            } else {
+                // bd-ecibg: DDL, transaction control, and zero-row PRAGMAs return
+                // `sqlite3_changes()` (the previous DML's count), matching rusqlite.
+                self.last_changes.get()
             };
         }
         Ok(last_count)
@@ -34699,10 +34731,22 @@ impl Connection {
                     rows.len()
                 })
             } else {
-                Ok(self
+                let rows = self
                     .query_prepared_with_params_after_background_status(stmt, Some(params))
-                    .await?
-                    .len())
+                    .await?;
+                Ok(
+                    if stmt.prepared_schema_statement().is_some()
+                        || (rows.is_empty()
+                            && matches!(
+                                stmt.deferred_query_statement.as_deref(),
+                                Some(Statement::Pragma(_))
+                            ))
+                    {
+                        self.last_changes.get()
+                    } else {
+                        rows.len()
+                    },
+                )
             }
         }))
     }
@@ -34775,11 +34819,13 @@ impl Connection {
                     }
                     return rows_result;
                 }
-                return Err(FrankenError::Internal(
-                    "DML prepared statements must be executed through \
-                 Connection::execute_prepared() or Connection::execute_prepared_with_params()"
-                        .to_owned(),
-                ));
+                // bd-ecibg: stepping a non-RETURNING prepared DML statement via
+                // query() executes the write and yields zero rows, matching stock
+                // SQLite and rusqlite.
+                let _ = self
+                    .execute_prepared_autocommit_with_conflict_retry(stmt, params.unwrap_or(&[]))
+                    .await?;
+                return Ok(Vec::new());
             }
             let params = params.unwrap_or(&[]);
             if stmt.may_observe_change_tracking {
@@ -35121,11 +35167,12 @@ impl Connection {
                     }
                     return Ok(());
                 }
-                return Err(FrankenError::Internal(
-                    "DML prepared statements must be executed through \
-                 Connection::execute_prepared() or Connection::execute_prepared_with_params()"
-                        .to_owned(),
-                ));
+                // bd-ecibg: stepping a non-RETURNING prepared DML statement via
+                // query_with_params_for_each() executes the write and emits zero rows.
+                let _ = self
+                    .execute_prepared_autocommit_with_conflict_retry(stmt, params)
+                    .await?;
+                return Ok(());
             }
             if stmt.may_observe_change_tracking {
                 self.sync_change_tracking_context();
@@ -35264,11 +35311,12 @@ impl Connection {
                         .await?;
                     return exactly_one_row_or_error(rows);
                 }
-                return Err(FrankenError::Internal(
-                    "DML prepared statements must be executed through \
-                 Connection::execute_prepared() or Connection::execute_prepared_with_params()"
-                        .to_owned(),
-                ));
+                // bd-ecibg: stepping a non-RETURNING prepared DML statement via
+                // query_row() executes the write and returns QueryReturnedNoRows.
+                let _ = self
+                    .execute_prepared_autocommit_with_conflict_retry(stmt, params.unwrap_or(&[]))
+                    .await?;
+                return exactly_one_row_or_error(Vec::new());
             }
             if stmt.may_observe_change_tracking {
                 self.sync_change_tracking_context();
