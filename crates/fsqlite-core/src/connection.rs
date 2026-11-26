@@ -121161,435 +121161,871 @@ impl Connection {
     }
 
     /// Execute `EXPLAIN QUERY PLAN` by describing the scan strategy of the
-    /// inner statement at a high level.  Each row has four columns:
+    /// inner statement at a high level, including nested `SCALAR SUBQUERY`,
+    /// `LIST SUBQUERY`, and `CORRELATED ... SUBQUERY` trees plus fallback
+    /// routing annotations when a correlated subquery takes a per-row fallback
+    /// (bd-oi8tv). Each row has four columns:
     ///   id | parent | notused | detail
     async fn execute_explain_query_plan(&self, stmt: &Statement) -> Vec<Row> {
-        let to_row = |id: i32, parent: i32, notused: i32, detail: String| Row {
-            values: vec![
-                SqliteValue::Integer(i64::from(id)),
-                SqliteValue::Integer(i64::from(parent)),
-                SqliteValue::Integer(i64::from(notused)),
-                SqliteValue::Text(detail.into()),
-            ],
-        };
-
+        let mut state = EqpWalkState::new();
         match stmt {
             Statement::Select(select) => {
-                // bd-jyyae: the planner directive records intent; codegen can
-                // decline the access path (`IN (SELECT ...)` compiles to a
-                // full scan probing an ephemeral membership index). A seek
-                // claim is rendered only when the emitted program actually
-                // performs it — an opcode fact, not planner intent — so EQP
-                // cannot diverge from execution. A scan claim cannot
-                // overstate and renders directly. A compile failure must NOT
-                // vouch for a seek claim either (bd-dqdoe msg 4166):
-                // "verification unavailable" falls through to the
-                // program-derived/source fallback, which only emits
-                // scan-shaped details.
-                let directive = {
-                    let schema = self.schema.borrow();
-                    Self::planner_select_directive(select, &schema)
-                };
-                if let Some(directive) = directive {
-                    let mut directive_seek_key_columns = None;
-                    // bd-r39kx / bd-vyy1q: facts of the verified program.
-                    let mut directive_seek_covering = false;
-                    let mut directive_temp_btrees = crate::explain::ProgramTempBtrees::default();
-                    let verified = match directive.access_kind {
-                        PlannerSelectAccessKind::FullTableScan => {
-                            // bd-2fong red 3 (bd-jyyae family): a FullTableScan
-                            // directive was trusted unconditionally, but codegen
-                            // may upgrade it to a seek — the native IN-probe lane
-                            // (bd-2dgf5) turns `ipk IN (SELECT ...)` into rowid
-                            // seeks, and a WITHOUT ROWID single-column PRIMARY KEY
-                            // equality becomes a direct table-b-tree seek
-                            // (bd-nd2ju / #377) — so EQP printed `SCAN t` for a
-                            // program whose first act is a seek. Verify scan
-                            // directives against the program like every other
-                            // access kind and report the path the program
-                            // actually performs.
-                            if let Ok(program) = self.compile_table_select(select).await {
-                                let temp_btrees = select_program_temp_btrees(select, &program);
-                                if crate::explain::program_seeks_rowid_on_table(
-                                    &program,
-                                    &directive.table_name,
-                                ) {
-                                    let mut rows = vec![to_row(
-                                        2,
-                                        0,
-                                        0,
-                                        format!(
-                                            "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
-                                            directive.table_name
-                                        ),
-                                    )];
-                                    push_temp_btree_eqp_rows(&mut rows, temp_btrees, &to_row);
-                                    return rows;
-                                }
-                                if crate::explain::program_seeks_without_rowid_pk_on_table(
-                                    &program,
-                                    &directive.table_name,
-                                ) && let Some(detail) = without_rowid_pk_eqp_detail(
-                                    &directive.table_name,
-                                    &self.schema.borrow(),
-                                ) {
-                                    let mut rows = vec![to_row(2, 0, 0, detail)];
-                                    push_temp_btree_eqp_rows(&mut rows, temp_btrees, &to_row);
-                                    return rows;
-                                }
-                                // bd-r39kx: a rowid range the program seeks,
-                                // or walks from the first row to an upper
-                                // bound.
-                                if (crate::explain::program_seeks_rowid_range_on_table(
-                                    &program,
-                                    &directive.table_name,
-                                ) || crate::explain::program_walks_rowid_up_to_bound(
-                                    &program,
-                                    &directive.table_name,
-                                )) && let Some(detail) =
-                                    rowid_range_eqp_detail(select, &self.schema.borrow())
-                                {
-                                    let mut rows = vec![to_row(2, 0, 0, detail)];
-                                    push_temp_btree_eqp_rows(&mut rows, temp_btrees, &to_row);
-                                    return rows;
-                                }
-                                directive_temp_btrees = temp_btrees;
-                            }
-                            true
-                        }
-                        PlannerSelectAccessKind::RowidLookup => {
-                            match self.compile_table_select(select).await {
-                                Ok(program)
-                                    if crate::explain::program_seeks_rowid_on_table(
-                                        &program,
-                                        &directive.table_name,
-                                    ) =>
-                                {
-                                    directive_temp_btrees =
-                                        select_program_temp_btrees(select, &program);
-                                    true
-                                }
-                                _ => false,
-                            }
-                        }
-                        PlannerSelectAccessKind::IndexEquality
-                        | PlannerSelectAccessKind::IndexRange => {
-                            match (
-                                self.compile_table_select(select).await,
-                                directive.index_name.as_deref(),
-                            ) {
-                                (Ok(program), Some(index_name))
-                                    if crate::explain::program_seeks_named_index(
-                                        &program, index_name,
-                                    ) =>
-                                {
-                                    directive_seek_key_columns =
-                                        crate::explain::program_index_seek_key_width(
-                                            &program, index_name,
-                                        );
-                                    directive_seek_covering =
-                                        crate::explain::program_index_seek_facts(&program)
-                                            .is_some_and(|seek| {
-                                                seek.covering
-                                                    && seek
-                                                        .index_name
-                                                        .eq_ignore_ascii_case(index_name)
-                                            });
-                                    directive_temp_btrees =
-                                        select_program_temp_btrees(select, &program);
-                                    true
-                                }
-                                _ => false,
-                            }
-                        }
-                    };
-                    if verified {
-                        let schema = self.schema.borrow();
-                        let source = single_table_select_source(select, &schema);
-                        // bd-r39kx: stock names the source by its alias; an
-                        // index seek that never looks the row up is COVERING
-                        // (a rowid table's lookup is IdxRowid + SeekRowid, which
-                        // a WITHOUT ROWID lookup lacks, so it keeps the
-                        // planner's flag); a range prints its bounds.
-                        let displayed = source
-                            .and_then(|(_, alias, _)| alias)
-                            .unwrap_or(directive.table_name.as_str());
-                        let covering = directive.covering
-                            || (directive_seek_covering
-                                && source.is_some_and(|(table, _, _)| !table.without_rowid));
-                        let key_terms = match directive.access_kind {
-                            _ if directive.index_key_is_expression => None,
-                            // A one-column key prints `({label}=?)`, as
-                            // `explain_query_plan_detail_from_directive` does.
-                            PlannerSelectAccessKind::IndexEquality => {
-                                directive_index_equality_key_terms(
-                                    select,
-                                    &directive,
-                                    directive_seek_key_columns,
-                                    &schema,
-                                )
-                                .or_else(|| {
-                                    directive
-                                        .index_key_label
-                                        .as_deref()
-                                        .map(|label| format!("{label}=?"))
-                                })
-                            }
-                            PlannerSelectAccessKind::IndexRange => source
-                                .zip(directive.index_key_label.as_deref())
-                                .and_then(|((table, alias, where_clause), key_column)| {
-                                    index_seek_eqp_range_key_terms(
-                                        where_clause,
-                                        &table.name,
-                                        alias,
-                                        key_column,
-                                    )
-                                }),
-                            PlannerSelectAccessKind::FullTableScan
-                            | PlannerSelectAccessKind::RowidLookup => None,
-                        };
-                        let detail = match (directive.access_kind, key_terms) {
-                            (_, Some(key_terms)) => format!(
-                                "SEARCH {displayed} USING {}INDEX {} ({key_terms})",
-                                if covering { "COVERING " } else { "" },
-                                directive.index_name.as_deref().unwrap_or("(unknown)"),
-                            ),
-                            (PlannerSelectAccessKind::FullTableScan, None) => {
-                                format!("SCAN {displayed}")
-                            }
-                            (PlannerSelectAccessKind::RowidLookup, None) => {
-                                format!("SEARCH {displayed} USING INTEGER PRIMARY KEY (rowid=?)")
-                            }
-                            _ => explain_query_plan_detail_from_directive(&directive),
-                        };
-                        let mut rows = vec![to_row(2, 0, 0, detail)];
-                        push_temp_btree_eqp_rows(&mut rows, directive_temp_btrees, &to_row);
-                        return rows;
-                    }
-                }
-
-                let fallback_detail = first_source_eqp_detail_from_core(&select.body.select);
-                if let Ok(program) = self.compile_table_select(select).await {
-                    // bd-2dgf5 / bd-jyyae / GH#381: some safe codegen paths have no
-                    // planner directive, and generic bytecode explain renders every
-                    // `OpenRead` as a `SCAN`. Read SEARCH vs SCAN from the emitted
-                    // program instead: a named index is searched exactly when a Seek*
-                    // opcode positions its cursor.
-                    let simple_top_level_select = select.with.is_none()
-                        && select.body.compounds.is_empty()
-                        && !select_contains_subquery_matching(select, self, &|_, _| true);
-                    let aggregate = select_core_is_aggregate(&select.body.select);
-                    let index_seek = if aggregate {
-                        crate::explain::aggregate_index_seek_facts(&program)
-                    } else {
-                        crate::explain::program_index_seek_facts(&program)
-                    };
-                    let seek_key_columns = index_seek.as_ref().and_then(|seek| {
-                        crate::explain::program_index_seek_key_width(&program, &seek.index_name)
-                    });
-                    // bd-xml0z: without ORDER BY or an aggregate, report the
-                    // seek only when the program binds a multi-column equality
-                    // key, which the generic bytecode explain renders as
-                    // `SCAN t` + `SCAN INDEX i`.
-                    let index_seek = index_seek.filter(|seek| {
-                        aggregate
-                            || !select.order_by.is_empty()
-                            || index_seek_binds_multi_column_equality_key(
-                                select,
-                                seek,
-                                seek_key_columns,
-                                &self.schema.borrow(),
-                            )
-                    });
-                    if simple_top_level_select
-                        && let Some(seek) = index_seek
-                        && let Some(detail) = index_seek_eqp_detail(
-                            select,
-                            &seek,
-                            seek_key_columns,
-                            &self.schema.borrow(),
-                        )
-                    {
-                        let mut rows = vec![to_row(2, 0, 0, detail)];
-                        // bd-vyy1q: report GROUP BY, DISTINCT, and ORDER BY temp
-                        // B-trees directly from bytecode (IN-list probe sorters are
-                        // filtered out inside `program_temp_btree_uses`).
-                        push_temp_btree_eqp_rows(
-                            &mut rows,
-                            select_program_temp_btrees(select, &program),
-                            &to_row,
-                        );
-                        return rows;
-                    }
-
-                    // GH #415: a rowid membership / equality seek under ORDER BY
-                    // or an aggregate has no planner directive (the planner
-                    // declines those shapes), and the generic bytecode explain
-                    // renders every `OpenRead` as a `SCAN`. When the program's
-                    // only way onto the table is a rowid probe — never a
-                    // `Rewind`/`Next` — report the seek it actually performs,
-                    // exactly as the directive-verified path does; a sorter
-                    // still surfaces as the temp b-tree marker.
-                    if simple_top_level_select
-                        && let Some(table_name) =
-                            single_table_source_name_from_core(&select.body.select)
-                        && crate::explain::program_accesses_table_only_by_rowid(
-                            &program, table_name,
-                        )
-                    {
-                        let mut rows = vec![to_row(
-                            2,
-                            0,
-                            0,
-                            format!("SEARCH {table_name} USING INTEGER PRIMARY KEY (rowid=?)"),
-                        )];
-                        push_temp_btree_eqp_rows(
-                            &mut rows,
-                            select_program_temp_btrees(select, &program),
-                            &to_row,
-                        );
-                        return rows;
-                    }
-
-                    // bd-r39kx: a rowid range the program seeks, as the
-                    // directive-verified path reports it.
-                    if simple_top_level_select
-                        && let Some(table_name) =
-                            single_table_source_name_from_core(&select.body.select)
-                        && (crate::explain::program_seeks_rowid_range_on_table(
-                            &program, table_name,
-                        ) || crate::explain::program_walks_rowid_up_to_bound(
-                            &program, table_name,
-                        ))
-                        && let Some(detail) = rowid_range_eqp_detail(select, &self.schema.borrow())
-                    {
-                        let mut rows = vec![to_row(2, 0, 0, detail)];
-                        push_temp_btree_eqp_rows(
-                            &mut rows,
-                            select_program_temp_btrees(select, &program),
-                            &to_row,
-                        );
-                        return rows;
-                    }
-
-                    // bd-r39kx: one index walked from an end (to an upper
-                    // bound, or for a min/max or a count), its table reached
-                    // only by the rowids it yields: stock's one row for the
-                    // source.
-                    if simple_top_level_select
-                        && let Some(walk) = crate::explain::program_index_walk(&program)
-                        && let Some(detail) =
-                            index_walk_eqp_detail(select, &walk, &self.schema.borrow())
-                    {
-                        let mut rows = vec![to_row(2, 0, 0, detail)];
-                        push_temp_btree_eqp_rows(
-                            &mut rows,
-                            select_program_temp_btrees(select, &program),
-                            &to_row,
-                        );
-                        return rows;
-                    }
-
-                    let explained = crate::explain::explain_query_plan(&program);
-                    if !explained.is_empty() {
-                        let has_source_detail = explained
-                            .iter()
-                            .any(|row| eqp_detail_is_scan_or_search(&row.detail));
-                        if has_source_detail {
-                            let mut rows: Vec<Row> = explained
-                                .iter()
-                                .map(|row| {
-                                    to_row(row.id, row.parent, row.notused, row.detail.clone())
-                                })
-                                .collect();
-                            // A virtual-table scan that the bytecode satisfies
-                            // without an explicit sorter still needs a temp
-                            // B-tree when an ORDER BY references the vtable's
-                            // declared columns (json_each/json_tree cannot honor
-                            // ordering via xBestIndex). SQLite emits the marker
-                            // here; the bytecode-level explain only adds it when
-                            // it sees Sorter opcodes, so cover the vtable case.
-                            let already_has_temp_btree = explained
-                                .iter()
-                                .any(|row| row.detail == "USE TEMP B-TREE FOR ORDER BY");
-                            if !already_has_temp_btree
-                                && select_requires_temp_btree_fallback_for_order_by(select)
-                            {
-                                let next_id = i32::try_from(rows.len() + 1).unwrap_or(i32::MAX);
-                                rows.push(to_row(
-                                    next_id,
-                                    0,
-                                    0,
-                                    "USE TEMP B-TREE FOR ORDER BY".to_owned(),
-                                ));
-                            }
-                            return rows;
-                        }
-                        if let Some(detail) = fallback_detail.clone() {
-                            let mut rows = vec![to_row(2, 0, 0, detail)];
-                            let mut next_id = 3;
-                            let mut saw_order_by_temp_btree = false;
-                            for row in explained {
-                                if row.detail.starts_with("USE TEMP B-TREE FOR ") {
-                                    saw_order_by_temp_btree |=
-                                        row.detail == "USE TEMP B-TREE FOR ORDER BY";
-                                    rows.push(to_row(next_id, 0, 0, row.detail));
-                                    next_id += 1;
-                                }
-                            }
-                            if !saw_order_by_temp_btree
-                                && select_requires_temp_btree_fallback_for_order_by(select)
-                            {
-                                rows.push(to_row(
-                                    next_id,
-                                    0,
-                                    0,
-                                    "USE TEMP B-TREE FOR ORDER BY".to_owned(),
-                                ));
-                            }
-                            return rows;
-                        }
-                    }
-                }
-
-                let detail = fallback_detail.unwrap_or_else(|| "SCAN CONSTANT ROW".to_owned());
-                let mut rows = vec![to_row(2, 0, 0, detail)];
-                // A virtual-table scan that we describe only via the fallback
-                // detail (no compiled bytecode plan) still needs the temp-btree
-                // marker when an ORDER BY references the vtable's declared
-                // columns — SQLite reports it and the oracle tests compare
-                // against that.
-                if select_requires_temp_btree_fallback_for_order_by(select) {
-                    rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
-                }
-                rows
+                self.build_select_eqp_rows(select, select, 0, &mut state, &[], 0)
+                    .await
             }
             Statement::Insert(insert) => {
-                vec![to_row(
-                    2,
+                let mut rows = vec![eqp_row(
+                    state.alloc_row_id(),
                     0,
                     0,
                     format!("SCAN {} (INSERT)", insert.table.name),
-                )]
+                )];
+                let mut subqueries = Vec::new();
+                let mut scopes = Vec::new();
+                if let InsertSource::Select(select) = &insert.source {
+                    if let Some(scope) = self.eqp_outer_scope_for_select(select) {
+                        scopes.push(scope);
+                    }
+                    collect_direct_select_subqueries(select, &mut subqueries);
+                }
+                if let InsertSource::Values(value_rows) = &insert.source {
+                    for expr in value_rows.iter().flatten() {
+                        collect_direct_expr_subqueries(expr, &mut subqueries);
+                    }
+                }
+                for col in &insert.returning {
+                    if let ResultColumn::Expr { expr, .. } = col {
+                        collect_direct_expr_subqueries(expr, &mut subqueries);
+                    }
+                }
+                if !subqueries.is_empty() {
+                    if let Some(scope) = self.eqp_outer_scope_for_table(
+                        &insert.table.name,
+                        insert.alias.as_deref(),
+                    ) {
+                        scopes.push(scope);
+                    }
+                    let fallback = if let InsertSource::Select(select) = &insert.source {
+                        self.select_correlated_subquery_fallback_reason(select)
+                    } else {
+                        None
+                    };
+                    self.append_eqp_subquery_rows(
+                        &subqueries,
+                        0,
+                        &mut state,
+                        &scopes,
+                        fallback,
+                        0,
+                        &mut rows,
+                    )
+                    .await;
+                }
+                rows
             }
             Statement::Update(update) => {
-                vec![to_row(
-                    2,
+                let mut rows = vec![eqp_row(
+                    state.alloc_row_id(),
                     0,
                     0,
                     format!("SCAN {} (UPDATE)", update.table.name.name),
-                )]
+                )];
+                let mut subqueries = Vec::new();
+                if let Some(where_expr) = &update.where_clause {
+                    collect_direct_expr_subqueries(where_expr, &mut subqueries);
+                }
+                if let Some(from) = &update.from {
+                    collect_direct_from_subqueries(from, &mut subqueries);
+                }
+                for assignment in &update.assignments {
+                    collect_direct_expr_subqueries(&assignment.value, &mut subqueries);
+                }
+                for col in &update.returning {
+                    if let ResultColumn::Expr { expr, .. } = col {
+                        collect_direct_expr_subqueries(expr, &mut subqueries);
+                    }
+                }
+                if !subqueries.is_empty() {
+                    let mut scopes = Vec::new();
+                    if let Some(scope) = self.eqp_outer_scope_for_update(update) {
+                        scopes.push(scope);
+                    }
+                    let fallback = self.update_correlated_subquery_fallback_reason(update);
+                    self.append_eqp_subquery_rows(
+                        &subqueries,
+                        0,
+                        &mut state,
+                        &scopes,
+                        fallback,
+                        0,
+                        &mut rows,
+                    )
+                    .await;
+                }
+                rows
             }
             Statement::Delete(delete) => {
-                vec![to_row(
-                    2,
+                let mut rows = vec![eqp_row(
+                    state.alloc_row_id(),
                     0,
                     0,
                     format!("SCAN {} (DELETE)", delete.table.name.name),
-                )]
+                )];
+                let mut subqueries = Vec::new();
+                if let Some(where_expr) = &delete.where_clause {
+                    collect_direct_expr_subqueries(where_expr, &mut subqueries);
+                }
+                for col in &delete.returning {
+                    if let ResultColumn::Expr { expr, .. } = col {
+                        collect_direct_expr_subqueries(expr, &mut subqueries);
+                    }
+                }
+                if !subqueries.is_empty() {
+                    let mut scopes = Vec::new();
+                    if let Some(scope) = self.eqp_outer_scope_for_table(
+                        &delete.table.name.name,
+                        delete.table.alias.as_deref(),
+                    ) {
+                        scopes.push(scope);
+                    }
+                    let fallback = self.delete_correlated_subquery_fallback_reason(delete);
+                    self.append_eqp_subquery_rows(
+                        &subqueries,
+                        0,
+                        &mut state,
+                        &scopes,
+                        fallback,
+                        0,
+                        &mut rows,
+                    )
+                    .await;
+                }
+                rows
             }
-            _ => vec![to_row(2, 0, 0, "SCAN".to_owned())],
+            _ => vec![eqp_row(state.alloc_row_id(), 0, 0, "SCAN".to_owned())],
         }
+    }
+
+    fn select_correlated_subquery_fallback_reason(
+        &self,
+        select: &SelectStatement,
+    ) -> Option<&'static str> {
+        if self.select_correlated_exists_where_requires_fallback(select) {
+            Some("correlated_exists_fallback")
+        } else if select_has_unsupported_correlated_scalar_subquery(select, self)
+            && self.select_uses_builtin_minmax_bare_tracking(select).is_none()
+        {
+            Some("correlated_scalar_subquery_fallback")
+        } else if select_has_unsupported_correlated_exists_subquery(select, self)
+            && self.select_uses_builtin_minmax_bare_tracking(select).is_none()
+        {
+            Some("correlated_exists_subquery_fallback")
+        } else if select_has_in_subquery_operand_requiring_semantic_fallback(select, self) {
+            Some("in_subquery_operand_semantic_fallback")
+        } else if select_has_correlated_in_subquery(select, self) {
+            Some("correlated_in_subquery_fallback")
+        } else {
+            None
+        }
+    }
+
+    fn update_correlated_subquery_fallback_reason(
+        &self,
+        update: &UpdateStatement,
+    ) -> Option<&'static str> {
+        let has_uncompiled = update
+            .where_clause
+            .as_ref()
+            .is_some_and(|wh| dml_expr_has_uncompiled_correlated_subquery(wh, self))
+            || update
+                .assignments
+                .iter()
+                .any(|a| dml_expr_has_uncompiled_correlated_subquery(&a.value, self))
+            || self.returning_has_uncompiled_correlated_subquery(&update.returning);
+        has_uncompiled.then_some("dml_correlated_subquery_fallback")
+    }
+
+    fn delete_correlated_subquery_fallback_reason(
+        &self,
+        delete: &DeleteStatement,
+    ) -> Option<&'static str> {
+        let has_uncompiled = delete
+            .where_clause
+            .as_ref()
+            .is_some_and(|wh| dml_expr_has_uncompiled_correlated_subquery(wh, self))
+            || self.returning_has_uncompiled_correlated_subquery(&delete.returning);
+        has_uncompiled.then_some("dml_correlated_subquery_fallback")
+    }
+
+    fn eqp_outer_scope_for_table(
+        &self,
+        table_name: &str,
+        alias: Option<&str>,
+    ) -> Option<EqpOuterScope> {
+        let schema = self.schema.borrow();
+        let mut scope = EqpOuterScope::default();
+        append_table_to_eqp_outer_scope(table_name, alias, &schema, &mut scope);
+        (!scope.col_map.is_empty()).then_some(scope)
+    }
+
+    fn eqp_outer_scope_for_select(&self, select: &SelectStatement) -> Option<EqpOuterScope> {
+        let SelectCore::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        else {
+            return None;
+        };
+        let schema = self.schema.borrow();
+        let mut scope = EqpOuterScope::default();
+        append_from_clause_to_eqp_outer_scope(from, &schema, &mut scope);
+        (!scope.col_map.is_empty()).then_some(scope)
+    }
+
+    fn eqp_outer_scope_for_update(&self, update: &UpdateStatement) -> Option<EqpOuterScope> {
+        let schema = self.schema.borrow();
+        let mut scope = EqpOuterScope::default();
+        append_table_to_eqp_outer_scope(
+            &update.table.name.name,
+            update.table.alias.as_deref(),
+            &schema,
+            &mut scope,
+        );
+        if let Some(from) = &update.from {
+            append_from_clause_to_eqp_outer_scope(from, &schema, &mut scope);
+        }
+        (!scope.col_map.is_empty()).then_some(scope)
+    }
+
+    fn build_select_eqp_rows<'a>(
+        &'a self,
+        source_select: &'a SelectStatement,
+        plan_select: &'a SelectStatement,
+        parent_id: i32,
+        state: &'a mut EqpWalkState,
+        ancestor_scopes: &'a [EqpOuterScope],
+        depth: usize,
+    ) -> Pin<Box<dyn Future<Output = Vec<Row>> + 'a>> {
+        Box::pin(async move {
+            let mut direct_subqueries = Vec::new();
+            collect_direct_select_subqueries(source_select, &mut direct_subqueries);
+            let has_direct_subqueries = !direct_subqueries.is_empty();
+
+            let mut rows = self
+                .build_select_outer_eqp_rows(
+                    plan_select,
+                    parent_id,
+                    state,
+                    has_direct_subqueries,
+                )
+                .await;
+
+            if has_direct_subqueries && depth < EQP_MAX_SUBQUERY_DEPTH {
+                let mut child_scopes = ancestor_scopes.to_vec();
+                if let Some(own_scope) = self.eqp_outer_scope_for_select(source_select) {
+                    child_scopes.push(own_scope);
+                }
+                let fallback_reason =
+                    self.select_correlated_subquery_fallback_reason(source_select);
+                self.append_eqp_subquery_rows(
+                    &direct_subqueries,
+                    parent_id,
+                    state,
+                    &child_scopes,
+                    fallback_reason,
+                    depth + 1,
+                    &mut rows,
+                )
+                .await;
+            }
+            rows
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_eqp_subquery_rows<'a>(
+        &'a self,
+        subqueries: &'a [EqpSubqueryEntry<'a>],
+        parent_id: i32,
+        state: &'a mut EqpWalkState,
+        outer_scopes: &'a [EqpOuterScope],
+        fallback_reason: Option<&'static str>,
+        depth: usize,
+        out: &'a mut Vec<Row>,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            for entry in subqueries {
+                let mut probe_sub = entry.query.clone();
+                let substituted = self.substitute_eqp_outer_scopes(&mut probe_sub, outer_scopes);
+                let correlated = substituted
+                    || (!outer_scopes.is_empty()
+                        && is_correlated_subquery_in_connection(entry.query, self));
+
+                if entry.kind == EqpSubqueryKind::Exists
+                    && !select_core_is_aggregate(&probe_sub.body.select)
+                {
+                    self.normalize_eqp_exists_probe_projection(&mut probe_sub);
+                }
+                if correlated {
+                    self.flatten_correlated_probe_source(&mut probe_sub);
+                    self.relax_correlated_exists_equalities_for_seek(&mut probe_sub);
+                    self.relax_eqp_hidden_rowid_bound_outer(&mut probe_sub);
+                }
+
+                let header_id = state.alloc_row_id();
+                let child_rows = self
+                    .build_select_eqp_rows(
+                        entry.query,
+                        &probe_sub,
+                        header_id,
+                        state,
+                        outer_scopes,
+                        depth,
+                    )
+                    .await;
+                let sub_num = state.alloc_subquery_num();
+                let kind_label = match (correlated, entry.kind) {
+                    (true, EqpSubqueryKind::List) => "CORRELATED LIST SUBQUERY",
+                    (false, EqpSubqueryKind::List) => "LIST SUBQUERY",
+                    (true, EqpSubqueryKind::Scalar | EqpSubqueryKind::Exists) => {
+                        "CORRELATED SCALAR SUBQUERY"
+                    }
+                    (false, EqpSubqueryKind::Scalar | EqpSubqueryKind::Exists) => {
+                        "SCALAR SUBQUERY"
+                    }
+                };
+                let show_fallback = match (correlated, entry.kind, fallback_reason) {
+                    (true, _, Some(reason)) => Some(reason),
+                    (false, EqpSubqueryKind::List, Some("in_subquery_operand_semantic_fallback")) => {
+                        Some("in_subquery_operand_semantic_fallback")
+                    }
+                    _ => None,
+                };
+                let header_detail = match show_fallback {
+                    Some(reason) => format!("{kind_label} {sub_num} (fallback: {reason})"),
+                    None => format!("{kind_label} {sub_num}"),
+                };
+                out.push(eqp_row(header_id, parent_id, 0, header_detail));
+                out.extend(child_rows);
+            }
+        })
+    }
+
+    fn substitute_eqp_outer_scopes(
+        &self,
+        subquery: &mut SelectStatement,
+        outer_scopes: &[EqpOuterScope],
+    ) -> bool {
+        if outer_scopes.is_empty() {
+            return false;
+        }
+        let original = subquery.clone();
+        let schema = self.schema.borrow();
+        let cte_scopes = CteScopes::new();
+        for scope in outer_scopes.iter().rev() {
+            let lookup = OuterReferenceLookup {
+                row: &scope.row,
+                col_map: &scope.col_map,
+                using_skip: None,
+                replacement_exprs: None,
+                column_collations: Some(&scope.column_collations),
+                column_affinities: Some(&scope.column_affinities),
+                declared_blob_columns: None,
+                schema: &schema,
+                connection: Some(self),
+                probe_unqualified_external_ref: false,
+            };
+            substitute_outer_refs_in_select_scoped(subquery, &lookup, &[], None, &cte_scopes);
+        }
+        *subquery != original
+    }
+
+    /// Normalize an `EXISTS (...)` subquery's projection for EQP planning so
+    /// rowid tables project their index-covered rowid/IPK key (matching
+    /// `emit_exists_subquery`, which skips `SeekRowid` when no residual reads
+    /// table columns, bd-tx55u / bd-oi8tv).
+    fn normalize_eqp_exists_probe_projection(&self, select: &mut SelectStatement) {
+        let replacement = {
+            let schema = self.schema.borrow();
+            single_table_select_source(select, &schema).and_then(|(table, _, _)| {
+                if table.without_rowid {
+                    return None;
+                }
+                if let Some(ipk) = table.columns.iter().find(|col| col.is_ipk) {
+                    Some(ipk.name.clone())
+                } else if !table
+                    .columns
+                    .iter()
+                    .any(|col| col.name.eq_ignore_ascii_case("rowid"))
+                {
+                    Some("rowid".to_owned())
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(col_name) = replacement
+            && select.body.compounds.is_empty()
+            && let SelectCore::Select { columns, .. } = &mut select.body.select
+        {
+            *columns = vec![ResultColumn::Expr {
+                expr: Expr::Column(ColumnRef::bare(col_name), Span::ZERO),
+                alias: None,
+            }];
+            return;
+        }
+        strip_exists_subquery_projection(select);
+    }
+
+    /// Companion to `relax_correlated_exists_equalities_for_seek` for EQP probe
+    /// planning: relaxes a hidden-rowid equality (`t.rowid = <bound outer int>`)
+    /// when `t` is a rowid table without an explicit `rowid` column so EQP
+    /// reports the `INTEGER PRIMARY KEY (rowid=?)` seek compiled EXISTS/scalar
+    /// probes perform (bd-oi8tv).
+    fn relax_eqp_hidden_rowid_bound_outer(&self, select: &mut SelectStatement) {
+        if select.with.is_some() || !select.body.compounds.is_empty() {
+            return;
+        }
+        let SelectCore::Select {
+            from: Some(from),
+            where_clause: Some(where_expr),
+            ..
+        } = &mut select.body.select
+        else {
+            return;
+        };
+        if !from.joins.is_empty() {
+            return;
+        }
+        let TableOrSubquery::Table { name, alias, .. } = &from.source else {
+            return;
+        };
+        let schema = self.schema.borrow();
+        let Some(table) = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&name.name))
+        else {
+            return;
+        };
+        if table.without_rowid {
+            return;
+        }
+        relax_hidden_rowid_eq_bound_outer(where_expr, table, alias.as_deref());
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn build_select_outer_eqp_rows(
+        &self,
+        select: &SelectStatement,
+        parent_id: i32,
+        state: &mut EqpWalkState,
+        has_direct_subqueries: bool,
+    ) -> Vec<Row> {
+        let mut emit_row = |detail: String| eqp_row(state.alloc_row_id(), parent_id, 0, detail);
+
+        // bd-jyyae: the planner directive records intent; codegen can
+        // decline the access path (`IN (SELECT ...)` compiles to a
+        // full scan probing an ephemeral membership index). A seek
+        // claim is rendered only when the emitted program actually
+        // performs it — an opcode fact, not planner intent — so EQP
+        // cannot diverge from execution. A scan claim cannot
+        // overstate and renders directly. A compile failure must NOT
+        // vouch for a seek claim either (bd-dqdoe msg 4166):
+        // "verification unavailable" falls through to the
+        // program-derived/source fallback, which only emits
+        // scan-shaped details.
+        let directive = {
+            let schema = self.schema.borrow();
+            Self::planner_select_directive(select, &schema)
+        };
+        if let Some(directive) = directive {
+            let mut directive_seek_key_columns = None;
+            // bd-r39kx / bd-vyy1q / bd-oi8tv: opcode-verified covering & temp
+            // B-tree facts of the verified program. On rowid tables, the
+            // emitted program's `IdxRowid -> SeekRowid` presence is
+            // authoritative so a residual WHERE predicate that forces a table
+            // lookup never falsely prints `COVERING`.
+            let mut directive_seek_covering: Option<bool> = None;
+            let mut directive_temp_btrees = crate::explain::ProgramTempBtrees::default();
+            let verified = match directive.access_kind {
+                PlannerSelectAccessKind::FullTableScan => {
+                    // bd-2fong red 3 (bd-jyyae family): a FullTableScan
+                    // directive was trusted unconditionally, but codegen
+                    // may upgrade it to a seek — the native IN-probe lane
+                    // (bd-2dgf5) turns `ipk IN (SELECT ...)` into rowid
+                    // seeks or indexed `col IN (SELECT ...)` into secondary
+                    // index seeks, and a WITHOUT ROWID single-column PRIMARY
+                    // KEY equality becomes a direct table-b-tree seek
+                    // (bd-nd2ju / #377) — so EQP printed `SCAN t` for a
+                    // program whose first act is a seek. Verify scan
+                    // directives against the program like every other
+                    // access kind and report the path the program
+                    // actually performs.
+                    if let Ok(program) = self.compile_table_select(select).await {
+                        let temp_btrees = select_program_temp_btrees(select, &program);
+                        if crate::explain::program_seeks_rowid_on_table(
+                            &program,
+                            &directive.table_name,
+                        ) {
+                            let schema = self.schema.borrow();
+                            let displayed = single_table_select_source(select, &schema)
+                                .and_then(|(_, alias, _)| alias)
+                                .unwrap_or(directive.table_name.as_str());
+                            let mut rows = vec![emit_row(format!(
+                                "SEARCH {displayed} USING INTEGER PRIMARY KEY (rowid=?)"
+                            ))];
+                            push_temp_btree_eqp_rows(&mut rows, temp_btrees, &mut emit_row);
+                            return rows;
+                        }
+                        if crate::explain::program_seeks_without_rowid_pk_on_table(
+                            &program,
+                            &directive.table_name,
+                        ) && let Some(detail) = without_rowid_pk_eqp_detail(
+                            &directive.table_name,
+                            &self.schema.borrow(),
+                        ) {
+                            let mut rows = vec![emit_row(detail)];
+                            push_temp_btree_eqp_rows(&mut rows, temp_btrees, &mut emit_row);
+                            return rows;
+                        }
+                        // bd-oi8tv: an IN-subquery index probe (e.g.
+                        // `repo IN (SELECT path FROM repos)`) compiles to
+                        // `SeekGE` on the secondary index + `IdxRowid` +
+                        // `SeekRowid`. Report the real index search rather
+                        // than falling back to `SCAN` or a bogus IPK seek.
+                        if let Some(seek) = crate::explain::program_outer_index_seek_facts(
+                            &program,
+                            &directive.table_name,
+                        ) && let Some(detail) = index_seek_eqp_detail(
+                            select,
+                            &seek,
+                            crate::explain::program_index_seek_key_width(
+                                &program,
+                                &seek.index_name,
+                            ),
+                            &self.schema.borrow(),
+                        ) {
+                            let mut rows = vec![emit_row(detail)];
+                            push_temp_btree_eqp_rows(&mut rows, temp_btrees, &mut emit_row);
+                            return rows;
+                        }
+                        // bd-r39kx: a rowid range the program seeks,
+                        // or walks from the first row to an upper
+                        // bound.
+                        if (crate::explain::program_seeks_rowid_range_on_table(
+                            &program,
+                            &directive.table_name,
+                        ) || crate::explain::program_walks_rowid_up_to_bound(
+                            &program,
+                            &directive.table_name,
+                        )) && let Some(detail) =
+                            rowid_range_eqp_detail(select, &self.schema.borrow())
+                        {
+                            let mut rows = vec![emit_row(detail)];
+                            push_temp_btree_eqp_rows(&mut rows, temp_btrees, &mut emit_row);
+                            return rows;
+                        }
+                        directive_temp_btrees = temp_btrees;
+                    }
+                    true
+                }
+                PlannerSelectAccessKind::RowidLookup => {
+                    match self.compile_table_select(select).await {
+                        Ok(program)
+                            if crate::explain::program_seeks_rowid_on_table(
+                                &program,
+                                &directive.table_name,
+                            ) =>
+                        {
+                            directive_temp_btrees = select_program_temp_btrees(select, &program);
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                PlannerSelectAccessKind::IndexEquality | PlannerSelectAccessKind::IndexRange => {
+                    match (
+                        self.compile_table_select(select).await,
+                        directive.index_name.as_deref(),
+                    ) {
+                        (Ok(program), Some(index_name))
+                            if crate::explain::program_seeks_named_index(&program, index_name) =>
+                        {
+                            directive_seek_key_columns =
+                                crate::explain::program_index_seek_key_width(&program, index_name);
+                            directive_seek_covering =
+                                crate::explain::program_index_seek_facts(&program)
+                                    .filter(|seek| seek.index_name.eq_ignore_ascii_case(index_name))
+                                    .map(|seek| seek.covering);
+                            directive_temp_btrees = select_program_temp_btrees(select, &program);
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+            };
+            if verified {
+                let schema = self.schema.borrow();
+                let source = single_table_select_source(select, &schema);
+                // bd-r39kx / bd-oi8tv: stock names the source by its alias; an
+                // index seek on a rowid table is COVERING iff the emitted
+                // program never looks the row up (`IdxRowid` + `SeekRowid`),
+                // whereas a WITHOUT ROWID lookup lacks that pair and keeps the
+                // planner's flag; a range prints its bounds.
+                let displayed = source
+                    .and_then(|(_, alias, _)| alias)
+                    .unwrap_or(directive.table_name.as_str());
+                let covering = if source.is_some_and(|(table, _, _)| !table.without_rowid) {
+                    directive_seek_covering.unwrap_or(directive.covering)
+                } else {
+                    directive.covering
+                };
+                let key_terms = match directive.access_kind {
+                    _ if directive.index_key_is_expression => None,
+                    // A one-column key prints `({label}=?)`, as
+                    // `explain_query_plan_detail_from_directive` does.
+                    PlannerSelectAccessKind::IndexEquality => directive_index_equality_key_terms(
+                        select,
+                        &directive,
+                        directive_seek_key_columns,
+                        &schema,
+                    )
+                    .or_else(|| {
+                        directive
+                            .index_key_label
+                            .as_deref()
+                            .map(|label| format!("{label}=?"))
+                    }),
+                    PlannerSelectAccessKind::IndexRange => source
+                        .zip(directive.index_key_label.as_deref())
+                        .and_then(|((table, alias, where_clause), key_column)| {
+                            index_seek_eqp_range_key_terms(
+                                where_clause,
+                                &table.name,
+                                alias,
+                                key_column,
+                            )
+                        }),
+                    PlannerSelectAccessKind::FullTableScan
+                    | PlannerSelectAccessKind::RowidLookup => None,
+                };
+                let detail = match (directive.access_kind, key_terms) {
+                    (_, Some(key_terms)) => format!(
+                        "SEARCH {displayed} USING {}INDEX {} ({key_terms})",
+                        if covering { "COVERING " } else { "" },
+                        directive.index_name.as_deref().unwrap_or("(unknown)"),
+                    ),
+                    (PlannerSelectAccessKind::FullTableScan, None) => {
+                        format!("SCAN {displayed}")
+                    }
+                    (PlannerSelectAccessKind::RowidLookup, None) => {
+                        format!("SEARCH {displayed} USING INTEGER PRIMARY KEY (rowid=?)")
+                    }
+                    _ => explain_query_plan_detail_from_directive(&directive),
+                };
+                let mut rows = vec![emit_row(detail)];
+                push_temp_btree_eqp_rows(&mut rows, directive_temp_btrees, &mut emit_row);
+                return rows;
+            }
+        }
+
+        let fallback_detail = first_source_eqp_detail_from_core(&select.body.select);
+        if let Ok(program) = self.compile_table_select(select).await {
+            // bd-2dgf5 / bd-jyyae / GH#381: some safe codegen paths have no
+            // planner directive, and generic bytecode explain renders every
+            // `OpenRead` as a `SCAN`. Read SEARCH vs SCAN from the emitted
+            // program instead: a named index is searched exactly when a Seek*
+            // opcode positions its cursor.
+            let plain_single_core = select.with.is_none() && select.body.compounds.is_empty();
+            let simple_top_level_select = plain_single_core
+                && !select_contains_subquery_matching(select, self, &|_, _| true);
+            let aggregate = select_core_is_aggregate(&select.body.select);
+            let index_seek = if aggregate {
+                crate::explain::aggregate_index_seek_facts(&program)
+            } else {
+                crate::explain::program_index_seek_facts(&program)
+            };
+            let seek_key_columns = index_seek.as_ref().and_then(|seek| {
+                crate::explain::program_index_seek_key_width(&program, &seek.index_name)
+            });
+            // bd-xml0z: without ORDER BY or an aggregate, report the
+            // seek only when the program binds a multi-column equality
+            // key, which the generic bytecode explain renders as
+            // `SCAN t` + `SCAN INDEX i`.
+            let index_seek = index_seek.filter(|seek| {
+                aggregate
+                    || !select.order_by.is_empty()
+                    || index_seek_binds_multi_column_equality_key(
+                        select,
+                        seek,
+                        seek_key_columns,
+                        &self.schema.borrow(),
+                    )
+            });
+            if simple_top_level_select
+                && let Some(seek) = index_seek
+                && let Some(detail) = index_seek_eqp_detail(
+                    select,
+                    &seek,
+                    seek_key_columns,
+                    &self.schema.borrow(),
+                )
+            {
+                let mut rows = vec![emit_row(detail)];
+                // bd-vyy1q: report GROUP BY, DISTINCT, and ORDER BY temp
+                // B-trees directly from bytecode (IN-list probe sorters are
+                // filtered out inside `program_temp_btree_uses`).
+                push_temp_btree_eqp_rows(
+                    &mut rows,
+                    select_program_temp_btrees(select, &program),
+                    &mut emit_row,
+                );
+                return rows;
+            }
+
+            // GH #415: a rowid membership / equality seek under ORDER BY
+            // or an aggregate has no planner directive (the planner
+            // declines those shapes), and the generic bytecode explain
+            // renders every `OpenRead` as a `SCAN`. When the program's
+            // only way onto the table is a rowid probe — never a
+            // `Rewind`/`Next` — report the seek it actually performs,
+            // exactly as the directive-verified path does; a sorter
+            // still surfaces as the temp b-tree marker.
+            if simple_top_level_select
+                && let Some(table_name) = single_table_source_name_from_core(&select.body.select)
+                && crate::explain::program_accesses_table_only_by_rowid(&program, table_name)
+            {
+                let mut rows = vec![emit_row(format!(
+                    "SEARCH {table_name} USING INTEGER PRIMARY KEY (rowid=?)"
+                ))];
+                push_temp_btree_eqp_rows(
+                    &mut rows,
+                    select_program_temp_btrees(select, &program),
+                    &mut emit_row,
+                );
+                return rows;
+            }
+
+            // bd-r39kx: a rowid range the program seeks, as the
+            // directive-verified path reports it.
+            if simple_top_level_select
+                && let Some(table_name) = single_table_source_name_from_core(&select.body.select)
+                && (crate::explain::program_seeks_rowid_range_on_table(&program, table_name)
+                    || crate::explain::program_walks_rowid_up_to_bound(&program, table_name))
+                && let Some(detail) = rowid_range_eqp_detail(select, &self.schema.borrow())
+            {
+                let mut rows = vec![emit_row(detail)];
+                push_temp_btree_eqp_rows(
+                    &mut rows,
+                    select_program_temp_btrees(select, &program),
+                    &mut emit_row,
+                );
+                return rows;
+            }
+
+            // bd-r39kx / bd-oi8tv: one outer index walked from an end (to an
+            // upper bound, or for a min/max, count, or GROUP BY / ORDER BY
+            // walk — including when a HAVING or SELECT clause carries a
+            // structured subquery whose inline cursors live at >= 128).
+            let index_walk = if simple_top_level_select {
+                crate::explain::program_index_walk(&program)
+            } else if plain_single_core && has_direct_subqueries {
+                crate::explain::program_outer_index_walk(&program)
+            } else {
+                None
+            };
+            if let Some(walk) = index_walk
+                && let Some(detail) = index_walk_eqp_detail(select, &walk, &self.schema.borrow())
+            {
+                let mut rows = vec![emit_row(detail)];
+                push_temp_btree_eqp_rows(
+                    &mut rows,
+                    select_program_temp_btrees(select, &program),
+                    &mut emit_row,
+                );
+                return rows;
+            }
+
+            let explained = if has_direct_subqueries {
+                crate::explain::explain_query_plan_outer(&program)
+            } else {
+                crate::explain::explain_query_plan(&program)
+            };
+            if !explained.is_empty() {
+                let has_source_detail = explained
+                    .iter()
+                    .any(|row| eqp_detail_is_scan_or_search(&row.detail));
+                if has_source_detail {
+                    let mut rows: Vec<Row> = if parent_id == 0 && !has_direct_subqueries {
+                        let max_id = explained.iter().map(|row| row.id).max().unwrap_or(1);
+                        state.advance_past(max_id);
+                        explained
+                            .iter()
+                            .map(|row| eqp_row(row.id, row.parent, row.notused, row.detail.clone()))
+                            .collect()
+                    } else {
+                        explained
+                            .iter()
+                            .map(|row| emit_row(row.detail.clone()))
+                            .collect()
+                    };
+                    // A virtual-table scan that the bytecode satisfies
+                    // without an explicit sorter still needs a temp
+                    // B-tree when an ORDER BY references the vtable's
+                    // declared columns (json_each/json_tree cannot honor
+                    // ordering via xBestIndex). SQLite emits the marker
+                    // here; the bytecode-level explain only adds it when
+                    // it sees Sorter opcodes, so cover the vtable case.
+                    let already_has_temp_btree = explained
+                        .iter()
+                        .any(|row| row.detail == "USE TEMP B-TREE FOR ORDER BY");
+                    if !already_has_temp_btree
+                        && select_requires_temp_btree_fallback_for_order_by(select)
+                    {
+                        let next_id = if parent_id == 0 && !has_direct_subqueries {
+                            i32::try_from(rows.len() + 1).unwrap_or(i32::MAX)
+                        } else {
+                            state.alloc_row_id()
+                        };
+                        rows.push(eqp_row(
+                            next_id,
+                            parent_id,
+                            0,
+                            "USE TEMP B-TREE FOR ORDER BY".to_owned(),
+                        ));
+                    }
+                    return rows;
+                }
+                if let Some(detail) = fallback_detail.clone() {
+                    let mut rows = vec![emit_row(detail)];
+                    let mut saw_order_by_temp_btree = false;
+                    for row in explained {
+                        if row.detail.starts_with("USE TEMP B-TREE FOR ") {
+                            saw_order_by_temp_btree |=
+                                row.detail == "USE TEMP B-TREE FOR ORDER BY";
+                            rows.push(emit_row(row.detail));
+                        }
+                    }
+                    if !saw_order_by_temp_btree
+                        && select_requires_temp_btree_fallback_for_order_by(select)
+                    {
+                        rows.push(emit_row("USE TEMP B-TREE FOR ORDER BY".to_owned()));
+                    }
+                    return rows;
+                }
+            }
+        }
+
+        let detail = fallback_detail.unwrap_or_else(|| "SCAN CONSTANT ROW".to_owned());
+        let mut rows = vec![emit_row(detail)];
+        // A virtual-table scan that we describe only via the fallback
+        // detail (no compiled bytecode plan) still needs the temp-btree
+        // marker when an ORDER BY references the vtable's declared
+        // columns — SQLite reports it and the oracle tests compare
+        // against that.
+        if select_requires_temp_btree_fallback_for_order_by(select) {
+            rows.push(emit_row("USE TEMP B-TREE FOR ORDER BY".to_owned()));
+        }
+        rows
     }
 
     /// Execute a VDBE program with the in-memory database attached.
@@ -163291,6 +163727,458 @@ fn statement_writes_under_query_only(statement: &Statement) -> bool {
     )
 }
 
+const EQP_MAX_SUBQUERY_DEPTH: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EqpSubqueryKind {
+    Scalar,
+    Exists,
+    List,
+}
+
+struct EqpSubqueryEntry<'a> {
+    kind: EqpSubqueryKind,
+    query: &'a SelectStatement,
+}
+
+struct EqpWalkState {
+    next_row_id: i32,
+    next_subquery_num: i32,
+}
+
+impl EqpWalkState {
+    const fn new() -> Self {
+        Self {
+            next_row_id: 2,
+            next_subquery_num: 1,
+        }
+    }
+
+    const fn alloc_row_id(&mut self) -> i32 {
+        let id = self.next_row_id;
+        self.next_row_id = self.next_row_id.saturating_add(1);
+        id
+    }
+
+    const fn alloc_subquery_num(&mut self) -> i32 {
+        let num = self.next_subquery_num;
+        self.next_subquery_num = self.next_subquery_num.saturating_add(1);
+        num
+    }
+
+    fn advance_past(&mut self, max_id: i32) {
+        self.next_row_id = self.next_row_id.max(max_id.saturating_add(1));
+    }
+}
+
+#[derive(Default, Clone)]
+struct EqpOuterScope {
+    col_map: Vec<(String, String, bool)>,
+    row: Vec<SqliteValue>,
+    column_collations: Vec<Option<String>>,
+    column_affinities: Vec<TypeAffinity>,
+}
+
+fn eqp_row(id: i32, parent: i32, notused: i32, detail: String) -> Row {
+    Row {
+        values: vec![
+            SqliteValue::Integer(i64::from(id)),
+            SqliteValue::Integer(i64::from(parent)),
+            SqliteValue::Integer(i64::from(notused)),
+            SqliteValue::Text(detail.into()),
+        ],
+    }
+}
+
+fn append_table_to_eqp_outer_scope(
+    table_name: &str,
+    alias: Option<&str>,
+    schema: &[TableSchema],
+    scope: &mut EqpOuterScope,
+) {
+    let Some(table) = schema
+        .iter()
+        .find(|candidate| candidate.name.eq_ignore_ascii_case(table_name))
+    else {
+        return;
+    };
+    let qualifier = alias.unwrap_or(&table.name).to_owned();
+    let mut has_declared_rowid = false;
+    for col in &table.columns {
+        if is_rowid_alias(&col.name) {
+            has_declared_rowid = true;
+        }
+        let affinity = affinity_char_to_type(col.affinity);
+        let sample = match affinity {
+            TypeAffinity::Text => SqliteValue::Text(String::new().into()),
+            TypeAffinity::Real => SqliteValue::Float(0.0),
+            TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Blob => {
+                SqliteValue::Integer(0)
+            }
+        };
+        scope
+            .col_map
+            .push((qualifier.clone(), col.name.clone(), false));
+        scope.row.push(sample);
+        scope.column_collations.push(col.collation.clone());
+        scope.column_affinities.push(affinity);
+    }
+    if !table.without_rowid && !has_declared_rowid {
+        scope
+            .col_map
+            .push((qualifier, "rowid".to_owned(), true));
+        scope.row.push(SqliteValue::Integer(0));
+        scope.column_collations.push(None);
+        scope.column_affinities.push(TypeAffinity::Integer);
+    }
+}
+
+fn append_table_or_subquery_to_eqp_outer_scope(
+    source: &TableOrSubquery,
+    schema: &[TableSchema],
+    scope: &mut EqpOuterScope,
+) {
+    match source {
+        TableOrSubquery::Table { name, alias, .. } => {
+            append_table_to_eqp_outer_scope(&name.name, alias.as_deref(), schema, scope);
+        }
+        TableOrSubquery::Subquery { query, alias } => {
+            let qualifier = alias.as_deref().unwrap_or("").to_owned();
+            if let SelectCore::Select { columns, .. } = &query.body.select {
+                for col in columns {
+                    if let ResultColumn::Expr { expr, alias } = col {
+                        let name = alias.clone().or_else(|| match expr {
+                            Expr::Column(col_ref, _) => Some(col_ref.column.to_string()),
+                            _ => None,
+                        });
+                        if let Some(name) = name {
+                            scope.col_map.push((qualifier.clone(), name, false));
+                            scope.row.push(SqliteValue::Integer(0));
+                            scope.column_collations.push(None);
+                            scope.column_affinities.push(TypeAffinity::Blob);
+                        }
+                    }
+                }
+            }
+        }
+        TableOrSubquery::ParenJoin(from) => {
+            append_from_clause_to_eqp_outer_scope(from, schema, scope);
+        }
+        TableOrSubquery::TableFunction { .. } => {}
+    }
+}
+
+fn append_from_clause_to_eqp_outer_scope(
+    from: &FromClause,
+    schema: &[TableSchema],
+    scope: &mut EqpOuterScope,
+) {
+    append_table_or_subquery_to_eqp_outer_scope(&from.source, schema, scope);
+    for join in &from.joins {
+        append_table_or_subquery_to_eqp_outer_scope(&join.table, schema, scope);
+    }
+}
+
+fn collect_direct_select_subqueries<'a>(
+    select: &'a SelectStatement,
+    out: &mut Vec<EqpSubqueryEntry<'a>>,
+) {
+    collect_direct_select_core_subqueries(&select.body.select, out);
+    for (_, core) in &select.body.compounds {
+        collect_direct_select_core_subqueries(core, out);
+    }
+    for term in &select.order_by {
+        collect_direct_expr_subqueries(&term.expr, out);
+    }
+    if let Some(limit) = &select.limit {
+        collect_direct_expr_subqueries(&limit.limit, out);
+        if let Some(offset) = &limit.offset {
+            collect_direct_expr_subqueries(offset, out);
+        }
+    }
+}
+
+fn collect_direct_select_core_subqueries<'a>(
+    core: &'a SelectCore,
+    out: &mut Vec<EqpSubqueryEntry<'a>>,
+) {
+    match core {
+        SelectCore::Values(rows) => {
+            for expr in rows.rows().iter().flatten() {
+                collect_direct_expr_subqueries(expr, out);
+            }
+        }
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            if let Some(where_expr) = where_clause {
+                collect_direct_expr_subqueries(where_expr, out);
+            }
+            if let Some(from) = from {
+                collect_direct_from_subqueries(from, out);
+            }
+            for col in columns {
+                if let ResultColumn::Expr { expr, .. } = col {
+                    collect_direct_expr_subqueries(expr, out);
+                }
+            }
+            for expr in group_by {
+                collect_direct_expr_subqueries(expr, out);
+            }
+            if let Some(having_expr) = having {
+                collect_direct_expr_subqueries(having_expr, out);
+            }
+            for window in windows {
+                collect_direct_window_spec_subqueries(&window.spec, out);
+            }
+        }
+    }
+}
+
+fn collect_direct_from_subqueries<'a>(
+    from: &'a FromClause,
+    out: &mut Vec<EqpSubqueryEntry<'a>>,
+) {
+    collect_direct_table_or_subquery_subqueries(&from.source, out);
+    for join in &from.joins {
+        collect_direct_table_or_subquery_subqueries(&join.table, out);
+        if let Some(JoinConstraint::On(expr)) = &join.constraint {
+            collect_direct_expr_subqueries(expr, out);
+        }
+    }
+}
+
+fn collect_direct_table_or_subquery_subqueries<'a>(
+    source: &'a TableOrSubquery,
+    out: &mut Vec<EqpSubqueryEntry<'a>>,
+) {
+    match source {
+        TableOrSubquery::Table { .. } | TableOrSubquery::Subquery { .. } => {}
+        TableOrSubquery::TableFunction { args, .. } => {
+            for arg in args {
+                collect_direct_expr_subqueries(arg, out);
+            }
+        }
+        TableOrSubquery::ParenJoin(from) => collect_direct_from_subqueries(from, out),
+    }
+}
+
+fn collect_direct_window_spec_subqueries<'a>(
+    spec: &'a WindowSpec,
+    out: &mut Vec<EqpSubqueryEntry<'a>>,
+) {
+    for expr in &spec.partition_by {
+        collect_direct_expr_subqueries(expr, out);
+    }
+    for term in &spec.order_by {
+        collect_direct_expr_subqueries(&term.expr, out);
+    }
+    if let Some(frame) = &spec.frame {
+        for bound in std::iter::once(&frame.start).chain(frame.end.as_ref()) {
+            if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = bound {
+                collect_direct_expr_subqueries(expr, out);
+            }
+        }
+    }
+}
+
+fn collect_direct_expr_subqueries<'a>(expr: &'a Expr, out: &mut Vec<EqpSubqueryEntry<'a>>) {
+    match expr {
+        Expr::Subquery(sub, _) => {
+            out.push(EqpSubqueryEntry {
+                kind: EqpSubqueryKind::Scalar,
+                query: sub,
+            });
+        }
+        Expr::Exists { subquery, .. } => {
+            out.push(EqpSubqueryEntry {
+                kind: EqpSubqueryKind::Exists,
+                query: subquery,
+            });
+        }
+        Expr::In {
+            expr: lhs, set, ..
+        } => {
+            collect_direct_expr_subqueries(lhs, out);
+            match set {
+                InSet::List(items) => {
+                    for item in items {
+                        collect_direct_expr_subqueries(item, out);
+                    }
+                }
+                InSet::Subquery(sub) => {
+                    out.push(EqpSubqueryEntry {
+                        kind: EqpSubqueryKind::List,
+                        query: sub,
+                    });
+                }
+                InSet::Table(_) => {}
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_direct_expr_subqueries(left, out);
+            collect_direct_expr_subqueries(right, out);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => {
+            collect_direct_expr_subqueries(inner, out);
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_direct_expr_subqueries(inner, out);
+            collect_direct_expr_subqueries(low, out);
+            collect_direct_expr_subqueries(high, out);
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_direct_expr_subqueries(inner, out);
+            collect_direct_expr_subqueries(pattern, out);
+            if let Some(escape) = escape {
+                collect_direct_expr_subqueries(escape, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                collect_direct_expr_subqueries(operand, out);
+            }
+            for (when, then) in whens {
+                collect_direct_expr_subqueries(when, out);
+                collect_direct_expr_subqueries(then, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_direct_expr_subqueries(else_expr, out);
+            }
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if let FunctionArgs::List(items) = args {
+                for item in items {
+                    collect_direct_expr_subqueries(item, out);
+                }
+            }
+            for term in order_by {
+                collect_direct_expr_subqueries(&term.expr, out);
+            }
+            if let Some(filter) = filter {
+                collect_direct_expr_subqueries(filter, out);
+            }
+            if let Some(over) = over {
+                collect_direct_window_spec_subqueries(over, out);
+            }
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            collect_direct_expr_subqueries(inner, out);
+            collect_direct_expr_subqueries(path, out);
+        }
+        Expr::RowValue(items, _) => {
+            for item in items {
+                collect_direct_expr_subqueries(item, out);
+            }
+        }
+        Expr::Literal(..)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Column(..)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(..) => {}
+    }
+}
+
+fn relax_hidden_rowid_eq_bound_outer(expr: &mut Expr, table: &TableSchema, alias: Option<&str>) {
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            relax_hidden_rowid_eq_bound_outer(left, table, alias);
+            relax_hidden_rowid_eq_bound_outer(right, table, alias);
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } => {
+            if expr_is_hidden_rowid_ref(left, table, alias)
+                && let Some(lit) = hidden_rowid_bound_outer_literal(right)
+            {
+                **right = lit;
+            } else if expr_is_hidden_rowid_ref(right, table, alias)
+                && let Some(lit) = hidden_rowid_bound_outer_literal(left)
+            {
+                **left = lit;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn expr_is_hidden_rowid_ref(expr: &Expr, table: &TableSchema, alias: Option<&str>) -> bool {
+    let Expr::Column(column, _) = expr else {
+        return false;
+    };
+    if column.schema.is_some() || !is_rowid_alias(&column.column) {
+        return false;
+    }
+    if table
+        .columns
+        .iter()
+        .any(|col| col.name.eq_ignore_ascii_case(&column.column))
+    {
+        return false;
+    }
+    column.table.as_deref().is_none_or(|qualifier| {
+        qualifier.eq_ignore_ascii_case(&table.name)
+            || alias.is_some_and(|a| qualifier.eq_ignore_ascii_case(a))
+    })
+}
+
+fn hidden_rowid_bound_outer_literal(expr: &Expr) -> Option<Expr> {
+    let Expr::BoundOuterValue {
+        value, affinity, ..
+    } = expr
+    else {
+        return None;
+    };
+    if matches!(value, SqliteValue::Null) {
+        return None;
+    }
+    matches!(
+        affinity,
+        Some(TypeAffinity::Integer | TypeAffinity::Numeric | TypeAffinity::Real)
+    )
+    .then(|| value_to_literal_expr(value.clone()))
+}
+
 fn eqp_detail_is_scan_or_search(detail: &str) -> bool {
     detail.starts_with("SCAN ") || detail.starts_with("SEARCH ")
 }
@@ -163584,11 +164472,10 @@ fn select_program_temp_btrees(
 fn push_temp_btree_eqp_rows(
     rows: &mut Vec<Row>,
     temp_btrees: crate::explain::ProgramTempBtrees,
-    to_row: &impl Fn(i32, i32, i32, String) -> Row,
+    emit_row: &mut impl FnMut(String) -> Row,
 ) {
-    let start_id = i32::try_from(rows.len() + 2).unwrap_or(i32::MAX);
-    for (next_id, detail) in (start_id..).zip(temp_btrees.detail_lines()) {
-        rows.push(to_row(next_id, 0, 0, detail.to_owned()));
+    for detail in temp_btrees.detail_lines() {
+        rows.push(emit_row(detail.to_owned()));
     }
 }
 

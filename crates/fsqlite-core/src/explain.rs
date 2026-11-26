@@ -118,11 +118,12 @@ pub struct EqpRow {
 ///   drain drives `SeekGE`/`SeekGT`/`SeekLE`/`SeekLT` on an `OpenRead` index
 ///   cursor) is NOT a temp B-tree clause.
 /// - A `GROUP BY` sorter has `AggStep` or `AggFinal` inside its drain loop.
-/// - Any other top-level sorter (outside `Once`-guarded subquery builds) is an
-///   `ORDER BY` sorter.
+/// - Any other top-level sorter (outside `Once`-guarded subquery builds and
+///   below inline subquery cursor range) is an `ORDER BY` sorter.
 /// - A top-level `DISTINCT` temp B-tree is an `OpenAutoindex` outside `Once`
-///   that is probed with `Found` and populated with `IdxInsert` and never
-///   walked (`Rewind`/`Last`/`Next`/`Prev`/`Seek*`), distinguishing it from
+///   and below inline subquery cursor range that is probed with `Found` and
+///   populated with `IdxInsert` and never walked
+///   (`Rewind`/`Last`/`Next`/`Prev`/`Seek*`), distinguishing it from
 ///   rowid/index IN-list probe sets and join automatic indexes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProgramTempBtrees {
@@ -152,6 +153,11 @@ impl ProgramTempBtrees {
         lines
     }
 }
+
+/// Minimum cursor number reserved for inline compiled subqueries in codegen:
+/// `emit_exists_subquery` uses `outer_ctx.cursor + 128` (+129 for index), and
+/// `emit_scalar_subquery` allocates via `alloc_aux_cursor_range` starting at 16384.
+const INLINE_SUBQUERY_CURSOR_MIN: i32 = 128;
 
 /// Classify the temp B-trees and sorters that `program` opens (bd-vyy1q).
 #[must_use]
@@ -187,7 +193,7 @@ pub fn program_temp_btree_uses(program: &VdbeProgram) -> ProgramTempBtrees {
     };
 
     for (addr, op) in ops.iter().enumerate() {
-        if in_once(addr) {
+        if in_once(addr) || op.p1 >= INLINE_SUBQUERY_CURSOR_MIN {
             continue;
         }
         match op.opcode {
@@ -249,7 +255,9 @@ pub fn program_temp_btree_uses(program: &VdbeProgram) -> ProgramTempBtrees {
 
     if sorter_opens.is_empty()
         && ops.iter().enumerate().any(|(addr, op)| {
-            !in_once(addr) && matches!(op.opcode, Opcode::SorterInsert | Opcode::SorterSort)
+            !in_once(addr)
+                && op.p1 < INLINE_SUBQUERY_CURSOR_MIN
+                && matches!(op.opcode, Opcode::SorterInsert | Opcode::SorterSort)
         })
     {
         uses.order_by = true;
@@ -292,6 +300,21 @@ pub fn program_temp_btree_uses(program: &VdbeProgram) -> ProgramTempBtrees {
 /// (invariant #23).
 #[must_use]
 pub fn explain_query_plan(program: &VdbeProgram) -> Vec<EqpRow> {
+    explain_query_plan_filtered(program, false)
+}
+
+/// Generate outer-query `EXPLAIN QUERY PLAN` rows without inline subqueries.
+///
+/// Like [`explain_query_plan`], but omits inline subquery cursors (`>= 128` or
+/// `OpenRead` with `P4::Int(_)`) so callers that render subqueries structurally
+/// do not leak raw `SCAN Int(...)` or duplicate inline subquery scans into the
+/// outer query's rows (bd-oi8tv).
+#[must_use]
+pub fn explain_query_plan_outer(program: &VdbeProgram) -> Vec<EqpRow> {
+    explain_query_plan_filtered(program, true)
+}
+
+fn explain_query_plan_filtered(program: &VdbeProgram, skip_inline_subqueries: bool) -> Vec<EqpRow> {
     let ops = program.ops();
     let mut rows = Vec::new();
     let mut next_id = 1_i32;
@@ -305,6 +328,11 @@ pub fn explain_query_plan(program: &VdbeProgram) -> Vec<EqpRow> {
     for op in ops {
         match op.opcode {
             Opcode::OpenRead | Opcode::OpenWrite => {
+                if skip_inline_subqueries
+                    && (op.p1 >= INLINE_SUBQUERY_CURSOR_MIN || matches!(op.p4, P4::Int(_)))
+                {
+                    continue;
+                }
                 let scan_type = if op.opcode == Opcode::OpenRead {
                     "SCAN"
                 } else {
@@ -599,17 +627,61 @@ pub fn program_index_seek_key_width(program: &VdbeProgram, index_name: &str) -> 
 ///
 /// bd-jyyae companion to [`program_seeks_named_index`] for the
 /// `SEARCH ... USING INTEGER PRIMARY KEY (rowid=?)` directive claim. The
-/// probe must target a cursor opened on the named table so that a rowid seek
-/// elsewhere in the program (an index's table-lookup leg, a subquery) cannot
-/// vouch for a main-table claim.
+/// probe must target a cursor opened on the named table and must NOT be the
+/// `IdxRowid -> SeekRowid` table-lookup leg of a secondary index seek, so an
+/// index lookup (e.g. `repo IN (SELECT ...)` seeking `idx_ev_repo` then
+/// fetching the table row) or a subquery probe cannot vouch for an IPK claim.
 #[must_use]
 pub fn program_seeks_rowid_on_table(program: &VdbeProgram, table_name: &str) -> bool {
     let ops = program.ops();
     let mut table_cursors: HashSet<i32> = HashSet::new();
+    let mut index_cursors: HashSet<i32> = HashSet::new();
     for op in ops {
-        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite)
-            && let P4::Table(name) = &op.p4
-            && name == table_name
+        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite) {
+            match &op.p4 {
+                P4::Table(name) if name == table_name => {
+                    table_cursors.insert(op.p1);
+                }
+                P4::Index(_) => {
+                    index_cursors.insert(op.p1);
+                }
+                _ => {}
+            }
+        }
+    }
+    if table_cursors.is_empty() {
+        return false;
+    }
+    let mut rowid_from_index = false;
+    for op in ops {
+        match op.opcode {
+            Opcode::IdxRowid => {
+                rowid_from_index = index_cursors.contains(&op.p1);
+            }
+            Opcode::SeekRowid | Opcode::NotExists => {
+                if table_cursors.contains(&op.p1) && !rowid_from_index {
+                    return true;
+                }
+                rowid_from_index = false;
+            }
+            _ => {
+                rowid_from_index = false;
+            }
+        }
+    }
+    false
+}
+
+/// True when any outer cursor (`< INLINE_SUBQUERY_CURSOR_MIN`) opened on
+/// `table_name` is walked sequentially via `Rewind`/`Last`/`Next`/`Prev`.
+#[must_use]
+pub fn program_walks_table(program: &VdbeProgram, table_name: &str) -> bool {
+    let ops = program.ops();
+    let mut table_cursors: HashSet<i32> = HashSet::new();
+    for op in ops {
+        if op.p1 < INLINE_SUBQUERY_CURSOR_MIN
+            && matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite)
+            && matches!(&op.p4, P4::Table(name) if name == table_name)
         {
             table_cursors.insert(op.p1);
         }
@@ -618,7 +690,66 @@ pub fn program_seeks_rowid_on_table(program: &VdbeProgram, table_name: &str) -> 
         return false;
     }
     ops.iter().any(|op| {
-        matches!(op.opcode, Opcode::SeekRowid | Opcode::NotExists) && table_cursors.contains(&op.p1)
+        table_cursors.contains(&op.p1)
+            && matches!(
+                op.opcode,
+                Opcode::Rewind | Opcode::Last | Opcode::Next | Opcode::Prev
+            )
+    })
+}
+
+/// Outer-query index seek facts, ignoring inline subquery cursors (bd-oi8tv).
+///
+/// Ignores inline subquery index cursors (`>= INLINE_SUBQUERY_CURSOR_MIN`) and
+/// declines whenever the outer table itself is walked
+/// (`Rewind`/`Last`/`Next`/`Prev`). Used for shapes like `repo IN (SELECT ...)`
+/// where the outer query seeks an index while a subquery opens separate cursors.
+#[must_use]
+pub fn program_outer_index_seek_facts(
+    program: &VdbeProgram,
+    table_name: &str,
+) -> Option<IndexSeek> {
+    if program_walks_table(program, table_name) {
+        return None;
+    }
+    let ops = program.ops();
+    let mut index_name_by_cursor: HashMap<i32, &str> = HashMap::new();
+    for op in ops {
+        if op.p1 < INLINE_SUBQUERY_CURSOR_MIN
+            && op.opcode == Opcode::OpenRead
+            && let P4::Index(name) = &op.p4
+        {
+            index_name_by_cursor.insert(op.p1, name.as_str());
+        }
+    }
+    let mut seeked: Vec<i32> = Vec::new();
+    for op in ops {
+        let positions_index = matches!(
+            op.opcode,
+            Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT
+        ) && index_name_by_cursor.contains_key(&op.p1);
+        if positions_index && !seeked.contains(&op.p1) {
+            seeked.push(op.p1);
+        }
+    }
+    let [cursor] = seeked[..] else {
+        return None;
+    };
+    let mut rowid_from_seeked_cursor = false;
+    let mut table_lookup = false;
+    for op in ops {
+        match op.opcode {
+            Opcode::IdxRowid => rowid_from_seeked_cursor = op.p1 == cursor,
+            Opcode::SeekRowid => {
+                table_lookup |= rowid_from_seeked_cursor;
+                rowid_from_seeked_cursor = false;
+            }
+            _ => rowid_from_seeked_cursor = false,
+        }
+    }
+    Some(IndexSeek {
+        index_name: (*index_name_by_cursor.get(&cursor)?).to_owned(),
+        covering: !table_lookup,
     })
 }
 
@@ -892,11 +1023,34 @@ pub struct IndexWalk {
 /// walked on its own), which keeps the existing rendering.
 #[must_use]
 pub fn program_index_walk(program: &VdbeProgram) -> Option<IndexWalk> {
+    program_index_walk_filtered(program, false)
+}
+
+/// Outer-query index walk facts, ignoring inline subquery cursors (bd-oi8tv).
+///
+/// Like [`program_index_walk`], ignoring inline subquery cursors (`>= 128` or
+/// `P4::Int(_)`) so an outer covering-index walk (such as `GROUP BY repo
+/// HAVING count(*) > (SELECT ...)`) is recognized without inline subquery
+/// opens polluting the outer query's walk classification.
+#[must_use]
+pub fn program_outer_index_walk(program: &VdbeProgram) -> Option<IndexWalk> {
+    program_index_walk_filtered(program, true)
+}
+
+fn program_index_walk_filtered(
+    program: &VdbeProgram,
+    skip_inline_subqueries: bool,
+) -> Option<IndexWalk> {
     let ops = program.ops();
     let mut index: Option<(i32, &str)> = None;
     let mut table_cursor: Option<i32> = None;
     for op in ops {
         if !matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite) {
+            continue;
+        }
+        if skip_inline_subqueries
+            && (op.p1 >= INLINE_SUBQUERY_CURSOR_MIN || matches!(op.p4, P4::Int(_)))
+        {
             continue;
         }
         match &op.p4 {
@@ -1354,11 +1508,60 @@ mod tests {
 
     #[test]
     fn test_index_table_lookup_leg_does_not_vouch_for_table_rowid_claim() {
-        // The SeekRowid in an index seek's table-lookup leg targets the table
-        // cursor, so it legitimately proves a rowid probe on that cursor —
-        // but the *index* claim for an unrelated index must still fail.
+        // The SeekRowid in an index seek's table-lookup leg is preceded by
+        // IdxRowid on the index cursor, so it must NOT vouch for an INTEGER
+        // PRIMARY KEY direct rowid seek on the table, nor for an unrelated index.
         let prog = build_index_seek_program();
         assert!(!program_seeks_named_index(&prog, "idx_other"));
+        assert!(
+            !program_seeks_rowid_on_table(&prog, "t"),
+            "IdxRowid -> SeekRowid is an index table-lookup leg, not a direct IPK seek"
+        );
+        assert_eq!(
+            program_outer_index_seek_facts(&prog, "t"),
+            Some(IndexSeek {
+                index_name: "idx_t_k".to_owned(),
+                covering: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_outer_helpers_ignore_inline_subquery_cursors() {
+        // Outer table t is walked (Rewind/Next) while an inline correlated
+        // EXISTS opens cursor 129 on idx_t_k (self-correlated shape) and an
+        // inline scalar opens cursor 16384 with P4::Int(3).
+        let mut b = ProgramBuilder::new();
+        let end_label = b.emit_label();
+        let done_label = b.emit_label();
+        let sub_done = b.emit_label();
+
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+        b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::OpenRead, 0, 2, 0, P4::Table("t".to_owned()), 0);
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, done_label, P4::None, 0);
+        b.emit_op(
+            Opcode::OpenRead,
+            129,
+            3,
+            0,
+            P4::Index("idx_t_k".to_owned()),
+            0,
+        );
+        b.emit_jump_to_label(Opcode::SeekGE, 129, 0, sub_done, P4::None, 0);
+        b.resolve_label(sub_done);
+        b.emit_op(Opcode::OpenRead, 16384, 2, 0, P4::Int(3), 0);
+        b.emit_op(Opcode::Next, 0, 4, 0, P4::None, 0);
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+
+        let prog = b.finish().unwrap();
+        assert!(program_walks_table(&prog, "t"));
+        assert_eq!(program_outer_index_seek_facts(&prog, "t"), None);
+        let outer_rows = explain_query_plan_outer(&prog);
+        assert_eq!(outer_rows.len(), 1);
+        assert_eq!(outer_rows[0].detail, "SCAN t");
     }
 
     /// GH #415: the rowid-only access check that renders the directive-less
