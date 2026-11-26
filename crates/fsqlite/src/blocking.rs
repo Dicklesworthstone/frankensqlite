@@ -22,7 +22,8 @@
 //! Covered: opening (`open`, `open_in_memory`, `open_with_flags`), `execute`,
 //! `execute_batch`, `prepare`/`prepare_cached`, `query_row`, statements
 //! (`execute`, `insert`, `query`, `query_map`, `query_and_then`, `query_row`,
-//! `exists`, column and parameter metadata), `Rows`/`Row` with [`FromSql`]
+//! `exists`, `raw_bind_parameter`, `raw_execute`, `raw_query`, `clear_bindings`,
+//! column and parameter metadata), `Rows`/`Row` with [`FromSql`]
 //! by index or column name, positional and named parameters ([`params!`],
 //! [`named_params!`], arrays, tuples, slices, [`params_from_iter`]),
 //! transactions and nested [`Savepoint`]s with [`TransactionBehavior`] and
@@ -1227,7 +1228,10 @@ pub mod functions {
             // invoke finalize a second time when this state is dropped.
             self.pending_finalization = false;
             let accumulator = self.accumulator.take();
-            let aggregate = self.aggregate.lock().unwrap_or_else(PoisonError::into_inner);
+            let aggregate = self
+                .aggregate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let mut context = Context { args: &[] };
             catch_unwind(AssertUnwindSafe(|| {
                 let value = aggregate.finalize(&mut context, accumulator)?;
@@ -1457,7 +1461,11 @@ impl Params for &[&dyn ToSql] {
 
 impl Params for &[(&str, &dyn ToSql)] {
     fn bind_to(self, slots: &BindParameterSlots, bindings: &mut [SqliteValue]) -> Result<()> {
-        bind_named(slots, bindings, self.iter().map(|(name, value)| (*name, *value)))
+        bind_named(
+            slots,
+            bindings,
+            self.iter().map(|(name, value)| (*name, *value)),
+        )
     }
 }
 
@@ -2035,10 +2043,11 @@ impl Connection {
         F: Fn(&str, &str) -> CmpOrdering + Send + 'static,
     {
         let _validated_name = std::ffi::CString::new(collation_name)?;
-        self.as_async().register_collation_function(CollationClosure {
-            name: collation_name.to_owned(),
-            compare: std::sync::Mutex::new(x_compare),
-        });
+        self.as_async()
+            .register_collation_function(CollationClosure {
+                name: collation_name.to_owned(),
+                compare: std::sync::Mutex::new(x_compare),
+            });
         Ok(())
     }
 
@@ -2097,6 +2106,35 @@ impl EngineStatement for crate::PreparedStatement<'_> {
     }
 }
 
+/// A numeric or named parameter index, as in rusqlite.
+pub trait BindIndex: Copy {
+    /// Resolve this index to a one-based parameter slot.
+    fn idx(&self, stmt: &Statement<'_>) -> Result<usize>;
+}
+
+impl BindIndex for usize {
+    fn idx(&self, _stmt: &Statement<'_>) -> Result<usize> {
+        // Conversion of the value precedes numeric range checking in SQLite.
+        Ok(*self)
+    }
+}
+
+impl BindIndex for &str {
+    fn idx(&self, stmt: &Statement<'_>) -> Result<usize> {
+        stmt.parameter_index(self)?
+            .ok_or_else(|| Error::InvalidParameterName((*self).to_owned()))
+    }
+}
+
+impl BindIndex for &std::ffi::CStr {
+    fn idx(&self, stmt: &Statement<'_>) -> Result<usize> {
+        self.to_str()
+            .ok()
+            .and_then(|name| stmt.slots.index_of(name))
+            .ok_or_else(|| Error::InvalidParameterName(self.to_string_lossy().into_owned()))
+    }
+}
+
 /// A compiled statement.
 pub struct Statement<'conn> {
     conn: &'conn Connection,
@@ -2131,14 +2169,53 @@ impl Statement<'_> {
     /// Run the statement with `params`; returns the number of rows changed.
     pub fn execute<P: Params>(&mut self, params: P) -> Result<usize> {
         params.bind_to(&self.slots, &mut self.bindings)?;
-        let result = self.stmt.execute(&self.bindings);
-        self.sync_metadata_if_reprepared();
-        result
+        self.raw_execute()
     }
 
     /// Reset every bound parameter to NULL.
     pub fn clear_bindings(&mut self) {
         self.bindings.fill(SqliteValue::Null);
+    }
+
+    /// Bind one parameter without executing the statement. Numeric indexes
+    /// start at one; named indexes include their sigil, such as `:name`.
+    pub fn raw_bind_parameter<I: BindIndex, T: ToSql>(
+        &mut self,
+        index: I,
+        parameter: T,
+    ) -> Result<()> {
+        let index = index.idx(self)?;
+        let value = bind_one(&parameter)?;
+        let binding = index
+            .checked_sub(1)
+            .and_then(|index| self.bindings.get_mut(index))
+            .ok_or_else(|| {
+                Error::SqliteFailure(
+                    ffi::Error::new(ffi::SQLITE_RANGE),
+                    Some("column index out of range".to_owned()),
+                )
+            })?;
+        *binding = value;
+        Ok(())
+    }
+
+    /// Execute using the current bindings and return the number of rows changed.
+    pub fn raw_execute(&mut self) -> Result<usize> {
+        let result = self.stmt.execute(&self.bindings);
+        self.sync_metadata_if_reprepared();
+        result
+    }
+
+    /// Query using the current bindings. The engine materializes the result at
+    /// the first [`Rows::next`]; dropping unstepped rows does not execute the
+    /// statement.
+    pub fn raw_query(&mut self) -> Rows<'_> {
+        Rows {
+            stmt: None,
+            deferred: Some(Box::new(PendingQuery { stmt: self })),
+            pending: Vec::new().into_iter(),
+            current: None,
+        }
     }
 
     /// Run an INSERT that must insert exactly one row; returns its rowid.
@@ -2156,7 +2233,8 @@ impl Statement<'_> {
         self.sync_metadata_if_reprepared();
         let rows = result?;
         Ok(Rows {
-            stmt: self,
+            stmt: Some(self),
+            deferred: None,
             pending: rows.into_iter(),
             current: None,
         })
@@ -2236,7 +2314,7 @@ impl Statement<'_> {
         Ok(self.slots.index_of(name))
     }
 
-    /// The name of parameter `index` (1-based), `None` for `?`/`?NNN`.
+    /// The name of parameter `index` (1-based), or `None` for an unnamed slot.
     #[must_use]
     pub fn parameter_name(&self, index: usize) -> Option<&str> {
         self.slots.name_of(index)
@@ -2255,9 +2333,36 @@ fn column_index(names: &[String], name: &str) -> Result<usize> {
         .ok_or_else(|| Error::InvalidColumnName(name.to_owned()))
 }
 
+// Preserve the original connection lifetime behind this object. A mutable
+// reference to Statement<'stmt> would incorrectly require that lifetime to
+// equal the shorter borrow used by Rows. Only the shared reference returned
+// after execution is shortened.
+trait DeferredQuery<'stmt> {
+    fn statement(&self) -> &Statement<'stmt>;
+    fn run(self: Box<Self>) -> (&'stmt Statement<'stmt>, Result<Vec<crate::Row>>);
+}
+
+struct PendingQuery<'stmt, 'conn> {
+    stmt: &'stmt mut Statement<'conn>,
+}
+
+impl<'stmt, 'conn: 'stmt> DeferredQuery<'stmt> for PendingQuery<'stmt, 'conn> {
+    fn statement(&self) -> &Statement<'stmt> {
+        self.stmt
+    }
+
+    fn run(self: Box<Self>) -> (&'stmt Statement<'stmt>, Result<Vec<crate::Row>>) {
+        let stmt = self.stmt;
+        let result = stmt.stmt.query(&stmt.bindings);
+        stmt.sync_metadata_if_reprepared();
+        (stmt, result)
+    }
+}
+
 /// The rows of a query, stepped with [`Rows::next`].
 pub struct Rows<'stmt> {
-    stmt: &'stmt Statement<'stmt>,
+    stmt: Option<&'stmt Statement<'stmt>>,
+    deferred: Option<Box<dyn DeferredQuery<'stmt> + 'stmt>>,
     pending: std::vec::IntoIter<crate::Row>,
     current: Option<Row<'stmt>>,
 }
@@ -2266,18 +2371,30 @@ impl<'stmt> Rows<'stmt> {
     /// The next row, or `None` after the last one.
     #[allow(clippy::should_implement_trait)] // rusqlite's lending `next`
     pub fn next(&mut self) -> Result<Option<&Row<'stmt>>> {
-        self.current = self.pending.next().map(|values| Row {
-            stmt: self.stmt,
-            values,
-        });
+        self.current = None;
+        if let Some(query) = self.deferred.take() {
+            let (stmt, result) = query.run();
+            self.pending = result?.into_iter();
+            self.stmt = Some(stmt);
+        }
+        let Some(stmt) = self.stmt else {
+            return Ok(None);
+        };
+        self.current = self.pending.next().map(|values| Row { stmt, values });
+        if self.current.is_none() {
+            self.stmt = None;
+        }
         Ok(self.current.as_ref())
     }
 
     /// The statement these rows come from (rusqlite's `Rows::as_ref`).
     #[allow(clippy::should_implement_trait)] // rusqlite's inherent `as_ref`
     #[must_use]
-    pub const fn as_ref(&self) -> Option<&Statement<'stmt>> {
-        Some(self.stmt)
+    pub fn as_ref(&self) -> Option<&Statement<'stmt>> {
+        match &self.deferred {
+            Some(query) => Some(query.statement()),
+            None => self.stmt,
+        }
     }
 
     /// Map each remaining row with `f`.
@@ -2759,15 +2876,13 @@ mod tests {
                 .unwrap();
             trace.push(format!("duplicate {}", snapshot(&mut stmt)));
 
-            trace.push(failure(stmt.query_row(
-                named_params! { ":a": 7, ":missing": 9 },
-                |_| Ok(()),
-            )));
+            trace.push(failure(
+                stmt.query_row(named_params! { ":a": 7, ":missing": 9 }, |_| Ok(())),
+            ));
             trace.push(format!("unknown-name {}", snapshot(&mut stmt)));
-            trace.push(failure(stmt.query_row(
-                named_params! { ":a": 8, ":b": Refused },
-                |_| Ok(()),
-            )));
+            trace.push(failure(
+                stmt.query_row(named_params! { ":a": 8, ":b": Refused }, |_| Ok(())),
+            ));
             trace.push(format!("named-conversion {}", snapshot(&mut stmt)));
             trace.push(failure(stmt.query_row((9, Refused, 10), |_| Ok(()))));
             trace.push(format!("tuple-conversion {}", snapshot(&mut stmt)));
@@ -2788,9 +2903,7 @@ mod tests {
             let items = [50, 51, 52, 53, 54]
                 .into_iter()
                 .inspect(|_| consumed.set(consumed.get() + 1));
-            trace.push(failure(
-                stmt.query_row(params_from_iter(items), |_| Ok(())),
-            ));
+            trace.push(failure(stmt.query_row(params_from_iter(items), |_| Ok(()))));
             trace.push(format!("iterator-consumed {}", consumed.get()));
             trace.push(format!("long-iterator {}", snapshot(&mut stmt)));
             trace.push(failure(stmt.query_row(params_from_iter([60]), |_| Ok(()))));
@@ -2855,8 +2968,10 @@ mod tests {
             use $m::{Connection, named_params};
 
             let conn = Connection::open_in_memory().unwrap();
-            conn.execute_batch("CREATE TABLE retained(id INTEGER PRIMARY KEY, label TEXT, data BLOB)")
-                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE retained(id INTEGER PRIMARY KEY, label TEXT, data BLOB)",
+            )
+            .unwrap();
             let mut insert = conn
                 .prepare("INSERT INTO retained VALUES (:id, :label, :data)")
                 .unwrap();
@@ -2895,7 +3010,9 @@ mod tests {
                 .unwrap()
                 .collect::<$m::Result<_>>()
                 .unwrap();
-            let mut select = conn.prepare("SELECT * FROM retained WHERE id = :id").unwrap();
+            let mut select = conn
+                .prepare("SELECT * FROM retained WHERE id = :id")
+                .unwrap();
             assert_eq!(
                 select
                     .query_row(named_params! { ":id": 3 }, |row| row.get::<_, i64>(0))
@@ -2927,6 +3044,321 @@ mod tests {
             ]
         );
         assert_eq!(actual.1, (3, "new".to_owned()));
+    }
+
+    macro_rules! raw_binding_scenario {
+        ($m:ident) => {{
+            use $m::{Connection, named_params};
+
+            struct Refused;
+
+            impl $m::types::ToSql for Refused {
+                fn to_sql(&self) -> $m::Result<$m::types::ToSqlOutput<'_>> {
+                    Err($m::Error::ToSqlConversionFailure(Box::new(
+                        std::io::Error::other("refused raw binding"),
+                    )))
+                }
+            }
+
+            fn values(stmt: &mut $m::Statement<'_>) -> Vec<$m::types::Value> {
+                let count = stmt.column_count();
+                let mut rows = stmt.raw_query();
+                assert!(rows.as_ref().is_some());
+                let values = {
+                    let row = rows.next().unwrap().unwrap();
+                    (0..count)
+                        .map(|index| row.get(index))
+                        .collect::<$m::Result<Vec<_>>>()
+                        .unwrap()
+                };
+                assert!(rows.as_ref().is_some());
+                assert!(rows.next().unwrap().is_none());
+                assert!(rows.as_ref().is_none());
+                assert!(rows.next().unwrap().is_none());
+                values
+            }
+
+            fn failure(result: $m::Result<()>) -> String {
+                match result {
+                    Err($m::Error::SqliteFailure(error, _)) => {
+                        assert_eq!(error.extended_code, $m::ffi::SQLITE_RANGE);
+                        "range".to_owned()
+                    }
+                    Err($m::Error::InvalidParameterName(name)) => format!("name {name}"),
+                    Err($m::Error::ToSqlConversionFailure(_)) => "conversion".to_owned(),
+                    Err(other) => panic!("unexpected raw binding error: {other}"),
+                    Ok(()) => panic!("raw binding unexpectedly succeeded"),
+                }
+            }
+
+            let conn = Connection::open_in_memory().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT ?2 AS a, :b AS b, :b AS again, ?4 AS d")
+                .unwrap();
+            assert_eq!(stmt.parameter_count(), 4);
+            let mut trace = vec![format!("initial {:?}", values(&mut stmt))];
+            // An unused slot below the highest index still accepts a binding.
+            stmt.raw_bind_parameter(1_usize, 999).unwrap();
+            stmt.raw_bind_parameter(2_usize, 2).unwrap();
+            stmt.raw_bind_parameter(":b", String::from("old")).unwrap();
+            stmt.raw_bind_parameter(c":b", String::from("named"))
+                .unwrap();
+            stmt.raw_bind_parameter(4_usize, vec![0_u8, 255]).unwrap();
+            trace.push(format!("bound {:?}", values(&mut stmt)));
+
+            // Unknown names are resolved before ToSql; numeric range checks
+            // happen after ToSql, matching sqlite3_bind_* error precedence.
+            trace.push(failure(stmt.raw_bind_parameter(":missing", Refused)));
+            trace.push(failure(stmt.raw_bind_parameter(c":missing", Refused)));
+            trace.push(failure(stmt.raw_bind_parameter(0_usize, Refused)));
+            trace.push(failure(stmt.raw_bind_parameter(5_usize, Refused)));
+            trace.push(failure(stmt.raw_bind_parameter(0_usize, 10)));
+            trace.push(failure(stmt.raw_bind_parameter(5_usize, 10)));
+            trace.push(format!("after-errors {:?}", values(&mut stmt)));
+
+            stmt.query_row((100, 200, 300, 400), |_| Ok(())).unwrap();
+            trace.push(format!("positional {:?}", values(&mut stmt)));
+            stmt.raw_bind_parameter(2_usize, 500).unwrap();
+            assert_eq!(
+                stmt.query_row(named_params! {}, |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                500
+            );
+            stmt.raw_bind_parameter(c":b", None::<i64>).unwrap();
+            trace.push(format!("null {:?}", values(&mut stmt)));
+            stmt.clear_bindings();
+            trace.push(format!("cleared {:?}", values(&mut stmt)));
+            trace
+        }};
+    }
+
+    #[test]
+    fn raw_binding_indexes_values_and_errors_match_rusqlite() {
+        let expected = raw_binding_scenario!(stock);
+        let actual = raw_binding_scenario!(ours);
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual,
+            [
+                "initial [Null, Null, Null, Null]",
+                "bound [Integer(2), Text(\"named\"), Text(\"named\"), Blob([0, 255])]",
+                "name :missing",
+                "name :missing",
+                "conversion",
+                "conversion",
+                "range",
+                "range",
+                "after-errors [Integer(2), Text(\"named\"), Text(\"named\"), Blob([0, 255])]",
+                "positional [Integer(200), Integer(300), Integer(300), Integer(400)]",
+                "null [Integer(500), Null, Null, Integer(400)]",
+                "cleared [Null, Null, Null, Null]",
+            ]
+        );
+    }
+
+    macro_rules! raw_query_lifecycle_scenario {
+        ($m:ident) => {{
+            use $m::{Connection, named_params};
+
+            fn count(conn: &Connection) -> i64 {
+                conn.query_row("SELECT count(*) FROM raw_lifecycle", [], |row| row.get(0))
+                    .unwrap()
+            }
+
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE raw_lifecycle(id INTEGER PRIMARY KEY, body TEXT)")
+                .unwrap();
+            let mut insert = conn
+                .prepare("INSERT INTO raw_lifecycle VALUES (:id, :body)")
+                .unwrap();
+            insert.raw_bind_parameter(":id", 1).unwrap();
+            insert.raw_bind_parameter(c":body", "retained").unwrap();
+            {
+                let rows = insert.raw_query();
+                assert_eq!(rows.as_ref().unwrap().parameter_count(), 2);
+                assert_eq!(count(&conn), 0);
+                drop(rows);
+            }
+            assert_eq!(count(&conn), 0, "unstepped rows must not execute INSERT");
+            {
+                let mut rows = insert.raw_query();
+                assert_eq!(count(&conn), 0);
+                assert!(rows.next().unwrap().is_none());
+                assert!(rows.as_ref().is_none());
+                assert!(rows.next().unwrap().is_none());
+            }
+            assert_eq!(count(&conn), 1);
+            let failure_code = {
+                let mut rows = insert.raw_query();
+                assert!(rows.as_ref().is_some());
+                let error = match rows.next() {
+                    Err(error) => error,
+                    Ok(_) => panic!("duplicate primary key unexpectedly succeeded"),
+                };
+                assert!(rows.as_ref().is_none());
+                assert!(
+                    rows.next().unwrap().is_none(),
+                    "a step error is returned once"
+                );
+                error.sqlite_error().unwrap().extended_code & 0xff
+            };
+            assert_eq!(failure_code, $m::ffi::SQLITE_CONSTRAINT);
+            assert_eq!(count(&conn), 1);
+            insert.raw_bind_parameter(1_usize, 2).unwrap();
+            assert_eq!(insert.raw_execute().unwrap(), 1);
+            assert_eq!(insert.execute(named_params! { ":id": 3 }).unwrap(), 1);
+            insert.clear_bindings();
+            insert.raw_bind_parameter(1_usize, 4).unwrap();
+            assert_eq!(insert.raw_execute().unwrap(), 1);
+            let data: Vec<(i64, Option<String>)> = conn
+                .prepare("SELECT id, body FROM raw_lifecycle ORDER BY id")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<$m::Result<_>>()
+                .unwrap();
+
+            let mut select = conn
+                .prepare("SELECT * FROM raw_lifecycle WHERE id = :id")
+                .unwrap();
+            select.raw_bind_parameter(c":id", 2).unwrap();
+            {
+                let mut rows = select.raw_query();
+                assert_eq!(rows.next().unwrap().unwrap().get::<_, i64>(0).unwrap(), 2);
+            }
+            conn.execute_batch("ALTER TABLE raw_lifecycle ADD COLUMN extra TEXT DEFAULT 'new'")
+                .unwrap();
+            let after_schema_change = {
+                let mut rows = select.raw_query();
+                let row = rows.next().unwrap().unwrap();
+                let result: (i64, String) = (row.get(0).unwrap(), row.get("extra").unwrap());
+                assert_eq!(rows.as_ref().unwrap().column_count(), 3);
+                assert!(rows.next().unwrap().is_none());
+                assert!(rows.as_ref().is_none());
+                result
+            };
+            (failure_code, data, after_schema_change)
+        }};
+    }
+
+    #[test]
+    fn raw_queries_defer_execution_and_reuse_after_errors_like_rusqlite() {
+        let expected = raw_query_lifecycle_scenario!(stock);
+        let actual = raw_query_lifecycle_scenario!(ours);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.0, ffi::SQLITE_CONSTRAINT);
+        assert_eq!(
+            actual.1,
+            vec![
+                (1, Some("retained".to_owned())),
+                (2, Some("retained".to_owned())),
+                (3, Some("retained".to_owned())),
+                (4, None),
+            ]
+        );
+        assert_eq!(actual.2, (2, "new".to_owned()));
+    }
+
+    macro_rules! numeric_parameter_name_scenario {
+        ($m:ident) => {{
+            use $m::{Connection, named_params};
+
+            struct Case {
+                sql: &'static str,
+                names: &'static [Option<&'static str>],
+                missing: &'static [&'static str],
+                values: &'static [Option<i64>],
+            }
+
+            let cases = [
+                Case {
+                    sql: "SELECT :a, ?1",
+                    names: &[Some(":a")],
+                    missing: &["?1", "?01"],
+                    values: &[Some(10), Some(10)],
+                },
+                Case {
+                    sql: "SELECT ?, ?1",
+                    names: &[Some("?1")],
+                    missing: &["?01"],
+                    values: &[Some(10), Some(10)],
+                },
+                Case {
+                    sql: "SELECT ?01, ?1",
+                    names: &[Some("?01")],
+                    missing: &["?1"],
+                    values: &[Some(10), Some(10)],
+                },
+                Case {
+                    sql: "SELECT ?1, ?01",
+                    names: &[Some("?1")],
+                    missing: &["?01"],
+                    values: &[Some(10), Some(10)],
+                },
+                Case {
+                    sql: "SELECT ?3, ?, ?2, :a, ?5",
+                    names: &[None, Some("?2"), Some("?3"), None, Some(":a")],
+                    missing: &["?1", "?4", "?5"],
+                    values: &[Some(30), None, Some(20), Some(50), Some(50)],
+                },
+                Case {
+                    sql: "SELECT ?0002, ?2",
+                    names: &[None, Some("?0002")],
+                    missing: &["?2", "?02"],
+                    values: &[Some(20), Some(20)],
+                },
+                Case {
+                    sql: "SELECT ?, ?1, :a, ?02",
+                    names: &[Some("?1"), Some(":a")],
+                    missing: &["?01", "?2", "?02"],
+                    values: &[Some(10), Some(10), Some(20), Some(20)],
+                },
+            ];
+            let conn = Connection::open_in_memory().unwrap();
+            for case in cases {
+                let mut stmt = conn.prepare(case.sql).unwrap();
+                assert_eq!(stmt.parameter_count(), case.names.len(), "{}", case.sql);
+                assert_eq!(stmt.parameter_name(0), None);
+                assert_eq!(stmt.parameter_name(case.names.len() + 1), None);
+                for (index, name) in case.names.iter().copied().enumerate() {
+                    assert_eq!(stmt.parameter_name(index + 1), name, "{}", case.sql);
+                    if let Some(name) = name {
+                        assert_eq!(stmt.parameter_index(name).unwrap(), Some(index + 1));
+                        let value = i64::try_from(index + 1).unwrap() * 10;
+                        stmt.raw_bind_parameter(name, value).unwrap();
+                        let name = std::ffi::CString::new(name).unwrap();
+                        stmt.raw_bind_parameter(name.as_c_str(), value).unwrap();
+                    }
+                }
+                for &name in case.missing {
+                    assert_eq!(stmt.parameter_index(name).unwrap(), None, "{}", case.sql);
+                    assert!(matches!(
+                        stmt.raw_bind_parameter(name, 999),
+                        Err($m::Error::InvalidParameterName(reported)) if reported == name
+                    ));
+                }
+                let mut rows = stmt.raw_query();
+                let row = rows.next().unwrap().unwrap();
+                let values: Vec<Option<i64>> = (0..case.values.len())
+                    .map(|index| row.get(index))
+                    .collect::<$m::Result<_>>()
+                    .unwrap();
+                assert_eq!(values.as_slice(), case.values, "{}", case.sql);
+                assert!(rows.next().unwrap().is_none());
+            }
+            // Numeric names are accepted by the higher-level binding API too.
+            let mut stmt = conn.prepare("SELECT ?01, ?1").unwrap();
+            let values: (i64, i64) = stmt
+                .query_row(named_params! { "?01": 7 }, |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            assert_eq!(values, (7, 7));
+        }};
+    }
+
+    #[test]
+    fn numeric_parameter_names_and_aliases_match_rusqlite() {
+        numeric_parameter_name_scenario!(stock);
+        numeric_parameter_name_scenario!(ours);
     }
 
     /// The same rusqlite-style code, compiled against module `$m`, run on a
@@ -3584,11 +4016,11 @@ mod tests {
                     "SELECT custom_sum(value) FILTER (WHERE 0) FROM aggregate_data",
                     None,
                 ),
+                ("SELECT custom_sum(value) FROM aggregate_data WHERE 0", None),
                 (
-                    "SELECT custom_sum(value) FROM aggregate_data WHERE 0",
-                    None,
+                    "SELECT variadic_sum(value, 10) FROM aggregate_data",
+                    Some(58),
                 ),
-                ("SELECT variadic_sum(value, 10) FROM aggregate_data", Some(58)),
                 ("SELECT variadic_sum() FROM aggregate_data", Some(0)),
                 (
                     "SELECT count_callbacks(DISTINCT value) FROM aggregate_data",
@@ -3702,9 +4134,9 @@ mod tests {
 
     macro_rules! aggregate_lifecycle_scenario {
         ($m:ident) => {{
-            use $m::functions::{Aggregate, Context, FunctionFlags};
             use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
             use std::sync::{Arc, Mutex};
+            use $m::functions::{Aggregate, Context, FunctionFlags};
 
             struct Accumulator {
                 value: i64,
@@ -3941,7 +4373,10 @@ mod tests {
         adapter
             .step(&mut completed, &[SqliteValue::Integer(4)])
             .unwrap();
-        assert_eq!(adapter.finalize(completed).unwrap(), SqliteValue::Integer(4));
+        assert_eq!(
+            adapter.finalize(completed).unwrap(),
+            SqliteValue::Integer(4)
+        );
         assert_eq!(finalized.load(Ordering::SeqCst), 1);
 
         let mut abandoned = adapter.initial_state();
@@ -4087,7 +4522,10 @@ mod tests {
                 ["2", "2", "2"]
             );
             assert_eq!(
-                integer(&conn, "SELECT count(DISTINCT value COLLATE fold) FROM duplicates"),
+                integer(
+                    &conn,
+                    "SELECT count(DISTINCT value COLLATE fold) FROM duplicates"
+                ),
                 3
             );
 

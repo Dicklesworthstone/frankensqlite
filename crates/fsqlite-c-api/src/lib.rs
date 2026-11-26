@@ -452,7 +452,7 @@ fn validate_and_classify_prepared_sql<'conn>(
 struct PreparedParamInfo {
     /// One NULL slot per bindable parameter (index `i` → `bindings[i - 1]`).
     bindings: Vec<SqliteValue>,
-    /// Full name (with sigil) per 1-based index, `None` for `?` / `?NNN`.
+    /// Full name (with sigil) per 1-based index, `None` for anonymous or unused slots.
     param_names: Vec<Option<CString>>,
 }
 
@@ -460,7 +460,7 @@ struct PreparedParamInfo {
 /// ([`fsqlite_parser::bind_parameter_slots`]), as `sqlite3_bind_parameter_count`
 /// / `_index` / `_name` report them. `bindings` is sized to the largest index
 /// (all NULL); `param_names[i - 1]` is the sigil-prefixed name of index `i`, or
-/// `None` for the nameless `?` / `?NNN` forms. bd-w2i2w.
+/// `None` for anonymous or unused slots. bd-w2i2w.
 fn compute_prepared_param_info(sql: &str) -> PreparedParamInfo {
     let slots = fsqlite_parser::bind_parameter_slots(sql);
     let count = slots.count;
@@ -1545,8 +1545,8 @@ pub unsafe extern "C" fn sqlite3_bind_parameter_index(
 
 /// Name (with sigil) of the parameter at 1-based `index`.
 ///
-/// NULL for the nameless `?` / `?NNN` forms or an out-of-range index. The
-/// returned pointer is owned by the statement and valid until it is finalized.
+/// NULL for anonymous or unused slots or an out-of-range index. The returned
+/// pointer is owned by the statement and valid until it is finalized.
 ///
 /// # Safety
 /// `stmt` must be a valid handle from `sqlite3_prepare_v2`.
@@ -1624,7 +1624,10 @@ pub unsafe extern "C" fn sqlite3_column_count(stmt: *mut Sqlite3Stmt) -> c_int {
 /// returned pointer is read-only and must not be used after the statement is
 /// finalized or automatically reprepared.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sqlite3_column_name(stmt: *mut Sqlite3Stmt, i_col: c_int) -> *const c_char {
+pub unsafe extern "C" fn sqlite3_column_name(
+    stmt: *mut Sqlite3Stmt,
+    i_col: c_int,
+) -> *const c_char {
     COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
 
     if stmt.is_null() || i_col < 0 {
@@ -1944,12 +1947,21 @@ mod tests {
             let other = open_memory();
             assert_eq!(sqlite3_last_insert_rowid(db), 0);
             assert_eq!(sqlite3_get_autocommit(db), 1);
-            schema_exec_ok(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT UNIQUE)");
+            schema_exec_ok(
+                db,
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT UNIQUE)",
+            );
             schema_exec_ok(db, "INSERT INTO t VALUES (7, 'first')");
             assert_eq!(sqlite3_last_insert_rowid(db), 7);
             let duplicate = CString::new("INSERT INTO t VALUES (8, 'first')").unwrap();
             assert_eq!(
-                sqlite3_exec(db, duplicate.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                sqlite3_exec(
+                    db,
+                    duplicate.as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
                 SQLITE_CONSTRAINT
             );
             let message = CStr::from_ptr(sqlite3_errmsg(db)).to_bytes().to_vec();
@@ -1986,7 +1998,13 @@ mod tests {
             let rollback =
                 CString::new("INSERT OR ROLLBACK INTO t VALUES (7, 'duplicate')").unwrap();
             assert_eq!(
-                sqlite3_exec(db, rollback.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                sqlite3_exec(
+                    db,
+                    rollback.as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
                 SQLITE_CONSTRAINT
             );
             assert_eq!(sqlite3_get_autocommit(db), 1);
@@ -4024,9 +4042,13 @@ mod tests {
             // Out-of-range indices report SQLITE_RANGE without corrupting state.
             assert_eq!(sqlite3_bind_int(stmt, 0, 1), SQLITE_RANGE);
             assert_eq!(sqlite3_bind_int(stmt, 3, 1), SQLITE_RANGE);
-            // '?' and '?2' are nameless → no parameter name.
+            // Bare '?' is nameless; numbered '?2' keeps its original name.
             assert!(sqlite3_bind_parameter_name(stmt, 1).is_null());
-            assert!(sqlite3_bind_parameter_name(stmt, 2).is_null());
+            let name = sqlite3_bind_parameter_name(stmt, 2);
+            assert!(!name.is_null());
+            assert_eq!(CStr::from_ptr(name).to_bytes(), b"?2");
+            let numbered = CString::new("?2").unwrap();
+            assert_eq!(sqlite3_bind_parameter_index(stmt, numbered.as_ptr()), 2);
             sqlite3_finalize(stmt);
             sqlite3_close(db);
         }

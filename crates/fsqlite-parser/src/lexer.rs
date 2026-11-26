@@ -1183,8 +1183,8 @@ const fn hex_digit(b: u8) -> Option<u8> {
 pub struct BindParameterSlots {
     /// The largest parameter index (`sqlite3_bind_parameter_count`).
     pub count: usize,
-    /// `(index, name)` for each named parameter, the name with its sigil
-    /// (`":id"`, `"@x"`, `"$y"`), in first-occurrence order.
+    /// `(index, name)` for each named slot, including `?NNN`, in the order
+    /// names are first assigned. Names retain their sigil and original spelling.
     pub names: Vec<(usize, String)>,
 }
 
@@ -1197,7 +1197,8 @@ impl BindParameterSlots {
             .find_map(|(index, candidate)| (candidate == name).then_some(*index))
     }
 
-    /// The name (with sigil) of parameter `index`, or `None` for `?`/`?NNN`.
+    /// The first explicit name of parameter `index`, or `None` for an
+    /// anonymous or unused slot.
     #[must_use]
     pub fn name_of(&self, index: usize) -> Option<&str> {
         self.names
@@ -1210,6 +1211,8 @@ impl BindParameterSlots {
 ///
 /// `?` takes the next index, `?NNN` takes NNN and moves the counter past it,
 /// and `:x`/`@x`/`$x` take the next index on first use and reuse it after.
+/// Each slot keeps the first explicit name assigned to it, including the
+/// original `?NNN` spelling; later numeric aliases do not replace that name.
 /// Tokenizing first means placeholders inside strings, comments or blobs are
 /// not counted.
 #[must_use]
@@ -1225,6 +1228,13 @@ pub fn bind_parameter_slots(sql: &str) -> BindParameterSlots {
             }
             TokenKind::QuestionNum(n) => {
                 let n = n as usize;
+                if n > slots.count || slots.name_of(n).is_none() {
+                    // Preserve the first name for a slot, including leading
+                    // zeros in the original numbered parameter spelling.
+                    let start = token.span.start as usize;
+                    let end = token.span.end as usize;
+                    slots.names.push((n, sql[start..end].to_owned()));
+                }
                 if n >= next {
                     next = n + 1;
                 }
@@ -1258,16 +1268,71 @@ mod tests {
             slots.names,
             vec![
                 (2, ":a".to_owned()),
+                (5, "?5".to_owned()),
                 (6, "@b".to_owned()),
                 (8, "$c".to_owned())
             ]
         );
         assert_eq!(slots.index_of(":a"), Some(2));
+        assert_eq!(slots.index_of("?5"), Some(5));
+        assert_eq!(slots.name_of(5), Some("?5"));
         assert_eq!(slots.index_of("a"), None, "the sigil is part of the name");
         assert_eq!(slots.name_of(6), Some("@b"));
         assert_eq!(slots.name_of(1), None);
         assert_eq!(bind_parameter_slots("SELECT 1").count, 0);
         assert_eq!(bind_parameter_slots("SELECT ?3, ?").count, 4);
+    }
+
+    #[test]
+    fn bind_parameter_slots_preserve_first_explicit_name() {
+        for (sql, expected) in [
+            ("SELECT :a, ?1", ":a"),
+            ("SELECT @a, ?1", "@a"),
+            ("SELECT $a, ?1", "$a"),
+            ("SELECT ?, ?1", "?1"),
+            ("SELECT ?01, ?1", "?01"),
+            ("SELECT ?1, ?01", "?1"),
+            ("SELECT ?, ?01, ?1", "?01"),
+        ] {
+            let slots = bind_parameter_slots(sql);
+            assert_eq!(slots.count, 1, "{sql}");
+            assert_eq!(slots.names, vec![(1, expected.to_owned())], "{sql}");
+            assert_eq!(slots.name_of(1), Some(expected), "{sql}");
+            for candidate in [":a", "@a", "$a", "?1", "?01", "?"] {
+                assert_eq!(
+                    slots.index_of(candidate),
+                    (candidate == expected).then_some(1),
+                    "{sql}: lookup {candidate}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bind_parameter_slots_preserve_numeric_spelling_and_gaps() {
+        let slots = bind_parameter_slots(
+            "SELECT 'é ?99', ?003, ?, ?2, :a, ?5, ?3, :a, x'3f' /* ?10 */ -- ?11\n",
+        );
+        assert_eq!(slots.count, 5);
+        assert_eq!(
+            slots.names,
+            vec![
+                (3, "?003".to_owned()),
+                (2, "?2".to_owned()),
+                (5, ":a".to_owned()),
+            ]
+        );
+        assert_eq!(slots.index_of("?003"), Some(3));
+        assert_eq!(slots.index_of("?2"), Some(2));
+        assert_eq!(slots.index_of(":a"), Some(5));
+        assert_eq!(slots.index_of("?3"), None);
+        assert_eq!(slots.index_of("?5"), None);
+        assert_eq!(slots.name_of(2), Some("?2"));
+        assert_eq!(slots.name_of(3), Some("?003"));
+        assert_eq!(slots.name_of(5), Some(":a"));
+        for index in [0, 1, 4, 6] {
+            assert_eq!(slots.name_of(index), None, "slot {index}");
+        }
     }
 
     #[test]
