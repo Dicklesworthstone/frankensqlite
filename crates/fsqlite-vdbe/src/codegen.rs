@@ -26821,6 +26821,25 @@ fn codegen_select_aggregate(
         }
     }
 
+    // HAVING and OFFSET decide whether to evaluate projection wrappers.
+    // Keep their emission after the wrappers so anonymous bind slots retain
+    // their SQL order; at runtime, jump to the filters first and return to
+    // the wrappers only for a row that will actually be emitted.
+    let wrapper_output_gate = if (having.is_some() || offset_reg.is_some())
+        && agg_columns
+            .iter()
+            .any(|agg| !agg.hidden && agg.wrapper_expr.is_some())
+    {
+        let filter_label = b.emit_label();
+        let wrapper_label = b.emit_label();
+        let result_label = b.emit_label();
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, filter_label, P4::None, 0);
+        b.resolve_label(wrapper_label);
+        Some((filter_label, wrapper_label, result_label))
+    } else {
+        None
+    };
+
     // Apply wrapper expressions after AggFinal.
     {
         let mut out_col_index = 0_i32;
@@ -26851,6 +26870,11 @@ fn codegen_select_aggregate(
         }
     }
 
+    if let Some((filter_label, _, result_label)) = wrapper_output_gate {
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, result_label, P4::None, 0);
+        b.resolve_label(filter_label);
+    }
+
     // HAVING filter: skip ResultRow if HAVING predicate is false/NULL.
     // For single-group aggregate (no GROUP BY), every finalized aggregate and
     // captured bare column lives directly at accum_base + i.
@@ -26879,6 +26903,11 @@ fn codegen_select_aggregate(
     // row, so any positive offset consumes that row.
     if let Some(offset_reg) = offset_reg {
         b.emit_jump_to_label(Opcode::IfPos, offset_reg, 1, output_skip_label, P4::None, 0);
+    }
+
+    if let Some((_, wrapper_label, result_label)) = wrapper_output_gate {
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, wrapper_label, P4::None, 0);
+        b.resolve_label(result_label);
     }
 
     // ResultRow (reached when HAVING passes or when there is no HAVING).
@@ -61801,6 +61830,218 @@ mod tests {
             matches!(err, CodegenError::ColumnNotFound { ref column, .. } if column == "u.a"),
             "unexpected error: {err:?}"
         );
+    }
+
+    fn aggregate_wrapper_query(
+        sql: &str,
+        bindings: &[SqliteValue],
+        input: &[i64],
+        registry: FunctionRegistry,
+    ) -> fsqlite_error::Result<Vec<Vec<SqliteValue>>> {
+        let stmt = select_sql(sql);
+        let mut builder = ProgramBuilder::new();
+        codegen_select(
+            &mut builder,
+            &stmt,
+            &test_schema(),
+            &CodegenContext::default(),
+        )
+        .expect("aggregate wrapper fixture should compile");
+        let program = builder
+            .finish()
+            .expect("aggregate wrapper program should finish");
+        let mut db = MemDatabase::new();
+        db.create_table_at(2, 2);
+        for (index, &value) in input.iter().enumerate() {
+            db.get_table_mut(2)
+                .expect("aggregate input table should exist")
+                .insert_row(
+                    i64::try_from(index + 1).expect("test rowid should fit"),
+                    vec![SqliteValue::Integer(value), SqliteValue::Integer(0)],
+                );
+        }
+        let mut engine = VdbeEngine::new(program.register_count());
+        engine.enable_storage_read_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.set_function_registry(Arc::new(registry));
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .expect("build aggregate wrapper test runtime");
+        let outcome = runtime.block_on(async {
+            engine
+                .execute_with_borrowed_bindings(&program, Some(bindings))
+                .await
+        })?;
+        assert_eq!(outcome, ExecOutcome::Done);
+        Ok(engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect())
+    }
+
+    #[test]
+    fn single_group_aggregate_wrapper_gates_preserve_required_errors() {
+        // These results match stock SQLite: OFFSET and a false HAVING skip
+        // SELECT-list wrappers, but neither skips aggregate finalization or
+        // evaluating a HAVING expression that references the wrapper.
+        for (sql, should_skip) in [
+            ("SELECT abs(sum(a)) FROM t LIMIT 1 OFFSET 1", true),
+            ("SELECT abs(sum(a)) FROM t HAVING 1 LIMIT 1 OFFSET 1", true),
+            ("SELECT abs(sum(a)) FROM t HAVING 0", true),
+            (
+                "SELECT abs(sum(a)) FROM t ORDER BY 1 LIMIT 1 OFFSET 1",
+                true,
+            ),
+            (
+                "SELECT abs(sum(a) + max(a) * 0) FROM t LIMIT 1 OFFSET 1",
+                true,
+            ),
+            (
+                "SELECT abs(coalesce(sum(a), -9223372036854775808)) \
+                 FROM t WHERE 0 LIMIT 1 OFFSET 1",
+                true,
+            ),
+            ("SELECT abs(sum(a)) FROM t LIMIT 1 OFFSET 0", false),
+            (
+                "SELECT abs(sum(a)) FROM t HAVING abs(sum(a)) > 0 LIMIT 1 OFFSET 1",
+                false,
+            ),
+            (
+                "SELECT abs(sum(a)) AS v FROM t HAVING v > 0 LIMIT 1 OFFSET 1",
+                false,
+            ),
+        ] {
+            let mut registry = FunctionRegistry::new();
+            register_builtins(&mut registry);
+            let result = aggregate_wrapper_query(sql, &[], &[i64::MIN], registry);
+            if should_skip {
+                assert_eq!(result.expect(sql), Vec::<Vec<SqliteValue>>::new(), "{sql}");
+            } else {
+                assert!(
+                    result
+                        .expect_err(sql)
+                        .to_string()
+                        .contains("integer overflow"),
+                    "a required wrapper must still fail: {sql}"
+                );
+            }
+        }
+
+        for sql in [
+            "SELECT abs(sum(a)) FROM t LIMIT 1 OFFSET 1",
+            "SELECT abs(sum(a)) FROM t HAVING 0",
+        ] {
+            let mut registry = FunctionRegistry::new();
+            register_builtins(&mut registry);
+            let error = aggregate_wrapper_query(sql, &[], &[i64::MAX, 1], registry)
+                .expect_err("aggregate overflow must precede output suppression");
+            assert!(
+                error.to_string().contains("integer overflow"),
+                "{sql}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_group_aggregate_wrapper_gates_preserve_anonymous_bindings() {
+        let sql = "SELECT sum(a) + ? FROM t HAVING sum(a) > ? LIMIT ? OFFSET ?";
+        for (bindings, expected_rows) in [
+            ([7, 4, 1, 0], vec![vec![SqliteValue::Integer(12)]]),
+            ([7, 10, 1, 0], vec![]),
+            ([7, 4, 1, 1], vec![]),
+        ] {
+            let mut registry = FunctionRegistry::new();
+            register_builtins(&mut registry);
+            let bindings = bindings.map(SqliteValue::Integer);
+            let rows = aggregate_wrapper_query(sql, &bindings, &[5], registry)
+                .expect("bound aggregate wrapper should execute");
+            assert_eq!(rows, expected_rows, "{bindings:?}");
+        }
+    }
+
+    #[test]
+    fn single_group_aggregate_wrapper_gates_preserve_volatile_call_order() {
+        use fsqlite_func::ScalarFunction;
+        use std::sync::Mutex;
+
+        struct MarkCall {
+            name: &'static str,
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl ScalarFunction for MarkCall {
+            fn invoke(&self, args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+                self.calls
+                    .lock()
+                    .expect("call recorder lock")
+                    .push(self.name);
+                Ok(args[0].clone())
+            }
+
+            fn is_deterministic(&self) -> bool {
+                false
+            }
+
+            fn num_args(&self) -> i32 {
+                1
+            }
+
+            fn name(&self) -> &str {
+                self.name
+            }
+        }
+
+        let cases: &[(&str, &[&str], bool)] = &[
+            (
+                "SELECT projection_mark(sum(a)) FROM t \
+                 HAVING having_mark(sum(a)) > 0 LIMIT 1 OFFSET 0",
+                &["having_mark", "projection_mark"],
+                true,
+            ),
+            (
+                "SELECT projection_mark(sum(a)) FROM t \
+                 HAVING having_mark(sum(a)) > 0 LIMIT 1 OFFSET 1",
+                &["having_mark"],
+                false,
+            ),
+            (
+                "SELECT projection_mark(sum(a)) FROM t HAVING having_mark(sum(a)) > 100",
+                &["having_mark"],
+                false,
+            ),
+            (
+                "SELECT projection_mark(sum(a)) AS v FROM t HAVING v > 0 LIMIT 1 OFFSET 1",
+                &["projection_mark"],
+                false,
+            ),
+        ];
+        for &(sql, expected_calls, emits_row) in cases {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut registry = FunctionRegistry::new();
+            register_builtins(&mut registry);
+            for name in ["projection_mark", "having_mark"] {
+                registry.register_scalar(MarkCall {
+                    name,
+                    calls: Arc::clone(&calls),
+                });
+            }
+            let rows = aggregate_wrapper_query(sql, &[], &[1], registry)
+                .expect("volatile aggregate wrapper should execute");
+            let expected_rows = if emits_row {
+                vec![vec![SqliteValue::Integer(1)]]
+            } else {
+                vec![]
+            };
+            assert_eq!(rows, expected_rows, "{sql}");
+            assert_eq!(
+                calls.lock().expect("call recorder lock").as_slice(),
+                expected_calls,
+                "HAVING must run before a retained projection, exactly once: {sql}"
+            );
+        }
     }
 
     // === Test 11: SELECT with LIMIT ===
