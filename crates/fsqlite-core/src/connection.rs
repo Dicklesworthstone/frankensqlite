@@ -302337,10 +302337,18 @@ mod pager_routing_tests {
                 txn.allocate_page(&cx).await.unwrap();
                 txn.allocate_page(&cx).await.unwrap();
                 txn.allocate_page(&cx).await.unwrap();
-                let reserved = txn.live_reserved_pages()[0];
+                // bd-emim5 B1: the lease hands out its lowest page first, so
+                // the unused lease pages lie past the live extent; name the
+                // lowest private reservation, which lies inside it.
+                let reserved = txn
+                    .live_reserved_pages()
+                    .into_iter()
+                    .min()
+                    .expect("three unwritten allocations are private reservations");
+                assert!(reserved.get() <= txn.live_db_size());
                 let mut schema = conn.schema.borrow().clone();
                 // Deliberately corrupt the table-root claim to name an actual
-                // private lease page. Ownership must fail before reading it.
+                // private reservation. Ownership must fail before reading it.
                 schema
                     .iter_mut()
                     .find(|table| table.name == "t")

@@ -26022,7 +26022,10 @@ where
     ///
     /// These pages are not reusable by peers and must never be added to the
     /// shared freelist merely to satisfy an integrity walk. Some can lie below
-    /// the highest issued page because lease allocation pops from the end.
+    /// the highest issued page: an unwritten allocation, a savepoint
+    /// quarantine, or lease pages below a page taken from the volatile
+    /// freelist. (The lease is handed out lowest page first, bd-emim5 B1, so
+    /// its unused pages lie above every page issued from the same batch.)
     /// Ownership validation must account for them separately from tree and
     /// freelist pages, retaining duplicate-owner detection.
     #[must_use]
@@ -27123,6 +27126,59 @@ where
         pending.extend(self.savepoint_quarantined_allocations.iter().copied());
         pending.extend(self.freed_pages.iter().copied());
         pending
+    }
+
+    /// bd-emim5 B1: at a Concurrent WAL commit, hand this transaction's unused
+    /// page-lease tail back to EOF allocation (`inner.next_page`), so the
+    /// commit neither counts it in its db_size nor publishes it as free, and no
+    /// volatile freelist entry is left above the extent for a later grower to
+    /// publish.
+    ///
+    /// The lease is handed out lowest page first, so its unused pages are the
+    /// top of this transaction's EOF growth. Rewinding `next_page` to the
+    /// tail's lowest page can only re-grant those pages, and it is done only
+    /// when nothing else can hold a page number in or above the tail:
+    /// - Concurrent mode in WAL, and this is the pager's only active
+    ///   transaction (with more, the tail takes the pre-existing path);
+    /// - no savepoint and no quarantine (their frontiers index the allocation
+    ///   lists), no shrink and no VACUUM freelist override;
+    /// - the tail lies above both the committed and the predicted db size, and
+    ///   its highest page is exactly `next_page - 1`, so no allocation by any
+    ///   transaction on this pager (live, committed, rolled back or abandoned)
+    ///   has gone past it.
+    ///
+    /// Done under `inner`'s lock in Phase A, before any page is published. If
+    /// the commit then fails, the tail is already back at EOF, which is where a
+    /// rollback would want it.
+    fn return_unused_lease_tail_to_eof(
+        &mut self,
+        inner: &mut PagerInner<V::File>,
+        committed_db_size: u32,
+    ) {
+        if self.mode != TransactionMode::Concurrent
+            || self.journal_mode != JournalMode::Wal
+            || inner.active_transactions != 1
+            || self.truncated_db_size.is_some()
+            || self.vacuum_override_freelist.is_some()
+            || !self.savepoint_stack.is_empty()
+            || !self.savepoint_quarantined_allocations.is_empty()
+        {
+            return;
+        }
+        // Stored descending: the last entry is the next page `pop()` gives.
+        let (Some(&lowest), Some(&highest)) = (self.page_lease.last(), self.page_lease.first())
+        else {
+            return;
+        };
+        if lowest.get() <= committed_db_size.max(inner.db_size)
+            || highest.get().checked_add(1) != Some(inner.next_page)
+        {
+            return;
+        }
+        // No `alloc_ledger` event here: the ledger's readers treat every
+        // event as a page handed to the transaction, and these pages are not.
+        self.page_lease.clear();
+        inner.next_page = lowest.get();
     }
 
     fn prepare_unstaged_allocations(&mut self) -> PendingReturnedAllocations {
@@ -31465,6 +31521,7 @@ where
                 } else {
                     1
                 };
+                let lease_start = self.page_lease.len();
 
                 for _ in 0..batch {
                     let mut raw = if let Some(shrunk) = self.truncated_db_size {
@@ -31517,6 +31574,14 @@ where
                         }
                     }
                 }
+                // bd-emim5 B1: store the new lease descending, so the fast
+                // path's `pop()` hands out its LOWEST page first. A transaction
+                // that uses part of a lease then leaves the unused pages as the
+                // top tail of its growth, above every page it wrote: they never
+                // fall inside its commit's db_size, and its commit can hand them
+                // back to EOF allocation (`return_unused_lease_tail_to_eof`)
+                // instead of publishing them as free.
+                self.page_lease[lease_start..].reverse();
                 dbg_alloc_db_size = inner.db_size;
             }
 
@@ -31900,6 +31965,7 @@ where
                 return Err(FrankenError::BusyRecovery);
             }
             let committed_db_size = self.committed_db_size_with_inner(&inner);
+            self.return_unused_lease_tail_to_eof(&mut inner, committed_db_size);
             // Keep unused allocations and leases transaction-owned across the
             // fallible abandonment fold. Transfer them only once the pending WAL
             // attempt can own them without an intervening await.
@@ -64668,10 +64734,21 @@ mod tests {
                 let low = txn.allocate_page(&cx).await.unwrap();
                 let high = txn.allocate_page(&cx).await.unwrap();
                 txn.write_page(&cx, high, &sample_page(0x22)).await.unwrap();
-                assert!(high.get() > low.get() + 1);
+                // bd-emim5 B1: the lease hands out its lowest page first, so
+                // `high` is `low + 1` and the rest of the lease lies past it.
+                // Every post-savepoint reservation is `low..=reserved_top`
+                // (before B1 the descending pop made `high` that top).
+                let reserved_top = txn
+                    .page_lease
+                    .iter()
+                    .map(|page| page.get())
+                    .max()
+                    .unwrap_or(0)
+                    .max(high.get());
+                assert!(reserved_top > low.get() + 1);
                 txn.rollback_to_savepoint(&cx, "before_growth").unwrap();
                 txn.release_savepoint(&cx, "before_growth").unwrap();
-                let mut abandoned: Vec<_> = (low.get()..=high.get())
+                let mut abandoned: Vec<_> = (low.get()..=reserved_top)
                     .map(|raw| PageNumber::new(raw).unwrap())
                     .collect();
                 if matches!(exit, "cancel_then_commit" | "fail_then_commit") {
@@ -64763,7 +64840,7 @@ mod tests {
                 }
                 growth.commit(&cx).await.unwrap();
                 let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
-                assert!(reader.live_db_size() > high.get());
+                assert!(reader.live_db_size() > reserved_top);
                 let free = reader.live_freelist_pages();
                 let missing: Vec<_> = abandoned
                     .into_iter()
@@ -64793,13 +64870,24 @@ mod tests {
             txn.savepoint(&cx, "before_high").unwrap();
             let high = txn.allocate_page(&cx).await.unwrap();
             txn.write_page(&cx, high, &sample_page(0x42)).await.unwrap();
-            assert!(high.get() > low.get() + 1, "must leave a private lease gap");
+            // bd-emim5 B1: the lease hands out its lowest page first, so the
+            // private lease pages lie past `high` (before B1 they were a gap
+            // below it).
+            let lease_top = txn
+                .page_lease
+                .iter()
+                .map(|page| page.get())
+                .max()
+                .expect("must leave private lease pages");
+            assert!(lease_top > high.get() + 1, "must leave several private lease pages");
             assert_eq!(txn.live_db_size(), high.get());
-            let expected: Vec<_> = (low.get() + 1..high.get())
+            let expected: Vec<_> = (high.get() + 1..=lease_top)
                 .map(|raw| PageNumber::new(raw).unwrap())
                 .collect();
             let shared_before = txn.inner.lock().unwrap().freelist.clone();
-            assert_eq!(txn.live_reserved_pages(), expected);
+            let mut reserved_now = txn.live_reserved_pages();
+            reserved_now.sort_unstable();
+            assert_eq!(reserved_now, expected);
             let free = txn.live_freelist_pages();
             assert!(expected.iter().all(|page| !free.contains(page)));
             assert_eq!(txn.inner.lock().unwrap().freelist, shared_before);
@@ -64820,7 +64908,7 @@ mod tests {
             txn.rollback_to_savepoint(&cx, "before_high").unwrap();
             let mut reserved = txn.live_reserved_pages();
             reserved.sort_unstable();
-            let expected: Vec<_> = (low.get() + 1..=high.get())
+            let expected: Vec<_> = (low.get() + 1..=lease_top)
                 .map(|raw| PageNumber::new(raw).unwrap())
                 .collect();
             assert_eq!(reserved, expected);
@@ -65214,6 +65302,22 @@ mod tests {
                 !txn.page_lease.is_empty(),
                 "bead_id={BEAD_ID} case=lease_hole_test_must_exercise_batched_allocator"
             );
+            // bd-emim5 B1: the lease hands out its lowest page first, so the
+            // unused lease pages lie above this transaction's own writes. They
+            // become in-range holes when a peer on the same pager commits
+            // growth past them (before B1 the descending pop put them below
+            // `high_page` inside this transaction alone).
+            let mut peer = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let peer_page = peer.allocate_page(&cx).await.unwrap();
+            assert!(
+                txn.page_lease.iter().all(|page| *page < peer_page),
+                "bead_id={BEAD_ID} case=peer_growth_lies_past_the_unused_lease"
+            );
+            peer.write_page(&cx, peer_page, &vec![0x84; ps])
+                .await
+                .unwrap();
+            peer.commit(&cx).await.unwrap();
+            drop(peer);
             let inner_arc = Arc::clone(&txn.inner);
             let inner = inner_arc.lock().unwrap();
             let committed_db_size = txn.committed_db_size_with_inner(&inner);
@@ -65234,6 +65338,228 @@ mod tests {
                 ),
                 "bead_id={BEAD_ID} case=returned_lease_holes_remain_durable_freelist_delta"
             );
+        });
+    }
+
+    /// The last committed page-1 frame's (page count, freelist count) and the
+    /// last commit frame's db size, from a mock WAL's frames.
+    fn last_committed_page_one_counts(frames: &SharedFrames) -> (u32, u32, u32) {
+        let frames = frames.lock().unwrap();
+        let (_, page_one, _) = frames
+            .iter()
+            .rev()
+            .find(|(page, _, _)| *page == PageNumber::ONE.get())
+            .expect("a committed page-1 frame");
+        let commit_db_size = frames
+            .iter()
+            .rev()
+            .find(|(_, _, db_size)| *db_size > 0)
+            .map(|(_, _, db_size)| *db_size)
+            .expect("a commit frame");
+        (
+            u32::from_be_bytes(page_one[28..32].try_into().unwrap()),
+            u32::from_be_bytes(page_one[36..40].try_into().unwrap()),
+            commit_db_size,
+        )
+    }
+
+    /// bd-emim5 B1 keeper: the page lease is handed out lowest page first, so
+    /// a Concurrent WAL growth that uses part of its lease leaves the unused
+    /// pages as the top tail of its growth. As the pager's only transaction,
+    /// its commit hands that tail back to EOF allocation: the committed db size
+    /// stops at the highest written page, page 1 publishes no freelist, the
+    /// volatile freelist never holds the tail, and the next transaction grows
+    /// into the tail from EOF.
+    /// - RED on the parent: the lease pops its HIGHEST page first, so the third
+    ///   page is the lease's top and the unused pages sit below it, inside the
+    ///   commit's db size, published as free.
+    /// - Mutant "tail kept out of db size but not returned" (no next_page
+    ///   rewind): the tail lands in the volatile freelist above the extent and
+    ///   next_page stays past it: RED.
+    #[test]
+    fn test_concurrent_wal_growth_returns_unused_lease_tail_to_eof_bd_emim5() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, frames) = wal_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let mut written = Vec::new();
+            for fill in [0x31_u8, 0x32, 0x33] {
+                let page = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, page, &sample_page(fill)).await.unwrap();
+                written.push(page);
+            }
+            let tail = txn.page_lease.clone();
+            assert!(
+                tail.len() >= 2,
+                "vacuity: the second allocation takes a batch lease and the third uses one \
+                 page of it, so several lease pages stay unused (unused {tail:?})"
+            );
+            let highest_written = written.iter().map(|page| page.get()).max().unwrap();
+            assert!(
+                tail.iter().all(|page| page.get() > highest_written),
+                "bd-emim5 B1: the lease hands out its lowest page first, so every unused lease \
+                 page lies above the written pages (written {written:?}, unused {tail:?})"
+            );
+            txn.commit(&cx).await.unwrap();
+            drop(txn);
+
+            let (page_count, freelist_count, commit_db_size) =
+                last_committed_page_one_counts(&frames);
+            assert_eq!(
+                (page_count, commit_db_size),
+                (highest_written, highest_written),
+                "bd-emim5 B1: the committed db size stops at the highest written page; the \
+                 unused tail {tail:?} is not counted"
+            );
+            assert_eq!(
+                freelist_count, 0,
+                "bd-emim5 B1: the commit publishes no freelist for its unused tail {tail:?}"
+            );
+            {
+                let inner = pager.inner.lock().unwrap();
+                assert!(
+                    tail.iter().all(|page| !inner.freelist.contains(page)),
+                    "bd-emim5 B1: the volatile freelist never holds the returned tail \
+                     (freelist {:?}, tail {tail:?})",
+                    inner.freelist
+                );
+                assert!(
+                    tail.iter()
+                        .all(|page| !inner.abandoned_eof_reservations.contains(page)),
+                    "bd-emim5 B1: the returned tail is not parked as abandoned either"
+                );
+                assert_eq!(
+                    inner.next_page,
+                    highest_written + 1,
+                    "bd-emim5 B1: EOF allocation resumes at the tail's lowest page"
+                );
+            }
+
+            let mut regrow = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let page = regrow.allocate_page(&cx).await.unwrap();
+            assert_eq!(
+                page.get(),
+                highest_written + 1,
+                "the next growth takes the first returned page"
+            );
+            assert!(
+                regrow.allocated_from_freelist.is_empty() && regrow.allocated_from_eof == [page],
+                "bd-emim5 B1: the returned page comes from EOF growth, not from a freelist"
+            );
+            regrow.rollback(&cx).await.unwrap();
+        });
+    }
+
+    /// bd-emim5 B1 keeper, the negative cases: the unused lease tail returns to
+    /// EOF only when nothing else on the pager can hold a page in or above it.
+    /// - `peer_allocated_past_the_tail`: a peer transaction took the next EOF
+    ///   page above the holder's lease and rolled back (its page is parked in
+    ///   the abandonment pool). The holder's commit must NOT rewind next_page
+    ///   below that page: a rewind would grant the pooled page again while the
+    ///   pool still owns it (double grant). Mutant "no next_page == tail top + 1
+    ///   guard": RED (the regrowth below reaches the pooled page).
+    /// - `peer_still_active`: with a second live transaction on the pager the
+    ///   tail takes the pre-existing path (volatile freelist), as the
+    ///   2026-11-26 decision states. Mutant "no single-active-transaction
+    ///   check": RED.
+    #[test]
+    fn test_unused_lease_tail_stays_off_eof_when_another_transaction_could_hold_past_it_bd_emim5()
+    {
+        asupersync::test_utils::run_test(|| async {
+            for case in ["peer_allocated_past_the_tail", "peer_still_active"] {
+                let (pager, frames) = wal_pager().await;
+                let cx = Cx::new();
+                let mut holder = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                let mut written = Vec::new();
+                for fill in [0x41_u8, 0x42, 0x43] {
+                    let page = holder.allocate_page(&cx).await.unwrap();
+                    holder
+                        .write_page(&cx, page, &sample_page(fill))
+                        .await
+                        .unwrap();
+                    written.push(page);
+                }
+                let tail = holder.page_lease.clone();
+                assert!(!tail.is_empty(), "case={case}: vacuity, an unused lease tail");
+                let tail_top = tail.iter().map(|page| page.get()).max().unwrap();
+                let written_top = written.iter().map(|page| page.get()).max().unwrap();
+                let reserved_top = written_top.max(tail_top);
+
+                let mut peer = Some(pager.begin(&cx, TransactionMode::Concurrent).await.unwrap());
+                let pooled = if case == "peer_allocated_past_the_tail" {
+                    let mut txn = peer.take().unwrap();
+                    let page = txn.allocate_page(&cx).await.unwrap();
+                    assert_eq!(
+                        page.get(),
+                        reserved_top + 1,
+                        "case={case}: the peer's EOF page lies past everything the holder reserved"
+                    );
+                    txn.write_page(&cx, page, &sample_page(0x51)).await.unwrap();
+                    txn.rollback(&cx).await.unwrap();
+                    drop(txn);
+                    assert!(
+                        pager
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .abandoned_eof_reservations
+                            .contains(&page),
+                        "case={case}: precondition, the rolled-back EOF page is pooled"
+                    );
+                    Some(page)
+                } else {
+                    None
+                };
+                holder.commit(&cx).await.unwrap();
+                drop(holder);
+
+                let (page_count, freelist_count, _) = last_committed_page_one_counts(&frames);
+                assert_eq!(
+                    (page_count, freelist_count),
+                    (written_top, 0),
+                    "case={case}: the tail is above the extent either way, so it is neither \
+                     counted nor published"
+                );
+                {
+                    let inner = pager.inner.lock().unwrap();
+                    assert!(
+                        inner.next_page > tail_top,
+                        "case={case}: next_page must not be rewound into the tail \
+                         (next_page {}, tail {tail:?})",
+                        inner.next_page
+                    );
+                    if let Some(pooled) = pooled {
+                        assert!(
+                            inner.next_page > pooled.get(),
+                            "case={case}: next_page must stay past the pooled page {pooled:?}"
+                        );
+                    }
+                    assert!(
+                        tail.iter().all(|page| inner.freelist.contains(page)),
+                        "case={case}: the tail takes the pre-existing path into the volatile \
+                         freelist (freelist {:?}, tail {tail:?})",
+                        inner.freelist
+                    );
+                }
+                if let Some(mut txn) = peer.take() {
+                    txn.rollback(&cx).await.unwrap();
+                }
+
+                if let Some(pooled) = pooled {
+                    // Regrow well past the tail: no page may be granted twice.
+                    let mut regrow = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                    let mut granted = Vec::new();
+                    for _ in 0..=tail.len() + 1 {
+                        granted.push(regrow.allocate_page(&cx).await.unwrap());
+                    }
+                    assert!(
+                        !granted.contains(&pooled),
+                        "case={case}: the pooled page {pooled:?} was granted again while the \
+                         abandonment pool still owns it (granted {granted:?})"
+                    );
+                    regrow.rollback(&cx).await.unwrap();
+                }
+            }
         });
     }
 

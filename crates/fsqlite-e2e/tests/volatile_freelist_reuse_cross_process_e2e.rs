@@ -40,6 +40,9 @@
 //! main 3e6cc4c0c step 5 hands R one of P's pages. Since bd-iay3d, R's commit
 //! in step 4 (which jumped past P's) makes its next begin re-read the
 //! committed state, which drops the unused tail, so step 5 allocates at EOF.
+//! Since bd-emim5 B1, R's step-1 commit hands the unused tail back to EOF
+//! allocation instead of parking it on the freelist; step 4 still moves R's
+//! allocation past P's page.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -412,11 +415,14 @@ fn a_writer_never_reuses_a_reserved_page_number_a_peer_committed_live() {
 /// writer whose own commit jumped past that peer commit must read the
 /// freelist again before it allocates.
 ///
-/// R's first transaction allocates four pages on a fresh WAL. Its page
-/// lease pops from the top, so the lease's unused tail lies inside R's
-/// committed extent and R's commit publishes it on the durable freelist. R
-/// then begins an in-place UPDATE; P takes three of those free pages for a
-/// split of its own table and commits; R commits. On main 83da909e2 R's next
+/// R's first transaction allocates four pages on a fresh WAL, and R then
+/// deletes two of its rows, which publishes their leaves on the durable
+/// freelist. (Before bd-emim5 B1 the page lease popped from the top, so the
+/// first transaction's unused lease tail lay inside R's committed extent and
+/// its commit published that instead; the lease now hands out its lowest page
+/// first and a commit returns the unused tail to EOF.) R then begins an
+/// in-place UPDATE; P takes free pages for a split of its own table and
+/// commits; R commits. On main 83da909e2 R's next
 /// begin kept its pre-P freelist (the refresh's "nothing committed since"
 /// early return, since R's own commit was the newest), so its next INSERT
 /// popped a page P had taken, the commit's freelist guard refused it (517
@@ -442,7 +448,8 @@ fn a_writer_rereads_the_freelist_after_a_peer_took_free_pages_before_its_commit(
     let mut p = Actor::spawn(&db, dir.path(), "p");
     let (mut r_rows, mut p_rows) = (BTreeSet::new(), BTreeSet::new());
 
-    // 1. R's four pages; the lease tail inside its extent is published free.
+    // 1. R's four pages, then two of its rows deleted: their leaves are
+    //    published on the durable freelist.
     let mut first = String::from("BEGIN\n");
     for id in 1..=4 {
         first.push_str(&big_row("r", id));
@@ -451,7 +458,9 @@ fn a_writer_rereads_the_freelist_after_a_peer_took_free_pages_before_its_commit(
     first.push_str("COMMIT");
     let results = r.run(&first);
     assert!(all_ok(&results), "R's first transaction: {results:?}");
-    r_rows.extend(1..=4);
+    let results = r.run("DELETE FROM r WHERE id IN (2, 3)");
+    assert!(all_ok(&results), "R's delete: {results:?}");
+    r_rows.extend([1, 4]);
     let results = p.run(&big_row("p", 1));
     assert!(all_ok(&results), "P's first row: {results:?}");
     p_rows.insert(1);
