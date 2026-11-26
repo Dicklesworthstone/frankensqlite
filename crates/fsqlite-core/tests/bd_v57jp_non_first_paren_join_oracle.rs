@@ -439,3 +439,302 @@ fn non_first_paren_join_cursor_budget_matches_stock() {
         }
     });
 }
+
+#[test]
+fn nested_paren_join_using_star_and_tvf_match_stock() {
+    let setup: &[&str] = &[
+        "CREATE TABLE tj(key INTEGER, val TEXT)",
+        "INSERT INTO tj VALUES (1, 'x'), (0, 'y')",
+        "CREATE TABLE tjv(key INTEGER, value INTEGER)",
+        "INSERT INTO tjv VALUES (1, 20), (0, 99)",
+        "CREATE TABLE t1(k INTEGER, j INTEGER, v1 TEXT)",
+        "INSERT INTO t1 VALUES (1, 2, 'a'), (9, 90, 'x')",
+        "CREATE TABLE t2(k INTEGER, j INTEGER, v2 TEXT)",
+        "INSERT INTO t2 VALUES (1, 5, 'b')",
+        "CREATE TABLE t3(j INTEGER, v3 TEXT)",
+        "INSERT INTO t3 VALUES (5, 'c'), (7, 'd')",
+        "CREATE TABLE s0(a INTEGER)",
+        "INSERT INTO s0 VALUES (1)",
+        "CREATE TABLE s1(a INTEGER, j INTEGER)",
+        "INSERT INTO s1 VALUES (1, 10)",
+        "CREATE TABLE s2(j INTEGER, x TEXT)",
+        "INSERT INTO s2 VALUES (10, 'p'), (11, 'p2')",
+        "CREATE TABLE s3(a INTEGER, j INTEGER)",
+        "INSERT INTO s3 VALUES (1, 20)",
+        "CREATE TABLE s4(j INTEGER, y TEXT)",
+        "INSERT INTO s4 VALUES (20, 'q'), (22, 'q2')",
+        "CREATE TABLE c1(k INTEGER, j TEXT)",
+        "INSERT INTO c1 VALUES (1, 'z')",
+        "CREATE TABLE c2(k INTEGER, j TEXT COLLATE NOCASE)",
+        "INSERT INTO c2 VALUES (1, 'b'), (1, 'A')",
+        "CREATE TABLE c3(j TEXT, v INTEGER)",
+        "INSERT INTO c3 VALUES ('b', 1), ('A', 2)",
+        "CREATE TABLE f1(k INTEGER, a TEXT)",
+        "INSERT INTO f1 VALUES (1, 'a')",
+        "CREATE TABLE f2(k INTEGER, b TEXT)",
+        "INSERT INTO f2 VALUES (2, 'b')",
+        "CREATE TABLE f3(k INTEGER, c TEXT)",
+        "INSERT INTO f3 VALUES (3, 'c')",
+        "CREATE TABLE d1(a INTEGER, b INTEGER, c INTEGER)",
+        "INSERT INTO d1 VALUES (1, 2, 3)",
+        "CREATE TABLE d2(a INTEGER, b INTEGER)",
+        "INSERT INTO d2 VALUES (1, 20)",
+        "CREATE TABLE d3(b INTEGER, c INTEGER)",
+        "INSERT INTO d3 VALUES (20, 30)",
+        "CREATE TABLE d4(c INTEGER, d INTEGER)",
+        "INSERT INTO d4 VALUES (30, 40)",
+        "CREATE VIEW v_nested_using AS SELECT * FROM t1 JOIN (t2 JOIN t3 USING(j)) USING(k)",
+    ];
+
+    // Exact-row parity cases (including error parity for ambiguous bare refs).
+    let exact_cases: &[(&str, &str)] = &[
+        // 1. Inner USING(j) with outer table also carrying column j (different values!).
+        (
+            "inner_using_j_outer_using_k_star",
+            "SELECT * FROM t1 JOIN (t2 JOIN t3 USING(j)) USING(k)",
+        ),
+        (
+            "inner_using_j_outer_on_star",
+            "SELECT * FROM t1 JOIN (t2 JOIN t3 USING(j)) ON t1.k = t2.k",
+        ),
+        (
+            "inner_full_using_j_outer_left_using_k_star",
+            "SELECT * FROM t1 LEFT JOIN (t2 FULL JOIN t3 USING(j)) USING(k) ORDER BY k",
+        ),
+        (
+            "inner_using_j_subquery_and_view",
+            "SELECT * FROM (SELECT * FROM t1 JOIN (t2 JOIN t3 USING(j)) USING(k))",
+        ),
+        ("inner_using_j_view", "SELECT * FROM v_nested_using"),
+        (
+            "inner_using_j_distinct_orderby_pos",
+            "SELECT DISTINCT * FROM t1 JOIN (t2 JOIN t3 USING(j)) USING(k) ORDER BY 2, 4",
+        ),
+        // 2. Triple-nested disjoint USING columns.
+        (
+            "triple_nested_disjoint_using",
+            "SELECT * FROM d1 JOIN (d2 JOIN (d3 JOIN d4 USING(c)) USING(b)) USING(a)",
+        ),
+        // 3. Two sibling ParenJoins both having inner USING(j) (must keep distinct values 10 vs 20!).
+        (
+            "two_sibling_paren_joins_same_using_col",
+            "SELECT * FROM s0 \
+             JOIN (s1 JOIN s2 USING(j)) ON s0.a = s1.a \
+             JOIN (s3 JOIN s4 USING(j)) ON s0.a = s3.a",
+        ),
+        (
+            "two_sibling_paren_joins_full_same_using_col",
+            "SELECT * FROM s0 \
+             JOIN (s1 FULL JOIN s2 USING(j)) ON s0.a = 1 \
+             JOIN (s3 FULL JOIN s4 USING(j)) ON s0.a = 1 \
+             ORDER BY 2, 5",
+        ),
+        // 4. GROUP BY, ungrouped aggregate, WINDOW, and GROUP BY + WINDOW over nested USING *.
+        (
+            "groupby_paren_using_star",
+            "SELECT *, count(*) FROM t1 JOIN (t2 JOIN t3 USING(j)) USING(k) GROUP BY t1.k",
+        ),
+        (
+            "ungrouped_agg_paren_using_star",
+            "SELECT *, count(*) FROM t1 JOIN (t2 JOIN t3 USING(j)) USING(k)",
+        ),
+        (
+            "window_paren_using_star",
+            "SELECT *, row_number() OVER () FROM t1 JOIN (t2 JOIN t3 USING(j)) USING(k)",
+        ),
+        (
+            "groupby_window_paren_using_star",
+            "SELECT *, count(*), row_number() OVER () FROM t1 JOIN (t2 JOIN t3 USING(j)) USING(k) GROUP BY t1.k",
+        ),
+        (
+            "groupby_two_sibling_parens",
+            "SELECT *, count(*) FROM s0 \
+             JOIN (s1 JOIN s2 USING(j)) ON s0.a = s1.a \
+             JOIN (s3 JOIN s4 USING(j)) ON s0.a = s3.a \
+             GROUP BY s0.a",
+        ),
+        (
+            "window_two_sibling_parens",
+            "SELECT *, row_number() OVER () FROM s0 \
+             JOIN (s1 JOIN s2 USING(j)) ON s0.a = s1.a \
+             JOIN (s3 JOIN s4 USING(j)) ON s0.a = s3.a",
+        ),
+        // 5. FULL JOIN USING + GROUP BY must project the coalesced USING key in SELECT *.
+        (
+            "full_join_using_groupby_star",
+            "SELECT *, count(*) FROM f1 FULL JOIN f2 USING(k) GROUP BY k ORDER BY k",
+        ),
+        // 6. Positional ORDER BY on synthetic inner USING slot preserves NOCASE collation.
+        (
+            "collation_on_inner_using_star_orderby",
+            "SELECT * FROM c1 JOIN (c2 JOIN c3 USING(j)) USING(k) ORDER BY 3",
+        ),
+        // 7. TVF inside nested ParenJoin with USING (projecting all SQLite-defined columns except opaque id).
+        (
+            "bd_qe8hc_tvf_using_key_projected",
+            "SELECT key, val, value, type, atom, parent, fullkey, path \
+             FROM tj JOIN (json_each('[10,20]') a JOIN (SELECT 1 AS key) b USING(key)) USING(key)",
+        ),
+        (
+            "bd_qe8hc_tvf_using_key_left",
+            "SELECT key, val, value, type, atom, parent, fullkey, path \
+             FROM tj LEFT JOIN (json_each('[10,20]') a JOIN (SELECT 1 AS key) b USING(key)) USING(key) ORDER BY key",
+        ),
+        // 8. Negative controls: genuinely ambiguous bare refs MUST still error like stock.
+        (
+            "negative_bare_ambiguous_j",
+            "SELECT j FROM t1 JOIN (t2 JOIN t3 USING(j)) USING(k)",
+        ),
+        (
+            "negative_full_using_then_on_ambiguous_star",
+            "SELECT * FROM f1 FULL JOIN f2 USING(k) JOIN f3 ON 1=1",
+        ),
+        (
+            "negative_full_using_then_on_groupby_ambiguous_star",
+            "SELECT *, count(*) FROM f1 FULL JOIN f2 USING(k) JOIN f3 ON 1=1 GROUP BY f3.c",
+        ),
+        (
+            "negative_full_using_then_on_window_ambiguous_star",
+            "SELECT *, row_number() OVER () FROM f1 FULL JOIN f2 USING(k) JOIN f3 ON 1=1",
+        ),
+    ];
+
+    // Exact bd-nested-paren-join-using-qe8hc SELECT * TVF cases (where json_each.id is an
+    // opaque implementation-defined integer, so we verify exact equality on every other column
+    // and check that the id slot is an integer with matching column count/names).
+    let tvf_star_cases: &[(&str, &str, usize)] = &[
+        (
+            "bd_qe8hc_exact_repro_star",
+            "SELECT * FROM tj JOIN (json_each('[10,20]') a JOIN (SELECT 1 AS key) b USING(key)) USING(key)",
+            5, // `id` column index in `key, val, value, type, atom, id, parent, fullkey, path`
+        ),
+        (
+            "bd_qe8hc_tvf_inner_using_value_outer_using_key_star",
+            "SELECT * FROM tjv JOIN (json_each('[10,20]') a JOIN (SELECT 20 AS value) b USING(value)) USING(key)",
+            5, // `id` column index in `key, value, value, type, atom, id, parent, fullkey, path`
+        ),
+    ];
+
+    let stock = rusqlite::Connection::open_in_memory().unwrap();
+    for stmt in setup {
+        stock.execute(stmt, []).unwrap();
+    }
+
+    let expected_exact: Vec<(&str, &str, String, String)> = exact_cases
+        .iter()
+        .map(|&(name, sql)| (name, sql, stock_rows_only(&stock, sql), stock_outcome(&stock, sql)))
+        .collect();
+    for (name, _, stock_rows, _) in &expected_exact {
+        if name.starts_with("negative_") {
+            assert!(
+                stock_rows.contains("ambiguous column name"),
+                "expected stock ambiguity error for {name}, got {stock_rows}"
+            );
+        } else {
+            assert!(
+                stock_rows.starts_with("rows="),
+                "expected stock rows for {name}, got {stock_rows}"
+            );
+        }
+    }
+
+    struct TvfStarExpectation<'a> {
+        name: &'a str,
+        sql: &'a str,
+        id_col: usize,
+        cols: Vec<String>,
+        rows: Vec<Vec<String>>,
+    }
+
+    let expected_tvf_star: Vec<TvfStarExpectation<'_>> = tvf_star_cases
+        .iter()
+        .map(|&(name, sql, id_col)| {
+            let mut stmt = stock.prepare(sql).unwrap();
+            let col_names: Vec<String> = stmt.column_names().map(str::to_owned).collect();
+            assert_eq!(col_names.get(id_col).map(String::as_str), Some("id"));
+            let ncols = stmt.column_count();
+            let mut rows = Vec::new();
+            let mut cursor = stmt.query([]).unwrap();
+            while let Some(row) = cursor.next().unwrap() {
+                let mut vals: Vec<String> = (0..ncols)
+                    .map(|i| render_stock(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                    .collect();
+                assert!(
+                    vals[id_col].parse::<i64>().is_ok(),
+                    "stock json_each id should be integer for {name}, got {}",
+                    vals[id_col]
+                );
+                vals[id_col] = "<id>".to_owned();
+                rows.push(vals);
+            }
+            assert!(!rows.is_empty(), "stock returned empty rows for {name}");
+            TvfStarExpectation {
+                name,
+                sql,
+                id_col,
+                cols: col_names,
+                rows,
+            }
+        })
+        .collect();
+
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = if file_backed {
+                    dir.path().join("bd_qe8hc.db").to_str().unwrap().to_owned()
+                } else {
+                    ":memory:".to_owned()
+                };
+                let conn = Connection::open(&path).await.unwrap();
+                for stmt in setup {
+                    conn.execute(stmt).await.unwrap();
+                }
+
+                for (name, sql, expected_rows, stock_debug) in &expected_exact {
+                    let got = fsqlite_rows_only(&conn, sql, prepared).await;
+                    assert_eq!(
+                        &got, expected_rows,
+                        "case={name} file_backed={file_backed} prepared={prepared}\nsql: {sql}\nstock full: {stock_debug}"
+                    );
+                }
+
+                for exp in &expected_tvf_star {
+                    let rows = if prepared {
+                        let stmt = conn.prepare(exp.sql).await.unwrap();
+                        assert_eq!(
+                            stmt.column_names(),
+                            exp.cols.as_slice(),
+                            "col_names mismatch for {} file_backed={file_backed}",
+                            exp.name
+                        );
+                        stmt.query().await.unwrap()
+                    } else {
+                        conn.query(exp.sql).await.unwrap()
+                    };
+                    let got_rows: Vec<Vec<String>> = rows
+                        .iter()
+                        .map(|row| {
+                            let mut vals: Vec<String> =
+                                row.values().iter().map(render_fsqlite).collect();
+                            assert!(
+                                vals[exp.id_col].parse::<i64>().is_ok(),
+                                "fsqlite json_each id should be integer for {}, got {}",
+                                exp.name,
+                                vals[exp.id_col]
+                            );
+                            vals[exp.id_col] = "<id>".to_owned();
+                            vals
+                        })
+                        .collect();
+                    assert_eq!(
+                        &got_rows, &exp.rows,
+                        "tvf star case={} file_backed={file_backed} prepared={prepared}\nsql: {}",
+                        exp.name, exp.sql
+                    );
+                }
+            }
+        }
+    });
+}

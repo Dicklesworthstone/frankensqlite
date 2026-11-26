@@ -101036,11 +101036,12 @@ impl Connection {
 
         let column_collations = self.build_join_col_collations(select);
         let column_affinities = self.build_join_col_affinities(select);
-        let using_column_projections = self.build_join_using_column_projections(
-            select,
-            &column_collations,
-            &column_affinities,
-        );
+        let (using_column_projections, coalesced_star_indices) = self
+            .build_join_using_projections_and_coalesced_stars(
+                select,
+                &column_collations,
+                &column_affinities,
+            );
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
                 declared_json_keys: self.build_join_declared_blob_columns(select),
@@ -101081,20 +101082,16 @@ impl Connection {
 
         // Step 4a: Expand Star / TableStar into explicit column references
         // using the col_map so GROUP BY can process them individually.
-        let expanded_columns: Vec<ResultColumn> = columns
-            .iter()
-            .flat_map(|col| match col {
+        let mut expanded_columns: Vec<ResultColumn> = Vec::with_capacity(columns.len());
+        for col in columns {
+            let expanded = match col {
                 ResultColumn::Star => col_map
                     .iter()
                     .enumerate()
                     .filter(|(idx, (_, _, hidden))| !*hidden && !using_skip_indices.contains(idx))
-                    .map(|(_, (tbl, c, _))| ResultColumn::Expr {
+                    .map(|(idx, (tbl, c, _))| ResultColumn::Expr {
                         expr: Expr::Column(
-                            if tbl.is_empty() {
-                                ColumnRef::bare(c.clone())
-                            } else {
-                                ColumnRef::qualified(tbl.clone(), c.clone())
-                            },
+                            join_star_column_ref(idx, tbl, c, true, &coalesced_star_indices),
                             Span::new(0, 0),
                         ),
                         alias: None,
@@ -101103,9 +101100,23 @@ impl Connection {
                 ResultColumn::TableStar(tbl) => {
                     self.expand_table_star_result_columns_from_col_map(&join_sources, &col_map, tbl)
                 }
-                other @ ResultColumn::Expr { .. } => vec![other.clone()],
-            })
-            .collect();
+                other @ ResultColumn::Expr { .. } => {
+                    expanded_columns.push(other.clone());
+                    continue;
+                }
+            };
+            for column in &expanded {
+                if let ResultColumn::Expr {
+                    expr: Expr::Column(col_ref, _),
+                    ..
+                } = column
+                    && col_ref.table.is_none()
+                {
+                    find_col_in_map(&col_map, None, &col_ref.column, using_skip)?;
+                }
+            }
+            expanded_columns.extend(expanded);
+        }
 
         // Step 4b: Parse result columns into GroupByColumn descriptors.
         let result_descriptors: Vec<GroupByColumn> = expanded_columns
@@ -109917,14 +109928,13 @@ impl Connection {
                             !*hidden && !using_skip_indices.contains(idx)
                         })
                         .map(|(idx, (tbl, c, _))| {
-                            let column = if !qualify_star
-                                || coalesced_star_indices.contains(&idx)
-                                || tbl.is_empty()
-                            {
-                                ColumnRef::bare(c.clone())
-                            } else {
-                                ColumnRef::qualified(tbl.clone(), c.clone())
-                            };
+                            let column = join_star_column_ref(
+                                idx,
+                                tbl,
+                                c,
+                                qualify_star,
+                                &coalesced_star_indices,
+                            );
                             ResultColumn::Expr {
                                 expr: Expr::Column(column, Span::new(0, 0)),
                                 alias: None,
@@ -110934,9 +110944,10 @@ impl Connection {
                 using_column_projections,
                 registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
             };
-            let expanded: Vec<ResultColumn> = columns
-                .iter()
-                .flat_map(|col| match col {
+            let join_using_skip = (!using_skip_indices.is_empty()).then_some(&using_skip_indices);
+            let mut expanded: Vec<ResultColumn> = Vec::with_capacity(columns.len());
+            for col in columns {
+                let piece = match col {
                     ResultColumn::Star => cmap
                         .iter()
                         .enumerate()
@@ -110944,11 +110955,13 @@ impl Connection {
                             !*hidden && !using_skip_indices.contains(idx)
                         })
                         .map(|(idx, (tbl, c, _))| {
-                            let column = if coalesced_star_indices.contains(&idx) || tbl.is_empty() {
-                                ColumnRef::bare(c.clone())
-                            } else {
-                                ColumnRef::qualified(tbl.clone(), c.clone())
-                            };
+                            let column = join_star_column_ref(
+                                idx,
+                                tbl,
+                                c,
+                                true,
+                                &coalesced_star_indices,
+                            );
                             ResultColumn::Expr {
                                 expr: Expr::Column(column, Span::new(0, 0)),
                                 alias: None,
@@ -110957,9 +110970,23 @@ impl Connection {
                         .collect::<Vec<_>>(),
                     ResultColumn::TableStar(tbl) => self
                         .expand_table_star_result_columns_from_col_map(&join_sources, &cmap, tbl),
-                    other => vec![other.clone()],
-                })
-                .collect();
+                    other => {
+                        expanded.push(other.clone());
+                        continue;
+                    }
+                };
+                for column in &piece {
+                    if let ResultColumn::Expr {
+                        expr: Expr::Column(col_ref, _),
+                        ..
+                    } = column
+                        && col_ref.table.is_none()
+                    {
+                        find_col_in_map(&cmap, None, &col_ref.column, join_using_skip)?;
+                    }
+                }
+                expanded.extend(piece);
+            }
             (cmap, using_skip_indices, Some(eval_ctx), expanded)
         } else {
             // Single-table path (original logic).
@@ -118727,11 +118754,8 @@ impl Connection {
                     .enumerate()
                     .filter(|(idx, (_, _, hidden))| !hidden && !using_skip_indices.contains(idx))
                     .map(|(idx, (tbl, c, _))| {
-                        let column = if coalesced_star_indices.contains(&idx) || tbl.is_empty() {
-                            ColumnRef::bare(c.clone())
-                        } else {
-                            ColumnRef::qualified(tbl.clone(), c.clone())
-                        };
+                        let column =
+                            join_star_column_ref(idx, tbl, c, true, &coalesced_star_indices);
                         ResultColumn::Expr {
                             expr: Expr::Column(column, Span::new(0, 0)),
                             alias: None,
@@ -183635,13 +183659,23 @@ fn join_raw_projection(
     let sql = join_statement_column_text(original);
     col_map
         .iter()
-        .map(|(table, column, hidden)| {
+        .enumerate()
+        .map(|(idx, (table, column, hidden))| {
             let named =
                 *hidden || sql.as_deref().is_none_or(|sql| join_column_is_named(sql, column));
             ResultColumn::Expr {
                 expr: if named {
+                    // Synthetic `bUsingTerm` slots from nested `ParenJoin`
+                    // sources carry empty or `\0`-prefixed internal labels; pin
+                    // them by exact `col_map` slot so sibling parenthesized
+                    // joins sharing a USING column name never collide.
+                    let qualifier = if table.is_empty() || table.starts_with('\0') {
+                        join_col_map_slot_qualifier(idx)
+                    } else {
+                        table.clone()
+                    };
                     Expr::Column(
-                        ColumnRef::qualified(table.clone(), column.clone()),
+                        ColumnRef::qualified(qualifier, column.clone()),
                         Span::new(0, 0),
                     )
                 } else {
@@ -188509,6 +188543,45 @@ pub(crate) fn eval_join_expr(
     }
 }
 
+const JOIN_COL_MAP_SLOT_QUALIFIER_PREFIX: &str = "\u{0}fsqlite-join-slot\u{0}";
+
+fn join_col_map_slot_qualifier(slot: usize) -> String {
+    format!("{JOIN_COL_MAP_SLOT_QUALIFIER_PREFIX}{slot}")
+}
+
+fn parse_join_col_map_slot_qualifier(prefix: &str) -> Option<usize> {
+    prefix
+        .strip_prefix(JOIN_COL_MAP_SLOT_QUALIFIER_PREFIX)?
+        .parse()
+        .ok()
+}
+
+/// Build the `ColumnRef` emitted by a bare `SELECT *` for a visible `col_map`
+/// slot. Outer RIGHT/FULL `USING` coalesced slots stay bare so they resolve
+/// through `using_column_projections` (and preserve SQLite's ambiguity error
+/// when another source also has that column name); synthetic `bUsingTerm` slots
+/// from an inner `ParenJoin` (`tbl.is_empty()`) are already materialized in
+/// their own `col_map` slot, so they target that exact slot directly instead
+/// of masquerading as an ambiguous unqualified reference
+/// (`bd-nested-paren-join-using-qe8hc`).
+fn join_star_column_ref(
+    idx: usize,
+    tbl: &str,
+    col: &str,
+    qualify_star: bool,
+    coalesced_star_indices: &HashSet<usize>,
+) -> ColumnRef {
+    if coalesced_star_indices.contains(&idx) {
+        ColumnRef::bare(col.to_owned())
+    } else if tbl.is_empty() {
+        ColumnRef::qualified(join_col_map_slot_qualifier(idx), col.to_owned())
+    } else if !qualify_star {
+        ColumnRef::bare(col.to_owned())
+    } else {
+        ColumnRef::qualified(tbl.to_owned(), col.to_owned())
+    }
+}
+
 /// Find a column's index in the combined column map.
 fn find_col_in_map(
     col_map: &[(String, String, bool)],
@@ -188517,6 +188590,16 @@ fn find_col_in_map(
     using_skip_indices: Option<&HashSet<usize>>,
 ) -> Result<usize> {
     if let Some(prefix) = table_prefix {
+        if let Some(slot) = parse_join_col_map_slot_qualifier(prefix) {
+            if let Some((_, col, _)) = col_map.get(slot)
+                && col.eq_ignore_ascii_case(col_name)
+            {
+                return Ok(slot);
+            }
+            return Err(FrankenError::Internal(format!(
+                "column not found: {prefix}.{col_name}"
+            )));
+        }
         // Qualified: match table label + declared column name first.
         if let Some(idx) = col_map.iter().position(|(tbl, col, hidden)| {
             !*hidden && tbl.eq_ignore_ascii_case(prefix) && col.eq_ignore_ascii_case(col_name)
