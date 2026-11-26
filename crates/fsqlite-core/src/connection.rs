@@ -175614,16 +175614,18 @@ impl<'a> SelectStructureResolver<'a> {
                 match validate_join_column_references(expr, col_map, using_skip, &[], &[]) {
                     Ok(()) => Ok(()),
                     Err(error @ FrankenError::AmbiguousColumn { .. }) => Err(error),
-                    Err(FrankenError::Internal(detail))
-                        if detail.starts_with("column not found: ")
-                            && column.table.is_none()
+                    // bd-76ftv: validate_join_column_references reports a
+                    // missing column as NoSuchColumn since 345d9221d
+                    // (bd-av6zk); a result alias or an enclosing SELECT's
+                    // column still resolves the name, as in stock.
+                    Err(FrankenError::NoSuchColumn { .. })
+                        if column.table.is_none()
                             && output_aliases.contains(&column.column.to_ascii_lowercase()) =>
                     {
                         Ok(())
                     }
-                    Err(FrankenError::Internal(detail))
-                        if detail.starts_with("column not found: ")
-                            && self.order_column_resolves_in_enclosing_select(expr) =>
+                    Err(FrankenError::NoSuchColumn { .. })
+                        if self.order_column_resolves_in_enclosing_select(expr) =>
                     {
                         Ok(())
                     }
@@ -247696,12 +247698,51 @@ mod tests {
         );
     }
 
+    /// Stock SQLite 3.54.1 refuses these at prepare with exactly
+    /// "no such column: <qualified name>" (bd-76ftv; fsqlite reports the same
+    /// since 345d9221d, bd-av6zk).
     fn assert_column_not_found(error: FrankenError, expected: &str) {
-        let message = error.to_string();
         assert!(
-            message.contains("column not found") && message.contains(expected),
+            matches!(&error, FrankenError::NoSuchColumn { name } if name == expected),
             "unexpected error: {error:?}"
         );
+        assert_eq!(error.to_string(), format!("no such column: {expected}"));
+    }
+
+    /// bd-76ftv: an ORDER BY name in a subquery resolves to the subquery's
+    /// result alias or to an enclosing SELECT's column, as in stock SQLite
+    /// 3.54.1; a name neither provides is still refused with stock's message,
+    /// and an alias is not reachable through a table qualifier. Every expected
+    /// value is stock's.
+    #[test]
+    fn test_subquery_order_by_alias_and_outer_column_resolve_unknown_names_fail() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE o (k INTEGER);").await.unwrap();
+            conn.execute("CREATE TABLE i (v INTEGER);").await.unwrap();
+            conn.execute("INSERT INTO o VALUES (2);").await.unwrap();
+            conn.execute("INSERT INTO i VALUES (1), (5), (3);").await.unwrap();
+            for (sql, want) in [
+                ("SELECT (SELECT v AS w FROM i ORDER BY w DESC LIMIT 1) FROM o;", 5),
+                ("SELECT (SELECT v FROM i ORDER BY abs(v - o.k), v LIMIT 1) FROM o;", 1),
+                ("SELECT (SELECT v FROM i ORDER BY v + k DESC LIMIT 1) FROM o;", 5),
+            ] {
+                let rows = conn
+                    .query(sql)
+                    .await
+                    .unwrap_or_else(|error| panic!("`{sql}`: {error:?}"));
+                assert_eq!(rows.len(), 1, "`{sql}`");
+                assert_eq!(rows[0].values(), &[SqliteValue::Integer(want)], "`{sql}`");
+            }
+            for (sql, name) in [
+                ("SELECT (SELECT v FROM i ORDER BY nosuch LIMIT 1) FROM o;", "nosuch"),
+                ("SELECT (SELECT v FROM i ORDER BY o.nosuch LIMIT 1) FROM o;", "o.nosuch"),
+                ("SELECT (SELECT v AS w FROM i ORDER BY i.w LIMIT 1) FROM o;", "i.w"),
+            ] {
+                let error = conn.query(sql).await.expect_err(sql);
+                assert_column_not_found(error, name);
+            }
+        });
     }
 
     #[test]
@@ -248147,10 +248188,8 @@ mod tests {
                 .query("SELECT * FROM t1 INNER JOIN t2 ON t1.missing = t2.b;")
                 .await
                 .expect_err("unknown ON column should error");
-            assert!(
-                err.to_string().contains("column not found"),
-                "unexpected error: {err}"
-            );
+            // Stock SQLite 3.54.1: "no such column: t1.missing" (bd-76ftv).
+            assert_column_not_found(err, "t1.missing");
         });
     }
 
@@ -248167,10 +248206,8 @@ mod tests {
                 .query("SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.b WHERE t2.missing = 1;")
                 .await
                 .expect_err("unknown WHERE column in JOIN context should error");
-            assert!(
-                err.to_string().contains("column not found"),
-                "unexpected error: {err}"
-            );
+            // Stock SQLite 3.54.1: "no such column: t2.missing" (bd-76ftv).
+            assert_column_not_found(err, "t2.missing");
         });
     }
 
@@ -248187,10 +248224,8 @@ mod tests {
                 .query("SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.b WHERE t1.a IN (t2.missing);")
                 .await
                 .expect_err("unknown column in JOIN IN-list should error");
-            assert!(
-                err.to_string().contains("column not found"),
-                "unexpected error: {err}"
-            );
+            // Stock SQLite 3.54.1: "no such column: t2.missing" (bd-76ftv).
+            assert_column_not_found(err, "t2.missing");
         });
     }
 
