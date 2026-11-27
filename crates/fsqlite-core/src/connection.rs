@@ -29001,6 +29001,7 @@ impl Connection {
                 false,
                 Vec::new(),
                 None,
+                false,
             )
             .await?;
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -46945,6 +46946,7 @@ impl Connection {
                             false,
                             Vec::new(),
                             None,
+                            false,
                         )
                     })
                     .await?;
@@ -47510,7 +47512,7 @@ impl Connection {
                 };
                 let stage_replace_write = self.table_has_replace_victim_callbacks(table_name);
                 let (rows, mut affected, _) = lean_future(|| {
-                    self.execute_table_program_with_cx_and_replace_staging(
+                    self.execute_table_program_with_cx(
                         program,
                         params,
                         false,
@@ -48036,6 +48038,7 @@ impl Connection {
                         true,
                         Vec::new(),
                         None,
+                        false,
                     )
                 })
                 .await?;
@@ -57291,6 +57294,7 @@ impl Connection {
                 false,
                 Vec::new(),
                 None,
+                false,
             )
             .await?;
         Ok(Some(rows))
@@ -101404,6 +101408,7 @@ impl Connection {
                         false,
                         Vec::new(),
                         None,
+                        false,
                     )
                     .await?;
                 rows
@@ -111740,6 +111745,7 @@ impl Connection {
                 false,
                 Vec::new(),
                 Some(TableRowSink::Flat(&mut rows)),
+                false,
             )
             .await?;
             WindowScanRows::Flat(rows)
@@ -112708,8 +112714,8 @@ impl Connection {
         }
         let execution_cx = self.op_cx()?;
         self.sync_change_tracking_context();
-        let (rows, _, _, remaining_offset) = self
-            .execute_table_program_with_cx_and_result_offset(
+        let (rows, _, _) = self
+            .execute_table_program_with_cx(
                 &program,
                 params,
                 false,
@@ -112721,7 +112727,8 @@ impl Connection {
                 false,
             )
             .await?;
-        let remaining_offset = remaining_offset
+        let remaining_offset = self
+            .parked_engine_remaining_result_offset(&program)
             .and_then(|offset| usize::try_from(offset).ok())
             .ok_or_else(|| {
                 FrankenError::internal("compound arm did not retain its result OFFSET counter")
@@ -122661,6 +122668,7 @@ impl Connection {
             false,
             Vec::new(),
             None,
+            false,
         )
         .await
     }
@@ -122669,6 +122677,13 @@ impl Connection {
     /// caller-supplied operation context so autocommit begin/dispatch/commit
     /// can stay on one execution lineage. With a `row_sink` the result rows
     /// go to the sink and the returned row vector is empty.
+    ///
+    /// This is the one executor layer every table program runs through, so it
+    /// stays a single `async fn`: each wrapper `async fn` around it moved this
+    /// future (about 11.7 KB) by value on every statement (bd-crzqa). A caller
+    /// that needs the OFFSET the program left unconsumed reads it afterwards
+    /// with [`Self::parked_engine_remaining_result_offset`].
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
     async fn execute_table_program_with_cx(
         &self,
         program: &VdbeProgram,
@@ -122679,62 +122694,8 @@ impl Connection {
         invalidate_memdb_count_shortcuts_on_success: bool,
         vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
         row_sink: Option<TableRowSink<'_, '_>>,
-    ) -> Result<(Vec<Row>, usize, Option<i64>)> {
-        self.execute_table_program_with_cx_and_replace_staging(
-            program,
-            params,
-            track_last_insert_rowid,
-            runtime_requirements,
-            execution_cx,
-            invalidate_memdb_count_shortcuts_on_success,
-            vtab_instances,
-            row_sink,
-            false,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-    async fn execute_table_program_with_cx_and_replace_staging(
-        &self,
-        program: &VdbeProgram,
-        params: Option<&[SqliteValue]>,
-        track_last_insert_rowid: bool,
-        runtime_requirements: TableExecutionRuntimeRequirements,
-        execution_cx: &Cx,
-        invalidate_memdb_count_shortcuts_on_success: bool,
-        vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
-        row_sink: Option<TableRowSink<'_, '_>>,
         stage_write_on_replace_victims: bool,
     ) -> Result<(Vec<Row>, usize, Option<i64>)> {
-        self.execute_table_program_with_cx_and_result_offset(
-            program,
-            params,
-            track_last_insert_rowid,
-            runtime_requirements,
-            execution_cx,
-            invalidate_memdb_count_shortcuts_on_success,
-            vtab_instances,
-            row_sink,
-            stage_write_on_replace_victims,
-        )
-        .await
-        .map(|(rows, changes, rowid, _)| (rows, changes, rowid))
-    }
-
-    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-    async fn execute_table_program_with_cx_and_result_offset(
-        &self,
-        program: &VdbeProgram,
-        params: Option<&[SqliteValue]>,
-        track_last_insert_rowid: bool,
-        runtime_requirements: TableExecutionRuntimeRequirements,
-        execution_cx: &Cx,
-        invalidate_memdb_count_shortcuts_on_success: bool,
-        vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
-        row_sink: Option<TableRowSink<'_, '_>>,
-        stage_write_on_replace_victims: bool,
-    ) -> Result<(Vec<Row>, usize, Option<i64>, Option<i64>)> {
         self.last_replace_victims.borrow_mut().clear();
         *self.pending_staged_replace_write.borrow_mut() = None;
         let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
@@ -122809,11 +122770,6 @@ impl Connection {
             stage_write_on_replace_victims,
         )
         .await;
-        let remaining_offset = result.as_ref().ok().and_then(|_| {
-            engine_back
-                .as_ref()
-                .and_then(|engine| engine.remaining_result_offset(program))
-        });
         let memdb_count_shortcuts_safe_after_exec = engine_back
             .as_ref()
             .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
@@ -122861,7 +122817,6 @@ impl Connection {
                     } else {
                         None
                     },
-                    remaining_offset,
                 ))
             }
             Err(exec_error) => {
@@ -122883,6 +122838,18 @@ impl Connection {
                 Err(exec_error.error)
             }
         }
+    }
+
+    /// The OFFSET counter `program` left unconsumed in the engine that
+    /// [`Self::execute_table_program_with_cx`] parked when it returned
+    /// (bd-ct8zm). Read it right after a successful execution of `program`:
+    /// the next table program takes the parked engine and resets it. `None`
+    /// when the program keeps no OFFSET counter or returned no engine.
+    fn parked_engine_remaining_result_offset(&self, program: &VdbeProgram) -> Option<i64> {
+        self.cached_vdbe_engine
+            .borrow()
+            .as_deref()
+            .and_then(|engine| engine.remaining_result_offset(program))
     }
 
     // ── Schema cookie and change counter tracking (bd-3mmj) ─────────

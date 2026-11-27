@@ -755,7 +755,7 @@ impl Connection {
                     _ => false,
                 };
                 let (_, mut affected, _) = lean_future(|| {
-                    self.execute_table_program_with_cx_and_replace_staging(
+                    self.execute_table_program_with_cx(
                         &kernel.program,
                         params,
                         false,
@@ -1787,7 +1787,7 @@ impl Connection {
         let vtab_instances = self.insert_program_vtab_instances(insert, program)?;
         let stage_replace_write = self.table_has_replace_victim_callbacks(table_name);
         let (mut rows, mut affected, mut last_insert_rowid) = self
-            .execute_table_program_with_cx_and_replace_staging(
+            .execute_table_program_with_cx(
                 program,
                 params,
                 true,
