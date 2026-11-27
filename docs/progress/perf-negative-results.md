@@ -94,6 +94,54 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-27 - REJECTED on its regression kill line (trig_values_20000 +5.83M Ir, +0.271%, over its +0.2% line; the extra cost is glibc allocator work on a row the lever barely executes), with its gain line cleared by far: upd_50k_grow -542.7M Ir (-29.9%), x4.88 -> x3.42 stock 3.54.1. A size-changing UPDATE rewrites its cell in place on a compact descending table leaf instead of delete + insert (bd-yb70u, trig lane rounds 5-9, lever Y1, and variant Y1b)
+
+- Target: a same-rowid UPDATE whose record changes size. The engine's `overwrite_in_place` arm falls back to
+  `BtreeCursorOps::delete` + an insert when the same-size overwrite refuses. After the first re-insert, the
+  leaf's pointers no longer descend, so every later delete takes the non-descending compact branch, which scans
+  all pointers (round 5 profile, bd-yb70u 2026-11-24).
+- Ledger preflight: 2026-07-11 (DML lane, bd-5310l follow-on) named grow-in-place-if-fits as deferred, not
+  rejected. The May 2026 freeblock family does not apply, since Y1 writes no freeblock. bd-w4pr1.13.20's staged
+  delete levers are reused.
+- Files: crates/fsqlite-btree/src/cursor.rs (`table_overwrite_current_payload_resized_no_overflow`, about 200
+  lines, plus a btree keeper); crates/fsqlite-vdbe/src/engine.rs (CursorBackend wrapper, and the call before the
+  fallback); crates/fsqlite-core/tests/bd_yb70u_dml_trigger_row_order_oracle.rs (stock-differential and
+  two-writer keepers).
+- Soundness evidence:
+  - keepers green on main's sources and on the lever;
+  - planted mutants a-d all red: pointers unshifted, the descending check removed, growth past the pointer
+    array, and the page kept out of the write set;
+  - btree lib 592/0, clippy rc 0, the core UPDATE / trigger / upsert binaries 103/0 (round 9, on the tip).
+- Evidence (round 9):
+  - Arms: P = origin/main 630329d7c, L = + Y1, both built in one rch job (a9a) on vmi1227854. P is cargo ELF
+    538d465b85a5295e, and its sources equal git in all 1,993 crate .rs files. L is 83bb27eab6bf41ef.
+  - Measurement: callgrind on thinkstation1, :memory:, 2 reps; stock 3.54.1 (8056229856cf74fe) live in the
+    same run; every answer equals stock's.
+  - upd_50k_grow 1,813.2M -> 1,270.5M. Every other row is within +0.08%, except trig_values_20000, which
+    went 2,147.3M -> 2,153.1M (+0.271%). Both arms' reps agree within 0.002%.
+  - Round 8's arms at 15ade1ae6 did not run trig_values: upd_50k_grow went from x4.66 to x3.30 there.
+- Where trig_values's +5.83M sits:
+  - 97% is in glibc: `_int_malloc` +4.06M, `unlink_chunk` +1.45M, `_int_free_merge_chunk` +0.43M.
+  - The allocator slow path is entered the same number of times (347,707 in P, 347,752 in L), and every Rust
+    function's self cost is within 0.12M.
+  - Y1's own path runs a handful of times on this row: about 2k Ir.
+  - So the same work went through a heap of a different shape (unlink_chunk calls 202k -> 230k).
+- Variant Y1b (plan posted on bd-yb70u before its build): the engine awaits the resize through
+  `boxed_future`, to test whether the inline resize future enlarged the interpreter's async state.
+  - Result: not supported. L = Y1b (cargo ELF c8c37ba1893ea89e, job a9b on vmi1227854) against a9a's P,
+    same worker and same tip sources: trig_values_20000 +5.56M (+0.259%), with the same allocator signature.
+    upd_50k_grow -519.9M.
+  - Y1b's P arm in a9b failed on vmi1227854's vanished-rlib infrastructure fault, so this pair is cross-job.
+- Not landed. Y1 is f77464542 and Y1b is 67677efa6, both local in frankensqlite-trig1ab and never pushed.
+  Patches: scratchpad trig9/y1_f77464542.patch and y1b_67677efa6.patch.
+- Retry when one of these holds:
+  - the allocator shape that trig_values_20000 is sensitive to is explained (the row also moved +0.106% under
+    bd-fpr5g lever 6, 2026-11-25), so that a lever can be built around it;
+  - the coordinator rules that an Ir regression line on a row where only glibc's malloc internals move is a
+    gate defect. Meeting that standard means building a null code change (an unused function) and showing
+    trig_values moving past 0.2% alone.
+  - With either, Y1 lands as is: it clears its gain line by 3.6x and every row it executes.
+
 ## 2026-11-27 - WIN (landed as db2b0343a; inside its prediction band; count_star x10.21 -> x0.710 stock 3.54.1 in instructions): a one-worker autocommit count(*) of a large tree walks the snapshot on its own thread (bd-read-miss-path-cost-w8msq, serial read lane rounds 15-17, lever SW)
 
 - Target: count_star, the read row furthest behind stock after PH v2. The cursor count takes each page through the
