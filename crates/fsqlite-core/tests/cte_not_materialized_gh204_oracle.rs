@@ -363,3 +363,155 @@ fn not_materialized_pre_expansion_honors_lexical_shadowing_9tcne() {
         .await;
     });
 }
+
+/// bd-ljuk0: a column-listed CTE or view renames only the columns exposed to
+/// outer queries; its body's ORDER BY / WHERE / GROUP BY / HAVING must resolve
+/// the body's own result aliases and reject the outer column-list names, while
+/// outer queries see only the column-list names and reject the body's aliases.
+#[test]
+fn bd_ljuk0_column_listed_cte_and_view_body_order_by_matches_stock() {
+    fn stock_outcome(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+        let mut stmt = conn.prepare(sql).map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(_, Some(msg))
+            | rusqlite::Error::SqlInputError { msg, .. } => msg,
+            other => other.to_string(),
+        })?;
+        let n = stmt.column_count();
+        stmt.query_map([], |row| {
+            Ok((0..n)
+                .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                .collect())
+        })
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(_, Some(msg))
+            | rusqlite::Error::SqlInputError { msg, .. } => msg,
+            other => other.to_string(),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(_, Some(msg))
+            | rusqlite::Error::SqlInputError { msg, .. } => msg,
+            other => other.to_string(),
+        })
+    }
+
+    async fn frank_outcome(
+        conn: &Connection,
+        sql: &str,
+        prepared: bool,
+    ) -> Result<Vec<Vec<String>>, String> {
+        let rows = if prepared {
+            match conn.prepare(sql).await {
+                Ok(stmt) => stmt.query().await,
+                Err(e) => Err(e),
+            }
+        } else {
+            conn.query(sql).await
+        };
+        rows.map(|rs| {
+            rs.iter()
+                .map(|r| r.values().iter().map(tag_f).collect())
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    const SETUP: &[&str] = &[
+        "CREATE TABLE s(p INT, q INT)",
+        "INSERT INTO s VALUES (7, 8), (3, 4), (9, 2), (7, 10)",
+        "CREATE VIEW v_ord(c1, c2) AS SELECT p AS x, q AS y FROM s WHERE p > 5 ORDER BY y DESC",
+        "CREATE VIEW v_where(c1, c2) AS SELECT p AS x, q AS y FROM s WHERE y > 5",
+        "CREATE VIEW v_bad_ord(c1, c2) AS SELECT p AS x, q AS y FROM s ORDER BY c2 DESC",
+        "CREATE VIEW v_bad_where(c1, c2) AS SELECT p AS x, q AS y FROM s WHERE c2 > 5",
+    ];
+
+    const QUERIES: &[&str] = &[
+        // Exact bd-ljuk0 repro (single-use unhinted CTE + LIMIT 1 + body ORDER BY alias).
+        "WITH w(c1, c2) AS (SELECT p AS x, q AS y FROM s WHERE p > 5 ORDER BY y DESC) SELECT c1 FROM w LIMIT 1",
+        "WITH w(c1, c2) AS (SELECT p AS x, q AS y FROM s WHERE p > 5 ORDER BY y DESC) SELECT c1, c2 FROM w",
+        // Explicit NOT MATERIALIZED with column list + body ORDER BY / WHERE alias.
+        "WITH w(c1, c2) AS NOT MATERIALIZED (SELECT p AS x, q AS y FROM s WHERE p > 5 ORDER BY y DESC) SELECT c1, c2 FROM w LIMIT 2",
+        "WITH w(c1, c2) AS NOT MATERIALIZED (SELECT p AS x, q AS y FROM s WHERE y > 5 ORDER BY y DESC) SELECT c1, c2 FROM w",
+        // Column-listed CTE body ordered by ordinal and by expression.
+        "WITH w(c1, c2) AS (SELECT p AS x, q AS y FROM s ORDER BY 2 DESC, 1 ASC) SELECT c1, c2 FROM w LIMIT 2",
+        "WITH w(c1, c2) AS (SELECT p AS x, q AS y FROM s ORDER BY q + p DESC, q ASC) SELECT c1, c2 FROM w LIMIT 3",
+        // Column-listed CTE with GROUP BY / HAVING referencing body alias.
+        "WITH w(c1, c2) AS (SELECT p AS x, sum(q) AS y FROM s GROUP BY x HAVING y >= 10 ORDER BY y DESC) SELECT c1, c2 FROM w LIMIT 2",
+        // Recursive CTE with a column list (ordinal and body alias in ORDER BY).
+        "WITH RECURSIVE r(c1, c2) AS (SELECT 1 AS a, 10 AS b UNION ALL SELECT c1 + 1, c2 - 2 FROM r WHERE c1 < 4 ORDER BY 2 DESC) SELECT c1, c2 FROM r",
+        "WITH RECURSIVE r(c1, c2) AS (SELECT 1 AS a, 10 AS b UNION ALL SELECT c1 + 1, c2 - 2 FROM r WHERE c1 < 4 ORDER BY b DESC) SELECT c1, c2 FROM r",
+        // Compound body with ORDER BY body alias and ordinal.
+        "WITH w(c1, c2) AS (SELECT p AS x, q AS y FROM s WHERE p > 5 UNION ALL SELECT 1, 99 ORDER BY y DESC) SELECT c1, c2 FROM w LIMIT 3",
+        "WITH w(c1, c2) AS (SELECT p AS x, q AS y FROM s WHERE p > 5 UNION ALL SELECT 1, 99 ORDER BY 2 DESC) SELECT c1, c2 FROM w LIMIT 3",
+        // View with a column list + body ORDER BY / WHERE alias.
+        "SELECT c1, c2 FROM v_ord LIMIT 2",
+        "SELECT c1, c2 FROM v_where ORDER BY c2 DESC",
+        // Negative cases: outer query cannot see body's alias (`y`).
+        "WITH w(c1, c2) AS (SELECT p AS x, q AS y FROM s WHERE p > 5 ORDER BY y DESC) SELECT y FROM w LIMIT 1",
+        "WITH w(c1, c2) AS NOT MATERIALIZED (SELECT p AS x, q AS y FROM s WHERE p > 5 ORDER BY y DESC) SELECT y FROM w",
+        "SELECT y FROM v_ord",
+        "SELECT y FROM v_where",
+        // Negative cases: body cannot see CTE / view column-list names (`c2`).
+        "WITH w(c1, c2) AS (SELECT p AS x, q AS y FROM s WHERE p > 5 ORDER BY c2 DESC) SELECT c1 FROM w LIMIT 1",
+        "WITH w(c1, c2) AS NOT MATERIALIZED (SELECT p AS x, q AS y FROM s WHERE p > 5 ORDER BY c2 DESC) SELECT c1 FROM w",
+        "WITH w(c1, c2) AS (SELECT p AS x, q AS y FROM s WHERE c2 > 5) SELECT c1 FROM w LIMIT 1",
+        "WITH w(c1, c2) AS (SELECT p AS x, q AS y FROM s WHERE p > 5 UNION ALL SELECT 1, 99 ORDER BY c2 DESC) SELECT c1 FROM w",
+        "WITH RECURSIVE r(c1, c2) AS (SELECT 1 AS a, 10 AS b UNION ALL SELECT c1 + 1, c2 - 2 FROM r WHERE c1 < 4 ORDER BY c2 DESC) SELECT c1 FROM r",
+        "SELECT c1 FROM v_bad_ord",
+        "SELECT c1 FROM v_bad_where",
+    ];
+
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = if file_backed {
+                let fpath = dir.path().join("f_ljuk0.db");
+                let rpath = dir.path().join("r_ljuk0.db");
+                (
+                    Connection::open(fpath.to_str().unwrap()).await.unwrap(),
+                    rusqlite::Connection::open(rpath).unwrap(),
+                )
+            } else {
+                (
+                    Connection::open(":memory:").await.unwrap(),
+                    rusqlite::Connection::open_in_memory().unwrap(),
+                )
+            };
+            let label = if file_backed { "file" } else { "memory" };
+            for sql in SETUP {
+                f.execute(sql).await.unwrap();
+                r.execute_batch(sql).unwrap();
+            }
+            for sql in QUERIES {
+                let stock = stock_outcome(&r, sql);
+                for prepared in [false, true] {
+                    let frank = frank_outcome(&f, sql, prepared).await;
+                    if frank != stock {
+                        diffs.push(format!(
+                            "[{label} prepared={prepared}] `{sql}`\n  frank={frank:?}\n  stock={stock:?}"
+                        ));
+                    }
+                }
+            }
+            // NOT MATERIALIZED with column list + ORDER BY body alias must still
+            // re-evaluate random() independently per reference.
+            let nm_rand = "WITH w(c1, c2) AS NOT MATERIALIZED \
+                           (SELECT random() AS x, q AS y FROM s WHERE p > 7 ORDER BY y DESC) \
+                           SELECT (SELECT c1 FROM w LIMIT 1) = (SELECT c1 FROM w LIMIT 1)";
+            let got = frank_rows(&f, nm_rand).await;
+            assert_eq!(
+                got,
+                vec![vec!["0".to_owned()]],
+                "[{label}] NOT MATERIALIZED column-listed CTE with ORDER BY must re-evaluate per use"
+            );
+            f.close().await.unwrap();
+        }
+        assert!(
+            diffs.is_empty(),
+            "bd-ljuk0 {} divergence(s) from rusqlite 3.54.1:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}

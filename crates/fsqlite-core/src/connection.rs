@@ -88399,10 +88399,33 @@ impl Connection {
             body = bound;
         }
         if !view.columns.is_empty() {
-            let SelectCore::Select { columns, .. } = &mut body.body.select else {
+            let SelectCore::Select {
+                columns,
+                where_clause,
+                group_by,
+                having,
+                windows,
+                ..
+            } = &mut body.body.select
+            else {
                 return None;
             };
-            if columns.len() != view.columns.len() {
+            // bd-ljuk0: a view's column list renames only the columns exposed
+            // to outer queries. Overwriting result aliases in place when the
+            // body can observe its own aliases (WHERE/GROUP BY/HAVING/ORDER BY/
+            // WINDOW or projection subqueries) destroys the body's aliases and
+            // leaks the view column-list names into the body.
+            if columns.len() != view.columns.len()
+                || !body.order_by.is_empty()
+                || where_clause.is_some()
+                || !group_by.is_empty()
+                || having.is_some()
+                || !windows.is_empty()
+                || columns.iter().any(|column| match column {
+                    ResultColumn::Expr { expr, .. } => expr_has_any_subquery(expr),
+                    ResultColumn::Star | ResultColumn::TableStar(_) => true,
+                })
+            {
                 return None;
             }
             let normalized_columns = Self::deduplicate_relation_column_names(view.columns.clone());
@@ -138089,10 +138112,88 @@ fn cte_body_references_relation(body: &SelectStatement, name: &str) -> bool {
     found
 }
 
+/// Wrap a single-core SELECT in a thin outer renaming projection
+/// `SELECT __fsqlite_cte_inner.<inner> AS <outer> FROM (<body>) AS __fsqlite_cte_inner`
+/// so the body keeps its own alias namespace while outer queries see only
+/// `normalized_columns` (bd-ljuk0). Returns `None` if any body column lacks an
+/// unambiguous bare/aliased name.
+fn wrap_select_with_column_aliases(
+    body: SelectStatement,
+    normalized_columns: &[String],
+) -> Option<SelectStatement> {
+    if !body.body.compounds.is_empty() {
+        return None;
+    }
+    let SelectCore::Select { columns, .. } = &body.body.select else {
+        return None;
+    };
+    if columns.len() != normalized_columns.len() {
+        return None;
+    }
+    let mut inner_names = Vec::with_capacity(columns.len());
+    let mut seen = HashSet::with_capacity(columns.len());
+    for column in columns {
+        let ResultColumn::Expr { expr, alias } = column else {
+            return None;
+        };
+        let inner_name = if let Some(alias_name) = alias {
+            alias_name.clone()
+        } else if let Expr::Column(col_ref, _) = expr {
+            col_ref.column.to_string()
+        } else {
+            return None;
+        };
+        if inner_name.is_empty() || !seen.insert(inner_name.to_ascii_lowercase()) {
+            return None;
+        }
+        inner_names.push(inner_name);
+    }
+    const INNER_ALIAS: &str = "__fsqlite_cte_inner";
+    let projected = inner_names
+        .into_iter()
+        .zip(normalized_columns.iter().cloned())
+        .map(|(inner_name, outer_alias)| ResultColumn::Expr {
+            expr: Expr::Column(
+                ColumnRef {
+                    schema: None,
+                    table: Some(Arc::from(INNER_ALIAS)),
+                    column: Arc::from(inner_name),
+                },
+                Span::ZERO,
+            ),
+            alias: Some(outer_alias),
+        })
+        .collect();
+    Some(SelectStatement {
+        with: None,
+        body: SelectBody {
+            select: SelectCore::Select {
+                distinct: Distinctness::All,
+                columns: projected,
+                from: Some(FromClause {
+                    source: TableOrSubquery::Subquery {
+                        query: Box::new(body),
+                        alias: Some(INNER_ALIAS.to_owned()),
+                    },
+                    joins: Vec::new(),
+                }),
+                where_clause: None,
+                group_by: Vec::new(),
+                having: None,
+                windows: Vec::new(),
+            },
+            compounds: Vec::new(),
+        },
+        order_by: Vec::new(),
+        limit: None,
+    })
+}
+
 /// Build the subquery body to inline for a CTE, applying its declared column
 /// aliases. Returns `None` when the aliases cannot be applied in place (a
-/// compound body, a `VALUES` body, a projection containing `*`, or an arity
-/// mismatch), leaving that CTE on the materialize path.
+/// compound body, a `VALUES` body, a projection containing `*`, an arity
+/// mismatch, or a body whose clauses can observe its own result aliases),
+/// leaving that CTE on the materialize path (or wrapped for `NOT MATERIALIZED`).
 fn cte_inline_body(cte: &fsqlite_ast::Cte) -> Option<SelectStatement> {
     let mut body = cte.query.clone();
     if cte.columns.is_empty() {
@@ -138101,13 +138202,42 @@ fn cte_inline_body(cte: &fsqlite_ast::Cte) -> Option<SelectStatement> {
     if !body.body.compounds.is_empty() {
         return None;
     }
-    let SelectCore::Select { columns, .. } = &mut body.body.select else {
+    let SelectCore::Select {
+        columns,
+        where_clause,
+        group_by,
+        having,
+        windows,
+        ..
+    } = &mut body.body.select
+    else {
         return None;
     };
     if columns.len() != cte.columns.len() {
         return None;
     }
+    // bd-ljuk0: a CTE's column list applies only to the names outer queries
+    // see — never to the body's own internal alias namespace. Overwriting
+    // result aliases in place when the body has ORDER BY, WHERE, GROUP BY,
+    // HAVING, WINDOW, or projection subqueries breaks body alias references
+    // (`ORDER BY y` -> "no such column: y") and leaks column-list names into
+    // the body (`ORDER BY c2` wrongly succeeding).
+    let body_can_observe_own_aliases = !body.order_by.is_empty()
+        || where_clause.is_some()
+        || !group_by.is_empty()
+        || having.is_some()
+        || !windows.is_empty()
+        || columns.iter().any(|column| match column {
+            ResultColumn::Expr { expr, .. } => expr_has_any_subquery(expr),
+            ResultColumn::Star | ResultColumn::TableStar(_) => true,
+        });
     let normalized_columns = Connection::deduplicate_relation_column_names(cte.columns.clone());
+    if body_can_observe_own_aliases {
+        if cte.materialized == Some(CteMaterialized::NotMaterialized) {
+            return wrap_select_with_column_aliases(body, &normalized_columns);
+        }
+        return None;
+    }
     for (column, alias_name) in columns.iter_mut().zip(&normalized_columns) {
         let ResultColumn::Expr { alias, .. } = column else {
             return None;
