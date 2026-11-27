@@ -115,6 +115,9 @@ enum Script {
     /// As `HoldWriteEmptySidecar`, but the peer died part-way through writing
     /// the anchor: the sidecar holds the first half of its newest record.
     HoldWriteTearAnchor,
+    /// Take WRITE and say `held`; after `HOLD_MS`, roll back (no stock row),
+    /// then checkpoint: only the reset is stock's (bd-30ip9).
+    HoldWriteThenRollBack,
 }
 
 /// How long a holding child keeps WRITE before it commits: the parent's
@@ -138,6 +141,7 @@ impl StockRun {
             Script::HoldWriteCreateSidecar => "hold-create",
             Script::HoldWriteEmptySidecar => "hold-empty",
             Script::HoldWriteTearAnchor => "hold-tear",
+            Script::HoldWriteThenRollBack => "hold-rollback",
         };
         let child = Command::new(std::env::current_exe().expect("test binary path"))
             .args([
@@ -242,7 +246,11 @@ fn stock_checkpointer_child() {
             .expect("stock takes WRITE");
         std::fs::write(dir.join("held"), b"").expect("held");
         std::thread::sleep(Duration::from_millis(HOLD_MS));
-        stock.execute_batch(&insert).expect("stock insert");
+        if script == "hold-rollback" {
+            stock.execute_batch("ROLLBACK").expect("stock rollback");
+        } else {
+            stock.execute_batch(&insert).expect("stock insert");
+        }
         if script == "hold-touch" {
             let mut cert = PathBuf::from(db).into_os_string();
             cert.push("-wal-cert");
@@ -279,7 +287,9 @@ fn stock_checkpointer_child() {
             // In place, as the peer's truncate and write: same file identity.
             std::fs::write(&cert, rewritten).expect("rewrite -wal-cert in place");
         }
-        stock.execute_batch("COMMIT").expect("stock commit");
+        if script != "hold-rollback" {
+            stock.execute_batch("COMMIT").expect("stock commit");
+        }
     }
     let started = Instant::now();
     let (busy, log, checkpointed): (i64, i64, i64) = stock
@@ -990,8 +1000,8 @@ fn a_transaction_that_read_is_refused_when_the_sidecar_appeared_during_the_wait(
 // the same sidecar as after a peer's compaction in the new generation.
 // Only the fail-closed half is here. A shape that left the anchor alone
 // committed even under a mutant that accepts only an unchanged sidecar
-// (hz4, 2026-11-26), so it never reached the anchor proof; the admission
-// half rests on wal_adapter.rs's bd_5eult_* unit tests.
+// (hz4, 2026-11-26), so it never reached the anchor proof. The admission
+// half is the bd-30ip9 keeper below, with a real fsqlite peer process.
 
 /// Killed after the truncate: an empty sidecar. An empty anchor proves no
 /// continuity (another fsqlite commit may have hidden behind the reset), so
@@ -1266,6 +1276,405 @@ mod peer_first_admission {
             peer.finish();
         }
     }
+}
+
+// bd-30ip9 (bd-5eult (p)): the admission half of c9c513a65's continuity
+// proof, across processes. Two fsqlite transactions wait for WRITE across a
+// stock TRUNCATE: T in this process (it reads `s`, then writes `t`) and P in
+// a fresh peer process (it writes `s`). Whichever takes WRITE first after the
+// reset makes the new generation's first commit, which compacts `-wal-cert`
+// to [anchor, its record], the anchor byte-identical to the record both
+// captured. When P is first, T's own first COMMIT must commit: every fsqlite
+// commit since its horizon lies in the new generation's WAL, which its
+// append's conflict scan reads, and P wrote no page T writes.
+//
+// T read `s`, which P changes, so a refusal cannot be replayed into `Ok`
+// inside the COMMIT (bd-q4o7z replays only when every value the caller saw
+// comes out identical): under a mutant that accepts only an unchanged
+// sidecar (the rule before c9c513a65) T's COMMIT answers `BusySnapshot`, and
+// this keeper is red. On c8112ae72 T's COMMIT answered `Internal("parallel
+// WAL authorized tail reconciliation failed: parallel WAL certificate epoch 1
+// is not newer than 1")` (bd-30ip9).
+//
+// Who committed first is read from the WAL (the first frame of either
+// table's root page). An attempt in which T took WRITE first after the reset
+// never reached the anchor branch and is run again from a fresh database, as
+// is one whose COMMIT answered `Ok` before the stock checkpoint returned (the
+// HOLD race, under `shape_with`'s rule: an early `Err` is judged). A P commit
+// before the reset is a hidden old-generation commit, which c9c513a65
+// refuses, so T must then be refused. A stall or an error is never
+// discarded, and the keeper fails if no attempt reached the interleaving.
+
+const PEER_CHILD_ENV: &str = "FSQLITE_30IP9_PEER_CHILD";
+/// Each attempt reaches the interleaving about half the time: P and T both
+/// wait for WRITE across the reset.
+const ADMIT_ATTEMPTS: usize = 8;
+
+/// The fsqlite peer P. "armed": BEGIN and write `s`, say `peer-armed`, then
+/// COMMIT on `peer-go` (it waits for the stock child's WRITE, as T does).
+/// "fresh": open, say `peer-armed`, and on `peer-go` commit one autocommit
+/// row into `s`.
+#[test]
+fn fsqlite_peer_child() {
+    let Ok(spec) = std::env::var(PEER_CHILD_ENV) else {
+        return;
+    };
+    let parts: Vec<&str> = spec.split('|').collect();
+    let [db, dir, mode] = parts[..] else {
+        panic!("peer spec {spec}");
+    };
+    let db = db.to_owned();
+    let dir = PathBuf::from(dir);
+    let fresh = mode == "fresh";
+    asupersync::test_utils::run_test(|| async move {
+        let peer = Connection::open(db.as_str()).await.expect("peer open");
+        peer.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}"))
+            .await
+            .expect("peer busy_timeout");
+        if !fresh {
+            peer.execute("BEGIN").await.expect("peer BEGIN");
+            peer.execute("INSERT INTO s(v) VALUES ('peer')")
+                .await
+                .expect("peer INSERT");
+        }
+        std::fs::write(dir.join("peer-armed"), b"").expect("peer-armed");
+        assert!(
+            wait_for(&dir.join("peer-go"), Duration::from_secs(60)),
+            "the parent never released the peer"
+        );
+        let commit = if fresh {
+            peer.execute("INSERT INTO s(v) VALUES ('peer')").await
+        } else {
+            peer.execute("COMMIT").await
+        };
+        let done_us = unix_us();
+        std::fs::write(
+            dir.join("peer-result"),
+            format!("{done_us} {}", commit.is_ok()),
+        )
+        .expect("peer-result");
+        if peer.in_transaction() {
+            let _ = peer.execute("ROLLBACK").await;
+        }
+        commit.expect("the peer's COMMIT");
+        peer.close().await.expect("peer close");
+    });
+}
+
+fn spawn_peer(db: &Path, dir: &Path, mode: &str) -> ChildGuard {
+    let child = Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--exact",
+            "fsqlite_peer_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(
+            PEER_CHILD_ENV,
+            format!("{}|{}|{mode}", db.display(), dir.display()),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fsqlite peer");
+    ChildGuard(Some(child))
+}
+
+/// The root pages of `t` and `s`.
+fn root_pages(db: &Path) -> (u32, u32) {
+    let stock = rusqlite::Connection::open(db).expect("stock open");
+    let root = |name: &str| -> u32 {
+        stock
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .expect("rootpage")
+    };
+    (root("t"), root("s"))
+}
+
+/// `Some(true)` when the WAL's first frame of either table's root page is
+/// `s`'s (P's table), `Some(false)` when it is `t`'s (T's).
+fn peer_frame_first(db: &Path, root_t: u32, root_s: u32) -> Option<bool> {
+    let wal = std::fs::read(with_suffix(db, "-wal")).ok()?;
+    let page_size = usize::try_from(u32::from_be_bytes(wal.get(8..12)?.try_into().ok()?)).ok()?;
+    let mut offset = 32;
+    while offset + 24 + page_size <= wal.len() {
+        let page = u32::from_be_bytes(wal[offset..offset + 4].try_into().ok()?);
+        if page == root_s {
+            return Some(true);
+        }
+        if page == root_t {
+            return Some(false);
+        }
+        offset += 24 + page_size;
+    }
+    None
+}
+
+struct AdmitOutcome {
+    commit: Result<usize, FrankenError>,
+    took: Duration,
+    commit_done_us: u128,
+    peer_done_us: u128,
+    checkpoint: (i64, i64, i64, Duration),
+    checkpoint_done_us: u128,
+    peer_first: Option<bool>,
+    db: PathBuf,
+}
+
+async fn run_admit_shape(dir: &Path) -> AdmitOutcome {
+    let db = seed(dir);
+    let (root_t, root_s) = root_pages(&db);
+    // One fsqlite commit: the record T and P capture, and the anchor.
+    let frank = open_frank(&db, 1).await;
+    let peer = spawn_peer(&db, dir, "armed");
+    assert!(
+        wait_for(&dir.join("peer-armed"), Duration::from_secs(60)),
+        "the fsqlite peer never began its transaction"
+    );
+    frank_transaction_body(&frank, "s", Txn::ReadsStockTable)
+        .await
+        .expect("T before its COMMIT");
+    let run = StockRun {
+        db: db.clone(),
+        dir: dir.to_path_buf(),
+        script: Script::HoldWriteThenRollBack,
+        table: "s",
+        mode: "TRUNCATE",
+    };
+    let child = run.spawn();
+    release_stock_child(dir, Script::HoldWriteThenRollBack);
+    std::fs::write(dir.join("peer-go"), b"").expect("peer-go");
+    let started = Instant::now();
+    let commit = frank.execute("COMMIT").await;
+    let took = started.elapsed();
+    let commit_done_us = unix_us();
+    if frank.in_transaction() {
+        let _ = frank.execute("ROLLBACK").await;
+    }
+    child.finish();
+    peer.finish();
+    // Before this connection's close folds the WAL into the database file.
+    let peer_first = peer_frame_first(&db, root_t, root_s);
+    frank.close().await.expect("close");
+    let peer_done_us = std::fs::read_to_string(dir.join("peer-result"))
+        .expect("peer-result")
+        .split_whitespace()
+        .next()
+        .and_then(|field| field.parse().ok())
+        .expect("peer completion time");
+    AdmitOutcome {
+        commit,
+        took,
+        commit_done_us,
+        peer_done_us,
+        checkpoint: run.checkpoint_result(),
+        checkpoint_done_us: run.checkpoint_done_us(),
+        peer_first,
+        db,
+    }
+}
+
+/// The rows stock 3.54.1 leaves for the same transactions: a stock
+/// connection plays T (BEGIN and its count of `s`), a stock connection plays
+/// P and commits its row, T's stale writer is refused, a stock TRUNCATE
+/// resets the WAL, and the application retries T. Returns the refusal's
+/// extended code and the final `t` and `s` rows.
+fn stock_admit_oracle() -> (i32, Vec<String>, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = seed(dir.path());
+    // The same files as the fsqlite run, `-wal-cert` sidecar included.
+    let seed_db = db.clone();
+    asupersync::test_utils::run_test(|| async move {
+        open_frank(&seed_db, 1).await.close().await.expect("close");
+    });
+    let open = |who: &str| {
+        let conn = rusqlite::Connection::open(&db).unwrap_or_else(|error| {
+            panic!("stock oracle: {who} open: {error}");
+        });
+        conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))
+            .expect("busy_timeout");
+        conn
+    };
+    let read = "SELECT count(*) FROM s";
+    let t = open("T");
+    t.execute_batch("BEGIN").expect("stock T BEGIN");
+    let _: i64 = t
+        .query_row(read, [], |row| row.get(0))
+        .expect("stock T snapshot");
+    let p = open("P");
+    p.execute("INSERT INTO s(v) VALUES ('peer')", [])
+        .expect("stock P commit");
+    let first = t
+        .execute("INSERT INTO t(v) VALUES ('frank')", [])
+        .and_then(|_| t.execute_batch("COMMIT"));
+    let refusal = match first {
+        Ok(()) => panic!("stock oracle: the stale stock writer committed"),
+        Err(rusqlite::Error::SqliteFailure(error, _)) => error.extended_code,
+        Err(error) => panic!("stock oracle: unexpected error {error}"),
+    };
+    let _ = t.execute_batch("ROLLBACK");
+    let busy: i64 = p
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .expect("stock checkpoint");
+    assert_eq!(busy, 0, "stock oracle: the TRUNCATE was blocked");
+    t.execute_batch("BEGIN IMMEDIATE")
+        .expect("stock T retry BEGIN");
+    let _: i64 = t
+        .query_row(read, [], |row| row.get(0))
+        .expect("stock T retry read");
+    t.execute("INSERT INTO t(v) VALUES ('frank')", [])
+        .expect("stock T retry INSERT");
+    t.execute_batch("COMMIT").expect("stock T retry COMMIT");
+    drop(t);
+    drop(p);
+    (refusal, stock_values(&db, "t"), stock_values(&db, "s"))
+}
+
+#[test]
+fn a_waiting_commit_is_admitted_when_a_peer_made_the_new_generations_first_commit_on_other_pages() {
+    if std::env::var_os(CHILD_ENV).is_some() || std::env::var_os(PEER_CHILD_ENV).is_some() {
+        return;
+    }
+    let context = "TRUNCATE while T (read s, write t) and an fsqlite peer (write s) wait; the peer \
+                   commits first in the new generation";
+    let limit = PROMPT + Duration::from_millis(HOLD_MS);
+    let (refusal, stock_t, stock_s) = stock_admit_oracle();
+    assert!(
+        stock_t == ["seed", "frank"] && stock_s == ["seed", "frank-seed", "peer"],
+        "{context}: stock oracle (stale writer refused with {refusal}, then retried): t \
+         {stock_t:?} and s {stock_s:?}"
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut missed = Vec::new();
+    for attempt in 1..=ADMIT_ATTEMPTS {
+        let attempt_dir = dir.path().join(format!("attempt-{attempt}"));
+        std::fs::create_dir_all(&attempt_dir).expect("attempt dir");
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let out = std::sync::Arc::clone(&slot);
+        asupersync::test_utils::run_test(|| async move {
+            let outcome = run_admit_shape(&attempt_dir).await;
+            *out.lock().expect("outcome slot") = Some(outcome);
+        });
+        let outcome = slot
+            .lock()
+            .expect("outcome slot")
+            .take()
+            .expect("the shape ran");
+        let took = outcome.took;
+        assert_checkpoint_finished(context, outcome.checkpoint);
+        let t_before_reset = outcome.commit_done_us <= outcome.checkpoint_done_us
+            && outcome.commit.is_ok()
+            && took < limit;
+        let p_before_reset = outcome.peer_done_us <= outcome.checkpoint_done_us;
+        let t_first_after_reset = outcome.peer_first == Some(false) && outcome.commit.is_ok();
+        if t_before_reset || t_first_after_reset {
+            eprintln!(
+                "event=admit_interleaving_missed attempt={attempt} t_before_reset={t_before_reset} \
+                 peer_first={:?} commit={:?}",
+                outcome.peer_first, outcome.commit
+            );
+            missed.push((t_before_reset, outcome.peer_first));
+            continue;
+        }
+        if p_before_reset {
+            // P's commit hid behind the reset in the old generation, so
+            // c9c513a65 must refuse T (round-9 keeper n1), and T read `s`.
+            assert!(
+                matches!(outcome.commit, Err(FrankenError::BusySnapshot { .. })),
+                "{context}: the peer committed before the reset, so T must be refused; it \
+                 answered {:?}",
+                outcome.commit
+            );
+            eprintln!(
+                "event=admit_interleaving_missed attempt={attempt} peer_before_reset=true \
+                 (T refused)"
+            );
+            missed.push((false, outcome.peer_first));
+            continue;
+        }
+        assert_eq!(
+            outcome.peer_first,
+            Some(true),
+            "{context}: the WAL must show the peer's frame first (T answered {:?} after {took:?})",
+            outcome.commit
+        );
+        if let Err(error) = &outcome.commit {
+            panic!("{context}: T's own COMMIT answered Err({error:?}) after {took:?}");
+        }
+        assert!(took < limit, "{context}: T's COMMIT took {took:?}");
+        assert_eq!(
+            (
+                stock_values(&outcome.db, "t"),
+                stock_values(&outcome.db, "s")
+            ),
+            (stock_t.clone(), stock_s.clone()),
+            "{context}: fsqlite's rows against stock's (refused with {refusal}, then retried)"
+        );
+        assert_eq!(stock_integrity(&outcome.db), "ok", "{context}");
+        eprintln!(
+            "event=admit_interleaving_got attempt={attempt} took_ms={}",
+            took.as_millis()
+        );
+        return;
+    }
+    panic!(
+        "{context}: no attempt of {ADMIT_ATTEMPTS} reached the interleaving \
+         (t_before_reset, peer_first): {missed:?}"
+    );
+}
+
+/// The control for the keeper above, with no waiting COMMIT: this process
+/// commits in the old generation, a stock TRUNCATE resets the WAL, a fresh
+/// fsqlite peer process makes the new generation's first commit, and this
+/// process then commits one autocommit row. Stock commits such a row; so does
+/// fsqlite (its begin refreshes past the peer's commit).
+#[test]
+fn a_commit_after_a_fresh_peers_first_commit_of_the_new_generation_commits() {
+    if std::env::var_os(CHILD_ENV).is_some() || std::env::var_os(PEER_CHILD_ENV).is_some() {
+        return;
+    }
+    let context =
+        "TRUNCATE, a fresh peer's first commit of the new generation, then this process commits";
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = seed(dir.path());
+        let frank = open_frank(&db, 1).await;
+        let peer = spawn_peer(&db, dir.path(), "fresh");
+        assert!(
+            wait_for(&dir.path().join("peer-armed"), Duration::from_secs(60)),
+            "the fsqlite peer never opened"
+        );
+        let run = StockRun {
+            db: db.clone(),
+            dir: dir.path().to_path_buf(),
+            script: Script::CommitAtGo,
+            table: "s",
+            mode: "TRUNCATE",
+        };
+        let child = run.spawn();
+        release_stock_child(dir.path(), Script::CommitAtGo);
+        child.finish();
+        assert_checkpoint_finished(context, run.checkpoint_result());
+        std::fs::write(dir.path().join("peer-go"), b"").expect("peer-go");
+        peer.finish();
+        let commit = frank.execute("INSERT INTO t(v) VALUES ('frank')").await;
+        assert!(
+            matches!(commit, Ok(1)),
+            "{context}: the INSERT answered {commit:?}"
+        );
+        frank.close().await.expect("close");
+        assert_eq!(stock_values(&db, "t"), ["seed", "frank"], "{context}");
+        assert_eq!(
+            stock_values(&db, "s"),
+            ["seed", "frank-seed", "stock", "peer"],
+            "{context}"
+        );
+        assert_eq!(stock_integrity(&db), "ok", "{context}");
+    });
 }
 
 const CHURN_CHILD_ENV: &str = "FSQLITE_557_CHURN_CHILD";
