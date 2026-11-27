@@ -12616,6 +12616,19 @@ async fn trigger_when_matches(
     let params = (!subquery_params.is_empty()).then_some(subquery_params.as_slice());
     let row: [SqliteValue; 0] = [];
     let col_map: [(String, String, bool); 0] = [];
+    // bd-fpr5g W1: a guard bound to literals, operators, CAST, COLLATE and
+    // searched CASE runs on the synchronous twin (bd-k5isc), which follows
+    // the same short-circuit rules and evaluates each leaf through the same
+    // functions, without the async evaluator's two boxed futures per leaf.
+    // The twin returns None for a leaf it cannot evaluate, and has had no
+    // side effect by then, so the async evaluator then runs the whole guard.
+    if params.is_none()
+        && trigger_when_is_sync_evaluable(&bound_expr)
+        && let Some(truth) =
+            connection.try_eval_expr_truthiness_sync(&bound_expr, true, &row, &col_map)
+    {
+        return truth.map(|truth| truth.unwrap_or(false));
+    }
     // WHEN is a truthiness context: stock compiles it through ExprIfTrue, so
     // the boolean skeleton short-circuits and a FALSE guard arm keeps later
     // arms (and any error they would raise) from ever being evaluated.
@@ -12623,6 +12636,40 @@ async fn trigger_when_matches(
         .eval_expr_truthiness(&bound_expr, true, &row, &col_map, params)
         .await
         .map(|truth| truth.unwrap_or(false))
+}
+
+/// bd-fpr5g W1: whether a bound trigger WHEN clause is built only from nodes
+/// the synchronous truthiness twin evaluates exactly as the async evaluator
+/// does without consulting any statement state: literals, unary and binary
+/// operators, CAST, COLLATE, IS [NOT] NULL and searched CASE. A column
+/// reference, a subquery, EXISTS, IN, a function, a placeholder or any other
+/// node keeps the guard on the async evaluator; the twin's EXISTS and IN-list
+/// arms read the join evaluation context, which a WHEN clause does not set.
+fn trigger_when_is_sync_evaluable(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(..) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            trigger_when_is_sync_evaluable(left) && trigger_when_is_sync_evaluable(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => trigger_when_is_sync_evaluable(inner),
+        Expr::Case {
+            operand: None,
+            whens,
+            else_expr,
+            ..
+        } => {
+            whens.iter().all(|(when_expr, then_expr)| {
+                trigger_when_is_sync_evaluable(when_expr)
+                    && trigger_when_is_sync_evaluable(then_expr)
+            }) && else_expr
+                .as_deref()
+                .is_none_or(trigger_when_is_sync_evaluable)
+        }
+        _ => false,
+    }
 }
 
 /// For `UPDATE OF col1, col2` triggers, ensure at least one listed column

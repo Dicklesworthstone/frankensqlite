@@ -831,3 +831,226 @@ fn spare_cursors_follow_self_writes_recursion_schema_changes_and_rollbacks() {
         assert_marked_script_matches_stock(SPARE_CURSOR_SCRIPT, "spare cursors").await;
     });
 }
+
+/// Lever W1 evaluates a WHEN guard on the connection's synchronous truthiness
+/// twin when the bound guard is made only of literals (the binder turned
+/// NEW / OLD into them), comparisons, arithmetic, CAST, COLLATE, IS [NOT]
+/// NULL, unary operators, AND / OR / NOT and searched CASE; every other guard
+/// keeps the async evaluator. Each INSERT guard below fires one trigger that
+/// logs its tag and the row, and must fire on exactly stock's rows. `null`
+/// marks a guard that some row makes NULL (checked on stock, so the NULL arm
+/// is exercised, not assumed). `TAG` is the guard's own tag, so a guard
+/// that reads `lg` sees only its own earlier firings, whatever order the
+/// triggers on one row fire in.
+const WHEN_GUARDS: &[(&str, bool)] = &[
+    // Arithmetic: the bead's guard, `%` by zero, integer overflow to REAL.
+    ("NEW.n % 7 <> 3", true),
+    ("NEW.n % (NEW.n - 4) > 0", true),
+    ("NEW.n * 4611686018427387904 = 9223372036854775808.0", true),
+    ("-NEW.n < -5", true),
+    ("~NEW.n = -6", true),
+    ("NEW.a || NEW.b = 'xY'", true),
+    // Collations: b is NOCASE, a is BINARY; left, right, explicit, mixed.
+    ("NEW.b = 'Y'", true),
+    ("NEW.a = 'Y'", true),
+    ("'Y' = NEW.b", true),
+    ("NEW.b COLLATE BINARY = 'Y'", true),
+    ("NEW.b < 'm'", true),
+    ("NEW.a = NEW.b", true),
+    ("NEW.b = NEW.a", true),
+    // Classes: INTEGER and REAL columns against literals of other classes.
+    // Bundled 3.54.1 fires `NEW.n = '5'` on no row (NEW.n compares without
+    // its column's affinity), and an INTEGER sorts below any TEXT.
+    ("NEW.n = 5.0", true),
+    ("NEW.n < '5'", true),
+    ("NEW.r = 2", true),
+    // IS / IS NOT, NULL tests, NOT, AND / OR chains with a NULL arm.
+    ("NEW.n IS 5", false),
+    ("NEW.a IS NOT NULL", false),
+    ("NOT (NEW.n > 5)", true),
+    ("NEW.n > 100 OR NEW.r > 1.0", true),
+    ("NEW.n > 3 AND NEW.r IS NULL", true),
+    ("CASE WHEN NEW.n > 10 THEN 1 WHEN NEW.n IS NULL THEN NULL ELSE 0 END", true),
+    ("CAST(NEW.a AS INTEGER) = 7", true),
+    ("CASE WHEN NEW.n > 3 THEN 'big' ELSE 'small' END = 'big'", false),
+    // An AND in a value position: the twin declines it (None), so this guard
+    // runs on the async evaluator after the twin's attempt.
+    ("(NEW.n > 3 AND NEW.r > 1.0) = 1", true),
+    // Guards that keep the async evaluator: BETWEEN, an IN list, LIKE, a
+    // function, an uncorrelated scalar subquery and EXISTS that read rows
+    // this statement's firings wrote, and EXISTS on NEW (a parameter).
+    ("NEW.n BETWEEN 3 AND 9", true),
+    ("NEW.n IN (1, 2, 3)", true),
+    ("NEW.a LIKE 'x%'", true),
+    ("abs(NEW.n) > 3", true),
+    ("(SELECT count(*) FROM lg WHERE tag = TAG) % 2 = 0", false),
+    ("NOT EXISTS (SELECT 1 FROM lg WHERE tag = TAG AND id > 8)", false),
+    ("EXISTS (SELECT 1 FROM u WHERE u.k = NEW.a)", false),
+];
+
+/// UPDATE guards over OLD and NEW; tags start at 100.
+const WHEN_UPDATE_GUARDS: &[&str] = &[
+    "OLD.n <> NEW.n AND NEW.b = 'Y'",
+    "OLD.b IS NOT NEW.b",
+    "NEW.n % 3 = OLD.n % 3",
+    "OLD.a = NEW.b",
+];
+
+/// Rows (a, b, n, r) that make the guards TRUE, FALSE and NULL.
+const WHEN_ROWS: &[&str] = &[
+    "('x', 'Y', 1, 1.5)",
+    "('y', 'y', 2, 2.0)",
+    "('Y', 'n', 3, NULL)",
+    "('1', 'Y', 4, 0.5)",
+    "('7', 'y', 5, 2.0)",
+    "(NULL, NULL, NULL, NULL)",
+    "('x', 'M', NULL, 3.0)",
+    "('5', 'a', 11, NULL)",
+    "('Y', 'Y', -3, 1.0)",
+    "('x', 'z', 12, 2.5)",
+    "('7', NULL, -7, NULL)",
+    "('x', 'Y', '5', '2')",
+    "('y', 'Y', 6, 1.0)",
+];
+
+const WHEN_SCHEMA: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT COLLATE NOCASE, n INTEGER, r REAL)",
+    "CREATE TABLE lg(tag, id)",
+    "CREATE TABLE u(k TEXT PRIMARY KEY)",
+    "INSERT INTO u VALUES ('x'), ('Y')",
+    "CREATE TRIGGER gr BEFORE INSERT ON t WHEN NEW.n = 666 BEGIN \
+       SELECT RAISE(ABORT, 'six six six'); END",
+];
+
+fn when_guard_triggers() -> Vec<String> {
+    let mut sql = Vec::new();
+    for (tag, (guard, _)) in WHEN_GUARDS.iter().enumerate() {
+        let guard = guard.replace("TAG", &tag.to_string());
+        sql.push(format!(
+            "CREATE TRIGGER g{tag} AFTER INSERT ON t WHEN {guard} BEGIN \
+               INSERT INTO lg VALUES ({tag}, NEW.id); END"
+        ));
+    }
+    for (i, guard) in WHEN_UPDATE_GUARDS.iter().enumerate() {
+        let tag = 100 + i;
+        sql.push(format!(
+            "CREATE TRIGGER gu{tag} AFTER UPDATE ON t WHEN {guard} BEGIN \
+               INSERT INTO lg VALUES ({tag}, NEW.id); END"
+        ));
+    }
+    sql
+}
+
+/// The steps: each row in its own autocommit INSERT, all rows through the
+/// bead's CTE-fed INSERT ... SELECT, each row again inside one transaction, a
+/// RAISE that fails its statement on both engines, then UPDATEs.
+fn when_guard_steps() -> Vec<String> {
+    let mut steps: Vec<String> = WHEN_ROWS
+        .iter()
+        .map(|row| format!("INSERT INTO t(a, b, n, r) VALUES {row}"))
+        .collect();
+    steps.push(format!(
+        "WITH v(a, b, n, r) AS (VALUES {}) INSERT INTO t(a, b, n, r) SELECT * FROM v",
+        WHEN_ROWS.join(", ")
+    ));
+    steps.push("BEGIN".to_owned());
+    steps.extend(
+        WHEN_ROWS
+            .iter()
+            .map(|row| format!("INSERT INTO t(a, b, n, r) VALUES {row}")),
+    );
+    steps.push("COMMIT".to_owned());
+    steps.push("!INSERT INTO t(a, b, n, r) VALUES ('x', 'Y', 666, 1.0)".to_owned());
+    steps.push("UPDATE t SET n = n + 1 WHERE id % 2 = 0".to_owned());
+    // Only the case of b changes: NOCASE OLD.b IS NOT NEW.b stays FALSE.
+    steps.push("UPDATE t SET b = upper(b) WHERE id % 3 = 0".to_owned());
+    steps.push("UPDATE t SET b = b || '!' WHERE id % 5 = 0".to_owned());
+    steps
+}
+
+const WHEN_VERIFY: &[&str] = &[
+    "SELECT tag, id FROM lg ORDER BY tag, id",
+    "SELECT count(*), sum(n), sum(id) FROM t",
+];
+
+#[test]
+fn trigger_when_guards_fire_on_stocks_rows_on_both_evaluators() {
+    let _serial = serial();
+    let triggers = when_guard_triggers();
+    let steps = when_guard_steps();
+    // Not vacuous, on stock: in the first pass (one autocommit INSERT a row)
+    // every INSERT guard fires on some rows and not on others, and each guard
+    // marked `null` is NULL on some row, its truth taken as
+    // CASE WHEN g THEN 1 WHEN NOT g THEN 0 END over the same rows.
+    let probe = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in WHEN_SCHEMA.iter().copied().chain(triggers.iter().map(String::as_str)) {
+        probe.execute_batch(sql).unwrap();
+    }
+    for step in &steps[..WHEN_ROWS.len()] {
+        probe.execute_batch(step).unwrap();
+    }
+    for (tag, (guard, null)) in WHEN_GUARDS.iter().enumerate() {
+        let fired = stock_rows(&probe, &format!("SELECT count(*) FROM lg WHERE tag = {tag}"));
+        let fired: usize = fired[0][0].parse().unwrap();
+        assert!(
+            fired > 0 && fired < WHEN_ROWS.len(),
+            "guard {tag} `{guard}` fired on {fired} of {} rows",
+            WHEN_ROWS.len()
+        );
+        if *null {
+            let guard = guard.replace("NEW.", "t.");
+            let nulls = stock_rows(
+                &probe,
+                &format!(
+                    "SELECT count(*) FROM t WHERE \
+                     (CASE WHEN {guard} THEN 1 WHEN NOT ({guard}) THEN 0 END) IS NULL"
+                ),
+            );
+            assert_ne!(nulls[0][0], "0", "guard {tag} `{guard}` is never NULL");
+        }
+    }
+    asupersync::test_utils::run_test(|| async move {
+        for file_backed in [false, true] {
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let conn = Connection::open(&database_path(&dir, file_backed))
+                .await
+                .unwrap();
+            for sql in WHEN_SCHEMA.iter().copied().chain(triggers.iter().map(String::as_str)) {
+                stock.execute_batch(sql).unwrap();
+                conn.execute(sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("file_backed={file_backed}: {sql}: {e}"));
+            }
+            for step in &steps {
+                if let Some(failing) = step.strip_prefix('!') {
+                    let stock_error = stock.execute_batch(failing).unwrap_err().to_string();
+                    let error = conn.execute(failing).await.unwrap_err().to_string();
+                    assert!(
+                        stock_error.contains("six six six") && error.contains("six six six"),
+                        "file_backed={file_backed}: `{failing}`: stock `{stock_error}`, \
+                         fsqlite `{error}`"
+                    );
+                } else {
+                    stock.execute_batch(step).unwrap();
+                    conn.execute(step)
+                        .await
+                        .unwrap_or_else(|e| panic!("file_backed={file_backed}: {step}: {e}"));
+                }
+                for sql in WHEN_VERIFY {
+                    assert_eq!(
+                        fsqlite_rows(&conn, sql).await,
+                        stock_rows(&stock, sql),
+                        "file_backed={file_backed}: after `{step}`: {sql}"
+                    );
+                }
+            }
+            // Not vacuous: every UPDATE guard fired somewhere and not everywhere.
+            let fired = stock_rows(
+                &stock,
+                "SELECT tag, count(*) FROM lg WHERE tag >= 100 GROUP BY tag ORDER BY tag",
+            );
+            assert_eq!(fired.len(), WHEN_UPDATE_GUARDS.len(), "{fired:?}");
+        }
+    });
+}
