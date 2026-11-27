@@ -153,7 +153,7 @@ impl<V> CursorSlots<V> {
     }
 }
 use fsqlite_types::sync_primitives::{Duration, Instant};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use fsqlite_btree::cursor::{CursorPositionStamp, FirstIndexKeyIntegerLocalRunSegment};
@@ -389,6 +389,25 @@ fn observe_requested_execution_cancellation(cx: &Cx) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Pages a one-thread snapshot count walks between two full checkpoints
+/// (bd-read-miss-path-cost-w8msq). The cursor count it stands in for takes a
+/// full checkpoint at every page read; the whole walk runs inside one opcode,
+/// so the main loop's interval checkpoint cannot cover it.
+const SNAPSHOT_COUNT_CHECKPOINT_PAGES: u32 = 256;
+
+/// The `stop` of a one-thread snapshot count: a requested cancellation at
+/// every page, and every [`SNAPSHOT_COUNT_CHECKPOINT_PAGES`] pages a full
+/// checkpoint, which also observes the deadline and budget planes. Stopping
+/// hands the count to the cursor path, which reports what stopped it.
+fn snapshot_count_should_stop(cx: &Cx, pages: &AtomicU32) -> bool {
+    if cx.is_cancel_requested() {
+        return true;
+    }
+    let walked = pages.fetch_add(1, AtomicOrdering::Relaxed);
+    walked % SNAPSHOT_COUNT_CHECKPOINT_PAGES == SNAPSHOT_COUNT_CHECKPOINT_PAGES - 1
+        && cx.checkpoint().is_err()
 }
 
 const MAKE_RECORD_FIXED_WIDTH_RESERVE_BYTES: usize = 9;
@@ -9786,10 +9805,13 @@ pub struct VdbeEngine {
     /// Execute-scoped metrics flag latched once per statement.
     collect_vdbe_metrics: bool,
     /// Threads one scan of this statement may use, the engine's own included
-    /// (bd-w4pr1.13.11). 1 runs every scan on this thread alone, as before;
-    /// a larger value lets a scan read the transaction's snapshot through a
-    /// [`fsqlite_pager::SnapshotPageReader`] on that many threads when the
-    /// transaction offers one. Set per statement by the connection.
+    /// (bd-w4pr1.13.11). 0, the default, keeps every scan on the statement's
+    /// cursors (a statement inside an explicit transaction, whose reads may
+    /// need conflict tracking); 1 runs every scan on this thread alone, a
+    /// count through the transaction's [`fsqlite_pager::SnapshotPageReader`]
+    /// when it offers one (bd-read-miss-path-cost-w8msq); a larger value lets
+    /// a scan read that snapshot on that many threads. Set per statement by
+    /// the connection.
     parallel_workers: usize,
     /// Active `PRAGMA temp_store` policy, byte budget, VFS temp-file backend,
     /// and live telemetry shared with the owning connection (bd-dwjnq.5).
@@ -10682,7 +10704,7 @@ impl VdbeEngine {
             text_encoding_authoritative: false,
             trace_opcodes: opcode_trace_enabled(),
             collect_vdbe_metrics: false,
-            parallel_workers: 1,
+            parallel_workers: 0,
             temp_store_runtime: TempStoreRuntime::default(),
             ephemeral_roots_by_cursor: HashMap::new(),
             results: Vec::with_capacity(64),
@@ -11203,10 +11225,14 @@ impl VdbeEngine {
         self.retain_storage_cursors_on_close = retain;
     }
 
-    /// Threads one scan of the next execution may use, this one included
-    /// (bd-w4pr1.13.11). 0 and 1 keep every scan on this thread.
+    /// Threads one scan of the next execution may use, this one included.
+    ///
+    /// bd-w4pr1.13.11: 0 keeps every scan on the statement's cursors (a
+    /// statement inside an explicit transaction); 1 keeps every scan on this
+    /// thread, where a count may read the committed snapshot
+    /// (bd-read-miss-path-cost-w8msq); N lets a scan use up to N threads.
     pub fn set_parallel_workers(&mut self, workers: usize) {
-        self.parallel_workers = workers.max(1);
+        self.parallel_workers = workers;
     }
 
     /// Configure the active `PRAGMA temp_store` runtime policy, byte budget,
@@ -11238,10 +11264,21 @@ impl VdbeEngine {
 
     /// A reader of the lent transaction's committed snapshot for threads
     /// outside this engine, when parallel scans are allowed and the
-    /// transaction offers one. A transaction with an MVCC concurrent context
-    /// records page reads for conflict detection and never offers one.
+    /// transaction offers one.
     fn parallel_snapshot_reader(&self) -> Option<fsqlite_pager::SnapshotPageReader> {
         if self.parallel_workers <= 1 {
+            return None;
+        }
+        self.snapshot_scan_reader()
+    }
+
+    /// A reader of the lent transaction's committed snapshot, when this
+    /// statement may read it directly (`parallel_workers` 1 or more: not
+    /// inside an explicit transaction) and the transaction offers one. A
+    /// transaction with an MVCC concurrent context records page reads for
+    /// conflict detection and never offers one.
+    fn snapshot_scan_reader(&self) -> Option<fsqlite_pager::SnapshotPageReader> {
+        if self.parallel_workers == 0 {
             return None;
         }
         let io = self.txn_page_io.as_ref()?;
@@ -17908,17 +17945,22 @@ impl VdbeEngine {
                     } else if self.storage_cursors.get(&cursor_id).is_some() {
                         // bd-w4pr1.13.11: with parallel workers allowed and a
                         // snapshot reader offered, count the cursor's b-tree on
-                        // several threads. Any failure or stop falls back to the
-                        // serial count, which reports errors and cancellation as
+                        // several threads. bd-read-miss-path-cost-w8msq: with one
+                        // worker, count it through the same reader on this
+                        // thread, observing a requested cancellation at every
+                        // page and the deadline and budget planes (a full
+                        // checkpoint) every SNAPSHOT_COUNT_CHECKPOINT_PAGES
+                        // pages. Any failure or stop falls back to the serial
+                        // cursor count, which reports errors and cancellation as
                         // it always has.
-                        let reader = self.parallel_snapshot_reader();
+                        let reader = self.snapshot_scan_reader();
                         let workers = self.parallel_workers;
                         let sc = self
                             .storage_cursors
                             .get_mut(&cursor_id)
                             .ok_or_else(|| FrankenError::internal("Count cursor vanished"))?;
                         let parallel = match (&reader, &sc.cursor) {
-                            (Some(reader), CursorBackend::Txn(btree)) => {
+                            (Some(reader), CursorBackend::Txn(btree)) if workers > 1 => {
                                 let cx = &sc.cx;
                                 fsqlite_btree::snapshot_walk::count_entries_parallel(
                                     reader,
@@ -17926,6 +17968,18 @@ impl VdbeEngine {
                                     btree.usable_size(),
                                     workers,
                                     &|| cx.is_cancel_requested(),
+                                )
+                                .ok()
+                                .flatten()
+                            }
+                            (Some(reader), CursorBackend::Txn(btree)) => {
+                                let cx = &sc.cx;
+                                let pages = AtomicU32::new(0);
+                                fsqlite_btree::snapshot_walk::count_entries_on_this_thread(
+                                    reader,
+                                    btree.root_page(),
+                                    btree.usable_size(),
+                                    &|| snapshot_count_should_stop(cx, &pages),
                                 )
                                 .ok()
                                 .flatten()
@@ -31543,6 +31597,43 @@ mod tests {
                     "window={window} {signal:?}: {rows} rows, bound {bound} after row 500000"
                 );
             }
+        }
+    }
+
+    /// bd-read-miss-path-cost-w8msq: a one-thread snapshot count stops at the
+    /// next page for a requested cancellation, and within
+    /// SNAPSHOT_COUNT_CHECKPOINT_PAGES pages for a native timeout or a spent
+    /// budget, which only a full checkpoint sees; a healthy context never
+    /// stops it.
+    #[test]
+    fn test_snapshot_count_stop_observes_requests_at_once_and_native_signals_per_interval() {
+        let interval = SNAPSHOT_COUNT_CHECKPOINT_PAGES;
+        let cx = Cx::new();
+        let pages = AtomicU32::new(0);
+        assert!((0..10 * interval).all(|_| !snapshot_count_should_stop(&cx, &pages)));
+        cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+        assert!(snapshot_count_should_stop(&cx, &pages));
+        for signal in [AggregateSignal::NativeTimeout, AggregateSignal::NativeBudget] {
+            let cx = Cx::new();
+            match signal {
+                AggregateSignal::NativeTimeout => {
+                    let native = asupersync::Cx::for_testing();
+                    native.set_cancel_reason(asupersync::types::CancelReason::timeout());
+                    cx.set_native_cx(native);
+                }
+                AggregateSignal::NativeBudget => {
+                    cx.set_native_cx(asupersync::Cx::for_testing_with_budget(
+                        asupersync::Budget::INFINITE.with_poll_quota(0),
+                    ));
+                }
+                AggregateSignal::Requested => unreachable!("tested above"),
+            }
+            let pages = AtomicU32::new(0);
+            let stopped_at = (1..=2 * interval).find(|_| snapshot_count_should_stop(&cx, &pages));
+            assert!(
+                stopped_at.is_some_and(|page| page <= interval),
+                "{signal:?}: stopped at {stopped_at:?}"
+            );
         }
     }
 

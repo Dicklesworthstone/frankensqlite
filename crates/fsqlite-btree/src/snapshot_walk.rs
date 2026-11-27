@@ -606,6 +606,109 @@ pub fn count_entries_parallel(
     Ok(Some(i64::try_from(total).unwrap_or(i64::MAX)))
 }
 
+/// Leaf pages from which [`count_entries_on_this_thread`] walks a tree.
+///
+/// The size at which a walk is worth a second thread. A smaller tree stays on
+/// the cursor path, whose pages the shared page cache keeps between
+/// statements; a snapshot walk reads every page from the file again.
+pub const SNAPSHOT_COUNT_MIN_LEAF_PAGES: u64 = 2 * LEAF_PAGES_PER_THREAD;
+
+/// What the last [`count_entries_on_this_thread`] on a thread counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotCountRecord {
+    /// The split's estimate of the tree's leaf pages.
+    pub leaf_pages: u64,
+    /// Leaf pages the walk counted.
+    pub leaves_walked: u64,
+    /// Whether it gave a count (`false`: `stop` ended it).
+    pub counted: bool,
+}
+
+thread_local! {
+    static LAST_SNAPSHOT_COUNT: Cell<Option<SnapshotCountRecord>> = const { Cell::new(None) };
+}
+
+/// Take what the last [`count_entries_on_this_thread`] on this thread walked.
+///
+/// Leaves `None` (bd-read-miss-path-cost-w8msq). A tree it left to the cursor
+/// path records nothing.
+pub fn take_last_snapshot_count() -> Option<SnapshotCountRecord> {
+    LAST_SNAPSHOT_COUNT.with(Cell::take)
+}
+
+/// Entries of the b-tree rooted at `root`, counted on the calling thread alone.
+///
+/// They are counted as [`count_entries_parallel`] counts them: the count of a
+/// statement allowed one thread (bd-read-miss-path-cost-w8msq). It reads each
+/// page into one reused buffer, where the cursor path takes it through the
+/// transaction, the page cache and the VFS, at several times the cost.
+///
+/// `Ok(None)` when the tree has fewer than [`SNAPSHOT_COUNT_MIN_LEAF_PAGES`]
+/// leaf pages, or when `stop` ended the walk; the caller then runs its cursor
+/// count. It asks for no thread and records no [`ParallelWalk::run`].
+pub fn count_entries_on_this_thread(
+    reader: &SnapshotPageReader,
+    root: PageNumber,
+    usable_size: u32,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<i64>> {
+    // A database of fewer pages holds no such tree: leave it without a read.
+    if u64::from(reader.db_size()) < SNAPSHOT_COUNT_MIN_LEAF_PAGES {
+        return Ok(None);
+    }
+    let split = split_subtrees(reader, root, usable_size, 2)?;
+    if split.leaf_pages < SNAPSHOT_COUNT_MIN_LEAF_PAGES {
+        return Ok(None);
+    }
+    let mut buf = reader.new_buffer();
+    let is_index = {
+        let page = cell::usable_prefix(reader.read_page(root, &mut buf)?, usable_size);
+        cell::parse_page_header(page, root)?.page_type.is_index()
+    };
+    let mut stack = Vec::new();
+    let mut leaf_cells = 0_u64;
+    let mut interior_cells = 0_u64;
+    let mut leaves_walked = 0_u64;
+    let mut counted = true;
+    for &subtree in &split.subtrees {
+        let walked = walk_subtree(
+            reader,
+            &mut buf,
+            &mut stack,
+            subtree,
+            usable_size,
+            stop,
+            &mut |leaf| {
+                leaf_cells += u64::from(leaf.header.cell_count);
+                leaves_walked += 1;
+                Ok(true)
+            },
+        )?;
+        match walked {
+            Some(cells) => interior_cells += cells,
+            None => {
+                counted = false;
+                break;
+            }
+        }
+    }
+    LAST_SNAPSHOT_COUNT.with(|last| {
+        last.set(Some(SnapshotCountRecord {
+            leaf_pages: split.leaf_pages,
+            leaves_walked,
+            counted,
+        }));
+    });
+    if !counted {
+        return Ok(None);
+    }
+    let mut total = leaf_cells;
+    if is_index {
+        total += split.cells_above + interior_cells;
+    }
+    Ok(Some(i64::try_from(total).unwrap_or(i64::MAX)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

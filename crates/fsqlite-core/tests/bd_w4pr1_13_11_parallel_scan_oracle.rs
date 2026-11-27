@@ -7,8 +7,10 @@
 //! file-backed WAL database read its snapshot through a
 //! `fsqlite_pager::SnapshotPageReader` on N threads. Every answer here must
 //! equal stock's at every N, and N = 1 must take the serial path (no
-//! parallel walk recorded on the thread). The walk's own record of the
-//! threads that did work is the evidence that a parallel plan ran.
+//! parallel walk recorded on the thread); there a `count(*)` of a tree worth a
+//! second thread reads the snapshot on the connection's own thread
+//! (bd-read-miss-path-cost-w8msq). The walk's own record of the threads that
+//! did work is the evidence that a parallel plan ran.
 //!
 //! Two operators use it: `count(*)` of a table or index b-tree (the `Count`
 //! opcode), and ungrouped `count` / `sum` / `min` / `max` over a filtered
@@ -19,7 +21,10 @@
 //! alias, rows ALTER TABLE left short, payloads on overflow pages, and the
 //! shapes that must stay serial.
 
-use fsqlite_btree::snapshot_walk::{SerialReason, WalkRecord, take_last_parallel_walk};
+use fsqlite_btree::snapshot_walk::{
+    SNAPSHOT_COUNT_MIN_LEAF_PAGES, SerialReason, SnapshotCountRecord, WalkRecord,
+    take_last_parallel_walk, take_last_snapshot_count,
+};
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
@@ -175,6 +180,80 @@ fn parallel_count_stays_serial_inside_a_transaction_and_sees_own_writes() {
     });
 }
 
+/// bd-read-miss-path-cost-w8msq: with one worker, an autocommit `count(*)` of
+/// a tree worth a second thread counts it through the snapshot reader on the
+/// connection's own thread (no parallel walk, no helper thread). A smaller
+/// tree stays on the cursor path, and so does every count inside an explicit
+/// transaction, concurrent or not, with or without its own writes.
+#[test]
+fn one_worker_count_walks_the_snapshot_on_its_own_thread() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("one.db");
+        let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+        f.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE big(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);",
+            "CREATE TABLE ix(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);",
+            "CREATE INDEX ix_a ON ix(a);",
+            "CREATE TABLE small(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);",
+        ] {
+            both(&f, &r, sql).await;
+        }
+        // Some 300 table leaves for `big`, some 150 index leaves for `ix`, and
+        // some 15 table leaves for `small`: the first two are worth a second
+        // thread, the third is not.
+        both(&f, &r, &fill("big", 60_000)).await;
+        both(&f, &r, &fill("ix", 60_000)).await;
+        both(&f, &r, &fill("small", 3_000)).await;
+        set_workers(&f, 1).await;
+        let walked = |sql: &str, record: Option<SnapshotCountRecord>| {
+            let record = record.unwrap_or_else(|| panic!("`{sql}` did not walk the snapshot"));
+            assert!(record.counted, "`{sql}`: {record:?}");
+            assert!(
+                record.leaves_walked >= SNAPSHOT_COUNT_MIN_LEAF_PAGES
+                    && record.leaves_walked >= record.leaf_pages,
+                "`{sql}`: {record:?}"
+            );
+        };
+        for sql in ["SELECT count(*) FROM big;", "SELECT count(*) FROM ix;"] {
+            let _ = take_last_parallel_walk();
+            let _ = take_last_snapshot_count();
+            assert_eq!(frank(&f, sql).await, stock(&r, sql), "`{sql}`");
+            assert_eq!(take_last_parallel_walk(), None, "`{sql}` ran a parallel walk");
+            walked(sql, take_last_snapshot_count());
+        }
+        let sql = "SELECT count(*) FROM small;";
+        assert_eq!(frank(&f, sql).await, stock(&r, sql));
+        assert_eq!(take_last_snapshot_count(), None, "a small tree walked the snapshot");
+
+        // Explicit transactions keep their counts on the cursors: the default
+        // concurrent BEGIN, and a plain one with concurrent mode off.
+        let sql = "SELECT count(*) FROM big;";
+        for (setup, begin) in [
+            (None, "BEGIN;"),
+            (Some("PRAGMA fsqlite.concurrent_mode = OFF;"), "BEGIN;"),
+            (Some("PRAGMA fsqlite.concurrent_mode = OFF;"), "BEGIN DEFERRED;"),
+        ] {
+            if let Some(setup) = setup {
+                f.execute(setup).await.unwrap();
+            }
+            both(&f, &r, begin).await;
+            assert_eq!(frank(&f, sql).await, stock(&r, sql), "{begin} read");
+            assert_eq!(take_last_snapshot_count(), None, "{setup:?} {begin}: read walked");
+            both(&f, &r, "DELETE FROM big WHERE id % 7 = 0;").await;
+            assert_eq!(frank(&f, sql).await, stock(&r, sql), "{begin} after its own delete");
+            assert_eq!(take_last_snapshot_count(), None, "{setup:?} {begin}: write walked");
+            both(&f, &r, "ROLLBACK;").await;
+        }
+        f.execute("PRAGMA fsqlite.concurrent_mode = ON;").await.unwrap();
+        // Back in autocommit, the count walks the snapshot again.
+        assert_eq!(frank(&f, sql).await, stock(&r, sql));
+        walked(sql, take_last_snapshot_count());
+    });
+}
+
 #[test]
 fn parallel_count_reads_one_committed_snapshot_while_a_writer_commits() {
     const BASE: i64 = 30_000;
@@ -248,7 +327,9 @@ fn parallel_count_reads_one_committed_snapshot_while_a_writer_commits() {
 /// equal stock's, and a `stop` that fires mid-walk ends it with no answer.
 #[test]
 fn snapshot_walk_counts_a_stock_written_file_and_stops_when_asked() {
-    use fsqlite_btree::snapshot_walk::{count_entries_parallel, split_subtrees};
+    use fsqlite_btree::snapshot_walk::{
+        count_entries_on_this_thread, count_entries_parallel, split_subtrees,
+    };
     use fsqlite_pager::SnapshotPageReader;
     use fsqlite_types::PageNumber;
     use std::sync::Arc;
@@ -330,6 +411,43 @@ fn snapshot_walk_counts_a_stock_written_file_and_stops_when_asked() {
         ),
         Ok(Some(count)) => panic!("counted {count} rows of a truncated snapshot"),
     }
+
+    // bd-read-miss-path-cost-w8msq: the same counts on the calling thread
+    // alone. They record no parallel walk and walk every leaf once.
+    for root in [table_root, index_root] {
+        let _ = take_last_parallel_walk();
+        let counted = count_entries_on_this_thread(&reader, root, 4096, &never).unwrap();
+        assert_eq!(counted, Some(rows), "root={}", root.get());
+        assert_eq!(take_last_parallel_walk(), None);
+        let record = take_last_snapshot_count().expect("a one-thread count records its walk");
+        assert!(record.counted && record.leaves_walked >= record.leaf_pages, "{record:?}");
+    }
+    // Asked to stop before the first page, or after 50 of a tree of hundreds:
+    // no answer, and the record says the walk did not finish.
+    assert_eq!(count_entries_on_this_thread(&reader, table_root, 4096, &|| true).unwrap(), None);
+    assert!(!take_last_snapshot_count().expect("stopped walk").counted);
+    let polls = AtomicUsize::new(0);
+    let later = || polls.fetch_add(1, Ordering::Relaxed) >= 50;
+    assert_eq!(count_entries_on_this_thread(&reader, table_root, 4096, &later).unwrap(), None);
+    let record = take_last_snapshot_count().expect("stopped walk");
+    // `stop` is asked once before each page is read: 50 pages read, and the
+    // 51st ask ends the walk. Pages read are leaves plus any interior pages
+    // under the split, so at most 50 leaves.
+    assert_eq!(polls.load(Ordering::Relaxed), 51, "{record:?}");
+    assert!(!record.counted && record.leaves_walked <= 50, "{record:?}");
+    // A page past the snapshot's end is an error, not a short count.
+    assert!(count_entries_on_this_thread(&short, table_root, 4096, &never).is_err());
+    // A tree under SNAPSHOT_COUNT_MIN_LEAF_PAGES leaves is left to the cursor
+    // path, unwalked.
+    r.execute_batch("CREATE TABLE s(x); INSERT INTO s VALUES (1), (2), (3);").unwrap();
+    let small = SnapshotPageReader::new(
+        Arc::new(std::fs::File::open(&path).unwrap()),
+        None,
+        4096,
+        u32::try_from(std::fs::metadata(&path).unwrap().len() / 4096).unwrap(),
+    );
+    assert_eq!(count_entries_on_this_thread(&small, root("s"), 4096, &never).unwrap(), None);
+    assert_eq!(take_last_snapshot_count(), None);
 }
 
 /// bd-w4pr1.13.11 sizing: a tree of one interior level over a few leaves

@@ -29410,12 +29410,14 @@ impl Connection {
     }
 
     /// Threads a scan of the statement about to run may use (bd-w4pr1.13.11):
-    /// `PRAGMA fsqlite.parallel_workers` for an autocommit statement, 1 inside
+    /// `PRAGMA fsqlite.parallel_workers` for an autocommit statement, 0 inside
     /// an explicit transaction, whose reads may need conflict tracking and
-    /// whose own writes a snapshot reader would not see.
+    /// whose own writes a snapshot reader would not see: there every scan
+    /// stays on the statement's cursors, a one-thread snapshot count
+    /// included (bd-read-miss-path-cost-w8msq).
     fn statement_parallel_workers(&self) -> usize {
         if self.in_transaction.get() || self.concurrent_txn.get() {
-            1
+            0
         } else {
             self.parallel_workers.get()
         }
