@@ -701,3 +701,72 @@ fn bd_l7z39_index_xinfo_and_index_info_without_rowid_pk_collation_desc_oracle() 
         native_outer.close().await.expect("close outer");
     });
 }
+
+#[test]
+fn clustered_primary_key_collations_govern_writes_and_secondary_locators_after_reopen() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clustered.db");
+        let reference = rusqlite::Connection::open_in_memory().unwrap();
+        let mut db = Connection::open(path.to_str().unwrap()).await.unwrap();
+        for sql in [
+            "CREATE TABLE t(k TEXT COLLATE NOCASE, v TEXT UNIQUE, PRIMARY KEY(k COLLATE BINARY DESC)) WITHOUT ROWID",
+            "INSERT INTO t VALUES('A','one')",
+            "INSERT OR REPLACE INTO t VALUES('a','two')",
+            "CREATE INDEX by_column ON t(k,v)",
+            "CREATE INDEX by_key ON t(k COLLATE BINARY,v)",
+            "CREATE TABLE n(k TEXT, v TEXT, PRIMARY KEY(k COLLATE NOCASE)) WITHOUT ROWID",
+            "INSERT INTO n VALUES('Alpha','first')",
+            "INSERT OR IGNORE INTO n VALUES('alpha','ignored')",
+            "CREATE TABLE r(k TEXT, id INT, v TEXT, PRIMARY KEY(k COLLATE NOCASE,k COLLATE BINARY,id,id DESC)) WITHOUT ROWID",
+            "INSERT INTO r VALUES('A',1,'one'),('a',1,'two')",
+            "CREATE INDEX by_repeated_key ON r(k COLLATE NOCASE)",
+            "CREATE TABLE audit(k TEXT, old_v TEXT, new_v TEXT)",
+            "CREATE TRIGGER t_updates AFTER UPDATE OF v ON t BEGIN INSERT INTO audit VALUES(OLD.k,OLD.v,NEW.v); END",
+        ] {
+            reference.execute_batch(sql).unwrap();
+            db.execute(sql).await.unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+        let probes = [
+            "SELECT k,v FROM t WHERE k='a' ORDER BY k COLLATE BINARY",
+            "SELECT k,v FROM t INDEXED BY by_column ORDER BY k COLLATE BINARY",
+            "SELECT k,v FROM t INDEXED BY by_key ORDER BY k COLLATE BINARY",
+            "SELECT k,v FROM n WHERE k='alpha'",
+            "SELECT k,v FROM n ORDER BY k",
+            "SELECT k,id,v FROM r INDEXED BY by_repeated_key ORDER BY k COLLATE BINARY",
+            "SELECT k,old_v,new_v FROM audit ORDER BY rowid",
+            "PRAGMA integrity_check",
+        ];
+        for stage in ["created", "reopened", "updated"] {
+            if stage == "reopened" {
+                db.close().await.unwrap();
+                db = Connection::open(path.to_str().unwrap()).await.unwrap();
+            }
+            if stage == "updated" {
+                for sql in [
+                    "UPDATE OR IGNORE t SET k='a' WHERE v='one'",
+                    "UPDATE t SET v=v||'!' WHERE k='a'",
+                    "UPDATE n SET k='ALPHA' WHERE v='first'",
+                    "INSERT OR REPLACE INTO n VALUES('alpha','replacement')",
+                    "UPDATE r SET v='updated' WHERE k COLLATE BINARY='A'",
+                    "DELETE FROM r WHERE k COLLATE BINARY='a'",
+                    "REINDEX by_column",
+                    "REINDEX by_repeated_key",
+                ] {
+                    reference.execute_batch(sql).unwrap();
+                    db.execute(sql).await.unwrap_or_else(|error| panic!("{sql}: {error}"));
+                }
+            }
+            for sql in probes {
+                let expected = stock_pragma_rows(&reference, sql);
+                let actual = db.query(sql).await.unwrap();
+                assert_eq!(actual.iter().map(row_values).collect::<Vec<_>>(), expected, "{stage}: {sql}");
+            }
+        }
+        db.close().await.unwrap();
+        let stock = rusqlite::Connection::open(path).unwrap();
+        for sql in probes {
+            assert_eq!(stock_pragma_rows(&stock, sql), stock_pragma_rows(&reference, sql), "native file opened by stock: {sql}");
+        }
+    });
+}

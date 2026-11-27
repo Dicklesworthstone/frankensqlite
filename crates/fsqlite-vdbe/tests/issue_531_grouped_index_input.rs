@@ -44,6 +44,7 @@ fn schema(key_affinity: char, index_columns: &[&str]) -> Vec<TableSchema> {
         strict: false,
         without_rowid: false,
         without_rowid_pk_conflict: None,
+        without_rowid_pk_terms: Vec::new(),
         primary_key_constraints: Vec::new(),
         foreign_keys: Vec::new(),
         check_constraints: Vec::new(),

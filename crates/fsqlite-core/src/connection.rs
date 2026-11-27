@@ -260,7 +260,8 @@ use fsqlite_vdbe::codegen::{
     codegen_insert,
     codegen_select, codegen_update, emit_backfill_column_read, emit_backfill_key_expr,
     emit_scan_filter, join_select_seeks_outer_table, join_select_uses_lookup,
-    parse_autoindex_ordinal, without_rowid_index_appended_pk, without_rowid_pk_indices,
+    parse_autoindex_ordinal, without_rowid_index_appended_pk, without_rowid_index_appended_pk_slots,
+    without_rowid_pk_indices,
     without_rowid_pk_ordinal,
 };
 #[cfg(not(test))]
@@ -49260,7 +49261,7 @@ impl Connection {
                         self.reset_statement_change_count();
                         return Ok(Vec::new());
                     }
-                    effective_delete.where_clause = Some(Self::locator_rows_filter(
+                    effective_delete.where_clause = Some(self.locator_rows_filter(
                         &effective_delete.table,
                         &locator_columns,
                         locator_rows,
@@ -51199,6 +51200,7 @@ impl Connection {
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -64021,7 +64023,7 @@ impl Connection {
                 .materialize_dml_replay_locators(table_ref, where_clause, params)
                 .await?
                 .map(|(locator_columns, locator_rows)| {
-                    Self::locator_rows_filter(table_ref, &locator_columns, locator_rows)
+                    self.locator_rows_filter(table_ref, &locator_columns, locator_rows)
                 })
                 .transpose();
         }
@@ -64122,10 +64124,12 @@ impl Connection {
                 pk_indices
                     .into_iter()
                     .zip(desc_flags)
-                    .map(|(column, descending)| WithoutRowidKeyTerm {
+                    .enumerate()
+                    .map(|(slot, (column, descending))| WithoutRowidKeyTerm {
                         column,
-                        descending,
-                        collation: table.columns[column].collation.clone(),
+                        descending: table.without_rowid_pk_terms.get(slot)
+                            .map_or(descending, |(_, direction)| *direction == SortDirection::Desc),
+                        collation: table.without_rowid_pk_collation(slot, column).map(str::to_owned),
                     })
                     .collect(),
             ))
@@ -64206,9 +64210,14 @@ impl Connection {
         fn pinned_columns<'e>(
             expr: &'e Expr,
             table_ref: &fsqlite_ast::QualifiedTableRef,
-            out: &mut Vec<&'e str>,
+            out: &mut Vec<(&'e str, Option<&'e str>)>,
         ) {
-            let target_column = |expr: &'e Expr| match expr {
+            let target_column = |expr: &'e Expr| {
+                let (expr, explicit_collation) = match expr {
+                    Expr::Collate { expr, collation, .. } => (expr.as_ref(), Some(collation.as_str())),
+                    other => (other, None),
+                };
+                match expr {
                 Expr::Column(column, _)
                     if column.schema.is_none()
                         && column.table.as_deref().is_none_or(|qualifier| {
@@ -64218,9 +64227,10 @@ impl Connection {
                             )
                         }) =>
                 {
-                    Some(&*column.column)
+                    Some((&*column.column, explicit_collation))
                 }
                 _ => None,
+                }
             };
             match expr {
                 Expr::BinaryOp {
@@ -64259,13 +64269,19 @@ impl Connection {
         if pinned.is_empty() {
             return false;
         }
-        let is_pinned = |name: &str| pinned.iter().any(|column| column.eq_ignore_ascii_case(name));
+        let is_pinned = |name: &str| pinned.iter().any(|(column, _)| column.eq_ignore_ascii_case(name));
         self.with_dml_target_table(table_ref, |table| {
             if table.without_rowid {
                 without_rowid_pk_indices(table).is_ok_and(|indices| {
                     !indices.is_empty()
-                        && indices.into_iter().all(|index| {
-                            table.columns.get(index).is_some_and(|column| is_pinned(&column.name))
+                        && indices.into_iter().enumerate().all(|(slot, index)| {
+                            let column = &table.columns[index];
+                            let key_collation = table.without_rowid_pk_collation(slot, index).unwrap_or("BINARY");
+                            pinned.iter().any(|&(name, explicit)| {
+                                column.name.eq_ignore_ascii_case(name)
+                                    && explicit.or(column.collation.as_deref()).unwrap_or("BINARY")
+                                        .eq_ignore_ascii_case(key_collation)
+                            })
                         })
                 })
             } else {
@@ -64552,7 +64568,32 @@ impl Connection {
         Ok(set_pairs)
     }
 
+    fn replay_locator_expr(
+        &self,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        name: &str,
+        slot: usize,
+    ) -> Result<Expr> {
+        let expr = Self::build_limit_scope_projection_expr(table_ref, name);
+        self.with_dml_target_table(table_ref, |table| {
+            if table.without_rowid
+                && let Some(column) = table.column_index(name)
+                && !table.without_rowid_pk_matches_column(slot, column)
+            {
+                Expr::Collate {
+                    expr: Box::new(expr),
+                    collation: table.without_rowid_pk_collation(slot, column)
+                        .unwrap_or("BINARY").to_owned(),
+                    span: Span::ZERO,
+                }
+            } else {
+                expr
+            }
+        })
+    }
+
     fn build_update_replay_locator_filter(
+        &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
         locator_columns: &[String],
         locator_values: Vec<Expr>,
@@ -64568,19 +64609,20 @@ impl Connection {
         let mut predicates = locator_columns
             .iter()
             .zip(locator_values)
-            .map(|(column, value)| Expr::BinaryOp {
-                left: Box::new(Self::build_limit_scope_projection_expr(table_ref, column)),
+            .enumerate()
+            .map(|(slot, (column, value))| Ok(Expr::BinaryOp {
+                left: Box::new(self.replay_locator_expr(table_ref, column, slot)?),
                 op: BinaryOp::Eq,
                 right: Box::new(value),
                 span: Span::ZERO,
-            });
+            }));
         let first = predicates.next().ok_or_else(|| {
             FrankenError::Internal("UPDATE row replay locator cannot be empty".to_owned())
-        })?;
-        Ok(predicates.fold(first, |left, right| Expr::BinaryOp {
+        })??;
+        predicates.try_fold(first, |left, right: Result<Expr>| Ok(Expr::BinaryOp {
             left: Box::new(left),
             op: BinaryOp::And,
-            right: Box::new(right),
+            right: Box::new(right?),
             span: Span::ZERO,
         }))
     }
@@ -64590,6 +64632,7 @@ impl Connection {
     /// one-column locator, otherwise an OR of per-row key equalities, built
     /// balanced so a large row set does not nest one level per row.
     fn locator_rows_filter(
+        &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
         locator_columns: &[String],
         locator_rows: Vec<Vec<SqliteValue>>,
@@ -64603,7 +64646,7 @@ impl Connection {
                     FrankenError::Internal("DML row locator is missing its key".to_owned())
                 })?;
             return Ok(Expr::In {
-                expr: Box::new(Self::build_limit_scope_projection_expr(table_ref, key)),
+                expr: Box::new(self.replay_locator_expr(table_ref, key, 0)?),
                 set: InSet::List(values),
                 not: false,
                 span: Span::ZERO,
@@ -64612,7 +64655,7 @@ impl Connection {
         let mut terms = locator_rows
             .into_iter()
             .map(|row| {
-                Self::build_update_replay_locator_filter(
+                self.build_update_replay_locator_filter(
                     table_ref,
                     locator_columns,
                     row.into_iter().map(value_to_literal_expr).collect(),
@@ -64646,6 +64689,7 @@ impl Connection {
     /// `set_values` are the expressions standing for the row's values, either
     /// literals or bind parameters.
     fn build_dml_replay_row_statement(
+        &self,
         statement: DmlRowReplay<'_>,
         locator_columns: &[String],
         locator_values: Vec<Expr>,
@@ -64674,7 +64718,7 @@ impl Connection {
                         value,
                     })
                     .collect();
-                row_update.where_clause = Some(Self::build_update_replay_locator_filter(
+                row_update.where_clause = Some(self.build_update_replay_locator_filter(
                     &update.table,
                     locator_columns,
                     locator_values,
@@ -64685,7 +64729,7 @@ impl Connection {
             }
             DmlRowReplay::Update(update) => {
                 let mut row_update = update.clone();
-                row_update.where_clause = Some(Self::build_update_replay_locator_filter(
+                row_update.where_clause = Some(self.build_update_replay_locator_filter(
                     &update.table,
                     locator_columns,
                     locator_values,
@@ -64696,7 +64740,7 @@ impl Connection {
             }
             DmlRowReplay::Delete(delete) => {
                 let mut row_delete = delete.clone();
-                row_delete.where_clause = Some(Self::build_update_replay_locator_filter(
+                row_delete.where_clause = Some(self.build_update_replay_locator_filter(
                     &delete.table,
                     locator_columns,
                     locator_values,
@@ -64711,6 +64755,7 @@ impl Connection {
     /// bd-h7hox: `SELECT <SET values> FROM <target> WHERE <locator>`, which
     /// reads one row's SET values for an `UpdateEvaluated` replay.
     fn build_update_row_set_select(
+        &self,
         update: &fsqlite_ast::UpdateStatement,
         locator_columns: &[String],
         locator_values: Vec<Expr>,
@@ -64722,7 +64767,7 @@ impl Connection {
                 alias: None,
             })
             .collect();
-        let locator = Self::build_update_replay_locator_filter(
+        let locator = self.build_update_replay_locator_filter(
             &update.table,
             locator_columns,
             locator_values,
@@ -64755,7 +64800,7 @@ impl Connection {
             self.execute_statement(set_select, Some(&select_params))
                 .await?
         } else {
-            let literal_select = Self::build_update_row_set_select(
+            let literal_select = self.build_update_row_set_select(
                 update,
                 locator_columns,
                 locator_row.iter().cloned().map(value_to_literal_expr).collect(),
@@ -65074,13 +65119,13 @@ impl Connection {
             let locator_slots: Vec<Expr> = slots.by_ref().take(locator_columns.len()).collect();
             let set_slots = slots.take(set_count).collect();
             if let Some(update) = set_source {
-                parameterized_set_select = Some(Self::build_update_row_set_select(
+                parameterized_set_select = Some(self.build_update_row_set_select(
                     update,
                     locator_columns,
                     locator_slots.clone(),
                 )?);
             }
-            let row_statement = Self::build_dml_replay_row_statement(
+            let row_statement = self.build_dml_replay_row_statement(
                 statement,
                 locator_columns,
                 locator_slots,
@@ -65145,7 +65190,7 @@ impl Connection {
                     row_params.extend_from_slice(locator_row);
                     (parameterized, Some(row_params.as_slice()))
                 } else {
-                    let built = Self::build_dml_replay_row_statement(
+                    let built = self.build_dml_replay_row_statement(
                         statement,
                         locator_columns,
                         locator_values.iter().cloned().map(value_to_literal_expr).collect(),
@@ -68841,6 +68886,7 @@ impl Connection {
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -68974,6 +69020,7 @@ impl Connection {
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -76985,6 +77032,7 @@ impl Connection {
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -77017,6 +77065,7 @@ impl Connection {
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -77860,7 +77909,6 @@ impl Connection {
         let rowid_alias_columns = self.rowid_alias_columns.borrow();
         let autoincrement_tables = self.autoincrement_tables.borrow();
         let without_rowid_pk_desc = self.without_rowid_pk_desc.borrow();
-        let original_ddl = self.original_ddl_sql.borrow();
         let temp_names = self.temp_table_names.borrow();
         let mut wr_binary_ascending_roots = Vec::new();
         let mut wr_index_suffix_roots = Vec::new();
@@ -77916,75 +77964,21 @@ impl Connection {
                     real_columns_by_root_page.insert(table.root_page, Arc::from(real));
                 }
             }
-            // Inspect the original AST, not column names alone: table-level PK
-            // terms can override column collation and direction. Cache this
-            // once per schema generation, not once per trigger invocation.
-            // TEMP shadowing has a separate DDL namespace; decline it here.
-            if table.without_rowid
-                && !temp_names.contains(&table_name_key)
-                && let Some(sql) = original_ddl.get(&table_name_key)
-                && let Ok(Statement::CreateTable(create)) = parse_single_statement(sql)
-                && create.without_rowid
-                && let CreateTableBody::Columns {
-                    columns,
-                    constraints,
-                } = &create.body
-                && let Ok(slots) = implicit_autoindex_layout(columns, constraints, true)
-                && let Some(pk) = slots
-                    .iter()
-                    .find(|slot| slot.hidden_without_rowid_primary_key)
-                && table.primary_key_constraints.first() == Some(&pk.definition.columns)
+            // A table carries its bound clustered key across live creation and
+            // schema reload. Bare-column range probes additionally need the
+            // column's comparison to agree with the ascending BINARY key.
+            if table.without_rowid && !temp_names.contains(&table_name_key)
+                && !table.without_rowid_pk_terms.is_empty()
+                && let Ok(pk) = without_rowid_pk_indices(table)
+                && pk.len() == table.without_rowid_pk_terms.len()
             {
-                // The compact TableSchema loses a table-level PK COLLATE
-                // override. Do not infer the suffix from column defaults in
-                // that case: retain the existing handling until that metadata
-                // reaches DML codegen too. DESC and inherited non-BINARY
-                // collations are fully represented and are safe here.
-                let collations_match_columns = pk.definition.key_collations.len()
-                    == pk.definition.columns.len()
-                    && pk.definition.columns.iter().zip(&pk.definition.key_collations).all(
-                        |(name, pk_collation)| {
-                            table.column_index(name).is_some_and(|column| {
-                                table.columns[column]
-                                    .collation
-                                    .as_deref()
-                                    .unwrap_or("BINARY")
-                                    .eq_ignore_ascii_case(pk_collation.as_deref().unwrap_or("BINARY"))
-                            })
-                        },
-                    );
-                let directions_match = without_rowid_pk_desc
-                    .get(&table_name_key)
-                    .is_some_and(|flags| {
-                        flags.len() == pk.definition.columns.len()
-                            && pk.definition.key_sort_directions.len() == flags.len()
-                            && flags.iter().zip(&pk.definition.key_sort_directions).all(
-                                |(descending, direction)| {
-                                    *descending == (*direction == SortDirection::Desc)
-                                },
-                            )
-                    });
-                if collations_match_columns && directions_match {
-                    wr_index_suffix_roots.push(table.root_page);
-                }
-                if collations_match_columns
-                    && pk
-                        .definition
-                        .key_sort_directions
-                        .iter()
-                        .all(|direction| *direction == SortDirection::Asc)
-                    && pk.definition.key_collations.iter().all(|collation| {
-                        collation
-                            .as_deref()
+                wr_index_suffix_roots.push(table.root_page);
+                if pk.iter().enumerate().all(|(slot, &column)| {
+                    table.without_rowid_pk_matches_column(slot, column)
+                        && table.without_rowid_pk_terms[slot].1 == SortDirection::Asc
+                        && table.without_rowid_pk_collation(slot, column)
                             .is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
-                    })
-                    && without_rowid_pk_desc
-                        .get(&table_name_key)
-                        .is_some_and(|flags| {
-                            flags.len() == pk.definition.columns.len()
-                                && flags.iter().all(|descending| !descending)
-                        })
-                {
+                }) {
                     wr_binary_ascending_roots.push(table.root_page);
                 }
             }
@@ -78080,21 +78074,10 @@ impl Connection {
                     // INDEX suffixes inherit the declared PK direction.
                     let inherits_pk_direction =
                         parse_autoindex_ordinal(&index.name, &table.name).is_none();
-                    let pk_desc = without_rowid_pk_desc
-                        .get(&table_name_key)
-                        .filter(|flags| flags.len() == pk.len());
-                    for column in without_rowid_index_appended_pk(table, index, pk) {
-                        let position = pk.iter().position(|&pk_column| pk_column == column);
-                        descending.push(
-                            inherits_pk_direction
-                                && position
-                                    .and_then(|position| {
-                                        pk_desc.and_then(|flags| flags.get(position))
-                                    })
-                                    .copied()
-                                    .unwrap_or(false),
-                        );
-                        collations.push(table.columns[column].collation.clone());
+                    for slot in without_rowid_index_appended_pk_slots(table, index, pk) {
+                        descending.push(inherits_pk_direction
+                            && table.without_rowid_pk_terms[slot].1 == SortDirection::Desc);
+                        collations.push(table.without_rowid_pk_collation(slot, pk[slot]).map(str::to_owned));
                     }
                 }
                 index_desc_flags_by_root_page.insert(index.root_page, descending);
@@ -78108,25 +78091,19 @@ impl Connection {
             if table.without_rowid
                 && let Some(pk_cols) = table.primary_key_constraints.first()
             {
-                // bd-w9r11 (GH#222/#223): honor declared PK direction. The
-                // AST-derived registry keeps what primary_key_constraints
-                // (names only) discards; absent entries (legacy snapshots)
-                // conservatively fall back to all-ascending.
-                let desc_flags: Vec<bool> = without_rowid_pk_desc
-                    .get(&table_name_key)
-                    .filter(|flags| flags.len() == pk_cols.len())
-                    .cloned()
-                    .unwrap_or_else(|| pk_cols.iter().map(|_| false).collect());
-                let collations: Vec<Option<String>> = pk_cols
-                    .iter()
-                    .map(|name| {
-                        table
-                            .columns
-                            .iter()
-                            .find(|column| column.name.eq_ignore_ascii_case(name))
-                            .and_then(|column| column.collation.clone())
-                    })
-                    .collect();
+                let desc_flags = if table.without_rowid_pk_terms.len() == pk_cols.len() {
+                    table.without_rowid_pk_terms.iter()
+                        .map(|(_, direction)| *direction == SortDirection::Desc).collect()
+                } else {
+                    without_rowid_pk_desc.get(&table_name_key)
+                        .filter(|flags| flags.len() == pk_cols.len())
+                        .cloned().unwrap_or_else(|| vec![false; pk_cols.len()])
+                };
+                let collations = pk_cols.iter().enumerate().map(|(slot, name)| {
+                    table.column_index(name)
+                        .and_then(|column| table.without_rowid_pk_collation(slot, column))
+                        .map(str::to_owned)
+                }).collect();
                 index_desc_flags_by_root_page.insert(table.root_page, desc_flags);
                 index_collations_by_root_page.insert(table.root_page, collations);
             }
@@ -78927,6 +78904,10 @@ impl Connection {
                     }
                 }
 
+                let mut primary_key_constraints = primary_key_constraints;
+                let without_rowid_pk_terms = implicit_autoindex_slots.iter()
+                    .find_map(|slot| slot.without_rowid_pk_terms(&mut primary_key_constraints))
+                    .unwrap_or_default();
                 let table_schema = TableSchema {
                     name: table_name,
                     root_page,
@@ -78934,6 +78915,7 @@ impl Connection {
                     indexes: implicit_indexes,
                     strict: create.strict,
                     without_rowid: create.without_rowid,
+                    without_rowid_pk_terms,
                     without_rowid_pk_conflict: implicit_autoindex_slots
                         .iter()
                         .find_map(ImplicitAutoindexSlot::without_rowid_pk_conflict),
@@ -79155,6 +79137,7 @@ impl Connection {
                 strict: false,
                 without_rowid: false,
                 without_rowid_pk_conflict: None,
+                without_rowid_pk_terms: Vec::new(),
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -79223,6 +79206,7 @@ impl Connection {
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -91104,6 +91088,7 @@ impl Connection {
                         strict: false,
                         without_rowid: false,
                         without_rowid_pk_conflict: None,
+                        without_rowid_pk_terms: Vec::new(),
                         primary_key_constraints: Vec::new(),
                         foreign_keys: Vec::new(),
                         check_constraints: Vec::new(),
@@ -91260,6 +91245,7 @@ impl Connection {
                     strict: false,
                     without_rowid: false,
                     without_rowid_pk_conflict: None,
+                    without_rowid_pk_terms: Vec::new(),
                     primary_key_constraints: Vec::new(),
                     foreign_keys: Vec::new(),
                     check_constraints: Vec::new(),
@@ -118382,6 +118368,7 @@ impl Connection {
                         strict: false,
                         without_rowid: false,
                         without_rowid_pk_conflict: None,
+                        without_rowid_pk_terms: Vec::new(),
                         primary_key_constraints: Vec::new(),
                         foreign_keys: Vec::new(),
                         check_constraints: Vec::new(),
@@ -118475,6 +118462,7 @@ impl Connection {
                     strict: false,
                     without_rowid: false,
                     without_rowid_pk_conflict: None,
+                    without_rowid_pk_terms: Vec::new(),
                     primary_key_constraints: Vec::new(),
                     foreign_keys: Vec::new(),
                     check_constraints: Vec::new(),
@@ -118728,6 +118716,7 @@ impl Connection {
                 strict: false,
                 without_rowid: false,
                 without_rowid_pk_conflict: None,
+                without_rowid_pk_terms: Vec::new(),
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -128360,6 +128349,10 @@ impl Connection {
                     },
                 );
 
+                let mut primary_key_constraints = primary_key_constraints;
+                let without_rowid_pk_terms = bound_table_autoindexes.into_iter().flat_map(|bound| bound.implicit_slots())
+                    .find_map(|slot| slot.without_rowid_pk_terms(&mut primary_key_constraints))
+                    .unwrap_or_default();
                 new_schema.push(TableSchema {
                     name: name.to_string(),
                     root_page: real_root_page,
@@ -128370,6 +128363,7 @@ impl Connection {
                         |create| create.strict,
                     ),
                     without_rowid,
+                    without_rowid_pk_terms,
                     without_rowid_pk_conflict: bound_table_autoindexes.and_then(|bound| {
                         bound.implicit_slots().find_map(ImplicitAutoindexSlot::without_rowid_pk_conflict)
                     }),
@@ -128578,6 +128572,7 @@ impl Connection {
                     strict: false,
                     without_rowid: false,
                     without_rowid_pk_conflict: None,
+                    without_rowid_pk_terms: Vec::new(),
                     primary_key_constraints: Vec::new(),
                     foreign_keys: Vec::new(),
                     check_constraints: Vec::new(),
@@ -140888,7 +140883,24 @@ where
         }
         let cols = pk
             .iter()
-            .map(|name| maybe_quote_ident(name))
+            .enumerate()
+            .map(|(slot, name)| {
+                let mut term = maybe_quote_ident(name);
+                if let Some((_, direction)) = table.without_rowid_pk_terms.get(slot) {
+                    if let Some(column) = table.column_index(name)
+                        && !table.without_rowid_pk_matches_column(slot, column)
+                    {
+                        term.push_str(" COLLATE ");
+                        let collation = table.without_rowid_pk_collation(slot, column)
+                            .unwrap_or("BINARY");
+                        term.push_str(&fsqlite_ast::quote_ident_if_needed(collation));
+                    }
+                    if *direction == SortDirection::Desc {
+                        term.push_str(" DESC");
+                    }
+                }
+                term
+            })
             .collect::<Vec<_>>()
             .join(", ");
         defs.push(format!("PRIMARY KEY ({cols})"));
@@ -150998,6 +151010,7 @@ fn rewrite_probe_is_correlated(conn: &Connection, sub: &SelectStatement) -> bool
         strict: false,
         without_rowid: false,
         without_rowid_pk_conflict: None,
+        without_rowid_pk_terms: Vec::new(),
         primary_key_constraints: Vec::new(),
         foreign_keys: Vec::new(),
         check_constraints: Vec::new(),
@@ -157514,6 +157527,33 @@ impl ImplicitAutoindexSlot {
     #[must_use]
     pub(crate) fn columns(&self) -> &[String] {
         &self.definition.columns
+    }
+
+    #[must_use]
+    pub(crate) fn without_rowid_pk_terms(
+        &self,
+        primary_keys: &mut [Vec<String>],
+    ) -> Option<Vec<(Option<String>, SortDirection)>> {
+        if !self.hidden_without_rowid_primary_key {
+            return None;
+        }
+        let columns = primary_keys.first_mut()?;
+        let mut physical = Vec::<String>::new();
+        let mut terms = Vec::<(Option<String>, SortDirection)>::new();
+        for ((name, collation), &direction) in self.definition.columns.iter()
+            .zip(&self.definition.key_collations).zip(&self.definition.key_sort_directions)
+        {
+            if physical.iter().zip(&terms).any(|(other, (previous, _))| {
+                other.eq_ignore_ascii_case(name)
+                    && implicit_autoindex_collations_match(previous.as_deref(), collation.as_deref())
+            }) {
+                continue;
+            }
+            physical.push(name.clone());
+            terms.push((collation.clone(), direction));
+        }
+        *columns = physical;
+        Some(terms)
     }
 
     #[must_use]
@@ -267845,6 +267885,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -267889,6 +267930,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -267956,6 +267998,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -268007,6 +268050,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -268054,6 +268098,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -268086,6 +268131,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             strict: false,
             without_rowid: primary_key.is_some(),
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: primary_key
                 .map(|name| vec![vec![name.to_owned()]])
                 .unwrap_or_default(),
@@ -287562,6 +287608,7 @@ mod pager_routing_tests {
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -295721,6 +295768,7 @@ mod pager_routing_tests {
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -295770,6 +295818,7 @@ mod pager_routing_tests {
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -295821,6 +295870,7 @@ mod pager_routing_tests {
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -295869,6 +295919,7 @@ mod pager_routing_tests {
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -295926,6 +295977,7 @@ mod pager_routing_tests {
             strict: false,
             without_rowid: false,
             without_rowid_pk_conflict: None,
+            without_rowid_pk_terms: Vec::new(),
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -310483,6 +310535,7 @@ mod pager_routing_tests {
                 strict: false,
                 without_rowid: false,
                 without_rowid_pk_conflict: None,
+                without_rowid_pk_terms: Vec::new(),
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -310495,6 +310548,7 @@ mod pager_routing_tests {
                 strict: false,
                 without_rowid: false,
                 without_rowid_pk_conflict: None,
+                without_rowid_pk_terms: Vec::new(),
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -310525,6 +310579,7 @@ mod pager_routing_tests {
                 strict: false,
                 without_rowid: false,
                 without_rowid_pk_conflict: None,
+                without_rowid_pk_terms: Vec::new(),
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -310537,6 +310592,7 @@ mod pager_routing_tests {
                 strict: false,
                 without_rowid: false,
                 without_rowid_pk_conflict: None,
+                without_rowid_pk_terms: Vec::new(),
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),

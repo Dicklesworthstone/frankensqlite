@@ -1156,6 +1156,7 @@ mod tests {
                 strict: false,
                 without_rowid: false,
                 without_rowid_pk_conflict: None,
+                without_rowid_pk_terms: Vec::new(),
                 primary_key_constraints: vec![vec!["id".to_owned()]],
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
