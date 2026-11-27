@@ -566,6 +566,122 @@ pub(crate) async fn balance_quick_known_divider_rowid<W: PageWriter>(
     }))
 }
 
+/// Rightmost `LeafTable` append split when the parent interior page is full
+/// (bd-71uar).
+///
+/// Unlike [`balance_quick_known_divider_rowid`], which returns `Ok(None)` when
+/// the parent cannot accept one more divider without splitting, this preserves
+/// 100% packing on `leaf_page_no`, places only `overflow_cell` onto a fresh
+/// rightmost leaf, and delegates the parent update (and interior split) to
+/// [`apply_child_replacement`]. Falling through to `balance_nonroot` instead
+/// would redistribute 3 already-packed rightmost leaves into 4 partially full
+/// leaves (`[6, 7, 7, 5]` instead of `[8, 8, 8, 1]`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn balance_quick_with_parent_split<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    parent_page_no: PageNumber,
+    child_idx: usize,
+    leaf_page_no: PageNumber,
+    leaf_image: Option<PageData>,
+    overflow_cell: &[u8],
+    divider_rowid: i64,
+    usable_size: u32,
+    page_size: u32,
+    parent_is_root: bool,
+) -> Result<Option<BalanceResult>> {
+    let parent_data = writer.read_page_data(cx, parent_page_no).await?;
+    let parent_header = parse_page_header(parent_data.as_bytes(), parent_page_no)?;
+    if parent_header.page_type != BtreePageType::InteriorTable
+        || parent_header.right_child != Some(leaf_page_no)
+        || child_idx != usize::from(parent_header.cell_count)
+    {
+        return Ok(None);
+    }
+
+    let cell_size = overflow_cell.len();
+    let Some(content_start) = (usable_size as usize).checked_sub(cell_size) else {
+        return Ok(None);
+    };
+    if content_start < usize::from(BTREE_LEAF_HEADER_SIZE) + usize::from(CELL_POINTER_SIZE) {
+        return Ok(None);
+    }
+
+    let mut divider = [0u8; 13];
+    divider[0..4].copy_from_slice(&leaf_page_no.get().to_be_bytes());
+    #[allow(clippy::cast_sign_loss)]
+    let varint_size = write_varint(&mut divider[4..], divider_rowid as u64);
+    let divider_size = 4 + varint_size;
+
+    // bd-ujp0h: keep the old rightmost leaf in the write-conflict set so a
+    // concurrent rightmost appender cannot commit a key past `divider_rowid`.
+    if !writer.claim_write_conflict_page(cx, leaf_page_no).await? {
+        let leaf_data = match leaf_image {
+            Some(image) => image,
+            None => writer.read_page_data(cx, leaf_page_no).await?,
+        };
+        writer.write_page_data(cx, leaf_page_no, leaf_data).await?;
+    }
+
+    let new_pgno = writer.allocate_page(cx).await?;
+    let new_offset = header_offset_for_page(new_pgno);
+    if content_start
+        < new_offset + usize::from(BTREE_LEAF_HEADER_SIZE) + usize::from(CELL_POINTER_SIZE)
+    {
+        let _ = writer.free_page(cx, new_pgno).await;
+        return Ok(None);
+    }
+
+    let mut new_page = vec![0u8; page_size as usize];
+    let new_header = BtreePageHeader {
+        page_type: BtreePageType::LeafTable,
+        first_freeblock: 0,
+        cell_count: 1,
+        #[allow(clippy::cast_possible_truncation)]
+        cell_content_offset: content_start as u32,
+        fragmented_free_bytes: 0,
+        right_child: None,
+    };
+    new_header.write(&mut new_page, new_offset);
+
+    #[allow(clippy::cast_possible_truncation)]
+    let cell_ptr = content_start as u16;
+    let ptr_offset = new_offset + usize::from(BTREE_LEAF_HEADER_SIZE);
+    new_page[ptr_offset..ptr_offset + 2].copy_from_slice(&cell_ptr.to_be_bytes());
+    new_page[content_start..content_start + cell_size].copy_from_slice(overflow_cell);
+
+    if let Err(err) = writer
+        .write_page_data(cx, new_pgno, PageData::from_vec(new_page))
+        .await
+    {
+        let _ = writer.free_page(cx, new_pgno).await;
+        return Err(err);
+    }
+
+    let new_pgnos = [leaf_page_no, new_pgno];
+    let new_dividers = [(leaf_page_no, divider[..divider_size].to_vec())];
+    match apply_child_replacement(
+        cx,
+        writer,
+        parent_page_no,
+        usable_size,
+        page_size,
+        child_idx,
+        1,
+        &new_pgnos,
+        &new_dividers,
+        parent_is_root,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(Some(outcome)),
+        Err(err) => {
+            let _ = writer.free_page(cx, new_pgno).await;
+            Err(err)
+        }
+    }
+}
+
 async fn quick_balance_divider_rowid<W: PageWriter>(
     cx: &Cx,
     writer: &W,
@@ -2123,6 +2239,15 @@ fn compute_interior_distribution(
     usable_size: u32,
     hdr_size: usize,
 ) -> Result<Vec<usize>> {
+    compute_interior_distribution_with_mode(cells, usable_size, hdr_size, false)
+}
+
+fn compute_interior_distribution_with_mode(
+    cells: &[GatheredCell],
+    usable_size: u32,
+    hdr_size: usize,
+    rightmost_append: bool,
+) -> Result<Vec<usize>> {
     let usable_space = usable_size as usize;
     let total_cells = cells.len();
     if total_cells == 0 {
@@ -2185,6 +2310,9 @@ fn compute_interior_distribution(
 
     // Pass 2: equalize adjacent pages, right-most boundary first, so each
     // boundary sees the already-adjusted size of the page to its right.
+    // For a rightmost `InteriorTable` append (bd-71uar), skip equalization so
+    // the left interior page stays packed (~99% full like stock SQLite) and
+    // only ensure the rightmost page holds at least one cell.
     let page_count = ends.len();
     let pointer_size = usize::from(CELL_POINTER_SIZE);
     for right in (1..page_count).rev() {
@@ -2201,6 +2329,9 @@ fn compute_interior_distribution(
         };
         // The left page must keep at least one cell.
         while ends[left] > left_start + 1 {
+            if rightmost_append && size_right != 0 {
+                break;
+            }
             let promoted = ends[left] - 1;
             let demoted = ends[left];
             let right_after = size_right + costs[demoted];
@@ -2580,6 +2711,10 @@ pub(crate) async fn apply_child_replacement<W: PageWriter>(
     }
 
     if !page_fits(&final_cells, header.page_type, offset, usable_size) {
+        let rightmost_table_append = header.page_type == BtreePageType::InteriorTable
+            && touches_rightmost
+            && old_sibling_count == 1
+            && new_dividers.len() == 1;
         if !parent_is_root {
             let (new_pgnos, new_dividers) = split_overflowing_nonroot_interior_page(
                 cx,
@@ -2592,6 +2727,7 @@ pub(crate) async fn apply_child_replacement<W: PageWriter>(
                 page_data.as_bytes(),
                 &final_cells,
                 right_child,
+                rightmost_table_append,
             )
             .await?;
             return Ok(BalanceResult::Split {
@@ -2611,6 +2747,7 @@ pub(crate) async fn apply_child_replacement<W: PageWriter>(
             &page_data.as_bytes()[..offset],
             &final_cells,
             right_child,
+            rightmost_table_append,
         )
         .await?;
         return Ok(BalanceResult::Done);
@@ -2789,6 +2926,7 @@ async fn split_overflowing_root<W: PageWriter>(
     root_prefix: &[u8],
     final_cells: &[GatheredCell<'_>],
     right_child: Option<PageNumber>,
+    rightmost_table_append: bool,
 ) -> Result<()> {
     if !page_type.is_interior() {
         return Err(FrankenError::DatabaseCorrupt {
@@ -2812,10 +2950,11 @@ async fn split_overflowing_root<W: PageWriter>(
     // Newly promoted index keys can be much larger than the separators they
     // replace. A midpoint by cell count can leave one child overfull even
     // though the same cells admit a valid byte-balanced split.
-    let distribution = compute_interior_distribution(
+    let distribution = compute_interior_distribution_with_mode(
         final_cells,
         usable_size,
         usize::from(page_type.header_size()),
+        rightmost_table_append,
     )?;
     let mut ranges = Vec::with_capacity(distribution.len());
     let mut dividers = Vec::with_capacity(distribution.len().saturating_sub(1));
@@ -2962,6 +3101,7 @@ async fn split_overflowing_nonroot_interior_page<W: PageWriter>(
     original_page: &[u8],
     final_cells: &[GatheredCell<'_>],
     right_child: Option<PageNumber>,
+    rightmost_table_append: bool,
 ) -> Result<SplitPagesAndDividers> {
     if !page_type.is_interior() {
         return Err(FrankenError::DatabaseCorrupt {
@@ -2985,7 +3125,71 @@ async fn split_overflowing_nonroot_interior_page<W: PageWriter>(
     let mut chosen_dividers: Option<Vec<Vec<u8>>> = None;
     let mut chosen_right_children: Option<Vec<PageNumber>> = None;
 
+    // bd-71uar: on a rightmost `InteriorTable` append, left-pack the existing
+    // interior page instead of splitting it 50/50 so sequential table growth
+    // keeps interior pages dense at depth >= 3.
+    if rightmost_table_append
+        && let Ok(distribution) = compute_interior_distribution_with_mode(
+            final_cells,
+            usable_size,
+            page_offset + usize::from(page_type.header_size()),
+            true,
+        )
+        && distribution.len() >= 2
+    {
+        let mut ranges = Vec::with_capacity(distribution.len());
+        let mut dividers = Vec::with_capacity(distribution.len().saturating_sub(1));
+        let mut right_children = Vec::with_capacity(distribution.len());
+        let mut start = 0usize;
+        let mut valid = true;
+        for (i, &count) in distribution.iter().enumerate() {
+            let end = start + count;
+            if count == 0 || end > final_cells.len() {
+                valid = false;
+                break;
+            }
+            let off = if i == 0 { page_offset } else { 0 };
+            if !page_fits(&final_cells[start..end], page_type, off, usable_size) {
+                valid = false;
+                break;
+            }
+            ranges.push((start, end));
+            if i + 1 < distribution.len() {
+                let Some(divider) = final_cells.get(end).map(|c| &c.data) else {
+                    valid = false;
+                    break;
+                };
+                if divider.len() < 4 {
+                    valid = false;
+                    break;
+                }
+                let raw = u32::from_be_bytes([divider[0], divider[1], divider[2], divider[3]]);
+                let Some(rc) = PageNumber::new(raw) else {
+                    valid = false;
+                    break;
+                };
+                dividers.push(divider.to_vec());
+                right_children.push(rc);
+                start = end + 1;
+            } else {
+                right_children.push(page_right_child);
+            }
+        }
+        if valid
+            && ranges.len() == distribution.len()
+            && dividers.len() == distribution.len().saturating_sub(1)
+            && right_children.len() == distribution.len()
+        {
+            chosen_ranges = Some(ranges);
+            chosen_dividers = Some(dividers);
+            chosen_right_children = Some(right_children);
+        }
+    }
+
     for child_count in 2usize..=8usize {
+        if chosen_ranges.is_some() {
+            break;
+        }
         if final_cells.len() < child_count.saturating_mul(2).saturating_sub(1) {
             break;
         }
@@ -5426,6 +5630,7 @@ mod tests {
                     &[],
                     &cells,
                     Some(pn(1_083)),
+                    false,
                 )
                 .await
                 .expect("clustered long keys admit a byte-balanced root split");
@@ -5499,6 +5704,7 @@ mod tests {
                 &prefix,
                 &cells,
                 Some(pn(2_000)),
+                false,
             )
             .await
             .expect("page-one header overflow needs only one full child");
@@ -5718,6 +5924,7 @@ mod tests {
                 &original_page,
                 &final_cells,
                 Some(pn(9_999)),
+                false,
             )
             .await;
             assert!(result.is_err(), "injected write failure should surface");
@@ -6155,6 +6362,148 @@ mod tests {
             assert_eq!(store.inner.pages.get(&2), Some(&parent_original));
             assert_eq!(store.inner.pages.get(&3), Some(&left_original));
             assert_eq!(store.inner.pages.get(&4), Some(&mid_original));
+        });
+    }
+
+    /// bd-71uar: rightmost `InteriorTable` append distribution keeps the left
+    /// interior page packed (~99% full) and places one divider on the new right
+    /// interior page, while non-append distribution continues to equalize 50/50.
+    #[test]
+    fn test_bd_71uar_compute_interior_distribution_rightmost_append_left_packs() {
+        // 510 uniform 6-byte interior cells (each costs 6 + 2 = 8 bytes);
+        // 4096 - 12 = 4084 usable bytes -> fits 510 cells? 510 * 8 = 4080 <= 4084,
+        // so 511 cells overflow by 1 cell into 2 pages.
+        let raw_cells: Vec<Vec<u8>> = (1..=511u32)
+            .map(|i| {
+                let mut cell = Vec::with_capacity(6);
+                cell.extend_from_slice(&i.to_be_bytes());
+                cell.extend_from_slice(&[0x81, 0x01]);
+                cell
+            })
+            .collect();
+        let gathered: Vec<GatheredCell<'_>> = raw_cells
+            .iter()
+            .map(|bytes| GatheredCell {
+                data: Cow::Borrowed(bytes.as_slice()),
+                size: u16::try_from(bytes.len()).unwrap(),
+            })
+            .collect();
+
+        let hdr_size = usize::from(BtreePageType::InteriorTable.header_size());
+        let equalized =
+            compute_interior_distribution_with_mode(&gathered, USABLE, hdr_size, false).unwrap();
+        assert_eq!(equalized.len(), 2);
+        assert!(
+            equalized[0].abs_diff(equalized[1]) <= 2,
+            "non-append should equalize 50/50, got {equalized:?}"
+        );
+
+        let right_packed =
+            compute_interior_distribution_with_mode(&gathered, USABLE, hdr_size, true).unwrap();
+        assert_eq!(
+            right_packed,
+            vec![509, 1],
+            "rightmost append should keep 509 cells on left, promote 1, and put 1 on right"
+        );
+    }
+
+    /// bd-71uar: when a rightmost `LeafTable` append overflows a full interior
+    /// root, `balance_quick_with_parent_split` keeps the rightmost leaf packed
+    /// (zero cells moved out) and left-packs the split interior root.
+    #[test]
+    fn test_bd_71uar_balance_quick_with_parent_split_keeps_leaf_packed_and_left_packs_root() {
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(600);
+            let payload = vec![b'a'; 200];
+            let packed_leaf_rows: Vec<(i64, &[u8])> =
+                (1..=19).map(|k| (k, payload.as_slice())).collect();
+            let packed_leaf = build_leaf_table(&packed_leaf_rows);
+
+            // Fill interior root page 2 until one more 6-byte divider overflows it.
+            // Usable interior space is 4096 - 12 = 4084 bytes:
+            //   rowids 1..=127:   127 * (5 + 2) =  889 bytes
+            //   rowids 128..=526: 399 * (6 + 2) = 3192 bytes
+            // Total = 4081 bytes (3 bytes free), so cell #527 (8 bytes) overflows.
+            let mut dividers = Vec::with_capacity(526);
+            for i in 0..526u32 {
+                dividers.push((pn(3 + i), i64::from(i + 1)));
+            }
+            let right_leaf_pgno = pn(586);
+            let root_page = build_interior_table(&dividers, right_leaf_pgno);
+            store.pages.insert(2, root_page);
+            store
+                .pages
+                .insert(right_leaf_pgno.get(), packed_leaf.clone());
+
+            let overflow_cell = build_leaf_table_cell(600, &payload);
+            // Fast path returns None because root is full.
+            assert!(
+                balance_quick_known_divider_rowid(
+                    &cx,
+                    &mut store,
+                    pn(2),
+                    right_leaf_pgno,
+                    Some(PageData::from_vec(packed_leaf.clone())),
+                    &overflow_cell,
+                    599,
+                    USABLE,
+                    USABLE,
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+
+            // Full-parent rightmost-append path preserves the packed leaf and
+            // splits the interior root with left-packing.
+            let outcome = balance_quick_with_parent_split(
+                &cx,
+                &mut store,
+                pn(2),
+                526,
+                right_leaf_pgno,
+                Some(PageData::from_vec(packed_leaf.clone())),
+                &overflow_cell,
+                599,
+                USABLE,
+                USABLE,
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("balance_quick_with_parent_split should succeed");
+            assert!(matches!(outcome, BalanceResult::Done));
+
+            // The old rightmost leaf stays 100% packed with all 19 cells untouched.
+            let old_leaf_hdr = parse_page_header(
+                store.pages.get(&right_leaf_pgno.get()).unwrap(),
+                right_leaf_pgno,
+            )
+            .unwrap();
+            assert_eq!(old_leaf_hdr.cell_count, 19);
+
+            // The split root now holds 1 divider pointing to a packed left interior
+            // child (525 cells) and a 1-cell right interior child.
+            let root_bytes = store.pages.get(&2).unwrap();
+            let root_hdr = parse_page_header(root_bytes, pn(2)).unwrap();
+            assert_eq!(root_hdr.page_type, BtreePageType::InteriorTable);
+            assert_eq!(root_hdr.cell_count, 1);
+            let root_ptrs = read_cell_pointers(root_bytes, &root_hdr, 0).unwrap();
+            let left_child_raw = u32::from_be_bytes(
+                root_bytes[usize::from(root_ptrs[0])..usize::from(root_ptrs[0]) + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let left_child = pn(left_child_raw);
+            let right_child = root_hdr.right_child.unwrap();
+            let left_hdr =
+                parse_page_header(store.pages.get(&left_child.get()).unwrap(), left_child).unwrap();
+            let right_hdr =
+                parse_page_header(store.pages.get(&right_child.get()).unwrap(), right_child)
+                    .unwrap();
+            assert_eq!(left_hdr.cell_count, 525);
+            assert_eq!(right_hdr.cell_count, 1);
         });
     }
 }

@@ -9788,8 +9788,35 @@ impl<P: PageWriter> BtCursor<P> {
         self.clear_seek_cache();
 
         if depth == 1 {
+            let root_entry = &self.stack[0];
+            let root_append_info = if root_entry.header.page_type == cell::BtreePageType::LeafTable
+                && self.root_page != PageNumber::ONE
+                && insert_idx == root_entry.header.cell_count
+                && root_entry.header.cell_count > 0
+                && let Some((_, n)) = read_varint(cell_data)
+                && let Some((rowid_u64, _)) = read_varint(&cell_data[n..])
+            {
+                #[allow(clippy::cast_possible_wrap)]
+                let rowid = rowid_u64 as i64;
+                let divider_rowid = self
+                    .rightmost_leaf_cache
+                    .as_ref()
+                    .filter(|cached| cached.page_no == root_entry.page_no)
+                    .map(|cached| cached.rowid)
+                    .unwrap_or_else(|| {
+                        Self::table_leaf_rowid_at(
+                            root_entry,
+                            root_entry.header.cell_count.saturating_sub(1),
+                        )
+                        .unwrap_or_else(|_| rowid.saturating_sub(1))
+                    });
+                (rowid > divider_rowid).then_some((rowid, divider_rowid))
+            } else {
+                None
+            };
+
             // Leaf is the root — push root down first.
-            balance::balance_deeper(
+            let child_pgno = balance::balance_deeper(
                 cx,
                 &mut self.pager,
                 self.root_page,
@@ -9798,6 +9825,50 @@ impl<P: PageWriter> BtCursor<P> {
             )
             .await?;
             self.note_split_event();
+
+            // bd-71uar: when sequentially appending to a full root table leaf,
+            // keep all existing cells packed on `child_pgno` and put only the
+            // new rightmost cell on a fresh leaf via `balance_quick` (matching
+            // SQLite's rightmost-append root split instead of a 50/50 split).
+            if let Some((rowid, divider_rowid)) = root_append_info {
+                let quick_balance_start = instrumentation::profile_start();
+                match balance::balance_quick_known_divider_rowid(
+                    cx,
+                    &mut self.pager,
+                    self.root_page,
+                    child_pgno,
+                    None,
+                    cell_data,
+                    divider_rowid,
+                    self.usable_size,
+                    self.page_size,
+                )
+                .await
+                {
+                    Ok(Some(result)) => {
+                        instrumentation::record_quick_balance_attempt(quick_balance_start, true);
+                        self.note_split_event();
+                        self.stack.clear();
+                        self.at_eof = true;
+                        self.last_known_depth = Some(2);
+                        self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
+                            page_no: result.new_pgno,
+                            rowid,
+                            tree_depth: 2,
+                            parent_page: Some(self.root_page),
+                            page_data: result.new_page_data,
+                            header: result.new_header,
+                            cell_pointers: vec![result.new_cell_ptr],
+                        });
+                        return Ok(());
+                    }
+                    Ok(None) => {
+                        instrumentation::record_quick_balance_attempt(quick_balance_start, false);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+
             // Root is now an interior page with 1 child at index 0.
             let outcome = balance::balance_nonroot(
                 cx,
@@ -9823,12 +9894,22 @@ impl<P: PageWriter> BtCursor<P> {
 
             // Attempt balance_quick optimization for sequential inserts.
             // This avoids full 3-sibling rewrites when just appending to the right.
-            let leaf_entry = &self.stack[depth - 1];
-            let parent_entry = &self.stack[depth - 2];
+            let (leaf_page_type, leaf_page_no, leaf_cell_count, parent_cell_count) = {
+                let leaf_entry = &self.stack[depth - 1];
+                let parent_entry = &self.stack[depth - 2];
+                (
+                    leaf_entry.header.page_type,
+                    leaf_entry.page_no,
+                    leaf_entry.header.cell_count,
+                    parent_entry.header.cell_count,
+                )
+            };
 
-            if leaf_entry.header.page_type == cell::BtreePageType::LeafTable
-                && insert_idx == leaf_entry.header.cell_count
-                && child_idx == parent_entry.header.cell_count as usize
+            let mut rightmost_parent_split_outcome: Option<balance::BalanceResult> = None;
+            if leaf_page_type == cell::BtreePageType::LeafTable
+                && insert_idx == leaf_cell_count
+                && leaf_cell_count > 0
+                && child_idx == parent_cell_count as usize
                 && let Some((_, n)) = read_varint(cell_data)
                 && let Some((rowid, _)) = read_varint(&cell_data[n..])
             {
@@ -9837,54 +9918,86 @@ impl<P: PageWriter> BtCursor<P> {
                 let divider_rowid = self
                     .rightmost_leaf_cache
                     .as_ref()
-                    .filter(|cached| cached.page_no == leaf_entry.page_no)
+                    .filter(|cached| cached.page_no == leaf_page_no)
                     .map(|cached| cached.rowid)
                     .unwrap_or_else(|| {
-                        Self::table_leaf_rowid_at(
-                            leaf_entry,
-                            leaf_entry.header.cell_count.saturating_sub(1),
-                        )
-                        .unwrap_or_else(|_| rowid.saturating_sub(1))
+                        let leaf_entry = &self.stack[depth - 1];
+                        Self::table_leaf_rowid_at(leaf_entry, leaf_cell_count.saturating_sub(1))
+                            .unwrap_or_else(|_| rowid.saturating_sub(1))
                     });
-                let quick_balance_start = instrumentation::profile_start();
-                match balance::balance_quick_known_divider_rowid(
-                    cx,
-                    &mut self.pager,
-                    parent_page_no,
-                    leaf_entry.page_no,
-                    Some(leaf_entry.page_data.clone()),
-                    cell_data,
-                    divider_rowid,
-                    self.usable_size,
-                    self.page_size,
-                )
-                .await
-                {
-                    Ok(Some(result)) => {
-                        instrumentation::record_quick_balance_attempt(quick_balance_start, true);
-                        self.note_split_event();
-                        self.stack.clear();
-                        self.at_eof = true;
-                        self.last_known_depth = Some(depth);
-                        self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
-                            page_no: result.new_pgno,
-                            rowid,
-                            tree_depth: depth,
-                            parent_page: Some(parent_page_no),
-                            page_data: result.new_page_data,
-                            header: result.new_header,
-                            cell_pointers: vec![result.new_cell_ptr],
-                        });
-                        return Ok(());
+                if rowid > divider_rowid {
+                    let leaf_page_data = self.stack[depth - 1].page_data.clone();
+                    let quick_balance_start = instrumentation::profile_start();
+                    match balance::balance_quick_known_divider_rowid(
+                        cx,
+                        &mut self.pager,
+                        parent_page_no,
+                        leaf_page_no,
+                        Some(leaf_page_data.clone()),
+                        cell_data,
+                        divider_rowid,
+                        self.usable_size,
+                        self.page_size,
+                    )
+                    .await
+                    {
+                        Ok(Some(result)) => {
+                            instrumentation::record_quick_balance_attempt(
+                                quick_balance_start,
+                                true,
+                            );
+                            self.note_split_event();
+                            self.stack.clear();
+                            self.at_eof = true;
+                            self.last_known_depth = Some(depth);
+                            self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
+                                page_no: result.new_pgno,
+                                rowid,
+                                tree_depth: depth,
+                                parent_page: Some(parent_page_no),
+                                page_data: result.new_page_data,
+                                header: result.new_header,
+                                cell_pointers: vec![result.new_cell_ptr],
+                            });
+                            return Ok(());
+                        }
+                        Ok(None) => {
+                            instrumentation::record_quick_balance_attempt(
+                                quick_balance_start,
+                                false,
+                            );
+                            // bd-71uar: when the parent interior page is full,
+                            // still keep the rightmost leaf 100% packed and
+                            // split the parent interior page instead of
+                            // tearing 3 packed leaves apart via balance_nonroot.
+                            if let Some(outcome) = balance::balance_quick_with_parent_split(
+                                cx,
+                                &mut self.pager,
+                                parent_page_no,
+                                child_idx,
+                                leaf_page_no,
+                                Some(leaf_page_data),
+                                cell_data,
+                                divider_rowid,
+                                self.usable_size,
+                                self.page_size,
+                                parent_is_root,
+                            )
+                            .await?
+                            {
+                                self.note_split_event();
+                                self.rightmost_leaf_cache = None;
+                                rightmost_parent_split_outcome = Some(outcome);
+                            }
+                        }
+                        Err(err) => return Err(err),
                     }
-                    Ok(None) => {
-                        instrumentation::record_quick_balance_attempt(quick_balance_start, false);
-                    }
-                    Err(err) => return Err(err),
                 }
             }
 
-            let mut outcome = if leaf_entry.header.page_type == cell::BtreePageType::LeafTable {
+            let mut outcome = if let Some(outcome) = rightmost_parent_split_outcome {
+                outcome
+            } else if leaf_page_type == cell::BtreePageType::LeafTable {
                 // bd-5qnn4: when a row-growing UPDATE overflows a table leaf
                 // while we are the sole transaction on this database, pack
                 // into an underfull adjacent leaf before splitting 1->2 so
@@ -9895,7 +10008,7 @@ impl<P: PageWriter> BtCursor<P> {
                         &mut self.pager,
                         parent_page_no,
                         child_idx,
-                        leaf_entry.page_no,
+                        leaf_page_no,
                         cell_data,
                         insert_idx as usize,
                         self.usable_size,
@@ -9916,7 +10029,7 @@ impl<P: PageWriter> BtCursor<P> {
                         &mut self.pager,
                         parent_page_no,
                         child_idx,
-                        leaf_entry.page_no,
+                        leaf_page_no,
                         cell_data,
                         insert_idx as usize,
                         self.usable_size,
@@ -21325,9 +21438,10 @@ mod tests {
             store.pages.insert(2, build_leaf_table(&[]));
             let cx = Cx::new();
             let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-            // 60-byte rows: several dozen to a leaf under one interior root.
+            // 50-byte rows: ~75 rows per packed leaf under one interior root,
+            // placing 127 and 128 well inside the second leaf (76..=150).
             for rowid in 1..=400_i64 {
-                cursor.table_insert(&cx, rowid, &[b'r'; 60]).await.unwrap();
+                cursor.table_insert(&cx, rowid, &[b'r'; 50]).await.unwrap();
             }
             assert_eq!(measure_tree_depth(&cursor.pager, pn(2), USABLE).await, 2);
 
