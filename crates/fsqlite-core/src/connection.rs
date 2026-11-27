@@ -100125,7 +100125,9 @@ impl Connection {
         let stat1_hints = self.sqlite_stat1_hints().await;
         let stat1_arg = (!stat1_hints.table_rows.is_empty()).then_some(&*stat1_hints);
         let pc = hot_path_profile_enabled().then(Instant::now);
-        let directive = Self::planner_select_directive_with_stats(select, schema, stat1_arg);
+        let directive = self.with_fallback_function_registry(|| {
+            Self::planner_select_directive_with_stats(select, schema, stat1_arg)
+        });
         record_hot_path_duration(&FSQLITE_PLAN_COMPUTE_NS, pc);
         self.insert_planner_directive_cache(key, canonical_sql, feature_flags, directive.clone());
         directive
@@ -100647,19 +100649,21 @@ impl Connection {
         let bypass_planner_cache = self.bypass_compiled_cache.get()
             || FSQLITE_PROGRAM_CACHE_FRONTED.with(std::cell::Cell::get)
                 && !FSQLITE_FORCE_PLANNER_CACHE_BENCH.with(std::cell::Cell::get);
-        let planner_select_directive = if self.like_or_glob_overridden.get() {
+        let planner_select_directive = if self.like_or_glob_overridden.get()
+            || self.has_implicit_aggregation_with_registry(canonical_select)
+        {
             // Planner directives do not retain the source predicate that
-            // produced an index range. Decline them conservatively because a
-            // LIKE/GLOB prefix rewrite is unsound after the corresponding
-            // scalar has been replaced; VDBE's ordinary equality/range
-            // heuristics remain available for unrelated predicates.
+            // produced an index range, and single-table non-aggregate
+            // directives must never divert an implicit-aggregate SELECT
+            // (including custom application aggregates) into a plain scan.
             None
         } else if bypass_planner_cache {
             let stat1_hints = self.sqlite_stat1_hints().await;
             let stat1_arg = (!stat1_hints.table_rows.is_empty()).then_some(&*stat1_hints);
             let pc = prof.then(Instant::now);
-            let directive =
-                Self::planner_select_directive_with_stats(canonical_select, schema, stat1_arg);
+            let directive = self.with_fallback_function_registry(|| {
+                Self::planner_select_directive_with_stats(canonical_select, schema, stat1_arg)
+            });
             record_hot_path_duration(&FSQLITE_PLAN_COMPUTE_NS, pc);
             directive
         } else {

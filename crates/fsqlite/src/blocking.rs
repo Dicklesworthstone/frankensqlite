@@ -1781,6 +1781,7 @@ impl Connection {
         let reprepare_count = stmt.reprepare_count();
         Ok(Statement {
             conn: self,
+            sql: sql.to_owned(),
             stmt: Box::new(stmt),
             bindings: vec![SqliteValue::Null; slots.count],
             slots,
@@ -2138,12 +2139,18 @@ impl BindIndex for &std::ffi::CStr {
 /// A compiled statement.
 pub struct Statement<'conn> {
     conn: &'conn Connection,
+    sql: String,
     stmt: Box<dyn EngineStatement + 'conn>,
     slots: Rc<BindParameterSlots>,
     bindings: Vec<SqliteValue>,
     names: Vec<String>,
     reprepare_count: u64,
 }
+
+/// Bounded retry budget for transparent `sqlite3_prepare_v2`-style re-prepare
+/// when a held statement is invalidated by `SQLITE_SCHEMA` (for example after
+/// redefining a user function or collation on the same connection).
+const MAX_SCHEMA_REPREPARE_RETRIES: usize = 5;
 
 impl fmt::Debug for Statement<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2164,6 +2171,48 @@ impl Statement<'_> {
             self.names = self.stmt.column_names();
             self.reprepare_count = current;
         }
+    }
+
+    fn reprepare_from_sql(&mut self) -> Result<()> {
+        let fresh = block_on(self.conn.as_async().prepare(&self.sql))?;
+        self.names = fresh.column_names();
+        self.reprepare_count = fresh.reprepare_count();
+        self.stmt = Box::new(fresh);
+        Ok(())
+    }
+
+    fn run_execute(&mut self) -> Result<usize> {
+        for attempt in 0..=MAX_SCHEMA_REPREPARE_RETRIES {
+            let result = self.stmt.execute(&self.bindings);
+            self.sync_metadata_if_reprepared();
+            match result {
+                Err(err)
+                    if attempt < MAX_SCHEMA_REPREPARE_RETRIES
+                        && err.sqlite_error_code() == Some(ErrorCode::SchemaChanged) =>
+                {
+                    self.reprepare_from_sql()?;
+                }
+                other => return other,
+            }
+        }
+        unreachable!("reprepare loop returns on the final attempt")
+    }
+
+    fn run_query(&mut self) -> Result<Vec<crate::Row>> {
+        for attempt in 0..=MAX_SCHEMA_REPREPARE_RETRIES {
+            let result = self.stmt.query(&self.bindings);
+            self.sync_metadata_if_reprepared();
+            match result {
+                Err(err)
+                    if attempt < MAX_SCHEMA_REPREPARE_RETRIES
+                        && err.sqlite_error_code() == Some(ErrorCode::SchemaChanged) =>
+                {
+                    self.reprepare_from_sql()?;
+                }
+                other => return other,
+            }
+        }
+        unreachable!("reprepare loop returns on the final attempt")
     }
 
     /// Run the statement with `params`; returns the number of rows changed.
@@ -2201,9 +2250,7 @@ impl Statement<'_> {
 
     /// Execute using the current bindings and return the number of rows changed.
     pub fn raw_execute(&mut self) -> Result<usize> {
-        let result = self.stmt.execute(&self.bindings);
-        self.sync_metadata_if_reprepared();
-        result
+        self.run_execute()
     }
 
     /// Query using the current bindings. The engine materializes the result at
@@ -2229,9 +2276,7 @@ impl Statement<'_> {
     /// Run the query; step through its rows with [`Rows::next`].
     pub fn query<P: Params>(&mut self, params: P) -> Result<Rows<'_>> {
         params.bind_to(&self.slots, &mut self.bindings)?;
-        let result = self.stmt.query(&self.bindings);
-        self.sync_metadata_if_reprepared();
-        let rows = result?;
+        let rows = self.run_query()?;
         Ok(Rows {
             stmt: Some(self),
             deferred: None,
@@ -2353,8 +2398,7 @@ impl<'stmt, 'conn: 'stmt> DeferredQuery<'stmt> for PendingQuery<'stmt, 'conn> {
 
     fn run(self: Box<Self>) -> (&'stmt Statement<'stmt>, Result<Vec<crate::Row>>) {
         let stmt = self.stmt;
-        let result = stmt.stmt.query(&stmt.bindings);
-        stmt.sync_metadata_if_reprepared();
+        let result = stmt.run_query();
         (stmt, result)
     }
 }
@@ -3931,7 +3975,7 @@ mod tests {
     }
 
     macro_rules! aggregate_scenario {
-        ($m:ident) => {{
+        ($m:ident, indexed_minmax_scans_all: $indexed_minmax_scans_all:expr) => {{
             use $m::functions::{Aggregate, Context, FunctionFlags};
 
             struct Sum {
@@ -4068,13 +4112,37 @@ mod tests {
             // inputs, must still invoke the registered implementation.
             conn.execute_batch("CREATE INDEX aggregate_values ON aggregate_data(value)")
                 .unwrap();
-            for name in ["min", "max"] {
-                conn.create_aggregate_function(name, 1, flags, Sum { factor: 1 })
+            for name in ["count", "sum"] {
+                conn.create_aggregate_function(name, 1, flags, Sum { factor: 10 })
                     .unwrap();
                 for argument in ["value", "value COLLATE NOCASE"] {
                     let sql = format!("SELECT {name}({argument}) FROM aggregate_data");
-                    assert_eq!(value(&conn, &sql), Some(8), "{sql}");
+                    assert_eq!(value(&conn, &sql), Some(80), "{sql}");
                 }
+            }
+            for (name, stock_indexed_extremum) in [("min", 10), ("max", 30)] {
+                conn.create_aggregate_function(name, 1, flags, Sum { factor: 10 })
+                    .unwrap();
+                // Non-indexed and collated inputs scan every row in both engines.
+                for sql in [
+                    format!("SELECT {name}(value COLLATE NOCASE) FROM aggregate_data"),
+                    format!("SELECT {name}(value) FROM aggregate_data NOT INDEXED"),
+                ] {
+                    assert_eq!(value(&conn, &sql), Some(80), "{sql}");
+                }
+                // On an indexed column, stock SQLite's minMaxQuery matches
+                // "min"/"max" by name (not SQLITE_FUNC_MINMAX) and stops after
+                // the single extremum row while still invoking our Sum { factor: 10 }
+                // callback (yielding 10/30 instead of builtin 1/3). FrankenSQLite
+                // disables one-row min/max seeks when min/max is overridden so
+                // every row feeds the registered aggregate (yielding 80).
+                let sql = format!("SELECT {name}(value) FROM aggregate_data");
+                let expected = if $indexed_minmax_scans_all {
+                    Some(80)
+                } else {
+                    Some(stock_indexed_extremum)
+                };
+                assert_eq!(value(&conn, &sql), expected, "{sql}");
             }
 
             // Function names are byte-limited, and empty quoted names are legal.
@@ -4128,8 +4196,8 @@ mod tests {
 
     #[test]
     fn user_aggregates_behave_like_rusqlite() {
-        aggregate_scenario!(stock);
-        aggregate_scenario!(ours);
+        aggregate_scenario!(stock, indexed_minmax_scans_all: false);
+        aggregate_scenario!(ours, indexed_minmax_scans_all: true);
     }
 
     macro_rules! aggregate_lifecycle_scenario {
@@ -4553,6 +4621,20 @@ mod tests {
                 text(&conn, "SELECT value FROM collated_items ORDER BY value"),
                 ["c", "b", "a"]
             );
+            assert_eq!(
+                text(
+                    &conn,
+                    "SELECT min(value COLLATE switch) FROM collated_items"
+                ),
+                ["c"]
+            );
+            assert_eq!(
+                text(
+                    &conn,
+                    "SELECT max(value COLLATE switch) FROM collated_items"
+                ),
+                ["a"]
+            );
 
             assert_eq!(integer(&conn, "SELECT 'x' = 'x ' COLLATE RTRIM"), 1);
             conn.create_collation("RTRIM", str::cmp).unwrap();
@@ -4565,6 +4647,13 @@ mod tests {
             assert_eq!(
                 text(&conn, "SELECT value FROM temp_items ORDER BY value"),
                 ["x", "x "]
+            );
+            assert_eq!(
+                integer(
+                    &conn,
+                    "SELECT count(DISTINCT value COLLATE RTRIM) FROM temp_items"
+                ),
+                2
             );
 
             let other = $m::Connection::open_in_memory().unwrap();

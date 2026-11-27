@@ -4949,7 +4949,9 @@ pub fn codegen_select(
         );
     }
 
-    if let Some(directive) = ctx.planner_select_directive.as_ref() {
+    if !is_aggregate
+        && let Some(directive) = ctx.planner_select_directive.as_ref()
+    {
         let bypass_reason = if !directive.table_name.eq_ignore_ascii_case(&table.name) {
             Some("table_mismatch")
         } else {
@@ -43055,7 +43057,7 @@ fn agg_column_matches_call(
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> bool {
-    if agg.name.is_empty() || agg.bare_expr.is_some() {
+    if (agg.name.is_empty() && !agg.multi_agg_indices.is_empty()) || agg.bare_expr.is_some() {
         return false;
     }
     if let Some(prior) = agg_expr {
@@ -53917,7 +53919,10 @@ fn emit_scalar_aggregate_subquery(
 
     // Separate real (hidden) aggregates from the output entry (which may
     // have a wrapper_expr for complex expressions like COUNT(*) - 1).
-    let real_aggs: Vec<&AggColumn> = agg_cols.iter().filter(|a| !a.name.is_empty()).collect();
+    let real_aggs: Vec<&AggColumn> = agg_cols
+        .iter()
+        .filter(|a| a.bare_expr.is_none() && (!a.name.is_empty() || a.multi_agg_indices.is_empty()))
+        .collect();
     let output_entry = agg_cols.last();
 
     // Allocate one accumulator per real aggregate.

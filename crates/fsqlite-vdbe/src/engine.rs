@@ -164,7 +164,7 @@ use fsqlite_btree::{
 use fsqlite_error::{
     ErrorCode, FrankenError, Result, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_ROWID,
 };
-use fsqlite_func::collation::CollationRegistry;
+use fsqlite_func::collation::{CollationFunction, CollationRegistry};
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{
     ApplicationFunctionKind, ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry,
@@ -10217,11 +10217,75 @@ impl RowSet {
 /// Stack-backed byte buffer for distinct keys (avoids heap allocation for small keys).
 type DistinctKeyBuf = smallvec::SmallVec<[u8; 64]>;
 
+/// Tuple key ordered by an application-registered or overridden collation for
+/// `DISTINCT` aggregate deduplication (`bd-o8j3c`).
+struct CollatedDistinctKey {
+    values: smallvec::SmallVec<[SqliteValue; 2]>,
+    collation: Arc<dyn CollationFunction>,
+}
+
+impl CollatedDistinctKey {
+    #[inline]
+    fn cmp_value(&self, lhs: &SqliteValue, rhs: &SqliteValue) -> Ordering {
+        match (lhs, rhs) {
+            (SqliteValue::Text(l), SqliteValue::Text(r)) => {
+                self.collation
+                    .compare(l.as_bytes_direct(), r.as_bytes_direct())
+            }
+            _ => lhs.cmp(rhs),
+        }
+    }
+}
+
+impl PartialEq for CollatedDistinctKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for CollatedDistinctKey {}
+
+impl PartialOrd for CollatedDistinctKey {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CollatedDistinctKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        for (lhs, rhs) in self.values.iter().zip(&other.values) {
+            let ord = self.cmp_value(lhs, rhs);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        self.values.len().cmp(&other.values.len())
+    }
+}
+
+enum DistinctSeen {
+    /// Fast O(1) hash path when the effective collation resolves to a built-in
+    /// implementation (`BINARY`, `NOCASE`, `RTRIM`).
+    Hashed(std::collections::HashSet<DistinctKeyBuf>),
+    /// Comparator-backed set when a custom collation or an overridden built-in
+    /// collation governs TEXT equality.
+    Collated {
+        collation: Arc<dyn CollationFunction>,
+        seen: BTreeSet<CollatedDistinctKey>,
+    },
+}
+
 struct AggregateContext {
     func: Arc<ErasedAggregateFunction>,
     state: Box<dyn Any + Send>,
-    /// When DISTINCT is active, tracks seen argument byte-keys to skip duplicates.
-    distinct_seen: Option<std::collections::HashSet<DistinctKeyBuf>>,
+    /// When DISTINCT is active, tracks seen arguments to skip duplicates.
+    distinct_seen: Option<DistinctSeen>,
+    /// Cached custom (or overridden built-in) collation for builtin `min`/`max`
+    /// steps so TEXT comparisons consult the registered comparator without
+    /// locking the collation registry per row.
+    min_max_custom_collation: Option<Arc<dyn CollationFunction>>,
 }
 
 /// The aggregate function resolved for the `AggStep` or `AggFinal` at one
@@ -10274,6 +10338,7 @@ struct AggStepCall<'a> {
     func: &'a Arc<ErasedAggregateFunction>,
     func_name: &'a str,
     agg_collation: Option<&'a str>,
+    collation_registry: &'a Arc<Mutex<CollationRegistry>>,
     execution_cx: &'a Cx,
     args: &'a [SqliteValue],
     /// Per-argument subtype tags (0 = untagged), parallel to `args`, so
@@ -20275,6 +20340,7 @@ impl VdbeEngine {
                     func: &func,
                     func_name,
                     agg_collation,
+                    collation_registry: &self.collation_registry,
                     execution_cx: &self.execution_cx,
                     args,
                     arg_subtypes: &arg_subtypes,
@@ -20294,6 +20360,7 @@ impl VdbeEngine {
                     func: &func,
                     func_name,
                     agg_collation,
+                    collation_registry: &self.collation_registry,
                     execution_cx: &self.execution_cx,
                     args: &args,
                     arg_subtypes: &arg_subtypes,
@@ -22657,19 +22724,47 @@ impl VdbeEngine {
         step: AggStepCall<'_>,
     ) -> Result<bool> {
         statement_cold_state.insert(StatementColdState::AGGREGATES);
+        let is_min_max = (step.func_name.eq_ignore_ascii_case("min")
+            || step.func_name.eq_ignore_ascii_case("max"))
+            && !step.args.is_empty()
+            && step.func.is_builtin_min_max();
         let ctx = cold_state
             .get_or_insert_with(|| Box::new(ColdVdbeState::new()))
             .aggregates
             .get_or_insert_with(step.accum_reg, || {
                 let state = step.func.initial_state();
+                let (distinct_seen, min_max_custom_collation) = if step.is_distinct || is_min_max {
+                    let registry = step
+                        .collation_registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let effective = step.agg_collation.unwrap_or("BINARY");
+                    let custom = if registry.uses_builtin_implementation(effective) {
+                        None
+                    } else {
+                        registry.find(effective)
+                    };
+                    let distinct_seen = if step.is_distinct {
+                        Some(match &custom {
+                            Some(collation) => DistinctSeen::Collated {
+                                collation: Arc::clone(collation),
+                                seen: BTreeSet::new(),
+                            },
+                            None => DistinctSeen::Hashed(std::collections::HashSet::new()),
+                        })
+                    } else {
+                        None
+                    };
+                    let min_max_custom_collation = if is_min_max { custom } else { None };
+                    (distinct_seen, min_max_custom_collation)
+                } else {
+                    (None, None)
+                };
                 AggregateContext {
                     func: step.func.clone(),
                     state,
-                    distinct_seen: if step.is_distinct {
-                        Some(std::collections::HashSet::new())
-                    } else {
-                        None
-                    },
+                    distinct_seen,
+                    min_max_custom_collation,
                 }
             })
             .ok_or_else(|| {
@@ -22688,10 +22783,15 @@ impl VdbeEngine {
         // DISTINCT removes duplicate argument values, including repeated
         // NULLs. Whether to ignore the first NULL belongs to the aggregate:
         // count/sum ignore it, while application functions and JSON may not.
-        let should_step = if let Some(ref mut seen) = ctx.distinct_seen {
-            seen.insert(distinct_key_collated(step.args, step.agg_collation))
-        } else {
-            true
+        let should_step = match ctx.distinct_seen.as_mut() {
+            Some(DistinctSeen::Hashed(seen)) => {
+                seen.insert(distinct_key_collated(step.args, step.agg_collation))
+            }
+            Some(DistinctSeen::Collated { collation, seen }) => seen.insert(CollatedDistinctKey {
+                values: step.args.iter().cloned().collect(),
+                collation: Arc::clone(collation),
+            }),
+            None => true,
         };
 
         observe_requested_execution_cancellation(step.execution_cx)?;
@@ -22703,27 +22803,25 @@ impl VdbeEngine {
             let min_max_collation = step.agg_collation.or_else(|| {
                 (!matches!(step.text_encoding, TextEncoding::Utf8)).then_some("BINARY")
             });
-            let is_min_max = (step.func_name.eq_ignore_ascii_case("min")
-                || step.func_name.eq_ignore_ascii_case("max"))
-                && !step.args.is_empty()
-                && ctx.func.is_builtin_min_max();
             if step.track_minmax_skip && is_min_max {
                 skipped = agg_step_min_max_tracked(
                     &mut ctx.state,
                     &step.args[0],
                     step.func_name.eq_ignore_ascii_case("max"),
                     min_max_collation,
+                    ctx.min_max_custom_collation.as_deref(),
                     step.text_encoding,
                 )?;
-            } else if let Some(collation) = min_max_collation
-                && is_min_max
+            } else if is_min_max
                 && !step.args[0].is_null()
+                && (min_max_collation.is_some() || ctx.min_max_custom_collation.is_some())
             {
                 agg_step_min_max_collated(
                     &mut ctx.state,
                     &step.args[0],
                     step.func_name.eq_ignore_ascii_case("max"),
-                    collation,
+                    min_max_collation.unwrap_or("BINARY"),
+                    ctx.min_max_custom_collation.as_deref(),
                     step.text_encoding,
                 );
             } else {
@@ -24723,13 +24821,17 @@ fn cmp_sqlite_values_collated(
     a: &SqliteValue,
     b: &SqliteValue,
     coll: &str,
+    custom_collation: Option<&dyn CollationFunction>,
     enc: TextEncoding,
 ) -> Ordering {
     match (a, b) {
         (SqliteValue::Text(l), SqliteValue::Text(r)) => {
-            builtin_collation_compare_text(l, r, coll, enc).unwrap_or_else(|| {
-                l.cmp_binary_in(r, enc)
-            })
+            if let Some(custom) = custom_collation {
+                custom.compare(l.as_bytes_direct(), r.as_bytes_direct())
+            } else {
+                builtin_collation_compare_text(l, r, coll, enc)
+                    .unwrap_or_else(|| l.cmp_binary_in(r, enc))
+            }
         }
         _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
     }
@@ -24740,6 +24842,7 @@ fn agg_step_min_max_collated(
     candidate: &SqliteValue,
     is_max: bool,
     coll: &str,
+    custom_collation: Option<&dyn CollationFunction>,
     enc: TextEncoding,
 ) {
     let current: &mut Option<SqliteValue> = state
@@ -24748,7 +24851,7 @@ fn agg_step_min_max_collated(
     match current {
         None => *current = Some(candidate.clone()),
         &mut Some(ref cur) => {
-            let ord = cmp_sqlite_values_collated(candidate, cur, coll, enc);
+            let ord = cmp_sqlite_values_collated(candidate, cur, coll, custom_collation, enc);
             if (is_max && ord == Ordering::Greater) || (!is_max && ord == Ordering::Less) {
                 *current = Some(candidate.clone());
             }
@@ -24766,6 +24869,7 @@ fn agg_step_min_max_tracked(
     candidate: &SqliteValue,
     is_max: bool,
     coll: Option<&str>,
+    custom_collation: Option<&dyn CollationFunction>,
     enc: TextEncoding,
 ) -> Result<bool> {
     let Some(current) = state.downcast_mut::<Option<SqliteValue>>() else {
@@ -24780,9 +24884,13 @@ fn agg_step_min_max_tracked(
         *current = Some(candidate.clone());
         return Ok(false);
     };
-    let ord = match coll {
-        Some(coll) => cmp_sqlite_values_collated(candidate, best, coll, enc),
-        None => candidate.cmp_binary_in(best, enc),
+    let ord = if let Some(custom) = custom_collation {
+        cmp_sqlite_values_collated(candidate, best, "BINARY", Some(custom), enc)
+    } else {
+        match coll {
+            Some(coll) => cmp_sqlite_values_collated(candidate, best, coll, None, enc),
+            None => candidate.cmp_binary_in(best, enc),
+        }
     };
     if (is_max && ord == Ordering::Greater) || (!is_max && ord == Ordering::Less) {
         *current = Some(candidate.clone());
