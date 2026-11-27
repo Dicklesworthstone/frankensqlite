@@ -2188,6 +2188,22 @@ impl GroupCommitQueue {
         combiner
     }
 
+    /// A commit readmitted across a WAL reset keeps its original transaction
+    /// snapshot, but its next certificate must follow the newly pinned durable
+    /// horizon. Only the allocator advances; pager/transaction visibility does
+    /// not. A queue with no combiner yet will import the authorized seed when
+    /// its first publication is prepared.
+    fn reconcile_readmitted_visibility_floor(&self, visible_commit_seq: CommitSeq) {
+        let combiner = self
+            .durability_combiner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(combiner) = combiner {
+            combiner.reconcile_durable_visibility_floor(visible_commit_seq);
+        }
+    }
+
     async fn prepare_persisted_epoch(
         &self,
         cx: &Cx,
@@ -13574,29 +13590,60 @@ async fn readmit_commit_read_claim<F: VfsFile + 'static>(
             conflicting_pages: COMMIT_READMISSION_RECOVERY_DETAIL.to_owned(),
         });
     }
-    let proven = {
+    let readmitted_visible_commit_seq = {
         let mut wal = async_rwlock_write(&backend, cx, "commit read claim readmission").await?;
         let generation = wal
             .published_snapshot()
             .map(|published| published.generation);
         if generation == Some(released.generation) {
             wal.discard_certificate_sidecar_capture();
-            true
-        } else {
-            wal.certificate_sidecar_unchanged_since_capture(
+            Ok(None)
+        } else if wal
+            .certificate_sidecar_unchanged_since_capture(
                 cx,
                 released.horizon_generation,
                 released.horizon,
             )
             .await
             .unwrap_or(false)
+        {
+            // bd-30ip9: a fresh peer can start the reset generation at
+            // certificate epoch 1 while this process's combiner retains an
+            // older generation's epoch 1 (or higher). Ordinary BEGIN imports
+            // this logical horizon; readmission must do so for the allocator
+            // too, without advancing the transaction's conflict snapshot.
+            // A prior-generation anchor is continuity evidence, never a
+            // reader horizon: require the current pinned generation and frame.
+            match (wal.pinned_read_snapshot(), wal.pinned_logical_read_snapshot(cx).await) {
+                (Some(pinned), Ok(Some(logical)))
+                    if Some(pinned.generation) == generation
+                        && logical.generation == pinned.generation
+                        && logical.last_commit_frame == pinned.last_commit_frame =>
+                {
+                    Ok(Some(logical.visible_commit_seq))
+                }
+                (_, Ok(None)) => Ok(None),
+                (_, Err(error)) => Err(error),
+                _ => Err(FrankenError::WalCorrupt {
+                    detail: "logical WAL reader horizon does not match the readmitted snapshot"
+                        .to_owned(),
+                }),
+            }
+        } else {
+            Err(FrankenError::BusySnapshot {
+                conflicting_pages: "WAL generation changed".to_owned(),
+            })
         }
     };
-    if !proven {
-        owner.restore().await?;
-        return Err(FrankenError::BusySnapshot {
-            conflicting_pages: "WAL generation changed".to_owned(),
-        });
+    let readmitted_visible_commit_seq = match readmitted_visible_commit_seq {
+        Ok(visible_commit_seq) => visible_commit_seq,
+        Err(error) => {
+            owner.restore().await?;
+            return Err(error);
+        }
+    };
+    if let Some(visible_commit_seq) = readmitted_visible_commit_seq {
+        queue.reconcile_readmitted_visibility_floor(visible_commit_seq);
     }
     reinstall_commit_read_claim(inner_arc, &mut owner)
 }
