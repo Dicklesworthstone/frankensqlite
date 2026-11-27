@@ -1083,10 +1083,14 @@ mod tests {
         let Statement::Select(select) = parse_single_statement(sql).expect("parses") else {
             panic!("not a SELECT: {sql}");
         };
+        // `run_test` takes a body whose future yields `()`: carry the result
+        // out (bd-7wn08).
+        let mut result = None;
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.expect("open memory db");
-            conn.validate_join_term_limits(&select)
-        })
+            result = Some(conn.validate_join_term_limits(&select));
+        });
+        result.expect("the test body ran")
     }
 
     fn refused_with(result: &Result<()>, message: &str) -> bool {
