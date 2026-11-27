@@ -12187,7 +12187,7 @@ fn codegen_select_index_in_ordered_scan(
         target,
         where_placeholder_base,
         descending,
-        |b, skip_row, probes_done| {
+        |b, skip_row, _next_probe, probes_done| {
             let rowid_reg = b.alloc_reg();
             b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
             if covering_output.is_none() {
@@ -22238,7 +22238,6 @@ fn emit_aggregate_accumulate_body(
     accum_base: i32,
     bare_capture: BareRowCapture,
 ) {
-    let first_row_flag = bare_capture.first_row_flag;
     let scan_ctx = ScanCtx {
         cursor,
         table,
@@ -22247,6 +22246,21 @@ fn emit_aggregate_accumulate_body(
         register_base: None,
         secondaries: &[],
     };
+    emit_aggregate_accumulate_body_with_ctx(b, &scan_ctx, agg_columns, accum_base, bare_capture);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_aggregate_accumulate_body_with_ctx(
+    b: &mut ProgramBuilder,
+    scan_ctx: &ScanCtx<'_>,
+    agg_columns: &[AggColumn],
+    accum_base: i32,
+    bare_capture: BareRowCapture,
+) {
+    let first_row_flag = bare_capture.first_row_flag;
+    let cursor = scan_ctx.cursor;
+    let table = scan_ctx.table;
+    let table_alias = scan_ctx.table_alias;
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for (i, agg) in agg_columns.iter().enumerate() {
         // Skip sentinel entries used for multi-aggregate wrappers.
@@ -22271,7 +22285,7 @@ fn emit_aggregate_accumulate_body(
             // GH #226: capture the first scanned row's value; skip on later rows.
             let skip_bare = b.emit_label();
             b.emit_jump_to_label(Opcode::If, first_row_flag, 0, skip_bare, P4::None, 0);
-            emit_expr(b, bare, accum_reg, Some(&scan_ctx));
+            emit_expr(b, bare, accum_reg, Some(scan_ctx));
             b.resolve_label(skip_bare);
             continue;
         }
@@ -22288,15 +22302,7 @@ fn emit_aggregate_accumulate_body(
             }
             let skip_lbl = b.emit_label();
             let filter_reg = b.alloc_temp();
-            let scan_ctx = ScanCtx {
-                cursor,
-                table,
-                table_alias,
-                schema: Some(schema),
-                register_base: None,
-                secondaries: &[],
-            };
-            emit_expr(b, filter_expr, filter_reg, Some(&scan_ctx));
+            emit_expr(b, filter_expr, filter_reg, Some(scan_ctx));
             // p3=1: treat NULL as false (skip AggStep).
             b.emit_jump_to_label(Opcode::IfNot, filter_reg, 1, skip_lbl, P4::None, 0);
             b.free_temp(filter_reg);
@@ -22326,35 +22332,39 @@ fn emit_aggregate_accumulate_body(
 
             // First argument.
             if agg.arg_is_rowid {
-                b.emit_op(Opcode::Rowid, cursor, arg_base, 0, P4::None, 0);
+                if let Some(rowid_reg) = scan_ctx.register_base.and_then(|row| row.rowid) {
+                    b.emit_op(Opcode::Copy, rowid_reg, arg_base, 0, P4::None, 0);
+                } else {
+                    b.emit_op(Opcode::Rowid, cursor, arg_base, 0, P4::None, 0);
+                }
             } else if let Some(ref expr) = agg.arg_expr {
-                let scan_ctx = ScanCtx {
-                    cursor,
-                    table,
-                    table_alias,
-                    schema: Some(schema),
-                    register_base: None,
-                    secondaries: &[],
-                };
-                emit_expr(b, expr, arg_base, Some(&scan_ctx));
+                emit_expr(b, expr, arg_base, Some(scan_ctx));
             } else {
                 let col_idx = agg.arg_col_index.unwrap_or(0);
-                // bd-hx3zu (GH#227 sibling): a VIRTUAL generated column passed as
-                // an aggregate argument on a table scan (no GROUP BY) read its
-                // NULL placeholder, so sum/avg/min/max/count saw NULLs. Compute
-                // the generating expression via the canonical reader instead.
-                if virtual_generated_column_expr(&table.columns[col_idx], table).is_some() {
+                if let Some(reg_row) = scan_ctx.register_base {
+                    b.emit_op(
+                        Opcode::Copy,
+                        reg_row.columns + col_idx as i32,
+                        arg_base,
+                        0,
+                        P4::None,
+                        0,
+                    );
+                } else if virtual_generated_column_expr(&table.columns[col_idx], table).is_some() {
+                    // bd-hx3zu (GH#227 sibling): a VIRTUAL generated column passed as
+                    // an aggregate argument on a table scan (no GROUP BY) read its
+                    // NULL placeholder, so sum/avg/min/max/count saw NULLs. Compute
+                    // the generating expression via the canonical reader instead.
                     emit_table_column_read(
                         b,
                         cursor,
                         table,
                         table_alias,
-                        Some(schema),
+                        scan_ctx.schema,
                         col_idx,
                         arg_base,
                     );
                 } else {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                     b.emit_op(
                         Opcode::Column,
                         cursor,
@@ -22368,18 +22378,9 @@ fn emit_aggregate_accumulate_body(
 
             // Extra arguments (e.g. separator for group_concat).
             if !agg.extra_args.is_empty() {
-                let scan_ctx = ScanCtx {
-                    cursor,
-                    table,
-                    table_alias,
-                    schema: Some(schema),
-                    register_base: None,
-                    secondaries: &[],
-                };
                 for (j, extra_expr) in agg.extra_args.iter().enumerate() {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                     let extra_reg = arg_base + 1 + j as i32;
-                    emit_expr(b, extra_expr, extra_reg, Some(&scan_ctx));
+                    emit_expr(b, extra_expr, extra_reg, Some(scan_ctx));
                 }
             }
 
@@ -22416,7 +22417,7 @@ fn emit_aggregate_accumulate_body(
             if let Some(bare) = agg.bare_expr.as_deref()
                 && expr_references_scan(bare, table, table_alias)
             {
-                emit_expr(b, bare, accum_base + i as i32, Some(&scan_ctx));
+                emit_expr(b, bare, accum_base + i as i32, Some(scan_ctx));
             }
         }
         b.resolve_label(skip_bare);
@@ -22424,6 +22425,1627 @@ fn emit_aggregate_accumulate_body(
     // GH #226: after the first scanned row's bare columns are captured, mark the
     // flag so subsequent rows skip the bare-column store (idempotent each row).
     b.emit_op(Opcode::Integer, 1, first_row_flag, 0, P4::None, 0);
+}
+
+/// Populate a row register image from an open secondary index cursor and rowid.
+///
+/// Restores `RealAffinity` for `REAL` (`'E'`) indexed columns so `MIN`/`MAX`
+/// and bare expressions see the exact SQL storage class without a table lookup.
+fn populate_index_entry_row_image(
+    b: &mut ProgramBuilder,
+    idx_cursor: i32,
+    rowid_reg: i32,
+    table: &TableSchema,
+    index: &IndexSchema,
+) -> i32 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let image = b.alloc_regs(table.columns.len() as i32);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (position, name) in index.columns.iter().enumerate() {
+        if let Some(col_idx) = table.column_index(name) {
+            let dst = image + col_idx as i32;
+            b.emit_op(Opcode::Column, idx_cursor, position as i32, dst, P4::None, 0);
+            if table.columns[col_idx].affinity == 'E' {
+                b.emit_op(Opcode::RealAffinity, dst, 0, 0, P4::None, 0);
+            }
+        }
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    if let Some(ipk) = table.columns.iter().position(|column| column.is_ipk) {
+        b.emit_op(Opcode::Copy, rowid_reg, image + ipk as i32, 0, P4::None, 0);
+    }
+    image
+}
+
+/// True when `index` holds every column read by `agg_columns` (including bare expressions).
+fn aggregate_columns_covered_by_index(
+    agg_columns: &[AggColumn],
+    index: &IndexSchema,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    if table.without_rowid || !index.supports_direct_column_lookup() {
+        return false;
+    }
+    agg_columns.iter().all(|agg| {
+        if agg.name.is_empty() && !agg.multi_agg_indices.is_empty() {
+            return true;
+        }
+        if let Some(bare) = agg.bare_expr.as_deref() {
+            return !expr_references_scan(bare, table, table_alias)
+                || expr_reads_only_index_columns(bare, table, table_alias, index, false);
+        }
+        agg.filter.is_none()
+            && agg.arg_expr.is_none()
+            && agg.extra_args.is_empty()
+            && (agg.num_args == 0
+                || agg.arg_is_rowid
+                || agg
+                    .arg_col_index
+                    .is_some_and(|c| index_key_position_of(index, table, c).is_some()))
+    })
+}
+
+/// Target column of an eligible lone `MIN(x)` / `MAX(x)` aggregate (bd-5kdea).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoneMinMaxKey<'a> {
+    Rowid,
+    Column {
+        col_name: &'a str,
+        collation: Option<&'a str>,
+    },
+}
+
+/// Eligibility metadata for stock SQLite's lone `MIN(x)` / `MAX(x)` optimization (bd-5kdea).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoneMinMaxSpec<'a> {
+    is_max: bool,
+    key: LoneMinMaxKey<'a>,
+    has_scan_bare: bool,
+}
+
+/// Extremum direction for a lone `MIN(x)` / `MAX(x)` walk (bd-5kdea).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MinMaxDir {
+    Min,
+    Max,
+}
+
+impl MinMaxDir {
+    const fn is_max(self) -> bool {
+        matches!(self, Self::Max)
+    }
+}
+
+/// Whether the extremum target of an index walk is an indexed column or the trailing rowid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MinMaxIndexKeyKind {
+    Column,
+    Rowid,
+}
+
+/// How a lone `MIN(x)` / `MAX(x)` index walk treats `x IS NULL` entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MinMaxNullPolicy {
+    /// A range bound or `x IS NOT NULL` excludes NULL `x` entries outright.
+    RejectNulls,
+    /// `MIN` with scan-referencing bare columns and no NULL rejection: Phase 1
+    /// skips NULLs and Phase 2 checks the NULL slice only if zero non-NULL rows match.
+    BareColumnFallback,
+    /// Neither explicit NULL rejection nor a Phase 2 fallback is needed.
+    Default,
+}
+
+/// How an index-driven min/max walk evaluates residual `WHERE` and reads row values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MinMaxIndexRowMode {
+    Covering,
+    TableWithIndexWhere,
+    TableWithTableWhere,
+}
+
+/// Stock SQLite's no-stat4 plan choice for lone `MIN(x)` / `MAX(x)` aggregates (bd-5kdea).
+///
+/// Ranking tuple `(tier, prefix_eq_len, has_minmax_order)` (empirically matched
+/// against stock SQLite 3.46 / 3.54 without `sqlite_stat4`):
+/// - `tier = 5`: rowid point lookup (`id = c [AND ...]`) — always beats min/max walks.
+/// - `tier = 4`: equality / `IS NULL` prefix of width `k` — beats non-equality min/max
+///   walks; ties break in favor of a min/max-ordered index with the same or wider prefix
+///   (e.g. `WHERE a = 5 AND c = 'v1'` picks `t_ab(a, b)` over `t_c(c)` for `max(b)`).
+/// - `tier = 3`: `IN` list on rowid or index — beats range/unbounded min/max walks;
+///   loses to a composite prefix-`IN` index that also orders `x` (`WHERE a IN (5, 3)`
+///   on `t_ab(a, b)`).
+/// - `tier = 2`: two-sided range (`BETWEEN` or both lower and upper bounds) — beats an
+///   unbounded/one-sided min/max walk (`WHERE c BETWEEN 'v1' AND 'v12'` picks `t_c`),
+///   loses to a two-sided range on the min/max index itself (`WHERE b BETWEEN 2 AND 4
+///   AND c BETWEEN 'v1' AND 'v12'` picks `t_b`).
+/// - `tier = 1`: min/max-ordered index with one-sided range or unconstrained (`t_b`
+///   for `max(b)`) — beats any one-sided range on another index/rowid (`c > 'v20'`,
+///   `id > 380`, `id < 10`), unindexed `WHERE`, or full table scan (`tier = 0`).
+/// - Fallback: when no index orders `x` and no `WHERE` seek applies, stock scans the
+///   narrowest covering index (tie-break: most recently created, matching SQLite's
+///   prepended `Table.pIndex` list), e.g. `SELECT id, max(b) FROM t` over `t_ab(a, b)`.
+enum LoneMinMaxPlan<'t, 'e> {
+    RowidWalk {
+        dir: MinMaxDir,
+        range: Option<RowidRangeTarget<'e>>,
+        has_residual: bool,
+    },
+    IndexWalk {
+        dir: MinMaxDir,
+        index: &'t IndexSchema,
+        prefix_exprs: Vec<&'e Expr>,
+        key_kind: MinMaxIndexKeyKind,
+        x_range: Option<ColumnRangeTarget<'e>>,
+        has_residual: bool,
+        null_policy: MinMaxNullPolicy,
+    },
+    IndexPrefixInWalk {
+        dir: MinMaxDir,
+        index: &'t IndexSchema,
+        in_predicate: &'e Expr,
+        in_values: Vec<&'e Expr>,
+        in_affinity: char,
+        in_anon_offset: u32,
+        key_kind: MinMaxIndexKeyKind,
+        has_residual: bool,
+        null_policy: MinMaxNullPolicy,
+    },
+    CoveringScan {
+        index: &'t IndexSchema,
+    },
+}
+
+/// Detect whether `agg_columns` is an eligible lone `MIN(x)` / `MAX(x)` aggregate (bd-5kdea).
+fn lone_minmax_spec<'a>(
+    agg_columns: &'a [AggColumn],
+    table: &'a TableSchema,
+    table_alias: Option<&str>,
+    having: Option<&Expr>,
+) -> Option<LoneMinMaxSpec<'a>> {
+    if having.is_some() || table.without_rowid {
+        return None;
+    }
+    let mut real_aggs = agg_columns.iter().filter(|agg| {
+        agg.bare_expr.is_none() && (!agg.name.is_empty() || agg.multi_agg_indices.is_empty())
+    });
+    let agg = real_aggs.next()?;
+    if real_aggs.next().is_some() {
+        return None;
+    }
+    if agg.distinct
+        || agg.filter.is_some()
+        || agg.arg_expr.is_some()
+        || !agg.extra_args.is_empty()
+        || agg.num_args != 1
+        || !builtin_aggregate_semantics_available(&agg.name, 1)
+    {
+        return None;
+    }
+    let is_max = match agg.name.as_str() {
+        "MIN" => false,
+        "MAX" => true,
+        _ => return None,
+    };
+    let key = if agg.arg_is_rowid
+        || agg
+            .arg_col_index
+            .is_some_and(|idx| table.columns.get(idx).is_some_and(|col| col.is_ipk))
+    {
+        LoneMinMaxKey::Rowid
+    } else {
+        let col = table.columns.get(agg.arg_col_index?)?;
+        if col.generated_expr.is_some() {
+            return None;
+        }
+        LoneMinMaxKey::Column {
+            col_name: col.name.as_str(),
+            collation: agg.collation.as_deref(),
+        }
+    };
+    let has_scan_bare = agg_columns.iter().any(|candidate| {
+        candidate
+            .bare_expr
+            .as_deref()
+            .is_some_and(|bare| expr_references_scan(bare, table, table_alias))
+    });
+    Some(LoneMinMaxSpec {
+        is_max,
+        key,
+        has_scan_bare,
+    })
+}
+
+/// True when any WHERE conjunct pins `col_name` with an equality, `IS NULL`, or constant `IN`.
+fn where_pins_column_equality_or_in(
+    conjuncts: &[&Expr],
+    col_name: &str,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    conjuncts.iter().any(|term| {
+        extract_index_column_equality_expr(term, table, table_alias, col_name).is_some()
+            || matches!(
+                term,
+                Expr::IsNull {
+                    expr,
+                    not: false,
+                    ..
+                } if column_name(expr, table, table_alias)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
+            )
+            || const_in_list_members(term, table, table_alias)
+                .is_some_and(|(name, _, _)| name.eq_ignore_ascii_case(col_name))
+    })
+}
+
+/// True when `WHERE` pins a lone `MIN(x)` / `MAX(x)` target column to a single constant value
+/// (`x IS NULL`, or `x = <const>` with matching collation), so every matching row shares the
+/// exact same `x` and the first matching row is already the final extremum — matching SQLite's
+/// `WHERE_ORDERBY_MIN`/`MAX` early exit (including on all-NULL `WHERE x IS NULL` blocks).
+fn lone_minmax_target_pinned_single_value(
+    agg_columns: &[AggColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    where_clause: Option<&Expr>,
+    having: Option<&Expr>,
+) -> bool {
+    let Some(spec) = lone_minmax_spec(agg_columns, table, table_alias, having) else {
+        return false;
+    };
+    let Some(where_expr) = where_clause else {
+        return false;
+    };
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    match spec.key {
+        LoneMinMaxKey::Rowid => false,
+        LoneMinMaxKey::Column {
+            col_name,
+            collation,
+        } => {
+            let col_collation = table
+                .column_index(col_name)
+                .and_then(|ci| table.columns.get(ci))
+                .and_then(|col| col.collation.as_deref());
+            conjuncts.iter().any(|term| {
+                if matches!(
+                    term,
+                    Expr::IsNull {
+                        expr,
+                        not: false,
+                        ..
+                    } if column_name(expr, table, table_alias)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
+                ) {
+                    return true;
+                }
+                let Expr::BinaryOp {
+                    left,
+                    op: fsqlite_ast::BinaryOp::Eq,
+                    right,
+                    ..
+                } = term
+                else {
+                    return false;
+                };
+                !matches!(left.as_ref(), Expr::Collate { .. })
+                    && !matches!(right.as_ref(), Expr::Collate { .. })
+                    && extract_index_column_equality_expr(term, table, table_alias, col_name)
+                        .is_some()
+                    && collation_names_equivalent(collation, col_collation)
+            })
+        }
+    }
+}
+
+/// True when any WHERE conjunct explicitly requires `col_name IS NOT NULL`.
+fn where_has_column_is_not_null(
+    conjuncts: &[&Expr],
+    col_name: &str,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    conjuncts.iter().any(|term| {
+        matches!(
+            term,
+            Expr::IsNull {
+                expr,
+                not: true,
+                ..
+            } if column_name(expr, table, table_alias)
+                .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
+        )
+    })
+}
+
+/// True when `where_clause` is completely enforced by `prefix_exprs`, optional `x_range`,
+/// and optional `col_name IS NOT NULL` on `index` at `x_pos`.
+fn lone_minmax_where_has_residual(
+    conjuncts: &[&Expr],
+    index: &IndexSchema,
+    prefix_exprs: &[&Expr],
+    x_col_name: Option<&str>,
+    x_has_range: bool,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    if conjuncts.is_empty() {
+        return false;
+    }
+    let mut matched_prefix_count = 0_usize;
+    for term in conjuncts {
+        let pins_prefix = prefix_exprs.iter().enumerate().any(|(pos, probe)| {
+            extract_index_column_equality_expr(term, table, table_alias, &index.columns[pos])
+                .is_some_and(|expr| std::ptr::eq(expr, *probe))
+                && index_equality_term_uses_key_collation(term, table, table_alias, index, pos)
+        });
+        if pins_prefix {
+            matched_prefix_count += 1;
+            continue;
+        }
+        if let Some(col_name) = x_col_name {
+            if x_has_range && conjunct_is_range_bound_on_column(term, col_name, table, table_alias) {
+                continue;
+            }
+            if matches!(
+                term,
+                Expr::IsNull {
+                    expr,
+                    not: true,
+                    ..
+                } if column_name(expr, table, table_alias)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
+            ) {
+                continue;
+            }
+        }
+        return true;
+    }
+    matched_prefix_count != prefix_exprs.len()
+}
+
+/// Check anonymous-placeholder safety when a lone min/max probe emits prefix/range bounds.
+fn lone_minmax_probe_placeholders_safe(
+    where_clause: Option<&Expr>,
+    prefix_exprs: &[&Expr],
+    x_range: Option<&ColumnRangeTarget<'_>>,
+    has_residual: bool,
+) -> bool {
+    let Some(where_expr) = where_clause else {
+        return true;
+    };
+    if !expr_contains_non_numbered_placeholder(where_expr) {
+        return true;
+    }
+    let prefix_has_anon = prefix_exprs
+        .iter()
+        .any(|expr| expr_contains_non_numbered_placeholder(expr));
+    let range_bounds: usize = x_range.map_or(0, |r| {
+        usize::from(r.lower.is_some()) + usize::from(r.upper.is_some())
+    });
+    let range_has_anon = x_range.is_some_and(|r| {
+        r.lower
+            .as_ref()
+            .is_some_and(|b| expr_contains_non_numbered_placeholder(b.expr()))
+            || r.upper
+                .as_ref()
+                .is_some_and(|b| expr_contains_non_numbered_placeholder(b.expr()))
+    });
+    if !prefix_has_anon && !range_has_anon {
+        return true;
+    }
+    if has_residual {
+        return false;
+    }
+    (prefix_exprs.len() == 1 && range_bounds == 0)
+        || (prefix_exprs.is_empty() && range_bounds <= 1)
+}
+
+/// Choose stock SQLite's min/max-index plan (or covering-index fallback) for a lone `MIN`/`MAX`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn lone_minmax_plan<'t, 'e>(
+    agg_columns: &[AggColumn],
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    where_clause: Option<&'e Expr>,
+    having: Option<&Expr>,
+    from_index_hint: Option<&fsqlite_ast::IndexHint>,
+    best_where_rank: (u8, usize, bool),
+    has_any_where_seek: bool,
+    rowid_eq_pinned: bool,
+) -> Option<LoneMinMaxPlan<'t, 'e>> {
+    let spec = lone_minmax_spec(agg_columns, table, table_alias, having)?;
+    let constraint = aggregate_index_seek_constraint(from_index_hint);
+    let allow_index_seek = constraint.allows_index_seek();
+    let required_index = constraint.required_index();
+    let allow_rowid_seek = from_index_hint.is_none()
+        || matches!(from_index_hint, Some(fsqlite_ast::IndexHint::NotIndexed));
+
+    let mut conjuncts = Vec::new();
+    if let Some(where_expr) = where_clause {
+        collect_conjunctive_terms(where_expr, &mut conjuncts);
+    }
+
+    // When `x` is already pinned by equality / IS NULL / IN, SQLite omits `x` from
+    // the min/max ordering and runs the ordinary forward seek.
+    match spec.key {
+        LoneMinMaxKey::Rowid if rowid_eq_pinned => return None,
+        LoneMinMaxKey::Column { col_name, .. }
+            if where_pins_column_equality_or_in(&conjuncts, col_name, table, table_alias) =>
+        {
+            return None;
+        }
+        _ => {}
+    }
+
+    // Candidate ranking tuple:
+    // (tier, prefix_eq_len, has_minmax_order, x_range_sides, covers_query, neg_width, creation_order)
+    type CandidateScore = (u8, usize, bool, u8, bool, std::cmp::Reverse<usize>, usize);
+    let mut best_candidate: Option<(CandidateScore, LoneMinMaxPlan<'t, 'e>)> = None;
+    let mut consider = |score: CandidateScore, plan: LoneMinMaxPlan<'t, 'e>| {
+        if best_candidate
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best_candidate = Some((score, plan));
+        }
+    };
+
+    // 1. Rowid B-tree candidate when `x` is the rowid / INTEGER PRIMARY KEY.
+    let dir = if spec.is_max {
+        MinMaxDir::Max
+    } else {
+        MinMaxDir::Min
+    };
+    if spec.key == LoneMinMaxKey::Rowid && allow_rowid_seek {
+        let rowid_range = extract_rowid_range_residual_target(where_clause, table, table_alias);
+        let (range, has_residual, tier, range_sides) = match rowid_range {
+            Some((r, residual)) => {
+                let two_sided = r.lower.is_some() && r.upper.is_some();
+                let sides = u8::from(r.lower.is_some()) + u8::from(r.upper.is_some());
+                (Some(r), residual, if two_sided { 2 } else { 1 }, sides)
+            }
+            None => (None, where_clause.is_some(), 1, 0),
+        };
+        let score = (tier, 0, true, range_sides, true, std::cmp::Reverse(1), 0);
+        consider(
+            score,
+            LoneMinMaxPlan::RowidWalk {
+                dir,
+                range,
+                has_residual,
+            },
+        );
+    }
+
+    // 2. Secondary-index min/max candidates (Shapes M1, M2, M3).
+    if allow_index_seek {
+        for (idx_ordinal, index) in table.indexes.iter().enumerate() {
+            if !index_matches_required(index, required_index)
+                || !index.supports_direct_column_lookup()
+                || index.columns.len() != index.key_term_count()
+            {
+                continue;
+            }
+            let key_terms = index.key_term_count();
+            let covers_query = aggregate_columns_covered_by_index(
+                agg_columns,
+                index,
+                table,
+                table_alias,
+            ) && where_clause.is_none_or(|where_expr| {
+                expr_reads_only_index_columns(where_expr, table, table_alias, index, false)
+            });
+
+            // Equality prefix (0..k) matching leading key terms of `index`.
+            let prefix_exprs =
+                extract_index_equality_prefix_exprs(index, table, table_alias, where_clause);
+            let prefix_len = prefix_exprs.len();
+
+            // Check whether `x` sits immediately after `prefix_exprs` (M1 if k >= 1, M3 if k == 0).
+            let x_matches_after_prefix = match spec.key {
+                LoneMinMaxKey::Rowid => prefix_len > 0 && prefix_len == key_terms,
+                LoneMinMaxKey::Column {
+                    col_name,
+                    collation,
+                } => {
+                    prefix_len < key_terms
+                        && index
+                            .columns
+                            .get(prefix_len)
+                            .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+                        && collation_names_equivalent(collation, index.key_term_collation(prefix_len))
+                }
+            };
+            if x_matches_after_prefix {
+                let prefix_exact = prefix_exprs.iter().enumerate().all(|(pos, expr)| {
+                    index_eq_term_probe_plan(table, table_alias, schema, index, pos, expr, where_clause)
+                        .exact_after_coercion
+                });
+                if prefix_exact {
+                    let x_col_name = match spec.key {
+                        LoneMinMaxKey::Rowid => None,
+                        LoneMinMaxKey::Column { col_name, .. } => Some(col_name),
+                    };
+                    let x_range = x_col_name.and_then(|col_name| {
+                        let where_expr = where_clause?;
+                        let range = extract_named_column_range(where_expr, table, table_alias, col_name)?;
+                        let binary_key = index
+                            .key_term_collation(prefix_len)
+                            .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
+                        (binary_key
+                            && index_range_fast_path_is_safe(
+                                table,
+                                table_alias,
+                                schema,
+                                col_name,
+                                &range,
+                            ))
+                        .then_some(range)
+                    });
+                    let has_residual = lone_minmax_where_has_residual(
+                        &conjuncts,
+                        index,
+                        &prefix_exprs,
+                        x_col_name,
+                        x_range.is_some(),
+                        table,
+                        table_alias,
+                    );
+                    if lone_minmax_probe_placeholders_safe(
+                        where_clause,
+                        &prefix_exprs,
+                        x_range.as_ref(),
+                        has_residual,
+                    ) {
+                        let range_sides = x_range.as_ref().map_or(0, |r| {
+                            u8::from(r.lower.is_some()) + u8::from(r.upper.is_some())
+                        });
+                        let tier = if prefix_len > 0 {
+                            4
+                        } else if range_sides == 2 {
+                            2
+                        } else {
+                            1
+                        };
+                        let key_kind = if spec.key == LoneMinMaxKey::Rowid {
+                            MinMaxIndexKeyKind::Rowid
+                        } else {
+                            MinMaxIndexKeyKind::Column
+                        };
+                        let rejects_null_x = key_kind == MinMaxIndexKeyKind::Rowid
+                            || x_range.is_some()
+                            || x_col_name.is_some_and(|col_name| {
+                                where_has_column_is_not_null(
+                                    &conjuncts,
+                                    col_name,
+                                    table,
+                                    table_alias,
+                                )
+                            });
+                        let null_policy = if rejects_null_x {
+                            MinMaxNullPolicy::RejectNulls
+                        } else if !dir.is_max() && spec.has_scan_bare {
+                            MinMaxNullPolicy::BareColumnFallback
+                        } else {
+                            MinMaxNullPolicy::Default
+                        };
+                        let score = (
+                            tier,
+                            prefix_len,
+                            true,
+                            range_sides,
+                            covers_query,
+                            std::cmp::Reverse(key_terms),
+                            idx_ordinal,
+                        );
+                        consider(
+                            score,
+                            LoneMinMaxPlan::IndexWalk {
+                                dir,
+                                index,
+                                prefix_exprs,
+                                key_kind,
+                                x_range,
+                                has_residual,
+                                null_policy,
+                            },
+                        );
+                    }
+                }
+            }
+
+            // Shape M2: `WHERE a IN (...) [AND residual]` on `(a, x, ...)` (or `(a)` with `x = Rowid`).
+            let x_after_leading_in = match spec.key {
+                LoneMinMaxKey::Rowid => key_terms == 1,
+                LoneMinMaxKey::Column {
+                    col_name,
+                    collation,
+                } => {
+                    key_terms >= 2
+                        && index
+                            .columns
+                            .get(1)
+                            .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+                        && collation_names_equivalent(collation, index.key_term_collation(1))
+                }
+            };
+            if x_after_leading_in
+                && !index.key_term_descending(0)
+                && index
+                    .key_term_collation(0)
+                    .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+                && !conjuncts.is_empty()
+            {
+                let mut anon_offset = 0_u32;
+                for &term in &conjuncts {
+                    if let Some((col_name, in_values, in_affinity)) =
+                        const_in_list_members(term, table, table_alias)
+                        && index
+                            .columns
+                            .first()
+                            .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+                    {
+                        let has_residual = conjuncts.len() > 1;
+                        let key_kind = if spec.key == LoneMinMaxKey::Rowid {
+                            MinMaxIndexKeyKind::Rowid
+                        } else {
+                            MinMaxIndexKeyKind::Column
+                        };
+                        let rejects_null_x = key_kind == MinMaxIndexKeyKind::Rowid
+                            || match spec.key {
+                                LoneMinMaxKey::Column { col_name, .. } => {
+                                    where_has_column_is_not_null(
+                                        &conjuncts,
+                                        col_name,
+                                        table,
+                                        table_alias,
+                                    )
+                                }
+                                LoneMinMaxKey::Rowid => true,
+                            };
+                        let null_policy = if rejects_null_x {
+                            MinMaxNullPolicy::RejectNulls
+                        } else if !dir.is_max() && spec.has_scan_bare {
+                            MinMaxNullPolicy::BareColumnFallback
+                        } else {
+                            MinMaxNullPolicy::Default
+                        };
+                        let score = (
+                            3,
+                            1,
+                            true,
+                            0,
+                            covers_query,
+                            std::cmp::Reverse(key_terms),
+                            idx_ordinal,
+                        );
+                        consider(
+                            score,
+                            LoneMinMaxPlan::IndexPrefixInWalk {
+                                dir,
+                                index,
+                                in_predicate: term,
+                                in_values,
+                                in_affinity,
+                                in_anon_offset: anon_offset,
+                                key_kind,
+                                has_residual,
+                                null_policy,
+                            },
+                        );
+                        break;
+                    }
+                    anon_offset += count_anon_placeholders(term);
+                }
+            }
+        }
+    }
+
+    if let Some((score, plan)) = best_candidate {
+        let candidate_rank = (score.0, score.1, score.2);
+        // Under `INDEXED BY <idx>`, `best_candidate` already respects `required_index`
+        // and only exists when `<idx>` genuinely orders `x`; compare against `best_where_rank`
+        // (which is also restricted to `<idx>`).
+        if candidate_rank > best_where_rank {
+            return Some(plan);
+        }
+        return None;
+    }
+
+    // 3. Covering-index scan fallback (stock's `SEARCH t USING COVERING INDEX t_ab`
+    //    when no index orders `x` and no WHERE seek exists, e.g. `SELECT id, max(b) FROM t`
+    //    with only `t_ab(a, b)`). Pick the narrowest covering index, breaking ties in favor
+    //    of the most recently created index (matching SQLite's prepended `Table.pIndex`).
+    if spec.has_scan_bare
+        && allow_index_seek
+        && required_index.is_none()
+        && !has_any_where_seek
+        && best_where_rank.0 == 0
+    {
+        let covering_idx = table
+            .indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, idx)| {
+                idx.supports_direct_column_lookup()
+                    && aggregate_columns_covered_by_index(agg_columns, idx, table, table_alias)
+                    && where_clause.is_none_or(|where_expr| {
+                        expr_reads_only_index_columns(where_expr, table, table_alias, idx, false)
+                    })
+            })
+            .max_by_key(|(ordinal, idx)| (std::cmp::Reverse(idx.key_term_count()), *ordinal))
+            .map(|(_, idx)| idx);
+        if let Some(index) = covering_idx {
+            return Some(LoneMinMaxPlan::CoveringScan { index });
+        }
+    }
+
+    None
+}
+
+/// Emit the inner min/max walk for one pinned equality prefix (or empty prefix) of `index`.
+///
+/// Jumps to `block_done` as soon as the first row passing `WHERE` is accumulated,
+/// or when the prefix/range is exhausted. When `MIN` has no range/NOT-NULL rejection
+/// on `x` and bare columns reference the scan, Phase 2 checks the `x IS NULL` slice
+/// in the exact same walk direction so all-NULL groups match stock's bare-column tiebreak.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn emit_lone_minmax_index_block(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    idx_cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    index: &IndexSchema,
+    agg_columns: &[AggColumn],
+    accum_base: i32,
+    bare_capture: BareRowCapture,
+    where_clause: Option<&Expr>,
+    where_placeholder_base: u32,
+    skip_in_predicate: Option<&Expr>,
+    dir: MinMaxDir,
+    prefix_regs: i32,
+    prefix_len: usize,
+    key_kind: MinMaxIndexKeyKind,
+    x_range_lower: Option<(i32, bool)>,
+    x_range_upper: Option<(i32, bool)>,
+    has_residual: bool,
+    row_mode: MinMaxIndexRowMode,
+    null_policy: MinMaxNullPolicy,
+    block_done: crate::Label,
+) {
+    const JUMPIFNULL: u16 = 0x10;
+    let is_max = dir.is_max();
+    let x_is_rowid = key_kind == MinMaxIndexKeyKind::Rowid;
+    let covering = row_mode == MinMaxIndexRowMode::Covering;
+    let where_from_index = row_mode == MinMaxIndexRowMode::TableWithIndexWhere;
+    let rejects_null_x = null_policy == MinMaxNullPolicy::RejectNulls;
+    let needs_null_fallback = null_policy == MinMaxNullPolicy::BareColumnFallback;
+    let x_desc = !x_is_rowid && index.key_term_descending(prefix_len);
+    let reverse = is_max ^ x_desc;
+    let step_op = if reverse { Opcode::Prev } else { Opcode::Next };
+    let x_coll = if x_is_rowid {
+        P4::None
+    } else {
+        index
+            .key_term_collation(prefix_len)
+            .filter(|c| !c.eq_ignore_ascii_case("BINARY"))
+            .map_or(P4::None, |c| P4::Collation(c.to_owned()))
+    };
+    let has_x_range = x_range_lower.is_some() || x_range_upper.is_some();
+    let phase1_done = if needs_null_fallback {
+        b.emit_label()
+    } else {
+        block_done
+    };
+
+    // Helper: emit a MakeRecord + Seek* probe for `[prefix_regs[0..prefix_len], optional_x]`.
+    let emit_seek_with_opt_x =
+        |b: &mut ProgramBuilder, seek_op: Opcode, opt_x: Option<Option<i32>>, miss: crate::Label| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let k = prefix_len as i32;
+            let field_count = k + i32::from(opt_x.is_some());
+            let probe_base = b.alloc_regs(field_count);
+            for offset in 0..k {
+                b.emit_op(
+                    Opcode::Copy,
+                    prefix_regs + offset,
+                    probe_base + offset,
+                    0,
+                    P4::None,
+                    0,
+                );
+            }
+            if let Some(x_reg_opt) = opt_x {
+                match x_reg_opt {
+                    Some(x_reg) => {
+                        b.emit_op(Opcode::Copy, x_reg, probe_base + k, 0, P4::None, 0);
+                    }
+                    None => {
+                        b.emit_op(Opcode::Null, 0, probe_base + k, 0, P4::None, 0);
+                    }
+                }
+            }
+            let rec = b.alloc_reg();
+            b.emit_op(
+                Opcode::MakeRecord,
+                probe_base,
+                field_count,
+                rec,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(seek_op, idx_cursor, rec, miss, P4::None, 0);
+        };
+
+    // Helper: check prefix equality against `prefix_regs[0..prefix_len]`.
+    let emit_prefix_guard = |b: &mut ProgramBuilder, exit: crate::Label| {
+        if prefix_len == 0 {
+            return;
+        }
+        let cur_key = b.alloc_reg();
+        for pos in 0..prefix_len {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let col = pos as i32;
+            b.emit_op(Opcode::Column, idx_cursor, col, cur_key, P4::None, 0);
+            let coll = index
+                .key_term_collation(pos)
+                .filter(|c| !c.eq_ignore_ascii_case("BINARY"))
+                .map_or(P4::None, |c| P4::Collation(c.to_owned()));
+            b.emit_jump_to_label(
+                Opcode::Ne,
+                prefix_regs + col,
+                cur_key,
+                exit,
+                coll,
+                JUMPIFNULL,
+            );
+        }
+    };
+
+    // Helper: emit residual WHERE check + accumulate + immediate break to `block_done`.
+    let emit_match_and_break = |b: &mut ProgramBuilder, skip_row: crate::Label| {
+        let emit_residual = |b: &mut ProgramBuilder, scan_ctx: &ScanCtx<'_>, use_table: bool| {
+            let Some(where_expr) = where_clause else {
+                return;
+            };
+            if let Some(in_pred) = skip_in_predicate {
+                let mut terms = Vec::new();
+                collect_conjunctive_terms(where_expr, &mut terms);
+                let mut anon_offset = 0_u32;
+                for term in terms {
+                    b.set_next_anon_placeholder(where_placeholder_base + anon_offset);
+                    if !std::ptr::eq(term, in_pred) {
+                        if use_table {
+                            emit_where_filter(
+                                b,
+                                term,
+                                cursor,
+                                table,
+                                table_alias,
+                                schema,
+                                skip_row,
+                            );
+                        } else {
+                            let cond = b.alloc_temp();
+                            emit_expr(b, term, cond, Some(scan_ctx));
+                            b.emit_jump_to_label(Opcode::IfNot, cond, 1, skip_row, P4::None, 0);
+                            b.free_temp(cond);
+                        }
+                    }
+                    anon_offset += count_anon_placeholders(term);
+                }
+                b.set_next_anon_placeholder(where_placeholder_base + anon_offset);
+            } else {
+                b.set_next_anon_placeholder(where_placeholder_base);
+                if use_table {
+                    emit_where_filter(
+                        b,
+                        where_expr,
+                        cursor,
+                        table,
+                        table_alias,
+                        schema,
+                        skip_row,
+                    );
+                } else {
+                    let cond = b.alloc_temp();
+                    emit_expr(b, where_expr, cond, Some(scan_ctx));
+                    b.emit_jump_to_label(Opcode::IfNot, cond, 1, skip_row, P4::None, 0);
+                    b.free_temp(cond);
+                }
+            }
+        };
+
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        if covering {
+            let image = populate_index_entry_row_image(b, idx_cursor, rowid_reg, table, index);
+            let scan_ctx = ScanCtx {
+                cursor,
+                table,
+                table_alias,
+                schema: Some(schema),
+                register_base: Some(RegisterRow::with_rowid(image, rowid_reg)),
+                secondaries: &[],
+            };
+            if has_residual {
+                emit_residual(b, &scan_ctx, false);
+            }
+            emit_aggregate_accumulate_body_with_ctx(
+                b,
+                &scan_ctx,
+                agg_columns,
+                accum_base,
+                bare_capture,
+            );
+        } else {
+            if has_residual && where_from_index {
+                let image = populate_index_entry_row_image(b, idx_cursor, rowid_reg, table, index);
+                let idx_scan_ctx = ScanCtx {
+                    cursor,
+                    table,
+                    table_alias,
+                    schema: Some(schema),
+                    register_base: Some(RegisterRow::with_rowid(image, rowid_reg)),
+                    secondaries: &[],
+                };
+                emit_residual(b, &idx_scan_ctx, false);
+            }
+            b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
+            if has_residual && !where_from_index {
+                let table_scan_ctx = ScanCtx {
+                    cursor,
+                    table,
+                    table_alias,
+                    schema: Some(schema),
+                    register_base: None,
+                    secondaries: &[],
+                };
+                emit_residual(b, &table_scan_ctx, true);
+            }
+            emit_aggregate_accumulate_body(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                agg_columns,
+                accum_base,
+                bare_capture,
+            );
+        }
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, block_done, P4::None, 0);
+    };
+
+    // Phase 1: position at the extremum start end (skipping NULLs for MIN via SeekGT/SeekLT).
+    if is_max {
+        if let Some((up_reg, inclusive)) = x_range_upper {
+            let seek_op = match (x_desc, inclusive) {
+                (false, true) => Opcode::SeekLE,
+                (false, false) => Opcode::SeekLT,
+                (true, true) => Opcode::SeekGE,
+                (true, false) => Opcode::SeekGT,
+            };
+            emit_seek_with_opt_x(b, seek_op, Some(Some(up_reg)), phase1_done);
+        } else if prefix_len > 0 {
+            let seek_op = if reverse {
+                Opcode::SeekLE
+            } else {
+                Opcode::SeekGE
+            };
+            emit_seek_with_opt_x(b, seek_op, None, phase1_done);
+        } else {
+            let start_op = if reverse {
+                Opcode::Last
+            } else {
+                Opcode::Rewind
+            };
+            b.emit_jump_to_label(start_op, idx_cursor, 0, phase1_done, P4::None, 0);
+        }
+    } else if let Some((lo_reg, inclusive)) = x_range_lower {
+        let seek_op = match (x_desc, inclusive) {
+            (false, true) => Opcode::SeekGE,
+            (false, false) => Opcode::SeekGT,
+            (true, true) => Opcode::SeekLE,
+            (true, false) => Opcode::SeekLT,
+        };
+        emit_seek_with_opt_x(b, seek_op, Some(Some(lo_reg)), phase1_done);
+    } else if x_is_rowid {
+        if prefix_len > 0 {
+            emit_seek_with_opt_x(b, Opcode::SeekGE, None, phase1_done);
+        } else {
+            b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, phase1_done, P4::None, 0);
+        }
+    } else {
+        // Unbounded MIN: seek directly past the NULL region (O(log n) even with many NULLs).
+        let skip_null_seek = if x_desc {
+            Opcode::SeekLT
+        } else {
+            Opcode::SeekGT
+        };
+        emit_seek_with_opt_x(b, skip_null_seek, Some(None), phase1_done);
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let phase1_loop = b.current_addr() as i32;
+    emit_prefix_guard(b, phase1_done);
+
+    if !x_is_rowid && (has_x_range || rejects_null_x) {
+        let cur_x = b.alloc_reg();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        b.emit_op(
+            Opcode::Column,
+            idx_cursor,
+            prefix_len as i32,
+            cur_x,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(Opcode::IsNull, cur_x, 0, phase1_done, P4::None, 0);
+        if is_max {
+            if let Some((lo_reg, inclusive)) = x_range_lower {
+                let past = if inclusive { Opcode::Lt } else { Opcode::Le };
+                b.emit_jump_to_label(past, lo_reg, cur_x, phase1_done, x_coll.clone(), 0);
+            }
+        } else if let Some((up_reg, inclusive)) = x_range_upper {
+            let past = if inclusive { Opcode::Gt } else { Opcode::Ge };
+            b.emit_jump_to_label(past, up_reg, cur_x, phase1_done, x_coll.clone(), 0);
+        }
+    }
+
+    let skip_row = b.emit_label();
+    emit_match_and_break(b, skip_row);
+    b.resolve_label(skip_row);
+    b.emit_op(step_op, idx_cursor, phase1_loop, 0, P4::None, 0);
+
+    // Phase 2: reached only if Phase 1 found zero non-NULL matches for MIN with bare columns.
+    if needs_null_fallback {
+        b.resolve_label(phase1_done);
+        if prefix_len > 0 {
+            let null_seek = if reverse {
+                Opcode::SeekLE
+            } else {
+                Opcode::SeekGE
+            };
+            emit_seek_with_opt_x(b, null_seek, None, block_done);
+        } else {
+            let null_start = if reverse {
+                Opcode::Last
+            } else {
+                Opcode::Rewind
+            };
+            b.emit_jump_to_label(null_start, idx_cursor, 0, block_done, P4::None, 0);
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let phase2_loop = b.current_addr() as i32;
+        emit_prefix_guard(b, block_done);
+        let cur_x = b.alloc_reg();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        b.emit_op(
+            Opcode::Column,
+            idx_cursor,
+            prefix_len as i32,
+            cur_x,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(Opcode::NotNull, cur_x, 0, block_done, P4::None, 0);
+        let skip_null_row = b.emit_label();
+        emit_match_and_break(b, skip_null_row);
+        b.resolve_label(skip_null_row);
+        b.emit_op(step_op, idx_cursor, phase2_loop, 0, P4::None, 0);
+    }
+}
+
+/// Emit bytecode for a chosen [`LoneMinMaxPlan`] inside [`codegen_select_aggregate`] (bd-5kdea).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn emit_lone_minmax_plan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    agg_columns: &[AggColumn],
+    accum_base: i32,
+    bare_capture: BareRowCapture,
+    where_clause: Option<&Expr>,
+    where_placeholder_base: u32,
+    finalize_label: crate::Label,
+    plan: LoneMinMaxPlan<'_, '_>,
+) {
+    match plan {
+        LoneMinMaxPlan::RowidWalk {
+            dir,
+            range,
+            has_residual,
+        } => {
+            let is_max = dir.is_max();
+            let lower_reg = range.and_then(|r| r.lower).map(|bound| {
+                let reg = b.alloc_reg();
+                emit_expr(b, bound.expr, reg, None);
+                b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
+                (
+                    reg,
+                    bound.inclusive,
+                    resolved_rowid_range_comparison(table, table_alias, schema, bound),
+                )
+            });
+            let upper_reg = range.and_then(|r| r.upper).map(|bound| {
+                let reg = b.alloc_reg();
+                emit_expr(b, bound.expr, reg, None);
+                b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
+                (
+                    reg,
+                    bound.inclusive,
+                    resolved_rowid_range_comparison(table, table_alias, schema, bound),
+                )
+            });
+            b.emit_op(
+                Opcode::OpenRead,
+                cursor,
+                table.root_page,
+                0,
+                P4::Table(table.name.clone()),
+                0,
+            );
+            if is_max {
+                if let Some((reg, inclusive, _)) = upper_reg.as_ref() {
+                    let seek_op = if *inclusive {
+                        Opcode::SeekLE
+                    } else {
+                        Opcode::SeekLT
+                    };
+                    b.emit_jump_to_label(seek_op, cursor, *reg, finalize_label, P4::None, 0);
+                } else {
+                    b.emit_jump_to_label(Opcode::Last, cursor, 0, finalize_label, P4::None, 0);
+                }
+            } else if let Some((reg, inclusive, _)) = lower_reg.as_ref() {
+                let seek_op = if *inclusive {
+                    Opcode::SeekGE
+                } else {
+                    Opcode::SeekGT
+                };
+                b.emit_jump_to_label(seek_op, cursor, *reg, finalize_label, P4::None, 0);
+            } else {
+                b.emit_jump_to_label(Opcode::Rewind, cursor, 0, finalize_label, P4::None, 0);
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let loop_top = b.current_addr() as i32;
+            let end_bound = if is_max {
+                lower_reg
+                    .as_ref()
+                    .map(|(reg, incl, cmp)| (*reg, if *incl { Opcode::Lt } else { Opcode::Le }, cmp))
+            } else {
+                upper_reg
+                    .as_ref()
+                    .map(|(reg, incl, cmp)| (*reg, if *incl { Opcode::Gt } else { Opcode::Ge }, cmp))
+            };
+            if let Some((bound_reg, stop_op, cmp)) = end_bound {
+                let cur_rowid = b.alloc_reg();
+                b.emit_op(Opcode::Rowid, cursor, cur_rowid, 0, P4::None, 0);
+                b.emit_jump_to_label(
+                    stop_op,
+                    bound_reg,
+                    cur_rowid,
+                    finalize_label,
+                    cmp.collation_p4.clone(),
+                    cmp.cmp_p5,
+                );
+            }
+            let skip_row = b.emit_label();
+            if has_residual && let Some(where_expr) = where_clause {
+                b.set_next_anon_placeholder(where_placeholder_base);
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    skip_row,
+                );
+            }
+            emit_aggregate_accumulate_body(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                agg_columns,
+                accum_base,
+                bare_capture,
+            );
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+            b.resolve_label(skip_row);
+            b.emit_op(
+                if is_max { Opcode::Prev } else { Opcode::Next },
+                cursor,
+                loop_top,
+                0,
+                P4::None,
+                0,
+            );
+        }
+        LoneMinMaxPlan::IndexWalk {
+            dir,
+            index,
+            prefix_exprs,
+            key_kind,
+            x_range,
+            has_residual,
+            null_policy,
+        } => {
+            let idx_cursor = 1_i32;
+            let prefix_len = prefix_exprs.len();
+            let x_is_rowid = key_kind == MinMaxIndexKeyKind::Rowid;
+            let where_from_index = has_residual
+                && where_clause.is_some_and(|where_expr| {
+                    expr_reads_only_index_columns(where_expr, table, table_alias, index, false)
+                });
+            let covering = (!has_residual || where_from_index)
+                && aggregate_columns_covered_by_index(agg_columns, index, table, table_alias);
+            let row_mode = if covering {
+                MinMaxIndexRowMode::Covering
+            } else if where_from_index {
+                MinMaxIndexRowMode::TableWithIndexWhere
+            } else {
+                MinMaxIndexRowMode::TableWithTableWhere
+            };
+
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let prefix_regs = if prefix_len > 0 {
+                b.alloc_regs(prefix_len as i32)
+            } else {
+                0
+            };
+            for (pos, expr) in prefix_exprs.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let reg = prefix_regs + pos as i32;
+                let plan =
+                    index_eq_term_probe_plan(table, table_alias, schema, index, pos, expr, where_clause);
+                emit_expr(b, expr, reg, None);
+                b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
+                if let Some(aff) = plan.affinity_to_emit {
+                    b.emit_op(
+                        Opcode::Affinity,
+                        reg,
+                        1,
+                        0,
+                        P4::Affinity(aff.to_string()),
+                        0,
+                    );
+                }
+            }
+
+            let x_affinity = (!x_is_rowid)
+                .then(|| {
+                    index
+                        .columns
+                        .get(prefix_len)
+                        .and_then(|name| table.column_index(name))
+                        .map(|i| index_key_affinity(table.columns[i].affinity))
+                        .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'))
+                })
+                .flatten();
+            let emit_x_bound = |b: &mut ProgramBuilder, bound: &ColumnRangeBound<'_>| {
+                let reg = b.alloc_reg();
+                emit_expr(b, bound.expr(), reg, None);
+                if let Some(aff) = x_affinity
+                    && !bound_matches_affinity(aff, bound.expr())
+                {
+                    b.emit_op(
+                        Opcode::Affinity,
+                        reg,
+                        1,
+                        0,
+                        P4::Affinity(aff.to_string()),
+                        0,
+                    );
+                }
+                b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
+                (reg, bound.inclusive)
+            };
+            let x_range_lower = x_range
+                .as_ref()
+                .and_then(|r| r.lower.as_ref())
+                .map(|bound| emit_x_bound(b, bound));
+            let x_range_upper = x_range
+                .as_ref()
+                .and_then(|r| r.upper.as_ref())
+                .map(|bound| emit_x_bound(b, bound));
+
+            if !covering {
+                b.emit_op(
+                    Opcode::OpenRead,
+                    cursor,
+                    table.root_page,
+                    0,
+                    P4::Table(table.name.clone()),
+                    0,
+                );
+            }
+            b.emit_op(
+                Opcode::OpenRead,
+                idx_cursor,
+                index.root_page,
+                0,
+                P4::Index(index.name.clone()),
+                0,
+            );
+            emit_lone_minmax_index_block(
+                b,
+                cursor,
+                idx_cursor,
+                table,
+                table_alias,
+                schema,
+                index,
+                agg_columns,
+                accum_base,
+                bare_capture,
+                where_clause,
+                where_placeholder_base,
+                None,
+                dir,
+                prefix_regs,
+                prefix_len,
+                key_kind,
+                x_range_lower,
+                x_range_upper,
+                has_residual,
+                row_mode,
+                null_policy,
+                finalize_label,
+            );
+        }
+        LoneMinMaxPlan::IndexPrefixInWalk {
+            dir,
+            index,
+            in_predicate,
+            in_values,
+            in_affinity,
+            in_anon_offset,
+            key_kind,
+            has_residual,
+            null_policy,
+        } => {
+            let idx_cursor = 1_i32;
+            let probe_cursor = 2_i32;
+            let x_is_rowid = key_kind == MinMaxIndexKeyKind::Rowid;
+            let x_desc = !x_is_rowid && index.key_term_descending(1);
+            let reverse = dir.is_max() ^ x_desc;
+            let where_from_index = has_residual
+                && where_clause.is_some_and(|where_expr| {
+                    expr_reads_only_index_columns(where_expr, table, table_alias, index, false)
+                });
+            let covering = (!has_residual || where_from_index)
+                && aggregate_columns_covered_by_index(agg_columns, index, table, table_alias);
+            let row_mode = if covering {
+                MinMaxIndexRowMode::Covering
+            } else if where_from_index {
+                MinMaxIndexRowMode::TableWithIndexWhere
+            } else {
+                MinMaxIndexRowMode::TableWithTableWhere
+            };
+
+            if !covering {
+                b.emit_op(
+                    Opcode::OpenRead,
+                    cursor,
+                    table.root_page,
+                    0,
+                    P4::Table(table.name.clone()),
+                    0,
+                );
+            }
+            b.emit_op(
+                Opcode::OpenRead,
+                idx_cursor,
+                index.root_page,
+                0,
+                P4::Index(index.name.clone()),
+                0,
+            );
+            let sort_order = if reverse { "-" } else { "+" };
+            b.emit_op(
+                Opcode::SorterOpen,
+                probe_cursor,
+                1,
+                0,
+                P4::Str(sort_order.to_owned()),
+                0,
+            );
+            let key_reg = b.alloc_reg();
+            let record_reg = b.alloc_reg();
+            let prev_reg = b.alloc_reg();
+            let has_prev = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0, has_prev, 0, P4::None, 0);
+            b.set_next_anon_placeholder(where_placeholder_base + in_anon_offset);
+            for value in in_values {
+                let skip_val = b.emit_label();
+                emit_expr(b, value, key_reg, None);
+                b.emit_jump_to_label(Opcode::IsNull, key_reg, 0, skip_val, P4::None, 0);
+                b.emit_op(
+                    Opcode::Affinity,
+                    key_reg,
+                    1,
+                    0,
+                    P4::Affinity(in_affinity.to_string()),
+                    0,
+                );
+                b.emit_op(Opcode::MakeRecord, key_reg, 1, record_reg, P4::None, 0);
+                b.emit_op(Opcode::SorterInsert, probe_cursor, record_reg, 0, P4::None, 0);
+                b.resolve_label(skip_val);
+            }
+            let probes_done = b.emit_label();
+            b.emit_jump_to_label(Opcode::SorterSort, probe_cursor, 0, probes_done, P4::None, 0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let probe_loop = b.current_addr() as i32;
+            b.emit_op(Opcode::SorterData, probe_cursor, record_reg, 0, P4::None, 0);
+            b.emit_op(Opcode::Column, probe_cursor, 0, key_reg, P4::None, 0);
+            let first_key = b.emit_label();
+            let next_probe = b.emit_label();
+            b.emit_jump_to_label(Opcode::IfNot, has_prev, 0, first_key, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Eq, prev_reg, key_reg, next_probe, P4::None, 0);
+            b.resolve_label(first_key);
+            b.emit_op(Opcode::Copy, key_reg, prev_reg, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 1, has_prev, 0, P4::None, 0);
+
+            emit_lone_minmax_index_block(
+                b,
+                cursor,
+                idx_cursor,
+                table,
+                table_alias,
+                schema,
+                index,
+                agg_columns,
+                accum_base,
+                bare_capture,
+                where_clause,
+                where_placeholder_base,
+                Some(in_predicate),
+                dir,
+                key_reg,
+                1,
+                key_kind,
+                None,
+                None,
+                has_residual,
+                row_mode,
+                null_policy,
+                next_probe,
+            );
+
+            b.resolve_label(next_probe);
+            b.emit_op(Opcode::SorterNext, probe_cursor, probe_loop, 0, P4::None, 0);
+            b.resolve_label(probes_done);
+            b.emit_op(Opcode::Close, probe_cursor, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+        }
+        LoneMinMaxPlan::CoveringScan { index } => {
+            let idx_cursor = 1_i32;
+            b.emit_op(
+                Opcode::OpenRead,
+                idx_cursor,
+                index.root_page,
+                0,
+                P4::Index(index.name.clone()),
+                0,
+            );
+            b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let loop_top = b.current_addr() as i32;
+            let skip_row = b.emit_label();
+            let has_scan_bare = agg_columns.iter().any(|agg| {
+                agg.bare_expr
+                    .as_deref()
+                    .is_some_and(|bare| expr_references_scan(bare, table, table_alias))
+            });
+            let lone_agg = agg_columns.iter().enumerate().find(|(_, agg)| {
+                agg.bare_expr.is_none()
+                    && (!agg.name.is_empty() || agg.multi_agg_indices.is_empty())
+            });
+            if where_clause.is_none()
+                && (!has_scan_bare || bare_capture.minmax_skip_reg.is_some())
+                && let Some((agg_slot, agg)) = lone_agg
+            {
+                // Fast covering scan: read ONLY the lone min()/max() key column per row and
+                // defer IdxRowid + bare column decoding inside `If minmax_skip_reg` so non-extremum
+                // rows pay zero unused column decodes or rowid lookups.
+                let arg_reg = b.alloc_reg();
+                let is_rowid_arg = agg.arg_is_rowid
+                    || agg
+                        .arg_col_index
+                        .is_some_and(|ci| table.columns.get(ci).is_some_and(|c| c.is_ipk));
+                if is_rowid_arg {
+                    b.emit_op(Opcode::IdxRowid, idx_cursor, arg_reg, 0, P4::None, 0);
+                } else {
+                    let col_idx = agg.arg_col_index.unwrap_or(0);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    let idx_pos =
+                        index_key_position_of(index, table, col_idx).unwrap_or(0) as i32;
+                    b.emit_op(Opcode::Column, idx_cursor, idx_pos, arg_reg, P4::None, 0);
+                    if table.columns.get(col_idx).is_some_and(|c| c.affinity == 'E') {
+                        b.emit_op(Opcode::RealAffinity, arg_reg, 0, 0, P4::None, 0);
+                    }
+                }
+                if let Some(skip_reg) = bare_capture.minmax_skip_reg {
+                    b.emit_op(Opcode::CollSeq, skip_reg, 0, 0, P4::None, 0);
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let accum_reg = accum_base + agg_slot as i32;
+                let agg_p4 = agg_func_p4(&agg.name, agg.collation.as_ref());
+                b.emit_op(Opcode::AggStep, 0, arg_reg, accum_reg, agg_p4, 1);
+                if has_scan_bare && let Some(skip_reg) = bare_capture.minmax_skip_reg {
+                    let skip_bare = b.emit_label();
+                    b.emit_jump_to_label(Opcode::If, skip_reg, 0, skip_bare, P4::None, 0);
+                    let rowid_reg = b.alloc_reg();
+                    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+                    let image =
+                        populate_index_entry_row_image(b, idx_cursor, rowid_reg, table, index);
+                    let scan_ctx = ScanCtx {
+                        cursor,
+                        table,
+                        table_alias,
+                        schema: Some(schema),
+                        register_base: Some(RegisterRow::with_rowid(image, rowid_reg)),
+                        secondaries: &[],
+                    };
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    for (i, bare_agg) in agg_columns.iter().enumerate() {
+                        if let Some(bare) = bare_agg.bare_expr.as_deref()
+                            && expr_references_scan(bare, table, table_alias)
+                        {
+                            emit_expr(b, bare, accum_base + i as i32, Some(&scan_ctx));
+                        }
+                    }
+                    b.resolve_label(skip_bare);
+                }
+                b.emit_op(
+                    Opcode::Integer,
+                    1,
+                    bare_capture.first_row_flag,
+                    0,
+                    P4::None,
+                    0,
+                );
+            } else {
+                let rowid_reg = b.alloc_reg();
+                b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+                let image = populate_index_entry_row_image(b, idx_cursor, rowid_reg, table, index);
+                let scan_ctx = ScanCtx {
+                    cursor,
+                    table,
+                    table_alias,
+                    schema: Some(schema),
+                    register_base: Some(RegisterRow::with_rowid(image, rowid_reg)),
+                    secondaries: &[],
+                };
+                if let Some(where_expr) = where_clause {
+                    b.set_next_anon_placeholder(where_placeholder_base);
+                    let cond = b.alloc_temp();
+                    emit_expr(b, where_expr, cond, Some(&scan_ctx));
+                    b.emit_jump_to_label(Opcode::IfNot, cond, 1, skip_row, P4::None, 0);
+                    b.free_temp(cond);
+                }
+                emit_aggregate_accumulate_body_with_ctx(
+                    b,
+                    &scan_ctx,
+                    agg_columns,
+                    accum_base,
+                    bare_capture,
+                );
+            }
+            b.resolve_label(skip_row);
+            b.emit_op(Opcode::Next, idx_cursor, loop_top, 0, P4::None, 0);
+        }
+    }
 }
 
 /// The index a `WHERE <equality-prefix>` aggregate can seek instead of scanning.
@@ -24366,6 +25988,7 @@ fn aggregate_index_range_seek_target<'t, 'e>(
                 && index.key_term_count() == 1
                 && !covers_where(index)
         }));
+    let mut one_sided_fallback = None;
     for index in candidates {
         if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
             continue;
@@ -24413,10 +26036,13 @@ fn aggregate_index_range_seek_target<'t, 'e>(
             _ => false,
         };
         if bounds_ok {
-            return Some((index, range, true));
+            if range.lower.is_some() && range.upper.is_some() {
+                return Some((index, range, true));
+            }
+            one_sided_fallback.get_or_insert((index, range, true));
         }
     }
-    None
+    one_sided_fallback
 }
 
 /// Which indexes [`aggregate_index_prefix_residual_target`] may return.
@@ -24843,6 +26469,7 @@ fn emit_aggregate_index_value_seek(
     covering: bool,
     residual_where: Option<&Expr>,
     rowid_bounds: Option<IndexEqRowidBounds>,
+    break_inner_loop: bool,
 ) {
     // bd-in-list-composite-prefix-probe: a composite `(a, …)` index is probed with a 1-field PREFIX
     // `[value]` so SeekGE anchors at the first `a=value` entry regardless of the trailing key column
@@ -24917,6 +26544,9 @@ fn emit_aggregate_index_value_seek(
             agg_columns,
             accum_base,
         );
+        if break_inner_loop {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, next_value, P4::None, 0);
+        }
     } else {
         let skip_row = b.emit_label();
         let rowid_reg = b.alloc_reg();
@@ -24962,6 +26592,9 @@ fn emit_aggregate_index_value_seek(
             accum_base,
             bare_capture,
         );
+        if break_inner_loop {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, next_value, P4::None, 0);
+        }
         b.resolve_label(skip_row);
     }
     b.emit_op(Opcode::Next, idx_cursor, run_top, 0, P4::None, 0);
@@ -25134,7 +26767,7 @@ fn emit_index_const_list_rows<R>(
         target,
         anon_placeholder_base,
         false,
-        |b, skip_row, _probes_done| emit_row(b, skip_row),
+        |b, skip_row, _next_probe, _probes_done| emit_row(b, skip_row),
     )
 }
 
@@ -25146,7 +26779,7 @@ fn emit_index_const_list_rows_directed<R>(
     target: &IndexConstInList<'_, '_>,
     anon_placeholder_base: u32,
     reverse: bool,
-    emit_row: impl FnOnce(&mut ProgramBuilder, crate::Label, crate::Label) -> R,
+    emit_row: impl FnOnce(&mut ProgramBuilder, crate::Label, crate::Label, crate::Label) -> R,
 ) -> R {
     // bd-hyoms: the probe is `(prefix.., member, suffix..)`; an equality
     // around the member is computed once and takes its key term's affinity.
@@ -25305,7 +26938,7 @@ fn emit_index_const_list_rows_directed<R>(
         prefix_len,
         range_regs.as_ref(),
         reverse,
-        |b, skip_row| emit_row(b, skip_row, probes_done),
+        |b, skip_row| emit_row(b, skip_row, next_probe, probes_done),
     );
     b.resolve_label(next_probe);
     b.emit_op(Opcode::SorterNext, probe_cursor, probe_loop, 0, P4::None, 0);
@@ -25883,59 +27516,199 @@ fn codegen_select_aggregate(
         None
     };
 
-    // bd-2dgf5: rowid-range bounded scan instead of a full table scan.
-    //
-    // `SELECT SUM(v) FROM t WHERE <ipk> <= <const>` (and `<`, `>=`, `>`, `BETWEEN`)
-    // walked every row; a rowid range visits only `[lower, upper]` by positioning with
-    // `Seek*`/`Rewind` and stopping early once the cursor passes the upper bound. This
-    // reuses the *exact* extraction, safety gate, and bound-comparison helpers the
-    // oracle-tested non-aggregate `codegen_select_rowid_range_scan` uses
-    // (`extract_rowid_range_target` + `rowid_range_fast_path_is_safe` +
-    // `resolved_rowid_range_comparison`), so the aggregate inherits its affinity/collation
-    // correctness; only the per-row action changes (accumulate vs `ResultRow`). Ascending
-    // only — aggregates impose no order.
-    let rowid_range_seek = if allow_rowid_seek
+    // Selectivity-ordered aggregate WHERE seek extraction (bd-5kdea):
+    //   Tier 5: rowid point equality (`rowid = <const>` / `rowid = <int> AND <residual>`)
+    //   Tier 4: index equality prefix (whole-WHERE eq, composite prefix+range, whole-WHERE IS NULL,
+    //           composite IN+eq, prefix+residual literal / numbered param, with bd-z3a05 rowid bounds)
+    //   Tier 3: IN-list seeks (integer IN with optional bd-z3a05 rowid bounds, const IN, rowid IN)
+    //   Tier 2/0: pure ranges (two-sided ranges strictly before one-sided ranges across rowid/index/composite)
+    // Ordering high-selectivity seeks ahead of pure ranges prevents e.g. `b BETWEEN 2 AND 4` or
+    // `id > 10` from shadowing `c = 'v5'` or `id = 7`. At most one seek Option below is `Some`.
+
+    // bd-agg-rowid-eq-residual: `WHERE <rowid> = <int> AND <residual>` (Tier 5).
+    let rowid_eq_residual_seek = if allow_rowid_seek
         && having.is_none()
         && index_eq_seek.is_none()
         && rowid_eq_seek.is_none()
+        && !table.without_rowid
     {
-        extract_rowid_range_residual_target(where_clause, table, table_alias)
+        extract_rowid_eq_residual_target(where_clause, table, table_alias)
+            .filter(|rhs| matches!(rhs, Expr::Literal(Literal::Integer(_), _)))
     } else {
         None
     };
 
-    // bd-2dgf5: seek an INTEGER-affinity index once per distinct value of a
-    // `WHERE col IN (<int literals>)` instead of full-scanning. Narrowly gated so no
-    // per-value scan fallback is needed (see `index_integer_in_list_target`).
-    // bd-hyoms: a probe that also pins a neighbouring key term (`a IN (3, 77)
-    // AND b = 3` on `(a, b)`) is the constant-list seek's below.
-    let index_in_seek = if allow_index_seek
+    // Tier 4a: residual-free composite equality prefix + trailing range (`WHERE a = v AND b <range>`).
+    let composite_prefix_range_with_prefix = if allow_index_seek
         && having.is_none()
         && index_eq_seek.is_none()
         && rowid_eq_seek.is_none()
-        && rowid_range_seek.is_none()
-        && index_const_in_list_composite_target(
+        && rowid_eq_residual_seek.is_none()
+    {
+        let covers = |index: &IndexSchema| aggregate_seek_is_covering(&agg_columns, index, table);
+        composite_index_prefix_range_target(
+            where_clause,
+            table,
+            table_alias,
+            schema,
+            required_index,
+            Some(&covers),
+        )
+        .filter(|comp| !comp.prefix_exprs.is_empty())
+    } else {
+        None
+    };
+
+    // Tier 4b (bd-z62ru): whole-WHERE `col IS NULL` on an ascending leading index column.
+    let index_is_null_seek = if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && rowid_eq_seek.is_none()
+        && rowid_eq_residual_seek.is_none()
+        && composite_prefix_range_with_prefix.is_none()
+    {
+        aggregate_index_is_null_target(where_clause, table, table_alias, required_index).map(
+            |index| {
+                let nulls = ColumnRangeTarget {
+                    lower: None,
+                    upper: None,
+                };
+                (index, nulls, false, true)
+            },
+        )
+    } else {
+        None
+    };
+
+    // Tier 4c (bd-hyoms): composite index pinning >= 2 key terms with an IN list plus equality/range.
+    let index_const_in_composite = if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && rowid_eq_seek.is_none()
+        && rowid_eq_residual_seek.is_none()
+        && composite_prefix_range_with_prefix.is_none()
+        && index_is_null_seek.is_none()
+    {
+        index_const_in_list_composite_target(
             where_clause,
             table,
             table_alias,
             schema,
             required_index,
         )
-        .is_none()
-    {
-        index_integer_in_list_residual_target(where_clause, table, table_alias, required_index)
     } else {
         None
     };
 
-    // bd-in-or-index-scan-fs7nd: REAL/NUMERIC/TEXT membership and parameter
-    // lists need affinity-coerced, deduplicated probes, not a table scan.
-    // Keep the integer-literal specialization above and the same hint gate.
-    let index_const_in_seek = if allow_index_seek
+    // Optional integer-literal rowid range bounds reused by bd-z3a05 (`a = <lit> AND id < <int>`,
+    // `a IN (5, 7) AND id < <int>`) and by the pure-range tier below.
+    let raw_rowid_range = if allow_rowid_seek
         && having.is_none()
         && index_eq_seek.is_none()
         && rowid_eq_seek.is_none()
-        && rowid_range_seek.is_none()
+        && rowid_eq_residual_seek.is_none()
+        && composite_prefix_range_with_prefix.is_none()
+        && index_is_null_seek.is_none()
+        && index_const_in_composite.is_none()
+    {
+        extract_rowid_range_residual_target(where_clause, table, table_alias)
+    } else {
+        None
+    };
+
+    // Tier 4d: equality-prefix seek + residual (`WHERE a = <lit|?N> AND <residual>`).
+    // When integer-literal rowid bounds are also present (bd-z3a05), prefer a full-key literal
+    // prefix so the walk seeks `(prefix, rowid_bounds)` directly instead of scanning the full
+    // prefix run.
+    let index_prefix_residual_seek = if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && rowid_eq_seek.is_none()
+        && rowid_eq_residual_seek.is_none()
+        && composite_prefix_range_with_prefix.is_none()
+        && index_is_null_seek.is_none()
+        && index_const_in_composite.is_none()
+    {
+        let full_key_rowid_bounded = raw_rowid_range.as_ref().and_then(|(range, _)| {
+            let bounds = IndexEqRowidBounds::from_range(range)?;
+            let (idx, prefix) = aggregate_index_prefix_residual_target(
+                where_clause,
+                table,
+                table_alias,
+                schema,
+                PrefixIndexShape::FullKey,
+                PrefixProbe::Literal,
+                required_index,
+            )?;
+            Some((idx, prefix, Some(bounds)))
+        });
+        full_key_rowid_bounded.or_else(|| {
+            aggregate_index_prefix_residual_target(
+                where_clause,
+                table,
+                table_alias,
+                schema,
+                PrefixIndexShape::AnyPrefix,
+                PrefixProbe::Literal,
+                required_index,
+            )
+            .or_else(|| {
+                // bd-79p0a: numbered-parameter equality prefix (`WHERE a = ?1 AND <residual>`).
+                aggregate_index_prefix_residual_target(
+                    where_clause,
+                    table,
+                    table_alias,
+                    schema,
+                    PrefixIndexShape::AnyPrefix,
+                    PrefixProbe::LiteralOrNumberedParameter,
+                    required_index,
+                )
+            })
+            .map(|(idx, prefix)| (idx, prefix, None))
+        })
+    } else {
+        None
+    };
+
+    // Tier 3a (bd-2dgf5 / bd-z3a05): INTEGER-affinity index IN-list seek, optionally bounded by
+    // integer-literal rowid bounds on a single-column index.
+    let index_in_seek = if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && rowid_eq_seek.is_none()
+        && rowid_eq_residual_seek.is_none()
+        && composite_prefix_range_with_prefix.is_none()
+        && index_is_null_seek.is_none()
+        && index_const_in_composite.is_none()
+        && index_prefix_residual_seek.is_none()
+    {
+        index_integer_in_list_residual_target(where_clause, table, table_alias, required_index).map(
+            |(idx, values, has_residual)| {
+                let bounds = if idx.key_term_count() == 1 {
+                    raw_rowid_range
+                        .as_ref()
+                        .and_then(|(range, _)| IndexEqRowidBounds::from_range(range))
+                } else {
+                    None
+                };
+                (idx, values, has_residual, bounds)
+            },
+        )
+    } else {
+        None
+    };
+
+    // Tier 3b (bd-in-or-index-scan-fs7nd / bd-hyoms): REAL/NUMERIC/TEXT/parameter or composite IN-list.
+    let index_const_in_seek = if index_const_in_composite.is_some() {
+        index_const_in_composite
+    } else if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && rowid_eq_seek.is_none()
+        && rowid_eq_residual_seek.is_none()
+        && composite_prefix_range_with_prefix.is_none()
+        && index_is_null_seek.is_none()
+        && index_prefix_residual_seek.is_none()
         && index_in_seek.is_none()
     {
         index_const_in_list_residual_target(
@@ -25949,52 +27722,45 @@ fn codegen_select_aggregate(
         None
     };
 
-    // Seek + bounded walk over a single-column index for `WHERE col <range>` (`>`, `>=`, `<`, `<=`,
-    // `BETWEEN`) instead of a full scan. Reuses the residual-safe `aggregate_index_range_seek_target`
-    // detection; mirrors the non-aggregate `codegen_select_index_range_scan`, only the per-row action
-    // changes (accumulate vs `ResultRow`).
-    // bd-z62ru: `col IS NULL` walks the same way, over the index's leading NULL keys
-    // (the last tuple field).
-    let index_range_seek = if allow_index_seek
+    // Tier 3c (bd-agg-rowid-in): `WHERE <rowid> IN (<int literals>) [AND <residual>]`.
+    let rowid_in_seek = if allow_rowid_seek
         && having.is_none()
         && index_eq_seek.is_none()
         && rowid_eq_seek.is_none()
-        && rowid_range_seek.is_none()
+        && rowid_eq_residual_seek.is_none()
+        && composite_prefix_range_with_prefix.is_none()
+        && index_is_null_seek.is_none()
+        && index_prefix_residual_seek.is_none()
         && index_in_seek.is_none()
         && index_const_in_seek.is_none()
+        && !table.without_rowid
     {
-        aggregate_index_range_seek_target(where_clause, table, table_alias, schema, required_index)
-            .map(|(index, range, has_residual)| (index, range, has_residual, false))
-            .or_else(|| {
-                aggregate_index_is_null_target(where_clause, table, table_alias, required_index).map(
-                    |index| {
-                        let nulls = ColumnRangeTarget {
-                            lower: None,
-                            upper: None,
-                        };
-                        (index, nulls, false, true)
-                    },
-                )
-            })
+        extract_rowid_in_list_residual_target(where_clause, table, table_alias)
     } else {
         None
     };
 
-    // Seek + bounded walk over a composite index for `WHERE a = v AND b <range>` (equality prefix +
-    // trailing range). Reuses the now residual-safe `composite_index_prefix_range_target`
-    // (bd-zqkrp-residual-drop); mirrors the non-aggregate
-    // `codegen_select_composite_index_prefix_range_scan`. The demoted full-equality case (`a=? AND
-    // b=?`) is claimed by the earlier `index_eq_seek`, so this only sees genuine ranges.
-    let composite_prefix_range_seek = if allow_index_seek
-        && having.is_none()
-        && index_eq_seek.is_none()
-        && rowid_eq_seek.is_none()
-        && rowid_range_seek.is_none()
-        && index_in_seek.is_none()
-        && index_const_in_seek.is_none()
-        && index_range_seek.is_none()
-    {
-        // An index that holds every column the aggregates read walks without row lookups.
+    // Tier 2 / Tier 0: pure range seeks (rowid range, single-col / covering-WHERE index range,
+    // empty-prefix composite range). A two-sided range (`BETWEEN` / lower + upper) strictly beats
+    // a one-sided range across candidates; ties keep the original `rowid > index > composite` order.
+    let higher_tier_matched = index_eq_seek.is_some()
+        || rowid_eq_seek.is_some()
+        || rowid_eq_residual_seek.is_some()
+        || composite_prefix_range_with_prefix.is_some()
+        || index_is_null_seek.is_some()
+        || index_prefix_residual_seek.is_some()
+        || index_in_seek.is_some()
+        || index_const_in_seek.is_some()
+        || rowid_in_seek.is_some();
+
+    let raw_rowid_range_opt = raw_rowid_range.filter(|_| !higher_tier_matched);
+    let raw_index_range_opt = if allow_index_seek && having.is_none() && !higher_tier_matched {
+        aggregate_index_range_seek_target(where_clause, table, table_alias, schema, required_index)
+            .map(|(index, range, has_residual)| (index, range, has_residual, false))
+    } else {
+        None
+    };
+    let raw_composite_range_opt = if allow_index_seek && having.is_none() && !higher_tier_matched {
         let covers = |index: &IndexSchema| aggregate_seek_is_covering(&agg_columns, index, table);
         composite_index_prefix_range_target(
             where_clause,
@@ -26008,166 +27774,114 @@ fn codegen_select_aggregate(
         None
     };
 
-    // Seek the equality-prefix block and apply the full WHERE as a residual filter
-    // per row — for `WHERE a = <literal> AND <residual>` where the residual is not a range the composite
-    // path handles. The literal prefix needs no bind slot, so the residual filter is emitted once from
-    // the original WHERE bind base and its Variable opcodes are reused on every row.
-    let index_prefix_residual_seek = if allow_index_seek
-        && having.is_none()
-        && index_eq_seek.is_none()
-        && rowid_eq_seek.is_none()
-        && rowid_range_seek.is_none()
-        && index_in_seek.is_none()
-        && index_const_in_seek.is_none()
-        && index_range_seek.is_none()
-        && composite_prefix_range_seek.is_none()
-    {
-        aggregate_index_prefix_residual_target(
-            where_clause,
-            table,
-            table_alias,
-            schema,
-            PrefixIndexShape::AnyPrefix,
-            PrefixProbe::Literal,
-            required_index,
-        )
-    } else {
-        None
-    };
-
-    // bd-agg-rowid-in: aggregate over `WHERE <rowid> IN (<int literals>)` by SeekRowid per distinct value,
-    // accumulating each hit, instead of a full scan. The rowid analogue of `index_in_seek` (COUNT(*) is
-    // served by count_star's own rowid-IN; this serves SUM/AVG/MIN/MAX/COUNT(col)). Gated LAST so no
-    // existing seek gate changes — a rowid IN is mutually exclusive with every shape above. Integer
-    // literals only (SeekRowid coerces via to_integer()); sorted+deduped so each row accumulates once; an
-    // all-miss leaves the accumulators Null (the empty-scan result).
-    let rowid_in_seek = if allow_rowid_seek
-        && having.is_none()
-        && index_eq_seek.is_none()
-        && rowid_eq_seek.is_none()
-        && rowid_range_seek.is_none()
-        && index_in_seek.is_none()
-        && index_const_in_seek.is_none()
-        && index_range_seek.is_none()
-        && composite_prefix_range_seek.is_none()
-        && index_prefix_residual_seek.is_none()
-        && !table.without_rowid
-    {
-        extract_rowid_in_list_residual_target(where_clause, table, table_alias)
-    } else {
-        None
-    };
-
-    // bd-agg-rowid-eq-residual: aggregate over `WHERE <rowid> = <int> AND <residual>` by seeking the single
-    // row and re-applying the residual before AggStep. `extract_rowid_eq_residual_target` returns the const
-    // only when `rowid = const` is a conjunct alongside others (the bare eq is served by rowid_eq_seek).
-    // Integer literal only; gated after every other seek so no existing gate changes.
-    let rowid_eq_residual_seek = if allow_rowid_seek
-        && having.is_none()
-        && index_eq_seek.is_none()
-        && rowid_eq_seek.is_none()
-        && rowid_range_seek.is_none()
-        && index_in_seek.is_none()
-        && index_const_in_seek.is_none()
-        && index_range_seek.is_none()
-        && composite_prefix_range_seek.is_none()
-        && index_prefix_residual_seek.is_none()
-        && rowid_in_seek.is_none()
-        && !table.without_rowid
-    {
-        extract_rowid_eq_residual_target(where_clause, table, table_alias)
-            .filter(|rhs| matches!(rhs, Expr::Literal(Literal::Integer(_), _)))
-    } else {
-        None
-    };
-
-    // bd-79p0a: the same equality-prefix seek when the caller binds the key,
-    // `WHERE a = ?1 AND <residual>`. The literal-only gate above declined it,
-    // and the aggregate scanned in rowid order: slower than the literal
-    // spelling's seek, and a bare column took another row than stock's, which
-    // seeks. Taken last, so no shape that another seek serves changes. The
-    // emitter applies each term's index-capped affinity before seeking.
-    let index_prefix_residual_seek = if allow_index_seek
-        && having.is_none()
-        && index_eq_seek.is_none()
-        && rowid_eq_seek.is_none()
-        && rowid_range_seek.is_none()
-        && index_in_seek.is_none()
-        && index_const_in_seek.is_none()
-        && index_range_seek.is_none()
-        && composite_prefix_range_seek.is_none()
-        && index_prefix_residual_seek.is_none()
-        && rowid_in_seek.is_none()
-        && rowid_eq_residual_seek.is_none()
-    {
-        aggregate_index_prefix_residual_target(
-            where_clause,
-            table,
-            table_alias,
-            schema,
-            PrefixIndexShape::AnyPrefix,
-            PrefixProbe::LiteralOrNumberedParameter,
-            required_index,
-        )
-    } else {
-        index_prefix_residual_seek
-    };
-
-    // bd-z3a05: `SUM(c) WHERE a = <lit> AND id < <int>` took `rowid_range_seek`,
-    // which walks the rowid slice (usually most of the table) and filters on `a`.
-    // When literal equalities pin every key column of an index, that index
-    // stores the matching entries in rowid order, so the walk below seeks
-    // `(prefix, lower)` and leaves once the rowid passes `upper`: it visits only
-    // rows that satisfy both, as stock's `SEARCH t USING INDEX (a=? AND
-    // rowid<?)` does. Only integer-literal rowid bounds; the residual filter
-    // still applies the whole WHERE. Every gate after `rowid_range_seek` saw it
-    // set and declined, so taking it over here changes no other choice.
-    let index_prefix_rowid_bounded = rowid_range_seek.as_ref().and_then(|(range, _)| {
-        let bounds = IndexEqRowidBounds::from_range(range)?;
-        let (idx, prefix) = aggregate_index_prefix_residual_target(
-            where_clause,
-            table,
-            table_alias,
-            schema,
-            PrefixIndexShape::FullKey,
-            PrefixProbe::Literal,
-            required_index,
-        )?;
-        Some((idx, prefix, bounds))
-    });
-    // bd-z3a05: the IN-list form, `SUM(c) WHERE a IN (5, 7) AND id < <int>`, the
-    // same way. A one-column index stores each listed value's entries in rowid
-    // order, so each value's seek starts at `(value, floor)` and leaves its run
-    // past the ceiling. index_in_seek already de-duplicates the values, so the
-    // runs stay disjoint, and the residual filter applies the whole WHERE.
-    let index_in_rowid_bounded = rowid_range_seek
+    let rowid_range_two_sided = raw_rowid_range_opt
         .as_ref()
-        .filter(|_| index_prefix_rowid_bounded.is_none())
-        .and_then(|(range, _)| {
-            let bounds = IndexEqRowidBounds::from_range(range)?;
-            let (idx, values, has_residual) = index_integer_in_list_residual_target(
-                where_clause,
-                table,
-                table_alias,
-                required_index,
-            )?;
-            (idx.key_term_count() == 1).then_some((idx, values, has_residual, bounds))
-        });
-    let rowid_range_seek = rowid_range_seek.filter(|_| {
-        index_prefix_rowid_bounded.is_none() && index_in_rowid_bounded.is_none()
-    });
-    let index_prefix_residual_seek = match index_prefix_rowid_bounded {
-        Some((idx, prefix, bounds)) => Some((idx, prefix, Some(bounds))),
-        None => index_prefix_residual_seek.map(|(idx, prefix)| (idx, prefix, None)),
-    };
-    let index_in_seek = match index_in_rowid_bounded {
-        Some((idx, values, has_residual, bounds)) => Some((idx, values, has_residual, Some(bounds))),
-        None => index_in_seek.map(|(idx, values, has_residual)| (idx, values, has_residual, None)),
-    };
+        .is_some_and(|(r, _)| r.lower.is_some() && r.upper.is_some());
+    let index_range_two_sided = raw_index_range_opt
+        .as_ref()
+        .is_some_and(|(_, r, _, _)| r.lower.is_some() && r.upper.is_some());
+    let composite_range_two_sided = raw_composite_range_opt
+        .as_ref()
+        .is_some_and(|c| c.range.lower.is_some() && c.range.upper.is_some());
+
+    let (rowid_range_seek, index_range_seek, composite_prefix_range_seek) =
+        if index_is_null_seek.is_some() {
+            (None, index_is_null_seek, None)
+        } else if composite_prefix_range_with_prefix.is_some() {
+            (None, None, composite_prefix_range_with_prefix)
+        } else if rowid_range_two_sided {
+            (raw_rowid_range_opt, None, None)
+        } else if index_range_two_sided {
+            (None, raw_index_range_opt, None)
+        } else if composite_range_two_sided {
+            (None, None, raw_composite_range_opt)
+        } else if raw_rowid_range_opt.is_some() {
+            (raw_rowid_range_opt, None, None)
+        } else if raw_index_range_opt.is_some() {
+            (None, raw_index_range_opt, None)
+        } else {
+            (None, None, raw_composite_range_opt)
+        };
 
     let finalize_label = b.emit_label();
     let where_placeholder_base = b.current_anon_placeholder();
     let mut skip_scan = false;
+
+    // bd-5kdea: stock SQLite's lone `MIN(x)` / `MAX(x)` min/max-index plan choice
+    // (no stat4). Compares any index/rowid that orders `x` against the best
+    // non-min/max WHERE seek tier, walks the winner in its min/max direction, and
+    // stops at the first matching row.
+    let best_where_rank: (u8, usize, bool) = if rowid_eq_seek.is_some()
+        || rowid_eq_residual_seek.is_some()
+    {
+        (5, 1, false)
+    } else if let Some((_, prefix)) = &index_eq_seek {
+        (4, prefix.len(), false)
+    } else if let Some((_, prefix, _)) = &index_prefix_residual_seek {
+        (4, prefix.len(), false)
+    } else if let Some(comp) = &composite_prefix_range_seek
+        && !comp.prefix_exprs.is_empty()
+    {
+        (4, comp.prefix_exprs.len(), false)
+    } else if index_range_seek
+        .as_ref()
+        .is_some_and(|(_, _, _, nulls_only)| *nulls_only)
+    {
+        (4, 1, false)
+    } else if let Some(target) = &index_const_in_seek {
+        if target.prefix.is_empty() && target.suffix.is_empty() {
+            (3, 1, false)
+        } else {
+            (4, target.prefix.len() + 1 + target.suffix.len(), false)
+        }
+    } else if index_in_seek.is_some() || rowid_in_seek.is_some() {
+        (3, 1, false)
+    } else if rowid_range_seek
+        .as_ref()
+        .is_some_and(|(r, _)| r.lower.is_some() && r.upper.is_some())
+        || index_range_seek
+            .as_ref()
+            .is_some_and(|(_, r, _, _)| r.lower.is_some() && r.upper.is_some())
+        || composite_prefix_range_seek
+            .as_ref()
+            .is_some_and(|c| c.range.lower.is_some() && c.range.upper.is_some())
+    {
+        (2, 0, false)
+    } else {
+        (0, 0, false)
+    };
+    let has_any_where_seek = index_eq_seek.is_some()
+        || rowid_eq_seek.is_some()
+        || rowid_range_seek.is_some()
+        || index_in_seek.is_some()
+        || index_const_in_seek.is_some()
+        || index_range_seek.is_some()
+        || composite_prefix_range_seek.is_some()
+        || index_prefix_residual_seek.is_some()
+        || rowid_in_seek.is_some()
+        || rowid_eq_residual_seek.is_some();
+    let rowid_eq_pinned =
+        rowid_eq_seek.is_some() || rowid_eq_residual_seek.is_some() || rowid_in_seek.is_some();
+    let lone_minmax_selected = lone_minmax_plan(
+        &agg_columns,
+        table,
+        table_alias,
+        schema,
+        where_clause,
+        having,
+        from_index_hint,
+        best_where_rank,
+        has_any_where_seek,
+        rowid_eq_pinned,
+    );
+    let lone_minmax_const_pinned = lone_minmax_selected.is_none()
+        && lone_minmax_target_pinned_single_value(
+            &agg_columns,
+            table,
+            table_alias,
+            where_clause,
+            having,
+        );
 
     // #137 sub-2 / bd-aj9v4: fallback full walk of a forced `INDEXED BY <idx>`
     // in its STORED order when none of the constrained seeks above matched
@@ -26201,7 +27915,23 @@ fn codegen_select_aggregate(
             None
         };
 
-    if let Some((idx_schema, prefix_exprs)) = index_eq_seek {
+    if let Some(minmax_plan) = lone_minmax_selected {
+        emit_lone_minmax_plan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            &agg_columns,
+            accum_base,
+            bare_capture,
+            where_clause,
+            where_placeholder_base,
+            finalize_label,
+            minmax_plan,
+        );
+        skip_scan = true;
+    } else if let Some((idx_schema, prefix_exprs)) = index_eq_seek {
         let idx_cursor = 1_i32;
         let duplicate_run_done = b.emit_label();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -26357,6 +28087,9 @@ fn codegen_select_aggregate(
                 accum_base,
                 bare_capture,
             );
+        }
+        if lone_minmax_const_pinned {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
         }
 
         b.resolve_label(idx_skip_label);
@@ -26522,6 +28255,9 @@ fn codegen_select_aggregate(
             accum_base,
             bare_capture,
         );
+        if lone_minmax_const_pinned {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        }
         b.resolve_label(range_skip_label);
         b.emit_op(Opcode::Next, cursor, range_loop_top, 0, P4::None, 0);
         skip_scan = true;
@@ -26570,6 +28306,7 @@ fn codegen_select_aggregate(
                 covering,
                 residual_where,
                 rowid_bounds,
+                lone_minmax_const_pinned,
             );
         }
         skip_scan = true;
@@ -26589,13 +28326,21 @@ fn codegen_select_aggregate(
             Opcode::OpenRead, idx_cursor, idx_schema.root_page, 0,
             P4::Index(idx_schema.name.clone()), 0,
         );
-        emit_index_const_list_rows(
-            b, idx_cursor, probe_cursor, &target, where_placeholder_base,
-            |b, skip_row| {
+        emit_index_const_list_rows_directed(
+            b,
+            idx_cursor,
+            probe_cursor,
+            &target,
+            where_placeholder_base,
+            false,
+            |b, skip_row, next_probe, _probes_done| {
                 if covering {
                     emit_aggregate_accumulate_body_covering(
                         b, idx_cursor, idx_schema, table, &agg_columns, accum_base,
                     );
+                    if lone_minmax_const_pinned {
+                        b.emit_jump_to_label(Opcode::Goto, 0, 0, next_probe, P4::None, 0);
+                    }
                     return;
                 }
                 let rowid_reg = b.alloc_reg();
@@ -26619,6 +28364,9 @@ fn codegen_select_aggregate(
                 emit_aggregate_accumulate_body(
                     b, cursor, table, table_alias, schema, &agg_columns, accum_base, bare_capture,
                 );
+                if lone_minmax_const_pinned {
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, next_probe, P4::None, 0);
+                }
             },
         );
         b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
@@ -26844,6 +28592,9 @@ fn codegen_select_aggregate(
                 bare_capture,
             );
         }
+        if lone_minmax_const_pinned {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        }
 
         b.resolve_label(skip_label);
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -27060,6 +28811,9 @@ fn codegen_select_aggregate(
                 accum_base,
                 bare_capture,
             );
+        }
+        if lone_minmax_const_pinned {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
         }
 
         b.resolve_label(skip_label);
@@ -27288,6 +29042,9 @@ fn codegen_select_aggregate(
                 bare_capture,
             );
         }
+        if lone_minmax_const_pinned {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        }
 
         b.resolve_label(skip_label);
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -27508,6 +29265,9 @@ fn codegen_select_aggregate(
                 bare_capture,
             );
         }
+        if lone_minmax_const_pinned {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        }
         b.resolve_label(idx_skip_label);
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let idx_loop_body = idx_loop_top as i32;
@@ -27519,7 +29279,11 @@ fn codegen_select_aggregate(
     // bd-w4pr1.13.11: the full scan below may run on several threads.
     let mut parallel_plan = None;
     if !skip_scan {
-        if having.is_none() && limit_clause.is_none() && from_index_hint.is_none() {
+        if having.is_none()
+            && limit_clause.is_none()
+            && from_index_hint.is_none()
+            && !lone_minmax_const_pinned
+        {
             parallel_plan = parallel_aggregate_plan(
                 cursor,
                 table,
@@ -27573,6 +29337,9 @@ fn codegen_select_aggregate(
             accum_base,
             bare_capture,
         );
+        if lone_minmax_const_pinned {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        }
 
         // Skip label for WHERE-filtered rows.
         b.resolve_label(skip_label);
@@ -75339,5 +77106,167 @@ mod tests {
                 "emit_index_key_term for `{expected_col}` must not re-parse or emit Null/Add/Integer: {prog_ops:?}"
             );
         }
+    }
+
+    #[test]
+    fn bd_5kdea_lone_minmax_choice_rule_matches_stock_no_stat4_tiers() {
+        let mk_col = |name: &str, affinity: char, is_ipk: bool| ColumnInfo {
+            name: name.to_owned(),
+            affinity,
+            is_ipk,
+            type_name: None,
+            notnull: false,
+            unique: false,
+            default_value: None,
+            strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
+            collation: None,
+            conflict_action: None,
+        };
+        let mk_idx = |name: &str, root_page: i32, cols: &[&str]| IndexSchema {
+            name: name.to_owned(),
+            root_page,
+            columns: cols.iter().map(|c| (*c).to_owned()).collect(),
+            key_expressions: Vec::new(),
+            key_sort_directions: Vec::new(),
+            where_clause: None,
+            is_unique: false,
+            key_collations: Vec::new(),
+            conflict_action: None,
+        };
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                mk_col("id", 'D', true),
+                mk_col("a", 'D', false),
+                mk_col("b", 'D', false),
+                mk_col("c", 'B', false),
+                mk_col("n", 'D', false),
+            ],
+            indexes: vec![
+                mk_idx("t_ab", 3, &["a", "b"]),
+                mk_idx("t_b", 4, &["b"]),
+                mk_idx("t_c", 5, &["c"]),
+            ],
+            strict: false,
+            primary_key_constraints: vec![],
+            check_constraints: vec![],
+            without_rowid: false,
+            foreign_keys: vec![],
+        };
+        let compile_choice = |sql: &str, tbl: &TableSchema| -> Vec<fsqlite_types::opcode::Opcode> {
+            let select = select_sql(sql);
+            let mut b = ProgramBuilder::new();
+            let sch = std::slice::from_ref(tbl);
+            codegen_select(&mut b, &select, sch, &CodegenContext::default())
+                .expect("codegen_select");
+            b.finish()
+                .expect("finish")
+                .ops()
+                .iter()
+                .map(|op| op.opcode)
+                .collect()
+        };
+        let open_indexes = |sql: &str, tbl: &TableSchema| -> Vec<String> {
+            let select = select_sql(sql);
+            let mut b = ProgramBuilder::new();
+            let sch = std::slice::from_ref(tbl);
+            codegen_select(&mut b, &select, sch, &CodegenContext::default())
+                .expect("codegen_select");
+            b.finish()
+                .expect("finish")
+                .ops()
+                .iter()
+                .filter_map(|op| match (&op.opcode, &op.p4) {
+                    (Opcode::OpenRead, P4::Index(name)) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // 1. One-sided range on another index (`c > 'v20'`) loses to min/max index `t_b`.
+        assert_eq!(
+            open_indexes("SELECT id, min(b) FROM t WHERE c > 'v20'", &table),
+            vec!["t_b"]
+        );
+        assert_eq!(
+            open_indexes("SELECT id, max(b) FROM t WHERE c > 'v20'", &table),
+            vec!["t_b"]
+        );
+        // 2. Two-sided range on another index (`c BETWEEN 'v1' AND 'v12'`) beats `t_b`.
+        assert_eq!(
+            open_indexes(
+                "SELECT id, min(b) FROM t WHERE c BETWEEN 'v1' AND 'v12'",
+                &table
+            ),
+            vec!["t_c"]
+        );
+        // 3. Equality on another index (`c = 'v5'`) beats `t_b`, even with `b BETWEEN 2 AND 4` or `b > 10`.
+        assert_eq!(
+            open_indexes(
+                "SELECT id, max(b) FROM t WHERE b BETWEEN 2 AND 4 AND c = 'v5'",
+                &table
+            ),
+            vec!["t_c"]
+        );
+        assert_eq!(
+            open_indexes(
+                "SELECT id, max(b) FROM t WHERE b > 10 AND c = 'v5'",
+                &table
+            ),
+            vec!["t_c"]
+        );
+        // 3b. Rowid point lookup (`id = 7 AND a = 5`) beats secondary indexes (no index opened).
+        assert!(open_indexes("SELECT id, max(b) FROM t WHERE id = 7 AND a = 5", &table).is_empty());
+        // 3c. Two-sided range on another index (`c BETWEEN`) beats one-sided range on `b` or `id`.
+        assert_eq!(
+            open_indexes(
+                "SELECT id, max(b) FROM t WHERE b > 10 AND c BETWEEN 'v1' AND 'v12'",
+                &table
+            ),
+            vec!["t_c"]
+        );
+        assert_eq!(
+            open_indexes(
+                "SELECT id, max(b) FROM t WHERE id > 380 AND c BETWEEN 'v1' AND 'v12'",
+                &table
+            ),
+            vec!["t_c"]
+        );
+        // 3d. Two-sided rowid range (`id BETWEEN 100 AND 120`) beats one-sided `c > 'v20'`.
+        assert!(
+            open_indexes(
+                "SELECT id, max(b) FROM t WHERE id BETWEEN 100 AND 120 AND c > 'v20'",
+                &table
+            )
+            .is_empty()
+        );
+        // 4. Composite prefix equality + min/max (`a = 5 AND c = 'v1'`) picks `t_ab` over `t_c`.
+        assert_eq!(
+            open_indexes("SELECT id, max(b) FROM t WHERE a = 5 AND c = 'v1'", &table),
+            vec!["t_ab"]
+        );
+        // 5. `SELECT id, max(b) FROM t WHERE a = 5` walks `t_ab` backward (`SeekLE` + `Prev`) covering.
+        let max_ab_ops = compile_choice("SELECT id, max(b) FROM t WHERE a = 5", &table);
+        assert!(max_ab_ops.contains(&Opcode::SeekLE));
+        assert!(max_ab_ops.contains(&Opcode::Prev));
+        assert!(!max_ab_ops.contains(&Opcode::SeekRowid));
+        // 6. `HAVING` disables min/max reversal (`SeekGE` + `Next`, no `Prev`).
+        let having_ops = compile_choice(
+            "SELECT id, max(b) FROM t WHERE a = 5 HAVING max(b) > 0",
+            &table,
+        );
+        assert!(!having_ops.contains(&Opcode::Prev));
+        // 7. Covering-index fallback when only `t_ab(a, b)` exists for `SELECT id, max(b) FROM t`.
+        let mut t_only_ab = table.clone();
+        t_only_ab.indexes.retain(|idx| idx.name == "t_ab");
+        assert_eq!(
+            open_indexes("SELECT id, max(b) FROM t", &t_only_ab),
+            vec!["t_ab"]
+        );
+        // Non-covering (`c` not in `t_ab`) stays on full table scan (no index opened).
+        assert!(open_indexes("SELECT id, c, max(b) FROM t", &t_only_ab).is_empty());
     }
 }

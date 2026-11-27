@@ -165111,8 +165111,8 @@ fn index_walk_eqp_detail(
             "SCAN {displayed} USING COVERING INDEX {}",
             index.name
         )),
-        IndexWalkKind::Extremum if walk.covering && where_clause.is_none() => Some(format!(
-            "SEARCH {displayed} USING COVERING INDEX {}",
+        IndexWalkKind::Extremum => Some(format!(
+            "SEARCH {displayed} USING {using} {}",
             index.name
         )),
         IndexWalkKind::BoundedAbove => {
@@ -165128,7 +165128,7 @@ fn index_walk_eqp_detail(
                 format!("SEARCH {displayed} USING {using} {} ({terms})", index.name)
             })
         }
-        IndexWalkKind::Whole | IndexWalkKind::Count | IndexWalkKind::Extremum => None,
+        IndexWalkKind::Whole | IndexWalkKind::Count => None,
     }
 }
 
@@ -165296,14 +165296,32 @@ fn index_seek_eqp_detail(
             alias.as_deref(),
             key_column,
         )
-    })
-    .unwrap_or_else(|| format!("{key_column}=?"));
+    });
     let displayed = alias.as_deref().unwrap_or(&table.name);
     let covering = if seek.covering { "COVERING " } else { "" };
-    Some(format!(
-        "SEARCH {displayed} USING {covering}INDEX {} ({key_terms})",
-        index.name
-    ))
+    let constrains_leading_key = where_clause.as_deref().is_some_and(|expr| {
+        decompose_where(expr).into_iter().any(|term| {
+            classify_where_term(term).column.as_ref().is_some_and(|col| {
+                planner_where_column_matches(col, &table.name, alias.as_deref(), key_column)
+            })
+        })
+    });
+    if let Some(key_terms) = key_terms {
+        Some(format!(
+            "SEARCH {displayed} USING {covering}INDEX {} ({key_terms})",
+            index.name
+        ))
+    } else if select_core_is_aggregate(&select.body.select) && !constrains_leading_key {
+        Some(format!(
+            "SEARCH {displayed} USING {covering}INDEX {}",
+            index.name
+        ))
+    } else {
+        Some(format!(
+            "SEARCH {displayed} USING {covering}INDEX {} ({key_column}=?)",
+            index.name
+        ))
+    }
 }
 
 fn first_source_eqp_detail_from_from_clause(from_clause: &FromClause) -> Option<String> {
