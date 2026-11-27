@@ -94,6 +94,95 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-23 - WIN (landed as f96d616e9; inside its prediction on gb_id_mod100k, beyond its first band on gb_a_sum_c; gb_id_mod100k x3.77 -> x1.39 and gb_a_sum_c x4.27 -> x1.51 stock 3.54.1 in instructions): a spilled sorter merges its runs over a winner tree and compares INTEGER run heads as integers (bd-ku484, serial read lane rounds 14-16, lever SM1)
+
+- Target: the spilled-sorter GROUP BY regression bd-ku484.
+  - d081a0f87 (bd-dwjnq.5) made the sorter spill at the temp-store budget: 2,048,000 bytes at the default
+    cache_size, as stock's PMA size does, instead of a fixed 100 MiB.
+  - A 1M-row sorter at about 80 B a row then writes dozens of runs. SorterCursor::sort merged them by scanning
+    every run's head with compare_sorter_rows, about 40 generic comparisons per output row.
+  - gb_id_mod100k went 2,643M (x1.07, d52d8908b) -> 9,277M (x3.77); gb_a_sum_c 3,711M (x1.19) -> 13,276M (x4.27).
+  - Each run was already sorted by the single-integer pair sort; only the merge was generic.
+  - Not bisected by build: d081a0f87 lies inside the e0e82ede7..269f4b0ac window where spilled sorts error
+    (bd-46l13). Confirmed on one ELF instead: the parent at `PRAGMA cache_size=-400000` (no spill) costs 2,703M.
+- Ledger preflight:
+  - 2026-11-10 bd-w4pr1.13.3 (the pair sort; kept).
+  - 2026-11-11 "a spilled sorter run is sorted by the single-integer pair sort". Its retry condition, met here:
+    "stream it into the consumer, or at least compare run heads as integers: a build or sort past the spill
+    limit is the row being worked".
+  - 2026-11-11 REJECT (block moves of sorter rows; not this). INDEX "Thinning sorter rows" (not this).
+- Touched: `crates/fsqlite-vdbe/src/engine.rs` (SorterCursor::sort's merge; SorterMergeHead, SorterMergeOrder and
+  SorterMergeTree; two counters in VdbeMetricsSnapshot), `crates/fsqlite-e2e/src/perf_runner.rs` (the snapshot
+  literal), `crates/fsqlite-core/tests/bd_group_by_depth_oracle_probe.rs` (the keeper).
+  - The next row comes from a winner tree over the run indices, one head comparison per level.
+  - A head whose first key column is an INTEGER is cached as that integer, complemented for a DESC column. Two
+    such heads compare as i64, compare_sorter_rows' own answer for them. Equal integers go to the comparator
+    when another key column follows.
+  - A right child wins only when strictly first, so ties go to the lower run, as before. The merged order is
+    unchanged.
+- Prediction (on the bead before the build):
+  - gb_id_mod100k -5.6G to -6.3G Ir.
+  - gb_a_sum_c -5.5G to -6.4G, revised before any arm existed, from a profile of main, to -7.8G to -8.7G (its
+    merge was 8.6G, not 6.1G: more runs).
+  - Every other row within +-0.3%.
+  - gb_id_mod100k cpu about 660 -> 250-350 ms.
+- Kill lines: gb_id_mod100k drop under 4.0G; a replicated LOSE above 1%; a non-spilling row beyond +-0.5% Ir; a
+  keeper red or a mutant passing; gb_id_mod100k not a replicated WIN on cycles and cpu.
+- Result (8e3661d94 + sm1.patch 1f09d3fd09f1dbc9; one layout job on vmi1149989, -j 2, K=6; parent fsqlite-cargo
+  e13b836ed6e7c205, lever f27a2f77bfedde61; stock sqlite3 3.54.1 live; thinkstation1):
+  - Instructions (callgrind, single ELF, each arm on its own copy of one database; answers equal):
+    - gb_id_mod100k 9,276.82M -> 3,420.12M (-5,856.7M, -63.1%), x3.77 -> x1.39;
+    - gb_a_sum_c 13,275.97M -> 4,708.75M (-8,567.2M, -64.5%), x4.27 -> x1.51;
+    - no-spill controls (group_by_1000_groups; both rows at cache_size -400000) -0.21% to -0.26%;
+    - judge Ir: every other row within -0.25% to +0.00%.
+  - Time (judge v1 at 3.54.1; runs 1 and 3 valid at max null |z| 1.91 / 2.48; run 2 void at 4.37; recorded under the
+    host's powersave governor, so pending bd-j0jc0 / bd-gvews; the instruction lines are the verdict):
+    - gb_id_mod100k cycles 0.459 / 0.448 and cpu 0.533 / 0.525, both WIN;
+    - gb_a_sum_c cycles 0.455 / 0.454 and cpu 0.504 / 0.506, both WIN;
+    - vs stock: gb_id_mod100k cpu x3.52 -> x1.88 and x3.43 -> x1.80; gb_a_sum_c x3.49 -> x1.76 and x3.60 -> x1.82;
+    - no replicated LOSE on any row. bulk_insert_1M_one_txn cycles 0.984 / 0.984 is a replicated WIN at Ir
+      1.0000 where the lever's code does not run: a layout effect, not claimed.
+- Unit (rch vmi1153651; 8e3661d94 + the lever):
+  - The engine unit test and the core keeper (6 GROUP BY, 8 ORDER BY statements spilling at cache_size -16,
+    answers equal stock 3.54.1) are green.
+  - m1 (no INTEGER head): the unit test is red, and 8 keeper statements report every comparison going to the
+    comparator.
+  - m2 (a linear head scan): the unit test is red (47,055 comparisons against a bound of 3,212), and all 14
+    keeper statements exceed the tree bound.
+  - m3 (ties go right): the unit test is red, and the 3 tie statements (ORDER BY a, ORDER BY a DESC, GROUP BY a
+    with group_concat(id)) answer unlike stock.
+- Gate, on 6e171defc + the lever (rch, rounds 14-15):
+  - clippy -D warnings, vdbe + core + e2e, all targets: clean. vdbe lib 1,269 passed; golden_bytecode_snapshots 10,
+    hot_arm_stream_reachability 1, issue_531_grouped_index_input 14 (vmi1149989).
+  - core lib 4,211 passed; GROUP BY / aggregate set 56 passed (22 binaries); window set 68 (18); ORDER BY / temp_store /
+    sorter set 59 (19).
+  - e2e aggregate / window / join oracles and metrics readers: 28 binaries, 154 passed (vmi1227854).
+  - fsqlite crate: batch 1 (lib + 19) 879 passed, 1 failed (bd-mhat4's flaky held-statement keeper, since fixed by
+    6f5aa6fb1 and green below); batch 2 36 passed.
+- Rebased onto dfd2930a8 (range-diff "="; 190 intervening commits, among them engine.rs +1,488 lines with the VDBE
+  metrics gate the two counters are collected under, and GROUP BY binding / aggregate changes that feed the sorter).
+  The steps the rebase changes were rerun on that commit (eff901ada):
+  - clippy clean; vdbe lib 1,283 passed; hot_arm 1; issue_531 14; golden 4 passed, 6 failed (hz4);
+  - core GROUP BY / aggregate set 58 passed, 1 failed, the SM1 keeper green; ORDER BY / sorter set 57 passed, 2 failed
+    (vmi1153651);
+  - e2e: 28 binaries, 154 passed (vmi1153651);
+  - fsqlite crate, the 88 targets not green on the old base (batches 3-7, the new gh538 target, the bd-mhat4 keeper):
+    36 + 55 + 30 + 53 + 29 passed, 4 failed (vmi1153651, hz2).
+  - Every one of the 13 reds fails identically on main ee2d9089b in one parent job (vmi1153651): the 6 golden families
+    (codegen register numbering; the same 377 diff lines), bd_k66zh:378, bd_r9dhv:158 and bd_z0qqu:108 (NoSuchColumn),
+    gh444:227, gh538:49 (VACUUM companion -shm), nonagg_eq_residual:439 and nonagg_rowid_order_scan:135. None
+    touches the sorter's merge.
+  - Then rebased onto ede79b6d0 without a re-gate: the 44 newer commits touch neither the sorter, nor the metrics
+    snapshot or its two literals.
+  - rustfmt: ignored crates (vdbe, core); perf_runner.rs clean. ubs: engine.rs and the keeper 0 critical; perf_runner.rs
+    1 critical at line 5965, a hardware-signature string compare from 2026-03 (a false positive, not this lever's
+    code).
+- What remains: the spill itself. On these rows the lever is +0.72G and +0.97G over the parent's no-spill cost:
+  runs written, read back and decoded with a Vec per row, and every row collected into one vector again. Stock
+  spills too and costs 2,458.9M and 3,112.5M.
+- Retry / extend condition: a merge streamed into the consumer (no merged vector) and a run reader that decodes
+  the key into the row without a Vec. Measure on these two rows, and on CREATE INDEX past the spill limit.
+
 ## 2026-11-26 - KEPT (landed as a182075c8; bd-emim5 (b) step 1, a structural step toward commit-time relocation, inside every kill line by exact instruction counts, stock SQLite 3.54.1 live; time cells VOID under the powersave governor): a concurrent transaction writes its fresh end-of-file pages without the in-process page lock until COMMIT (single-writer lane r21)
 
 - Target: not a speed row. Two in-process growers both hand out "committed size + 1" (per-connection pagers); the
