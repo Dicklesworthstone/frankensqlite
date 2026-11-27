@@ -1275,7 +1275,69 @@ pub fn json_type(input: &str, path: Option<&str>) -> Result<Option<&'static str>
 ///
 /// - One path: return SQL-native value (text unwrapped, number typed, JSON null -> SQL NULL)
 /// - Multiple paths: return JSON array text of extracted values (missing paths become `null`)
+/// Preserve the original JSON token spellings when extracting multiple paths.
+///
+/// SQLite constructs the result array from the selected source tokens. Parsing
+/// those tokens into a value tree first changes observable JSON TEXT: for
+/// example, a string containing `\\u0074` must keep that escape and a number
+/// written as `1E+2` must not silently become `100.0`. Reuse the strict
+/// source-span scanner, translating valid JSON5 lexically before scanning.
+///
+/// A bounded fast path avoids repeatedly scanning huge inputs for many paths.
+/// Unsupported path forms retain the full resolver and its error semantics.
+fn try_lexical_json_extract_multi(input: &str, paths: &[&str]) -> Result<Option<String>> {
+    const MAX_LEXICAL_PATHS: usize = 8;
+    const MAX_LEXICAL_INPUT_BYTES: usize = 65_536;
+    if paths.len() > MAX_LEXICAL_PATHS || input.len() > MAX_LEXICAL_INPUT_BYTES {
+        return Ok(None);
+    }
+    // Check the path shapes before doing any JSON work. The full resolver
+    // handles quoted/escaped keys and all other extended JSON path forms.
+    let Some(fast_paths) = paths
+        .iter()
+        .map(|path| parse_fast_path(path))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let normalized;
+    let source = if validate_json_text(input) {
+        input
+    } else {
+        // Validation is mandatory before the lexical JSON5 translator, which
+        // deliberately assumes syntactically valid input.
+        parse_json5_text(input).map_err(|_| malformed_json())?;
+        normalized = translate_json5_to_json(input);
+        normalized.as_str()
+    };
+    let mut output = String::with_capacity(source.len().min(4096));
+    output.push('[');
+    for (index, path) in fast_paths.iter().enumerate() {
+        let span = extract_strict_json_span(source, path.as_slice());
+        let selected = match span {
+            StrictScanSpan::Missing => "null".to_owned(),
+            StrictScanSpan::Found(span) => {
+                minify_json_text(&source[span.start..span.end])
+            }
+            // Some valid JSON5 identifiers cannot be translated into a
+            // strict token stream; let the existing value resolver handle it.
+            StrictScanSpan::NotStrictJson => return Ok(None),
+        };
+        if index != 0 {
+            output.push(',');
+        }
+        output.push_str(&selected);
+    }
+    output.push(']');
+    Ok(Some(output))
+}
+
 pub fn json_extract(input: &str, paths: &[&str]) -> Result<SqliteValue> {
+    if paths.len() > 1
+        && let Some(encoded) = try_lexical_json_extract_multi(input, paths)?
+    {
+        return Ok(SqliteValue::Text(SmallText::from_string(encoded)));
+    }
     if paths.len() == 1
         && let Some((value, _)) = try_strict_json_extract_single(input, paths[0])?
     {
@@ -14060,5 +14122,37 @@ mod tests {
             diffs.len(),
             diffs.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod multi_path_lexical_parity_tests {
+    use super::*;
+
+    #[test]
+    fn json_extract_preserves_escaped_string_tokens_across_json5_translation() {
+        let input = r#"{first:'Infini\\u0074y', second:'plain', n:1E+2}"#;
+        let result = json_extract(input, &["$.first", "$.second", "$.n"]).unwrap();
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::new(r#"["Infini\\u0074y","plain",1E+2]"#))
+        );
+    }
+
+    #[test]
+    fn json_extract_preserves_strict_json_subtrees_and_missing_paths() {
+        let input = r#"{ "a": { "text": "a\\u002fb", "n": 1.50 }, "b": null }"#;
+        let result = json_extract(input, &["$.a", "$.missing", "$.b"]).unwrap();
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::new(
+                r#"[{"text":"a\\u002fb","n":1.50},null,null]"#
+            ))
+        );
+    }
+
+    #[test]
+    fn json_extract_bad_path_still_uses_full_resolver() {
+        assert!(json_extract(r#"{"a":1}"#, &["$.a", "$["]).is_err());
     }
 }
