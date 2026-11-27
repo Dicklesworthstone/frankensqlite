@@ -695,10 +695,9 @@ pub fn json_valid_blob(input: &[u8], flags: Option<u8>) -> i64 {
     0
 }
 
-/// Convert JSON text into JSONB bytes.
+/// Convert JSON or JSON5 text into stock-compatible JSONB bytes.
 pub fn jsonb(input: &str) -> Result<Vec<u8>> {
-    let value = parse_json_value_lenient(input)?;
-    encode_jsonb_root(&value)
+    translate_json_text_to_jsonb(input)
 }
 
 /// Convert JSONB bytes back into minified JSON text.
@@ -2351,142 +2350,26 @@ pub struct JsonTableRow {
 
 /// Table-valued `json_each`: iterate immediate children at root or `path`.
 pub fn json_each(input: &str, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
-    let root = parse_json_value_lenient(input)?;
-    json_each_value(&root, path)
+    let blob = translate_json_text_to_jsonb(input)?;
+    json_table_rows_from_jsonb(&blob, path, false)
 }
 
 /// Table-valued `json_each` over TEXT JSON or JSONB bytes.
 pub fn json_each_blob(input: &[u8], path: Option<&str>) -> Result<Vec<JsonTableRow>> {
-    let root = parse_json_input_blob(input)?;
-    json_each_value(&root, path)
-}
-
-/// The `key` column for the root row of a json_tree scan rooted at `path`: the
-/// last path segment — an object key (TEXT) or array index (INTEGER). NULL when
-/// scanning the document root (`$`), whose row has no parent key. Mirrors stock:
-/// `json_tree('{"a":{"b":1}}','$.a')` reports the `{"b":1}` row with key `'a'`,
-/// not NULL. (json_each's self-row key stays NULL — see its scalar branch.)
-/// bd-kzwze.
-fn path_root_key(path: Option<&str>) -> SqliteValue {
-    let Some(path) = path else {
-        return SqliteValue::Null;
-    };
-    match parse_path(path)
-        .ok()
-        .and_then(|segments| segments.last().cloned())
-    {
-        Some(PathSegment::Key(key)) => SqliteValue::Text(key.as_str().into()),
-        Some(PathSegment::Index(index)) => SqliteValue::Integer(i64::try_from(index).unwrap_or(0)),
-        // `$` (no segment), Append, and the rare `#-n` FromEnd form have no
-        // stable literal key here — fall back to NULL.
-        _ => SqliteValue::Null,
-    }
-}
-
-fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
-    let base_path = path.unwrap_or("$");
-    let target = match path {
-        Some(path_expr) => resolve_path(root, path_expr)?,
-        None => Some(root),
-    };
-    let Some(target) = target else {
-        return Ok(Vec::new());
-    };
-
-    let mut rows = Vec::new();
-    let mut next_id = 1_i64;
-
-    match target {
-        Value::Array(array) => {
-            for (index, item) in array.iter().enumerate() {
-                let index_i64 = i64::try_from(index).map_err(|error| {
-                    FrankenError::function_error(format!("json_each index overflow: {error}"))
-                })?;
-                let fullkey = append_array_path(base_path, index);
-                rows.push(JsonTableRow {
-                    key: SqliteValue::Integer(index_i64),
-                    value: json_value_column(item)?,
-                    type_name: json_type_name(item),
-                    atom: json_atom_column(item)?,
-                    id: next_id,
-                    parent: SqliteValue::Null,
-                    fullkey,
-                    path: base_path.to_owned(),
-                });
-                next_id += 1;
-            }
-        }
-        Value::Object(object) => {
-            for (key, item) in object {
-                let fullkey = append_object_path(base_path, key);
-                rows.push(JsonTableRow {
-                    key: SqliteValue::Text(key.as_str().into()),
-                    value: json_value_column(item)?,
-                    type_name: json_type_name(item),
-                    atom: json_atom_column(item)?,
-                    id: next_id,
-                    parent: SqliteValue::Null,
-                    fullkey,
-                    path: base_path.to_owned(),
-                });
-                next_id += 1;
-            }
-        }
-        scalar => {
-            rows.push(JsonTableRow {
-                // json_each's self/scalar row key is ALWAYS NULL — unlike
-                // json_tree, it does not surface the rooting path's last segment
-                // (verified vs stock: json_each('{"a":5}','$.a') -> key NULL,
-                // whereas json_tree of the same -> key 'a'). bd-kzwze.
-                key: SqliteValue::Null,
-                value: json_value_column(scalar)?,
-                type_name: json_type_name(scalar),
-                atom: json_atom_column(scalar)?,
-                id: next_id,
-                parent: SqliteValue::Null,
-                fullkey: base_path.to_owned(),
-                path: base_path.to_owned(),
-            });
-        }
-    }
-
-    Ok(rows)
+    let blob = json_blob_to_jsonb(input)?;
+    json_table_rows_from_jsonb(&blob, path, false)
 }
 
 /// Table-valued `json_tree`: recursively iterate subtree at root or `path`.
 pub fn json_tree(input: &str, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
-    let root = parse_json_value_lenient(input)?;
-    json_tree_value(&root, path)
+    let blob = translate_json_text_to_jsonb(input)?;
+    json_table_rows_from_jsonb(&blob, path, true)
 }
 
 /// Table-valued `json_tree` over TEXT JSON or JSONB bytes.
 pub fn json_tree_blob(input: &[u8], path: Option<&str>) -> Result<Vec<JsonTableRow>> {
-    let root = parse_json_input_blob(input)?;
-    json_tree_value(&root, path)
-}
-
-fn json_tree_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
-    let base_path = path.unwrap_or("$");
-    let target = match path {
-        Some(path_expr) => resolve_path(root, path_expr)?,
-        None => Some(root),
-    };
-    let Some(target) = target else {
-        return Ok(Vec::new());
-    };
-
-    let mut rows = Vec::new();
-    let mut next_id = 0_i64;
-    append_tree_rows(
-        &mut rows,
-        target,
-        path_root_key(path),
-        None,
-        base_path,
-        base_path,
-        &mut next_id,
-    )?;
-    Ok(rows)
+    let blob = json_blob_to_jsonb(input)?;
+    json_table_rows_from_jsonb(&blob, path, true)
 }
 
 /// Virtual table module for `json_each`.
@@ -2526,7 +2409,7 @@ impl VirtualTableCursor for JsonEachCursor {
         args: &[SqliteValue],
     ) -> Result<()> {
         self.rows = match parse_json_table_filter_args(args)? {
-            Some((input, path)) => json_each_value(&input, path)?,
+            Some((blob, path)) => json_table_rows_from_jsonb(&blob, path, false)?,
             None => Vec::new(),
         };
         self.pos = 0;
@@ -2595,7 +2478,7 @@ impl VirtualTableCursor for JsonTreeCursor {
         args: &[SqliteValue],
     ) -> Result<()> {
         self.rows = match parse_json_table_filter_args(args)? {
-            Some((input, path)) => json_tree_value(&input, path)?,
+            Some((blob, path)) => json_table_rows_from_jsonb(&blob, path, true)?,
             None => Vec::new(),
         };
         self.pos = 0;
@@ -5328,123 +5211,1379 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
     Ok(Some(cursor))
 }
 
-fn append_object_path(base: &str, key: &str) -> String {
-    // Quote keys containing special characters that would make the path
-    // ambiguous (dots, brackets, quotes, whitespace), including an empty label.
-    if key.is_empty()
-        || key.contains(|c: char| matches!(c, '.' | '[' | ']' | '"' | '\'') || c.is_whitespace())
-    {
-        format!("{base}.\"{}\"", key.replace('"', "\\\""))
-    } else {
-        format!("{base}.{key}")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonbTextStep {
+    Value(usize),
+    Eof,
+    EndObject(usize),
+    EndArray(usize),
+    Comma(usize),
+    Colon(usize),
+}
+
+const fn is_json_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+const fn is_json_id1(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'$' || b == b'_' || b >= 0x80
+}
+
+const fn is_json_id2(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'$' || b == b'_' || b >= 0x80
+}
+
+const fn is_json_ok_byte(b: u8) -> bool {
+    b >= 0x20 && b != b'"' && b != b'\'' && b != b'\\'
+}
+
+fn is_2hex(bytes: &[u8], pos: usize) -> bool {
+    bytes
+        .get(pos..pos + 2)
+        .is_some_and(|s| s[0].is_ascii_hexdigit() && s[1].is_ascii_hexdigit())
+}
+
+fn is_4hex(bytes: &[u8], pos: usize) -> bool {
+    is_2hex(bytes, pos) && is_2hex(bytes, pos + 2)
+}
+
+fn eq_ascii_ignore_case_at(bytes: &[u8], pos: usize, needle: &[u8]) -> bool {
+    bytes
+        .get(pos..pos + needle.len())
+        .is_some_and(|slice| slice.eq_ignore_ascii_case(needle))
+}
+
+/// Skip JSON5 whitespace and comments (`sqlite3.c`: `json5Whitespace`).
+fn json5_whitespace_len(bytes: &[u8]) -> usize {
+    let mut n = 0usize;
+    let len = bytes.len();
+    while n < len {
+        match bytes[n] {
+            0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x20 => n += 1,
+            b'/' => {
+                if bytes.get(n + 1) == Some(&b'*') && n + 2 < len {
+                    let mut j = n + 3;
+                    while j < len && !(bytes[j] == b'/' && bytes[j - 1] == b'*') {
+                        j += 1;
+                    }
+                    if j >= len {
+                        break;
+                    }
+                    n = j + 1;
+                } else if bytes.get(n + 1) == Some(&b'/') {
+                    let mut j = n + 2;
+                    while j < len {
+                        let c = bytes[j];
+                        if c == b'\n' || c == b'\r' {
+                            break;
+                        }
+                        if c == 0xe2
+                            && bytes.get(j + 1) == Some(&0x80)
+                            && matches!(bytes.get(j + 2), Some(0xa8 | 0xa9))
+                        {
+                            j += 2;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    n = if j < len { j + 1 } else { j };
+                } else {
+                    break;
+                }
+            }
+            0xc2 if bytes.get(n + 1) == Some(&0xa0) => n += 2,
+            0xe1 if bytes.get(n + 1) == Some(&0x9a) && bytes.get(n + 2) == Some(&0x80) => n += 3,
+            0xe2 if (bytes.get(n + 1) == Some(&0x80)
+                && matches!(bytes.get(n + 2), Some(0x80..=0x8a | 0xa8 | 0xa9 | 0xaf)))
+                || (bytes.get(n + 1) == Some(&0x81) && bytes.get(n + 2) == Some(&0x9f)) =>
+            {
+                n += 3;
+            }
+            0xe3 if bytes.get(n + 1) == Some(&0x80) && bytes.get(n + 2) == Some(&0x80) => n += 3,
+            0xef if bytes.get(n + 1) == Some(&0xbb) && bytes.get(n + 2) == Some(&0xbf) => n += 3,
+            _ => break,
+        }
     }
+    n
 }
 
-fn append_array_path(base: &str, index: usize) -> String {
-    format!("{base}[{index}]")
-}
-
-fn json_value_column(value: &Value) -> Result<SqliteValue> {
-    match value {
-        // Canonical writer keeps floats stock-canonical and renders non-finite
-        // numbers (FloatText) correctly (GH#212, bd-yalqc).
-        Value::Array(_) | Value::Object(_) => Ok(SqliteValue::Text(SmallText::from_string(
-            encode_json_text(value),
-        ))),
-        _ => json_to_sqlite_scalar(value),
-    }
-}
-
-fn json_atom_column(value: &Value) -> Result<SqliteValue> {
-    match value {
-        Value::Array(_) | Value::Object(_) => Ok(SqliteValue::Null),
-        _ => json_to_sqlite_scalar(value),
-    }
-}
-
-fn append_tree_rows(
-    rows: &mut Vec<JsonTableRow>,
-    value: &Value,
-    key: SqliteValue,
-    parent_id: Option<i64>,
-    fullkey: &str,
-    path: &str,
-    next_id: &mut i64,
+fn append_jsonb_header_placeholder(
+    node_type: u8,
+    estimated_payload_len: usize,
+    out: &mut Vec<u8>,
 ) -> Result<()> {
-    let current_id = *next_id;
-    *next_id += 1;
-
-    rows.push(JsonTableRow {
-        key,
-        value: json_value_column(value)?,
-        type_name: json_type_name(value),
-        atom: json_atom_column(value)?,
-        id: current_id,
-        parent: parent_id.map_or(SqliteValue::Null, SqliteValue::Integer),
-        fullkey: fullkey.to_owned(),
-        path: path.to_owned(),
-    });
-
-    match value {
-        Value::Array(array) => {
-            for (index, item) in array.iter().enumerate() {
-                let index_i64 = i64::try_from(index).map_err(|error| {
-                    FrankenError::function_error(format!("json_tree index overflow: {error}"))
-                })?;
-                let child_fullkey = append_array_path(fullkey, index);
-                append_tree_rows(
-                    rows,
-                    item,
-                    SqliteValue::Integer(index_i64),
-                    Some(current_id),
-                    &child_fullkey,
-                    fullkey,
-                    next_id,
-                )?;
-            }
-        }
-        Value::Object(object) => {
-            for (child_key, item) in object {
-                let child_fullkey = append_object_path(fullkey, child_key);
-                append_tree_rows(
-                    rows,
-                    item,
-                    SqliteValue::Text(child_key.as_str().into()),
-                    Some(current_id),
-                    &child_fullkey,
-                    fullkey,
-                    next_id,
-                )?;
-            }
-        }
-        _ => {}
+    if estimated_payload_len <= 11 {
+        let nibble = u8::try_from(estimated_payload_len).expect("<= 11 fits in u8");
+        out.push((nibble << 4) | node_type);
+    } else if let Ok(len8) = u8::try_from(estimated_payload_len) {
+        out.push((12 << 4) | node_type);
+        out.push(len8);
+    } else if let Ok(len16) = u16::try_from(estimated_payload_len) {
+        out.push((13 << 4) | node_type);
+        out.extend_from_slice(&len16.to_be_bytes());
+    } else if let Ok(len32) = u32::try_from(estimated_payload_len) {
+        out.push((14 << 4) | node_type);
+        out.extend_from_slice(&len32.to_be_bytes());
+    } else {
+        let len64 = u64::try_from(estimated_payload_len).map_err(|error| {
+            FrankenError::function_error(format!("jsonb payload too large: {error}"))
+        })?;
+        out.push((15 << 4) | node_type);
+        out.extend_from_slice(&len64.to_be_bytes());
     }
-
     Ok(())
 }
 
-/// The JSON input and PATH of a json_each/json_tree scan, or `None` when the
+/// Lexically translate JSON / JSON5 text directly into stock SQLite 3.54.1
+/// JSONB bytes (`sqlite3.c`: `jsonConvertTextToBlob` +
+/// `jsonTranslateTextToBlob`).
+///
+/// Preserves exact raw source token encodings (`TEXT` / `TEXTJ` / `TEXT5`,
+/// `INT` / `INT5`, `FLOAT` / `FLOAT5`, minimal container headers), so every
+/// JSONB node byte offset (`json_each.id`, `json_tree.id`, `json_tree.parent`)
+/// matches SQLite 3.54.1 byte-for-byte.
+fn translate_json_text_to_jsonb(input: &str) -> Result<Vec<u8>> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len().saturating_add(8));
+    let mut depth = 0usize;
+    let JsonbTextStep::Value(mut idx) = translate_json_text_step(bytes, 0, &mut out, &mut depth)?
+    else {
+        return Err(malformed_json());
+    };
+    while idx < bytes.len() && is_json_space(bytes[idx]) {
+        idx += 1;
+    }
+    if idx < bytes.len() {
+        idx += json5_whitespace_len(&bytes[idx..]);
+        if idx < bytes.len() {
+            return Err(malformed_json());
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_lines)]
+fn translate_json_text_step(
+    bytes: &[u8],
+    mut i: usize,
+    out: &mut Vec<u8>,
+    depth: &mut usize,
+) -> Result<JsonbTextStep> {
+    let len = bytes.len();
+    loop {
+        let Some(&ch) = bytes.get(i) else {
+            return Ok(JsonbTextStep::Eof);
+        };
+        match ch {
+            b'{' => {
+                let i_this = out.len();
+                append_jsonb_header_placeholder(JSONB_OBJECT_TYPE, len - i, out)?;
+                *depth += 1;
+                if *depth > STOCK_JSON_MAX_DEPTH {
+                    return Err(malformed_json());
+                }
+                let i_start = out.len();
+                let mut j = i + 1;
+                loop {
+                    let i_blob = out.len();
+                    let next_after_key = match translate_json_text_step(bytes, j, out, depth) {
+                        Ok(JsonbTextStep::Value(x)) => x,
+                        Ok(JsonbTextStep::EndObject(close_idx)) => {
+                            j = close_idx;
+                            break;
+                        }
+                        Ok(_) => return Err(malformed_json()),
+                        Err(_) => {
+                            out.truncate(i_blob);
+                            j += json5_whitespace_len(&bytes[j..]);
+                            let mut op = JSONB_TEXT_TYPE;
+                            let Some(&first) = bytes.get(j) else {
+                                return Err(malformed_json());
+                            };
+                            let starts_key = if is_json_id1(first) {
+                                true
+                            } else if first == b'\\'
+                                && bytes.get(j + 1) == Some(&b'u')
+                                && is_4hex(bytes, j + 2)
+                            {
+                                op = JSONB_TEXT_JSON_TYPE;
+                                true
+                            } else {
+                                false
+                            };
+                            if !starts_key {
+                                return Err(malformed_json());
+                            }
+                            let mut k = j + 1;
+                            while k < len {
+                                let b = bytes[k];
+                                if is_json_id2(b) && json5_whitespace_len(&bytes[k..]) == 0 {
+                                    k += 1;
+                                } else if b == b'\\'
+                                    && bytes.get(k + 1) == Some(&b'u')
+                                    && is_4hex(bytes, k + 2)
+                                {
+                                    op = JSONB_TEXT_JSON_TYPE;
+                                    k += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            append_jsonb_node(op, &bytes[j..k], out)?;
+                            k
+                        }
+                    };
+                    let key_type = out.get(i_blob).copied().unwrap_or(0) & 0x0f;
+                    if !(JSONB_TEXT_TYPE..=JSONB_TEXTRAW_TYPE).contains(&key_type) {
+                        return Err(malformed_json());
+                    }
+                    j = next_after_key;
+                    if bytes.get(j) == Some(&b':') {
+                        j += 1;
+                    } else {
+                        while bytes.get(j).is_some_and(|&b| is_json_space(b)) {
+                            j += 1;
+                        }
+                        if bytes.get(j) == Some(&b':') {
+                            j += 1;
+                        } else {
+                            let JsonbTextStep::Colon(colon_idx) =
+                                translate_json_text_step(bytes, j, out, depth)?
+                            else {
+                                return Err(malformed_json());
+                            };
+                            j = colon_idx + 1;
+                        }
+                    }
+                    let JsonbTextStep::Value(after_val) =
+                        translate_json_text_step(bytes, j, out, depth)?
+                    else {
+                        return Err(malformed_json());
+                    };
+                    j = after_val;
+                    if bytes.get(j) == Some(&b',') {
+                        j += 1;
+                        continue;
+                    }
+                    if bytes.get(j) == Some(&b'}') {
+                        break;
+                    }
+                    while bytes.get(j).is_some_and(|&b| is_json_space(b)) {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b',') {
+                        j += 1;
+                        continue;
+                    }
+                    if bytes.get(j) == Some(&b'}') {
+                        break;
+                    }
+                    match translate_json_text_step(bytes, j, out, depth)? {
+                        JsonbTextStep::Comma(comma_idx) => {
+                            j = comma_idx + 1;
+                        }
+                        JsonbTextStep::EndObject(close_idx) => {
+                            j = close_idx;
+                            break;
+                        }
+                        _ => return Err(malformed_json()),
+                    }
+                }
+                let payload_len = out.len() - i_start;
+                let _ = jsonb_change_payload_size(out, i_this, payload_len);
+                *depth -= 1;
+                return Ok(JsonbTextStep::Value(j + 1));
+            }
+            b'[' => {
+                let i_this = out.len();
+                append_jsonb_header_placeholder(JSONB_ARRAY_TYPE, len - i, out)?;
+                *depth += 1;
+                if *depth > STOCK_JSON_MAX_DEPTH {
+                    return Err(malformed_json());
+                }
+                let i_start = out.len();
+                let mut j = i + 1;
+                loop {
+                    match translate_json_text_step(bytes, j, out, depth)? {
+                        JsonbTextStep::Value(after_val) => j = after_val,
+                        JsonbTextStep::EndArray(close_idx) => {
+                            j = close_idx;
+                            break;
+                        }
+                        _ => return Err(malformed_json()),
+                    }
+                    if bytes.get(j) == Some(&b',') {
+                        j += 1;
+                        continue;
+                    }
+                    if bytes.get(j) == Some(&b']') {
+                        break;
+                    }
+                    while bytes.get(j).is_some_and(|&b| is_json_space(b)) {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b',') {
+                        j += 1;
+                        continue;
+                    }
+                    if bytes.get(j) == Some(&b']') {
+                        break;
+                    }
+                    match translate_json_text_step(bytes, j, out, depth)? {
+                        JsonbTextStep::Comma(comma_idx) => {
+                            j = comma_idx + 1;
+                        }
+                        JsonbTextStep::EndArray(close_idx) => {
+                            j = close_idx;
+                            break;
+                        }
+                        _ => return Err(malformed_json()),
+                    }
+                }
+                let payload_len = out.len() - i_start;
+                let _ = jsonb_change_payload_size(out, i_this, payload_len);
+                *depth -= 1;
+                return Ok(JsonbTextStep::Value(j + 1));
+            }
+            b'"' | b'\'' => {
+                let delim = ch;
+                let mut opcode = JSONB_TEXT_TYPE;
+                let mut j = i + 1;
+                loop {
+                    while j < len && is_json_ok_byte(bytes[j]) {
+                        j += 1;
+                    }
+                    let Some(&c) = bytes.get(j) else {
+                        return Err(malformed_json());
+                    };
+                    if c == delim {
+                        break;
+                    }
+                    if c == b'\\' {
+                        j += 1;
+                        let Some(&esc) = bytes.get(j) else {
+                            return Err(malformed_json());
+                        };
+                        if matches!(esc, b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't')
+                            || (esc == b'u' && is_4hex(bytes, j + 1))
+                        {
+                            if opcode == JSONB_TEXT_TYPE {
+                                opcode = JSONB_TEXT_JSON_TYPE;
+                            }
+                        } else if matches!(esc, b'\'' | b'v' | b'\n')
+                            || (esc == b'0' && !bytes.get(j + 1).is_some_and(u8::is_ascii_digit))
+                            || (esc == 0xe2
+                                && bytes.get(j + 1) == Some(&0x80)
+                                && matches!(bytes.get(j + 2), Some(0xa8 | 0xa9)))
+                            || (esc == b'x' && is_2hex(bytes, j + 1))
+                        {
+                            opcode = JSONB_TEXT5_TYPE;
+                        } else if esc == b'\r' {
+                            if bytes.get(j + 1) == Some(&b'\n') {
+                                j += 1;
+                            }
+                            opcode = JSONB_TEXT5_TYPE;
+                        } else {
+                            return Err(malformed_json());
+                        }
+                    } else if c <= 0x1f {
+                        if c == 0 {
+                            return Err(malformed_json());
+                        }
+                        opcode = JSONB_TEXT5_TYPE;
+                    } else if c == b'"' {
+                        opcode = JSONB_TEXT5_TYPE;
+                    }
+                    j += 1;
+                }
+                append_jsonb_node(opcode, &bytes[i + 1..j], out)?;
+                return Ok(JsonbTextStep::Value(j + 1));
+            }
+            b't' => {
+                if bytes.get(i..i + 4) == Some(b"true")
+                    && !bytes.get(i + 4).is_some_and(u8::is_ascii_alphanumeric)
+                {
+                    out.push(JSONB_TRUE_TYPE);
+                    return Ok(JsonbTextStep::Value(i + 4));
+                }
+                return Err(malformed_json());
+            }
+            b'f' => {
+                if bytes.get(i..i + 5) == Some(b"false")
+                    && !bytes.get(i + 5).is_some_and(u8::is_ascii_alphanumeric)
+                {
+                    out.push(JSONB_FALSE_TYPE);
+                    return Ok(JsonbTextStep::Value(i + 5));
+                }
+                return Err(malformed_json());
+            }
+            b'+' | b'-' | b'.' | b'0'..=b'9' => {
+                return translate_json_number_to_jsonb(bytes, i, out);
+            }
+            b'}' => return Ok(JsonbTextStep::EndObject(i)),
+            b']' => return Ok(JsonbTextStep::EndArray(i)),
+            b',' => return Ok(JsonbTextStep::Comma(i)),
+            b':' => return Ok(JsonbTextStep::Colon(i)),
+            0x09 | 0x0a | 0x0d | 0x20 => {
+                i += 1;
+                while i < len && is_json_space(bytes[i]) {
+                    i += 1;
+                }
+            }
+            0x0b | 0x0c | b'/' | 0xc2 | 0xe1 | 0xe2 | 0xe3 | 0xef => {
+                let ws = json5_whitespace_len(&bytes[i..]);
+                if ws == 0 {
+                    return Err(malformed_json());
+                }
+                i += ws;
+            }
+            b'n' if bytes.get(i..i + 4) == Some(b"null")
+                && !bytes.get(i + 4).is_some_and(u8::is_ascii_alphanumeric) =>
+            {
+                out.push(JSONB_NULL_TYPE);
+                return Ok(JsonbTextStep::Value(i + 4));
+            }
+            _ => {
+                const NAN_INF: &[(&[u8], bool)] = &[
+                    (b"inf", true),
+                    (b"infinity", true),
+                    (b"nan", false),
+                    (b"qnan", false),
+                    (b"snan", false),
+                ];
+                for &(needle, is_inf) in NAN_INF {
+                    if eq_ascii_ignore_case_at(bytes, i, needle)
+                        && !bytes
+                            .get(i + needle.len())
+                            .is_some_and(u8::is_ascii_alphanumeric)
+                    {
+                        if is_inf {
+                            append_jsonb_node(JSONB_FLOAT_TYPE, b"9e999", out)?;
+                        } else {
+                            out.push(JSONB_NULL_TYPE);
+                        }
+                        return Ok(JsonbTextStep::Value(i + needle.len()));
+                    }
+                }
+                return Err(malformed_json());
+            }
+        }
+    }
+}
+
+fn translate_json_number_to_jsonb(
+    bytes: &[u8],
+    i: usize,
+    out: &mut Vec<u8>,
+) -> Result<JsonbTextStep> {
+    let c = bytes[i];
+    let mut t: u8 = 0x00; // bit 0x01: JSON5, bit 0x02: FLOAT
+    let mut seen_e = false;
+    let skip_prefix = if c == b'.' {
+        if !bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            return Err(malformed_json());
+        }
+        t = 0x03;
+        true
+    } else {
+        false
+    };
+
+    let j = if !skip_prefix && c == b'0' {
+        if matches!(bytes.get(i + 1), Some(b'x' | b'X'))
+            && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
+        {
+            t = 0x01;
+            let mut k = i + 3;
+            while bytes.get(k).is_some_and(u8::is_ascii_hexdigit) {
+                k += 1;
+            }
+            k
+        } else if bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            return Err(malformed_json());
+        } else {
+            scan_decimal_number(bytes, i, &mut t, &mut seen_e)?
+        }
+    } else if !skip_prefix && (c == b'-' || c == b'+') {
+        if !bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            if eq_ascii_ignore_case_at(bytes, i + 1, b"inf") {
+                if c == b'-' {
+                    append_jsonb_node(JSONB_FLOAT_TYPE, b"-9e999", out)?;
+                } else {
+                    append_jsonb_node(JSONB_FLOAT_TYPE, b"9e999", out)?;
+                }
+                let advance = if eq_ascii_ignore_case_at(bytes, i + 4, b"inity") {
+                    9
+                } else {
+                    4
+                };
+                return Ok(JsonbTextStep::Value(i + advance));
+            }
+            if bytes.get(i + 1) == Some(&b'.') {
+                t |= 0x01;
+                scan_decimal_number(bytes, i, &mut t, &mut seen_e)?
+            } else {
+                return Err(malformed_json());
+            }
+        } else if bytes.get(i + 1) == Some(&b'0') {
+            if bytes.get(i + 2).is_some_and(u8::is_ascii_digit) {
+                return Err(malformed_json());
+            }
+            if matches!(bytes.get(i + 2), Some(b'x' | b'X'))
+                && bytes.get(i + 3).is_some_and(u8::is_ascii_hexdigit)
+            {
+                t |= 0x01;
+                let mut k = i + 4;
+                while bytes.get(k).is_some_and(u8::is_ascii_hexdigit) {
+                    k += 1;
+                }
+                k
+            } else {
+                scan_decimal_number(bytes, i, &mut t, &mut seen_e)?
+            }
+        } else {
+            scan_decimal_number(bytes, i, &mut t, &mut seen_e)?
+        }
+    } else {
+        scan_decimal_number(bytes, i, &mut t, &mut seen_e)?
+    };
+
+    let start = if bytes[i] == b'+' { i + 1 } else { i };
+    append_jsonb_node(JSONB_INT_TYPE + t, &bytes[start..j], out)?;
+    Ok(JsonbTextStep::Value(j))
+}
+
+fn scan_decimal_number(bytes: &[u8], i: usize, t: &mut u8, seen_e: &mut bool) -> Result<usize> {
+    let mut j = i + 1;
+    while let Some(&b) = bytes.get(j) {
+        if b.is_ascii_digit() {
+            j += 1;
+            continue;
+        }
+        if b == b'.' {
+            if (*t & 0x02) != 0 {
+                return Err(malformed_json());
+            }
+            *t |= 0x02;
+            j += 1;
+            continue;
+        }
+        if b == b'e' || b == b'E' {
+            if bytes[j - 1] < b'0' {
+                if bytes[j - 1] == b'.' && j >= i + 2 && bytes[j - 2].is_ascii_digit() {
+                    *t |= 0x01;
+                } else {
+                    return Err(malformed_json());
+                }
+            }
+            if *seen_e {
+                return Err(malformed_json());
+            }
+            *t |= 0x02;
+            *seen_e = true;
+            let mut next_b = bytes.get(j + 1).copied().unwrap_or(0);
+            if next_b == b'+' || next_b == b'-' {
+                j += 1;
+                next_b = bytes.get(j + 1).copied().unwrap_or(0);
+            }
+            if !next_b.is_ascii_digit() {
+                return Err(malformed_json());
+            }
+            j += 1;
+            continue;
+        }
+        break;
+    }
+    if bytes[j - 1] < b'0' {
+        if bytes[j - 1] == b'.' && j >= i + 2 && bytes[j - 2].is_ascii_digit() {
+            *t |= 0x01;
+        } else {
+            return Err(malformed_json());
+        }
+    }
+    Ok(j)
+}
+
+fn json_blob_to_jsonb(input: &[u8]) -> Result<Cow<'_, [u8]>> {
+    if decode_jsonb_root(input).is_ok() {
+        return Ok(Cow::Borrowed(input));
+    }
+    let text = std::str::from_utf8(input).map_err(|_| malformed_json())?;
+    Ok(Cow::Owned(translate_json_text_to_jsonb(text)?))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonbLookupError {
+    NotFound,
+    BadPath,
+    TooDeep,
+    Malformed,
+}
+
+/// Read-only path lookup over a JSONB blob (`sqlite3.c`: `jsonLookupStep`).
+/// Returns `(value_offset, label_offset)` where `label_offset == 0` for root
+/// or array elements and `label_offset > 0` for object members.
+fn jsonb_lookup_read(
+    blob: &[u8],
+    i_root: usize,
+    tail: &str,
+    i_label: usize,
+    depth: usize,
+    full_path: &str,
+) -> std::result::Result<(usize, usize), JsonbLookupError> {
+    if tail.is_empty() {
+        return Ok((i_root, i_label));
+    }
+    if tail.starts_with('.') {
+        let (key_bytes, raw_key, rest) =
+            jsonb_parse_path_object_key(tail, full_path).map_err(|_| JsonbLookupError::BadPath)?;
+        let (root_type, root_hdr, root_payload) =
+            jsonb_node_bounds(blob, i_root).ok_or(JsonbLookupError::Malformed)?;
+        if root_type != JSONB_OBJECT_TYPE {
+            return Err(JsonbLookupError::NotFound);
+        }
+        let mut pos = i_root + root_hdr;
+        let end = pos + root_payload;
+        while pos < end {
+            let (label_type, label_hdr, label_len) =
+                jsonb_node_bounds(blob, pos).ok_or(JsonbLookupError::Malformed)?;
+            if !(JSONB_TEXT_TYPE..=JSONB_TEXTRAW_TYPE).contains(&label_type) {
+                return Err(JsonbLookupError::Malformed);
+            }
+            let label_start = pos + label_hdr;
+            let val_pos = label_start + label_len;
+            if val_pos >= end {
+                return Err(JsonbLookupError::Malformed);
+            }
+            let matched =
+                jsonb_label_matches(key_bytes, raw_key, label_type, &blob[label_start..val_pos])
+                    .map_err(|_| JsonbLookupError::Malformed)?;
+            let (_, val_hdr, val_len) =
+                jsonb_node_bounds(blob, val_pos).ok_or(JsonbLookupError::Malformed)?;
+            if val_pos + val_hdr + val_len > end {
+                return Err(JsonbLookupError::Malformed);
+            }
+            if matched {
+                if depth + 1 >= JSONB_EDIT_MAX_DEPTH {
+                    return Err(JsonbLookupError::TooDeep);
+                }
+                return jsonb_lookup_read(blob, val_pos, rest, pos, depth + 1, full_path);
+            }
+            pos = val_pos + val_hdr + val_len;
+        }
+        if pos > end {
+            return Err(JsonbLookupError::Malformed);
+        }
+        Err(JsonbLookupError::NotFound)
+    } else if tail.starts_with('[') {
+        let (root_type, root_hdr, root_payload) =
+            jsonb_node_bounds(blob, i_root).ok_or(JsonbLookupError::Malformed)?;
+        if root_type != JSONB_ARRAY_TYPE {
+            return Err(JsonbLookupError::NotFound);
+        }
+        let array_count = jsonb_array_count(blob, i_root).ok_or(JsonbLookupError::Malformed)?;
+        let Some((mut kk, rest)) = jsonb_parse_path_array_index(tail, array_count, full_path)
+            .map_err(|_| JsonbLookupError::BadPath)?
+        else {
+            return Err(JsonbLookupError::NotFound);
+        };
+        let mut pos = i_root + root_hdr;
+        let end = pos + root_payload;
+        while pos < end {
+            if kk == 0 {
+                if depth + 1 >= JSONB_EDIT_MAX_DEPTH {
+                    return Err(JsonbLookupError::TooDeep);
+                }
+                return jsonb_lookup_read(blob, pos, rest, 0, depth + 1, full_path);
+            }
+            kk -= 1;
+            let (_, child_hdr, child_len) =
+                jsonb_node_bounds(blob, pos).ok_or(JsonbLookupError::Malformed)?;
+            pos += child_hdr + child_len;
+        }
+        if pos > end {
+            return Err(JsonbLookupError::Malformed);
+        }
+        Err(JsonbLookupError::NotFound)
+    } else {
+        Err(JsonbLookupError::BadPath)
+    }
+}
+
+const fn jsonb_type_name(node_type: u8) -> &'static str {
+    match node_type {
+        JSONB_TRUE_TYPE => "true",
+        JSONB_FALSE_TYPE => "false",
+        JSONB_INT_TYPE | JSONB_INT5_TYPE => "integer",
+        JSONB_FLOAT_TYPE | JSONB_FLOAT5_TYPE => "real",
+        JSONB_TEXT_TYPE | JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE | JSONB_TEXTRAW_TYPE => "text",
+        JSONB_ARRAY_TYPE => "array",
+        JSONB_OBJECT_TYPE => "object",
+        _ => "null",
+    }
+}
+
+/// Convert a single scalar JSONB node into its SQL value (`sqlite3.c`:
+/// `jsonReturnFromBlob`).
+#[allow(clippy::cast_precision_loss)]
+fn jsonb_node_to_sqlite_scalar(blob: &[u8], offset: usize) -> Result<SqliteValue> {
+    let (node_type, hdr_len, payload_len) =
+        jsonb_node_bounds(blob, offset).ok_or_else(malformed_json)?;
+    let payload = &blob[offset + hdr_len..offset + hdr_len + payload_len];
+    match node_type {
+        JSONB_NULL_TYPE => {
+            if !payload.is_empty() {
+                return Err(malformed_json());
+            }
+            Ok(SqliteValue::Null)
+        }
+        JSONB_TRUE_TYPE => {
+            if !payload.is_empty() {
+                return Err(malformed_json());
+            }
+            Ok(SqliteValue::Integer(1))
+        }
+        JSONB_FALSE_TYPE => {
+            if !payload.is_empty() {
+                return Err(malformed_json());
+            }
+            Ok(SqliteValue::Integer(0))
+        }
+        JSONB_INT_TYPE | JSONB_INT5_TYPE => {
+            let text = std::str::from_utf8(payload).map_err(|_| malformed_json())?;
+            if text.is_empty() {
+                return Err(malformed_json());
+            }
+            let normalized = if node_type == JSONB_INT5_TYPE {
+                text.strip_prefix('+').unwrap_or(text)
+            } else {
+                text
+            };
+            if node_type == JSONB_INT5_TYPE {
+                let (negative, unsigned) = normalized
+                    .strip_prefix('-')
+                    .map_or((false, normalized), |rest| (true, rest));
+                if let Some(digits) = unsigned
+                    .strip_prefix("0x")
+                    .or_else(|| unsigned.strip_prefix("0X"))
+                {
+                    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(malformed_json());
+                    }
+                    let magnitude =
+                        u64::from_str_radix(digits, 16).map_err(|_| malformed_json())?;
+                    return Ok(if let Ok(int) = i64::try_from(magnitude) {
+                        SqliteValue::Integer(if negative { -int } else { int })
+                    } else {
+                        let real = magnitude as f64;
+                        SqliteValue::Float(if negative { -real } else { real })
+                    });
+                }
+            }
+            if normalized == "-0" {
+                return Ok(SqliteValue::Integer(0));
+            }
+            if let Ok(int) = normalized.parse::<i64>() {
+                return Ok(SqliteValue::Integer(int));
+            }
+            let real = normalized.parse::<f64>().map_err(|_| malformed_json())?;
+            Ok(SqliteValue::Float(real))
+        }
+        JSONB_FLOAT_TYPE | JSONB_FLOAT5_TYPE => {
+            let text = std::str::from_utf8(payload).map_err(|_| malformed_json())?;
+            if text.is_empty() {
+                return Err(malformed_json());
+            }
+            let normalized = if node_type == JSONB_FLOAT5_TYPE {
+                text.strip_prefix('+').unwrap_or(text)
+            } else {
+                text
+            };
+            let real = normalized.parse::<f64>().map_err(|_| malformed_json())?;
+            Ok(SqliteValue::Float(real))
+        }
+        JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE => {
+            let text = std::str::from_utf8(payload).map_err(|_| malformed_json())?;
+            Ok(SqliteValue::Text(text.into()))
+        }
+        JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE => {
+            let decoded = decode_jsonb_text(node_type, payload)?;
+            Ok(SqliteValue::Text(decoded.into()))
+        }
+        _ => Err(malformed_json()),
+    }
+}
+
+/// Render a JSONB node directly into canonical JSON text preserving raw source
+/// spellings (`sqlite3.c`: `jsonTranslateBlobToText`).
+#[allow(clippy::too_many_lines)]
+fn jsonb_translate_node_to_json_text(
+    blob: &[u8],
+    offset: usize,
+    out: &mut String,
+    depth: usize,
+) -> Result<usize> {
+    let (node_type, hdr_len, sz) = jsonb_node_bounds(blob, offset).ok_or_else(malformed_json)?;
+    let start = offset + hdr_len;
+    let end = start + sz;
+    let payload = &blob[start..end];
+    match node_type {
+        JSONB_NULL_TYPE => {
+            out.push_str("null");
+            return Ok(offset + 1);
+        }
+        JSONB_TRUE_TYPE => {
+            out.push_str("true");
+            return Ok(offset + 1);
+        }
+        JSONB_FALSE_TYPE => {
+            out.push_str("false");
+            return Ok(offset + 1);
+        }
+        JSONB_INT_TYPE | JSONB_FLOAT_TYPE => {
+            if sz == 0 {
+                return Err(malformed_json());
+            }
+            let text = std::str::from_utf8(payload).map_err(|_| malformed_json())?;
+            out.push_str(text);
+        }
+        JSONB_INT5_TYPE => {
+            if sz == 0 {
+                return Err(malformed_json());
+            }
+            let mut k = 2usize;
+            if payload[0] == b'-' {
+                out.push('-');
+                k += 1;
+            } else if payload[0] == b'+' {
+                k += 1;
+            }
+            if k > sz {
+                return Err(malformed_json());
+            }
+            let mut u = 0_u64;
+            let mut overflow = false;
+            for &b in &payload[k..] {
+                let Some(digit) = hex_nibble(b) else {
+                    return Err(malformed_json());
+                };
+                if (u >> 60) != 0 {
+                    overflow = true;
+                } else {
+                    u = u * 16 + u64::from(digit);
+                }
+            }
+            if overflow {
+                out.push_str("9.0e999");
+            } else {
+                let _ = std::fmt::Write::write_fmt(out, format_args!("{u}"));
+            }
+        }
+        JSONB_FLOAT5_TYPE => {
+            if sz == 0 {
+                return Err(malformed_json());
+            }
+            let mut k = if payload[0] == b'-' {
+                out.push('-');
+                if sz <= 1 {
+                    return Err(malformed_json());
+                }
+                1
+            } else {
+                0usize
+            };
+            if payload[k] == b'.' {
+                out.push('0');
+            }
+            while k < sz {
+                let b = payload[k];
+                out.push(char::from(b));
+                if b == b'.' && !payload.get(k + 1).is_some_and(u8::is_ascii_digit) {
+                    out.push('0');
+                }
+                k += 1;
+            }
+        }
+        JSONB_TEXT_TYPE => {
+            let text = std::str::from_utf8(payload).map_err(|_| malformed_json())?;
+            if payload
+                .iter()
+                .all(|&b| b >= 0x20 && b != b'"' && b != b'\\')
+            {
+                out.push('"');
+                out.push_str(text);
+                out.push('"');
+            } else {
+                write_json_escaped_string(text, out);
+            }
+        }
+        JSONB_TEXT_JSON_TYPE => {
+            let text = std::str::from_utf8(payload).map_err(|_| malformed_json())?;
+            out.push('"');
+            out.push_str(text);
+            out.push('"');
+        }
+        JSONB_TEXT5_TYPE => {
+            let text = std::str::from_utf8(payload).map_err(|_| malformed_json())?;
+            let pbytes = text.as_bytes();
+            out.push('"');
+            let mut idx = 0usize;
+            while idx < pbytes.len() {
+                let run_start = idx;
+                while idx < pbytes.len() && (is_json_ok_byte(pbytes[idx]) || pbytes[idx] == b'\'') {
+                    idx += 1;
+                }
+                if idx > run_start {
+                    out.push_str(&text[run_start..idx]);
+                    if idx >= pbytes.len() {
+                        break;
+                    }
+                }
+                let b = pbytes[idx];
+                if b == b'"' {
+                    out.push_str("\\\"");
+                    idx += 1;
+                } else if b <= 0x1f {
+                    match b {
+                        0x08 => out.push_str("\\b"),
+                        0x0c => out.push_str("\\f"),
+                        b'\n' => out.push_str("\\n"),
+                        b'\r' => out.push_str("\\r"),
+                        b'\t' => out.push_str("\\t"),
+                        other => {
+                            let _ = std::fmt::Write::write_fmt(out, format_args!("\\u{other:04x}"));
+                        }
+                    }
+                    idx += 1;
+                } else {
+                    if idx + 1 >= pbytes.len() {
+                        return Err(malformed_json());
+                    }
+                    match pbytes[idx + 1] {
+                        b'\'' => {
+                            out.push('\'');
+                            idx += 2;
+                        }
+                        b'v' => {
+                            out.push_str("\\u000b");
+                            idx += 2;
+                        }
+                        b'x' => {
+                            if idx + 3 >= pbytes.len() {
+                                return Err(malformed_json());
+                            }
+                            out.push_str("\\u00");
+                            out.push_str(&text[idx + 2..idx + 4]);
+                            idx += 4;
+                        }
+                        b'0' => {
+                            out.push_str("\\u0000");
+                            idx += 2;
+                        }
+                        b'\r' => {
+                            idx += if pbytes.get(idx + 2) == Some(&b'\n') {
+                                3
+                            } else {
+                                2
+                            };
+                        }
+                        b'\n' => idx += 2,
+                        0xe2 => {
+                            if idx + 3 >= pbytes.len()
+                                || pbytes[idx + 2] != 0x80
+                                || !matches!(pbytes[idx + 3], 0xa8 | 0xa9)
+                            {
+                                return Err(malformed_json());
+                            }
+                            idx += 4;
+                        }
+                        _ => {
+                            out.push_str(&text[idx..idx + 2]);
+                            idx += 2;
+                        }
+                    }
+                }
+            }
+            out.push('"');
+        }
+        JSONB_TEXTRAW_TYPE => {
+            let text = std::str::from_utf8(payload).map_err(|_| malformed_json())?;
+            write_json_escaped_string(text, out);
+        }
+        JSONB_ARRAY_TYPE => {
+            if depth >= STOCK_JSON_MAX_DEPTH {
+                return Err(malformed_json());
+            }
+            out.push('[');
+            let mut pos = start;
+            while pos < end {
+                pos = jsonb_translate_node_to_json_text(blob, pos, out, depth + 1)?;
+                out.push(',');
+            }
+            if pos > end {
+                return Err(malformed_json());
+            }
+            if sz > 0 {
+                out.pop();
+            }
+            out.push(']');
+        }
+        JSONB_OBJECT_TYPE => {
+            if depth >= STOCK_JSON_MAX_DEPTH {
+                return Err(malformed_json());
+            }
+            out.push('{');
+            let mut pos = start;
+            let mut count = 0usize;
+            while pos < end {
+                pos = jsonb_translate_node_to_json_text(blob, pos, out, depth + 1)?;
+                out.push(if (count & 1) != 0 { ',' } else { ':' });
+                count += 1;
+            }
+            if (count & 1) != 0 || pos > end {
+                return Err(malformed_json());
+            }
+            if sz > 0 {
+                out.pop();
+            }
+            out.push('}');
+        }
+        _ => return Err(malformed_json()),
+    }
+    Ok(end)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JsonbParentFrame {
+    i_head: usize,
+    i_value: usize,
+    i_end: usize,
+    i_key: i64,
+    n_path: usize,
+}
+
+fn json_skip_label(blob: &[u8], e_type: u8, cur_i: usize) -> Result<usize> {
+    if e_type == JSONB_OBJECT_TYPE {
+        let (_, hdr_len, sz) = jsonb_node_bounds(blob, cur_i).ok_or_else(malformed_json)?;
+        let next = cur_i + hdr_len + sz;
+        if next >= blob.len() {
+            Ok(cur_i)
+        } else {
+            Ok(next)
+        }
+    } else {
+        Ok(cur_i)
+    }
+}
+
+/// Append the current element's path segment onto `path_buf` (`sqlite3.c`:
+/// `jsonAppendPathName`).
+fn json_append_path_name(
+    path_buf: &mut String,
+    blob: &[u8],
+    e_type: u8,
+    cur_i: usize,
+    array_key: i64,
+) -> Result<()> {
+    if e_type == JSONB_ARRAY_TYPE {
+        let _ = std::fmt::Write::write_fmt(path_buf, format_args!("[{array_key}]"));
+    } else {
+        let (_, hdr_len, sz) = jsonb_node_bounds(blob, cur_i).ok_or_else(malformed_json)?;
+        let raw = &blob[cur_i + hdr_len..cur_i + hdr_len + sz];
+        let raw_str = std::str::from_utf8(raw).map_err(|_| malformed_json())?;
+        let need_quote = raw.is_empty()
+            || !raw[0].is_ascii_alphabetic()
+            || raw.iter().any(|&b| !b.is_ascii_alphanumeric());
+        if need_quote {
+            path_buf.push_str(".\"");
+            path_buf.push_str(raw_str);
+            path_buf.push('"');
+        } else {
+            path_buf.push('.');
+            path_buf.push_str(raw_str);
+        }
+    }
+    Ok(())
+}
+
+/// Effective `path` prefix length for `json_each`/`json_tree` (`sqlite3.c`:
+/// `jsonEachPathLength`).
+fn json_each_path_length(
+    blob: &[u8],
+    path: &str,
+    rowid: usize,
+    recursive: bool,
+    cur_i: usize,
+) -> usize {
+    let bytes = path.as_bytes();
+    let mut n = bytes.len();
+    if rowid == 0 && recursive && n >= 2 {
+        while n > 1 {
+            n -= 1;
+            if bytes[n] == b'[' || bytes[n] == b'.' {
+                let prefix_tail = &path[1..n];
+                if let Ok((x, _)) = jsonb_lookup_read(blob, 0, prefix_tail, 0, 0, &path[..n])
+                    && let Some((_, hdr_len, _)) = jsonb_node_bounds(blob, x)
+                    && x + hdr_len == cur_i
+                {
+                    break;
+                }
+            }
+        }
+    }
+    n
+}
+
+fn sqlite_atoi64_prefix(text: &str) -> i64 {
+    let bytes = text.as_bytes();
+    let mut idx = 0usize;
+    while bytes.get(idx).is_some_and(u8::is_ascii_whitespace) {
+        idx += 1;
+    }
+    let mut neg = false;
+    if bytes.get(idx) == Some(&b'-') {
+        neg = true;
+        idx += 1;
+    } else if bytes.get(idx) == Some(&b'+') {
+        idx += 1;
+    }
+    let mut acc: u64 = 0;
+    let mut saw_digit = false;
+    while let Some(&b) = bytes.get(idx) {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        saw_digit = true;
+        acc = acc.saturating_mul(10).saturating_add(u64::from(b - b'0'));
+        idx += 1;
+    }
+    if !saw_digit {
+        return 0;
+    }
+    if neg {
+        if acc >= i64::MIN.unsigned_abs() {
+            i64::MIN
+        } else {
+            -i64::try_from(acc).unwrap_or(i64::MAX)
+        }
+    } else {
+        i64::try_from(acc).unwrap_or(i64::MAX)
+    }
+}
+
+/// Walk a JSONB document for `json_each` (`recursive = false`) or `json_tree`
+/// (`recursive = true`), matching SQLite 3.54.1's `jsonEachFilter`,
+/// `jsonEachNext`, and `jsonEachColumn` (`sqlite3.c:219160-219569`).
+#[allow(clippy::too_many_lines)]
+fn json_table_rows_from_jsonb(
+    blob: &[u8],
+    path: Option<&str>,
+    recursive: bool,
+) -> Result<Vec<JsonTableRow>> {
+    let mut path_buf = String::new();
+    let (i, mut cur_i, mut e_type) = if let Some(z_root) = path {
+        if !z_root.starts_with('$') {
+            return Err(bad_json_path(z_root));
+        }
+        path_buf.push_str(z_root);
+        if z_root.len() == 1 {
+            (0usize, 0usize, 0u8)
+        } else {
+            match jsonb_lookup_read(blob, 0, &z_root[1..], 0, 0, z_root) {
+                Ok((val_idx, label_idx)) => {
+                    if label_idx > 0 {
+                        (val_idx, label_idx, JSONB_OBJECT_TYPE)
+                    } else {
+                        (val_idx, val_idx, JSONB_ARRAY_TYPE)
+                    }
+                }
+                Err(JsonbLookupError::NotFound) => return Ok(Vec::new()),
+                Err(JsonbLookupError::BadPath) => return Err(bad_json_path(z_root)),
+                Err(JsonbLookupError::TooDeep) => {
+                    return Err(FrankenError::function_error("JSON path too deep"));
+                }
+                Err(JsonbLookupError::Malformed) => return Err(malformed_json()),
+            }
+        }
+    } else {
+        path_buf.push('$');
+        (0usize, 0usize, 0u8)
+    };
+    let n_root = path_buf.len();
+
+    let (root_val_type, root_hdr, root_sz) =
+        jsonb_node_bounds(blob, i).ok_or_else(malformed_json)?;
+    let i_end = i + root_hdr + root_sz;
+    let mut parents: Vec<JsonbParentFrame> = Vec::new();
+    if !recursive && (root_val_type == JSONB_ARRAY_TYPE || root_val_type == JSONB_OBJECT_TYPE) {
+        cur_i = i + root_hdr;
+        e_type = root_val_type;
+        parents.push(JsonbParentFrame {
+            i_head: cur_i,
+            i_value: i,
+            i_end,
+            i_key: 0,
+            n_path: path_buf.len(),
+        });
+    }
+
+    let mut rows = Vec::new();
+    let mut rowid = 0usize;
+    while cur_i < i_end {
+        let val_i = json_skip_label(blob, e_type, cur_i)?;
+        let (val_type, val_hdr, val_sz) =
+            jsonb_node_bounds(blob, val_i).ok_or_else(malformed_json)?;
+        let path_len = json_each_path_length(blob, &path_buf, rowid, recursive, cur_i);
+
+        let key = if parents.is_empty() {
+            if n_root == 1 {
+                SqliteValue::Null
+            } else {
+                let n = n_root.saturating_sub(path_len);
+                if n == 0 {
+                    SqliteValue::Null
+                } else if path_buf.as_bytes()[path_len] == b'[' {
+                    SqliteValue::Integer(sqlite_atoi64_prefix(
+                        &path_buf[path_len + 1..path_len + n],
+                    ))
+                } else if path_buf.as_bytes().get(path_len + 1) == Some(&b'"') {
+                    let slice = path_buf
+                        .get(path_len + 2..path_len + n - 1)
+                        .unwrap_or_default();
+                    SqliteValue::Text(slice.into())
+                } else {
+                    SqliteValue::Text(path_buf[path_len + 1..path_len + n].into())
+                }
+            }
+        } else if e_type == JSONB_OBJECT_TYPE {
+            jsonb_node_to_sqlite_scalar(blob, cur_i)?
+        } else {
+            SqliteValue::Integer(parents.last().expect("parent frame present").i_key)
+        };
+
+        let is_container = val_type == JSONB_ARRAY_TYPE || val_type == JSONB_OBJECT_TYPE;
+        let (value, atom) = if is_container {
+            let mut rendered = String::with_capacity(val_sz.saturating_add(4));
+            let _ = jsonb_translate_node_to_json_text(blob, val_i, &mut rendered, 0)?;
+            (
+                SqliteValue::Text(SmallText::from_string(rendered)),
+                SqliteValue::Null,
+            )
+        } else {
+            let scalar = jsonb_node_to_sqlite_scalar(blob, val_i)?;
+            (scalar.clone(), scalar)
+        };
+
+        let id = i64::try_from(cur_i).map_err(|error| {
+            FrankenError::function_error(format!("json_each id overflow: {error}"))
+        })?;
+        let parent = if recursive && let Some(parent_frame) = parents.last() {
+            let parent_id = i64::try_from(parent_frame.i_head).map_err(|error| {
+                FrankenError::function_error(format!("json_tree parent id overflow: {error}"))
+            })?;
+            SqliteValue::Integer(parent_id)
+        } else {
+            SqliteValue::Null
+        };
+
+        let n_base = path_buf.len();
+        if let Some(parent_frame) = parents.last() {
+            json_append_path_name(&mut path_buf, blob, e_type, cur_i, parent_frame.i_key)?;
+        }
+        let fullkey = path_buf.clone();
+        path_buf.truncate(n_base);
+        let row_path = path_buf[..path_len].to_owned();
+
+        rows.push(JsonTableRow {
+            key,
+            value,
+            type_name: jsonb_type_name(val_type),
+            atom,
+            id,
+            parent,
+            fullkey,
+            path: row_path,
+        });
+
+        // Advance cursor (`sqlite3.c`: `jsonEachNext`).
+        if recursive {
+            let mut level_change = if is_container {
+                let n_path = path_buf.len();
+                if e_type != 0
+                    && let Some(parent_frame) = parents.last()
+                {
+                    json_append_path_name(&mut path_buf, blob, e_type, cur_i, parent_frame.i_key)?;
+                }
+                parents.push(JsonbParentFrame {
+                    i_head: cur_i,
+                    i_value: val_i,
+                    i_end: val_i + val_hdr + val_sz,
+                    i_key: -1,
+                    n_path,
+                });
+                cur_i = val_i + val_hdr;
+                true
+            } else {
+                cur_i = val_i + val_hdr + val_sz;
+                false
+            };
+            while parents.last().is_some_and(|frame| cur_i >= frame.i_end) {
+                let popped = parents.pop().expect("parent frame checked");
+                path_buf.truncate(popped.n_path);
+                level_change = true;
+            }
+            if level_change {
+                e_type = parents.last().map_or(0, |frame| blob[frame.i_value] & 0x0f);
+            }
+        } else {
+            cur_i = val_i + val_hdr + val_sz;
+        }
+        if e_type == JSONB_ARRAY_TYPE
+            && let Some(parent_frame) = parents.last_mut()
+        {
+            parent_frame.i_key += 1;
+        }
+        rowid += 1;
+    }
+
+    Ok(rows)
+}
+
+/// The JSONB input and PATH of a json_each/json_tree scan, or `None` when the
 /// scan has no rows. As in stock's `jsonEachFilter`, that is a missing or NULL
 /// input (checked before the PATH, so `json_each(NULL, 'x')` is empty) or a
 /// NULL PATH (checked after the input parses, so malformed input still
 /// errors). `FROM t, json_each(t.tags)` thus skips rows whose `tags` is NULL.
-fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<Option<(Value, Option<&str>)>> {
+fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<Option<(Vec<u8>, Option<&str>)>> {
     let Some(input_arg) = args.first() else {
         return Ok(None);
     };
-    let input_value = match input_arg {
+    let input_blob = match input_arg {
         SqliteValue::Null => return Ok(None),
-        // JSON5 input accepted (bd-qear2) — json_each/json_tree canonicalize
-        // via the parsed tree; strict JSON is unaffected (tried first).
-        SqliteValue::Text(input_text) => parse_json_value_lenient(input_text)?,
-        SqliteValue::Blob(input_blob) => parse_json_input_blob(input_blob)?,
-        // A bare SQL numeric is a JSON number (C SQLite convention), mirroring
-        // the scalar `json_arg_value` path: json_each(1.5) yields a single row
-        // with type='real', atom=1.5; json_tree(7) yields type='integer'. A
-        // non-finite REAL renders as the numeric literal 9.0e+999 / -9.0e+999
-        // (NaN -> null), so json_each(9e999) yields a single row (GH#212).
-        SqliteValue::Integer(i) => Value::Number((*i).into()),
-        SqliteValue::Float(f) => float_to_json(*f)?,
+        SqliteValue::Text(input_text) => translate_json_text_to_jsonb(input_text)?,
+        SqliteValue::Blob(input_blob) => json_blob_to_jsonb(input_blob)?.into_owned(),
+        SqliteValue::Integer(i) => {
+            let mut out = Vec::new();
+            append_jsonb_node(JSONB_INT_TYPE, i.to_string().as_bytes(), &mut out)?;
+            out
+        }
+        SqliteValue::Float(f) => {
+            let mut out = Vec::new();
+            if f.is_nan() {
+                append_jsonb_node(JSONB_NULL_TYPE, &[], &mut out)?;
+            } else if f.is_infinite() {
+                let literal = if *f > 0.0 {
+                    b"9.0e+999".as_slice()
+                } else {
+                    b"-9.0e+999".as_slice()
+                };
+                append_jsonb_node(JSONB_FLOAT_TYPE, literal, &mut out)?;
+            } else {
+                let formatted = fsqlite_types::value::format_sqlite_float(*f);
+                append_jsonb_node(JSONB_FLOAT_TYPE, formatted.as_bytes(), &mut out)?;
+            }
+            out
+        }
     };
 
     let path = match args.get(1) {
@@ -5453,7 +6592,7 @@ fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<Option<(Value, O
         Some(_) => Some(path_arg("json_each", args, 1)?),
     };
 
-    Ok(Some((input_value, path)))
+    Ok(Some((input_blob, path)))
 }
 fn write_json_table_column(row: &JsonTableRow, ctx: &mut ColumnContext, col: i32) {
     let value = match col {
@@ -10699,7 +11838,7 @@ mod tests {
             value: "Integer(10)",
             type_name: "integer",
             atom: "Integer(10)",
-            id: 1,
+            id: 5,
             parent: "Null",
             fullkey: "$.a[0]",
             path: "$.a",
@@ -10709,7 +11848,7 @@ mod tests {
             value: "Text(\"{\\\"b\\\":20}\")",
             type_name: "object",
             atom: "Null",
-            id: 2,
+            id: 8,
             parent: "Null",
             fullkey: "$.a[1]",
             path: "$.a",
@@ -10721,18 +11860,18 @@ mod tests {
             value: "Text(\"[10,{\\\"b\\\":20}]\")",
             type_name: "array",
             atom: "Null",
-            id: 0,
+            id: 2,
             parent: "Null",
             fullkey: "$.a",
-            path: "$.a",
+            path: "$",
         },
         JsonTableRowStructure {
             key: "Integer(0)",
             value: "Integer(10)",
             type_name: "integer",
             atom: "Integer(10)",
-            id: 1,
-            parent: "Integer(0)",
+            id: 5,
+            parent: "Integer(2)",
             fullkey: "$.a[0]",
             path: "$.a",
         },
@@ -10741,8 +11880,8 @@ mod tests {
             value: "Text(\"{\\\"b\\\":20}\")",
             type_name: "object",
             atom: "Null",
-            id: 2,
-            parent: "Integer(0)",
+            id: 8,
+            parent: "Integer(2)",
             fullkey: "$.a[1]",
             path: "$.a",
         },
@@ -10751,8 +11890,8 @@ mod tests {
             value: "Integer(20)",
             type_name: "integer",
             atom: "Integer(20)",
-            id: 3,
-            parent: "Integer(2)",
+            id: 9,
+            parent: "Integer(8)",
             fullkey: "$.a[1].b",
             path: "$.a[1]",
         },
@@ -11183,9 +12322,10 @@ mod tests {
         // JSON number (yielding a single scalar row) instead of erroring
         // "must be TEXT or BLOB JSON". C SQLite: json_each(1.5) -> type='real'
         // atom=1.5; json_tree(7) -> type='integer'.
-        let (v_float, path) = super::parse_json_table_filter_args(&[SqliteValue::Float(1.5)])
+        let (blob_float, path) = super::parse_json_table_filter_args(&[SqliteValue::Float(1.5)])
             .unwrap()
             .unwrap();
+        let v_float = super::decode_jsonb_root(&blob_float).unwrap();
         // A non-integral REAL is carried as its stock text (bd-1nxwh); it is
         // still a JSON real whose atom is 1.5.
         assert_eq!(super::json_type_name(&v_float), "real");
@@ -11194,17 +12334,20 @@ mod tests {
             SqliteValue::Float(1.5)
         );
         assert!(path.is_none());
-        let (v_int, _) = super::parse_json_table_filter_args(&[SqliteValue::Integer(7)])
+        let (blob_int, _) = super::parse_json_table_filter_args(&[SqliteValue::Integer(7)])
             .unwrap()
             .unwrap();
+        let v_int = super::decode_jsonb_root(&blob_int).unwrap();
         assert_eq!(v_int, Value::Number(7_i64.into()));
         // GH#212 (verified against sqlite3 3.46.1): json_each(9e999) yields a
         // single row (type='real', atom=Inf), so a bare +Inf renders as the
         // numeric literal 9.0e+999 rather than erroring. The non-finite REAL is
         // carried as a tagged string (bd-yalqc).
-        let (v_inf, _) = super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)])
-            .unwrap()
-            .unwrap();
+        let (blob_inf, _) =
+            super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)])
+                .unwrap()
+                .unwrap();
+        let v_inf = super::decode_jsonb_root(&blob_inf).unwrap();
         assert_eq!(v_inf, super::number_text_value("9.0e+999"));
     }
 
@@ -12692,5 +13835,230 @@ mod tests {
         assert_eq!(json_valid(&deep_err, Some(1)), 0);
         assert!(parse_json_text(&deep_ok).is_ok());
         assert!(parse_json_text(&deep_err).is_err());
+    }
+
+    #[test]
+    fn bd_c1q6u_json_each_tree_ids_parents_and_rooted_paths_match_live_sqlite_oracle() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let cx = Cx::new();
+
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("each_nested_array_obj", r#"[10,{"a":20},[30]]"#, None),
+            ("each_plain_string", r#"["A",1]"#, None),
+            ("each_unicode_escape_string", r#"["\u0041",1]"#, None),
+            (
+                "each_json5_literals",
+                "[1.50, 1e2, +5, 0x10, .5, 5., Infinity, -Infinity, NaN]",
+                None,
+            ),
+            (
+                "each_json5_obj",
+                "{a:1, 'b': 'x\"y', c: [1,2,], /* comment */}",
+                None,
+            ),
+            (
+                "each_rooted_array",
+                r#"{"x":[1,{"y":2}],"z":"s"}"#,
+                Some("$.x"),
+            ),
+            ("each_rooted_scalar", r#"{"a":5}"#, Some("$.a")),
+            (
+                "each_rooted_compound_first",
+                r#"{"a":{"b":1,"c":2}}"#,
+                Some("$.a.b"),
+            ),
+            (
+                "each_rooted_compound_second",
+                r#"{"a":{"b":1,"c":2}}"#,
+                Some("$.a.c"),
+            ),
+            (
+                "each_rooted_array_first",
+                r#"{"a":[10,20,30]}"#,
+                Some("$.a[0]"),
+            ),
+            (
+                "each_rooted_array_second",
+                r#"{"a":[10,20,30]}"#,
+                Some("$.a[1]"),
+            ),
+            (
+                "each_rooted_array_from_end",
+                r#"{"a":[10,20,30]}"#,
+                Some("$.a[#-1]"),
+            ),
+            (
+                "each_quoted_and_special_keys",
+                r#"{"a.b":{"c":1,"d":2},"k_1":3,"k-2":4,"":5,"\u0061":6}"#,
+                None,
+            ),
+            (
+                "each_rooted_quoted_first",
+                r#"{"a.b":{"c":1,"d":2}}"#,
+                Some(r#"$."a.b".c"#),
+            ),
+            (
+                "each_rooted_quoted_second",
+                r#"{"a.b":{"c":1,"d":2}}"#,
+                Some(r#"$."a.b".d"#),
+            ),
+            ("each_duplicate_keys", r#"{"a":1,"a":2,"b":3}"#, None),
+            ("each_root_dollar", r#"{"a":1,"b":2}"#, Some("$")),
+            ("each_scalar_root", "42", None),
+            ("each_empty_array", "[]", None),
+            ("each_empty_object", "{}", None),
+            ("each_missing_path", r#"{"a":1}"#, Some("$.missing")),
+        ];
+
+        let mut diffs = Vec::new();
+        for &(label, doc, path) in cases {
+            let stock_jsonb = stock_json_scalar(&stock, "SELECT jsonb(?1)", &[text(doc)]);
+            for (input_kind, input_arg) in [("text", text(doc)), ("jsonb", stock_jsonb)] {
+                for recursive in [false, true] {
+                    let fn_name = if recursive { "json_tree" } else { "json_each" };
+                    let (sql, args) = match path {
+                        Some(p) => (
+                            format!(
+                                "SELECT rowid, key, value, type, atom, id, parent, fullkey, path FROM {fn_name}(?1, ?2)"
+                            ),
+                            vec![input_arg.clone(), text(p)],
+                        ),
+                        None => (
+                            format!(
+                                "SELECT rowid, key, value, type, atom, id, parent, fullkey, path FROM {fn_name}(?1)"
+                            ),
+                            vec![input_arg.clone()],
+                        ),
+                    };
+                    let expected = stock_json_rows(&stock, &sql, &args).unwrap();
+
+                    // Check direct API (`json_each`/`json_tree` and `*_blob`)
+                    let direct_rows = match (&input_arg, recursive) {
+                        (SqliteValue::Text(s), false) => json_each(s, path),
+                        (SqliteValue::Text(s), true) => json_tree(s, path),
+                        (SqliteValue::Blob(b), false) => json_each_blob(b, path),
+                        (SqliteValue::Blob(b), true) => json_tree_blob(b, path),
+                        _ => unreachable!(),
+                    }
+                    .unwrap();
+                    let direct_rendered: Vec<Vec<SqliteValue>> = direct_rows
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, row)| {
+                            vec![
+                                SqliteValue::Integer(i64::try_from(idx).unwrap()),
+                                row.key,
+                                row.value,
+                                text(row.type_name),
+                                row.atom,
+                                SqliteValue::Integer(row.id),
+                                row.parent,
+                                SqliteValue::Text(row.fullkey.into()),
+                                SqliteValue::Text(row.path.into()),
+                            ]
+                        })
+                        .collect();
+                    if direct_rendered != expected {
+                        diffs.push(format!(
+                            "  [{label}/{input_kind}/{fn_name}/direct]\n    frank={direct_rendered:?}\n    stock={expected:?}"
+                        ));
+                    }
+
+                    // Check virtual table cursor API
+                    let mut vtab_rows = Vec::new();
+                    if recursive {
+                        let vtab = JsonTreeVtab::connect(&cx, &[]).unwrap();
+                        let mut cursor = vtab.open().unwrap();
+                        cursor.filter(&cx, 0, None, &args).unwrap();
+                        while !cursor.eof() {
+                            let mut row = vec![SqliteValue::Integer(cursor.rowid().unwrap())];
+                            for col in 0..8 {
+                                let mut ctx = ColumnContext::new();
+                                cursor.column(&mut ctx, col).unwrap();
+                                row.push(ctx.take_value().unwrap_or(SqliteValue::Null));
+                            }
+                            vtab_rows.push(row);
+                            cursor.next(&cx).unwrap();
+                        }
+                    } else {
+                        let vtab = JsonEachVtab::connect(&cx, &[]).unwrap();
+                        let mut cursor = vtab.open().unwrap();
+                        cursor.filter(&cx, 0, None, &args).unwrap();
+                        while !cursor.eof() {
+                            let mut row = vec![SqliteValue::Integer(cursor.rowid().unwrap())];
+                            for col in 0..8 {
+                                let mut ctx = ColumnContext::new();
+                                cursor.column(&mut ctx, col).unwrap();
+                                row.push(ctx.take_value().unwrap_or(SqliteValue::Null));
+                            }
+                            vtab_rows.push(row);
+                            cursor.next(&cx).unwrap();
+                        }
+                    }
+                    if vtab_rows != expected {
+                        diffs.push(format!(
+                            "  [{label}/{input_kind}/{fn_name}/vtab]\n    frank={vtab_rows:?}\n    stock={expected:?}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Also check bare SQL scalar inputs (`json_each(7)`, `json_tree(1.5)`).
+        for (label, input_arg) in [
+            ("scalar_int", SqliteValue::Integer(7)),
+            ("scalar_float", SqliteValue::Float(1.5)),
+            ("scalar_null", SqliteValue::Null),
+        ] {
+            for recursive in [false, true] {
+                let fn_name = if recursive { "json_tree" } else { "json_each" };
+                let sql = format!(
+                    "SELECT rowid, key, value, type, atom, id, parent, fullkey, path FROM {fn_name}(?1)"
+                );
+                let expected = stock_json_rows(&stock, &sql, &[input_arg.clone()]).unwrap();
+                let mut vtab_rows = Vec::new();
+                if recursive {
+                    let vtab = JsonTreeVtab::connect(&cx, &[]).unwrap();
+                    let mut cursor = vtab.open().unwrap();
+                    cursor.filter(&cx, 0, None, &[input_arg.clone()]).unwrap();
+                    while !cursor.eof() {
+                        let mut row = vec![SqliteValue::Integer(cursor.rowid().unwrap())];
+                        for col in 0..8 {
+                            let mut ctx = ColumnContext::new();
+                            cursor.column(&mut ctx, col).unwrap();
+                            row.push(ctx.take_value().unwrap_or(SqliteValue::Null));
+                        }
+                        vtab_rows.push(row);
+                        cursor.next(&cx).unwrap();
+                    }
+                } else {
+                    let vtab = JsonEachVtab::connect(&cx, &[]).unwrap();
+                    let mut cursor = vtab.open().unwrap();
+                    cursor.filter(&cx, 0, None, &[input_arg.clone()]).unwrap();
+                    while !cursor.eof() {
+                        let mut row = vec![SqliteValue::Integer(cursor.rowid().unwrap())];
+                        for col in 0..8 {
+                            let mut ctx = ColumnContext::new();
+                            cursor.column(&mut ctx, col).unwrap();
+                            row.push(ctx.take_value().unwrap_or(SqliteValue::Null));
+                        }
+                        vtab_rows.push(row);
+                        cursor.next(&cx).unwrap();
+                    }
+                }
+                if vtab_rows != expected {
+                    diffs.push(format!(
+                        "  [{label}/{fn_name}/vtab]\n    frank={vtab_rows:?}\n    stock={expected:?}"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            diffs.is_empty(),
+            "{} bd-c1q6u json_each/json_tree divergence(s) vs live SQLite 3.54.1:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     }
 }

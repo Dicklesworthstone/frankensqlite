@@ -67,28 +67,29 @@ fn json_each_tree_match_rusqlite_oracle() {
             "SELECT sum(value) FROM json_each('[1,2,3,4,5]')",
             "SELECT count(*) FROM json_each('{\"a\":1,\"b\":2,\"c\":3}')",
             "SELECT type, count(*) FROM json_each('[1,\"x\",null,true,2.5]') GROUP BY type ORDER BY type",
-            // json_tree — recursive traversal. NOTE: the id/parent columns are
-            // documented opaque ("arbitrary and may change from one release to
-            // the next"), so they are NOT compared across implementations —
-            // frank uses a self-consistent sequential counter, stock uses
-            // internal JSONB offsets; both satisfy the parent-references-id
-            // contract. The well-defined columns (key/value/type/atom/fullkey/
-            // path) are what must match.
-            "SELECT key, value, type, atom, fullkey, path FROM json_tree('{\"a\":1,\"b\":[2,3]}')",
+            // json_tree — recursive traversal. Compare ALL 9 columns including
+            // rowid, id, parent, fullkey, and path (bd-c1q6u / bd-kenqt):
+            // fsqlite uses the same JSONB lexical byte offsets as SQLite 3.54.1.
+            "SELECT rowid, key, value, type, atom, id, parent, fullkey, path FROM json_each('[10,20,30]')",
+            "SELECT rowid, key, value, type, atom, id, parent, fullkey, path FROM json_each('[\"\\u0041\",1]')",
+            "SELECT rowid, key, value, type, atom, id, parent, fullkey, path FROM json_tree('{\"a\":1,\"b\":[2,3]}')",
+            "SELECT rowid, key, value, type, atom, id, parent, fullkey, path FROM json_tree('{\"a\":{\"b\":1,\"c\":2}}','$.a.b')",
+            "SELECT rowid, key, value, type, atom, id, parent, fullkey, path FROM json_tree('{\"a\":{\"b\":1,\"c\":2}}','$.a.c')",
+            "SELECT rowid, key, value, type, atom, id, parent, fullkey, path FROM json_tree('{\"a\":[10,20,30]}','$.a[1]')",
+            "SELECT rowid, key, value, type, atom, id, parent, fullkey, path FROM json_tree('{\"a.b\":{\"c\":1,\"d\":2},\"k_1\":3,\"\\u0061\":4}')",
+            "SELECT rowid, key, value, type, atom, id, parent, fullkey, path FROM json_tree(jsonb('{\"a\":[10,{\"b\":20}],\"c\":null}'),'$.a')",
             "SELECT fullkey, type FROM json_tree('{\"x\":{\"y\":{\"z\":5}}}')",
             "SELECT count(*) FROM json_tree('{\"a\":[1,2,{\"b\":3}]}')",
             "SELECT value FROM json_tree('{\"a\":[1,2,{\"b\":3}]}') WHERE type='integer' ORDER BY value",
             "SELECT fullkey, atom FROM json_tree('[{\"k\":1},{\"k\":2}]') WHERE atom IS NOT NULL ORDER BY fullkey",
-            // bd-kzwze: a PATH-rooted scan reports the self/root row's `key` as
-            // the last path segment (object key -> TEXT, array index -> INTEGER),
-            // NOT NULL. The `$`-rooted scans above still report root key NULL.
-            "SELECT key, value FROM json_tree('{\"a\":{\"b\":1}}','$.a')",
-            "SELECT key, value, type FROM json_tree('{\"outer\":{\"a\":1,\"b\":2}}','$.outer')",
-            "SELECT key, value, type FROM json_tree('[10,[20,30]]','$[1]')",
-            "SELECT key, value FROM json_tree('{\"a\":5}','$.a')",
-            "SELECT key, value FROM json_each('{\"a\":5}','$.a')",
-            "SELECT key, value, type FROM json_each('[10,[20,30]]','$[1]')",
-            "SELECT key FROM json_tree('{\"a\":1}')",
+            // bd-kzwze / bd-c1q6u: PATH-rooted scans match stock key, id, parent, path.
+            "SELECT key, value, id, parent, path FROM json_tree('{\"a\":{\"b\":1}}','$.a')",
+            "SELECT key, value, type, id, parent, path FROM json_tree('{\"outer\":{\"a\":1,\"b\":2}}','$.outer')",
+            "SELECT key, value, type, id, parent, path FROM json_tree('[10,[20,30]]','$[1]')",
+            "SELECT key, value, id, parent, path FROM json_tree('{\"a\":5}','$.a')",
+            "SELECT key, value, id, parent, path FROM json_each('{\"a\":5}','$.a')",
+            "SELECT key, value, type, id, parent, path FROM json_each('[10,[20,30]]','$[1]')",
+            "SELECT key, id, parent, path FROM json_tree('{\"a\":1}')",
             // atom is NULL for containers, non-NULL for leaves
             "SELECT type, atom FROM json_each('[[1],2,{\"k\":3}]') ORDER BY key",
         ];
@@ -99,6 +100,33 @@ fn json_each_tree_match_rusqlite_oracle() {
             let rr = rq(&r, q);
             if fr != rr {
                 diffs.push(format!("  `{q}`\n     frank= {fr:?}\n     stock= {rr:?}"));
+            }
+        }
+
+        // Also verify file-backed DB parity for JSONB-stored blobs read via json_each/json_tree.
+        let dir = tempfile::tempdir().unwrap();
+        let f_path = dir.path().join("frank.db");
+        let r_path = dir.path().join("stock.db");
+        let f_file = Connection::open(f_path.to_str().unwrap()).await.unwrap();
+        let r_file = rusqlite::Connection::open(&r_path).unwrap();
+        for setup in [
+            "CREATE TABLE docs(id INTEGER PRIMARY KEY, raw TEXT, bin BLOB)",
+            "INSERT INTO docs VALUES (1, '{\"a\":[10,{\"b\":20}],\"u\":\"\\u0041\"}', jsonb('{\"a\":[10,{\"b\":20}],\"u\":\"\\u0041\"}'))",
+        ] {
+            f_file.execute(setup).await.unwrap();
+            r_file.execute(setup, []).unwrap();
+        }
+        for q in [
+            "SELECT d.id, j.rowid, j.key, j.value, j.type, j.atom, j.id, j.parent, j.fullkey, j.path FROM docs d, json_tree(d.raw, '$.a') j",
+            "SELECT d.id, j.rowid, j.key, j.value, j.type, j.atom, j.id, j.parent, j.fullkey, j.path FROM docs d, json_tree(d.bin, '$.a') j",
+            "SELECT d.id, j.rowid, j.key, j.value, j.type, j.atom, j.id, j.parent, j.fullkey, j.path FROM docs d, json_each(d.bin) j",
+        ] {
+            let fr = fq(&f_file, q).await;
+            let rr = rq(&r_file, q);
+            if fr != rr {
+                diffs.push(format!(
+                    "  [file-backed] `{q}`\n     frank= {fr:?}\n     stock= {rr:?}"
+                ));
             }
         }
         assert!(
