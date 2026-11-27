@@ -18275,23 +18275,27 @@ impl Connection {
         .await
     }
 
-    /// bd-gfx4q: open a private image this process just wrote (VACUUM's
-    /// rebuild candidate or `VACUUM INTO` output) read-only, to validate it
-    /// before publication, without creating any `-wal`/`-shm` companion.
+    /// bd-gfx4q: open a private image read-only, to validate it before
+    /// publication, without creating any `-wal`/`-shm` companion: VACUUM's
+    /// rebuild candidate, `VACUUM INTO` output, and (bd-1jve4) the
+    /// caller-supplied candidate of whole-image publication and of the
+    /// bounded structural snapshot.
     ///
     /// The image is published only while it is self-contained
     /// (`ensure_vacuum_candidate_is_self_contained_in_vfs` refuses any
     /// `-shm`). A user's read-only open of a cleanly closed WAL database
     /// creates both companions as stock does (bd-cf0be); this open must not,
-    /// or VACUUM of a WAL database refuses its own candidate.
+    /// or a WAL-format candidate is refused because of its own validation and
+    /// the caller's directory keeps the pair.
     async fn open_private_image_schema_only(
         path: String,
         expected_identity: Option<FileIdentity>,
+        env: ConnectionEnv,
     ) -> Result<Self> {
         Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
             path,
             expected_identity,
-            ConnectionEnv::default(),
+            env,
             false,
             false,
             SchemaOnlyPagerDisposition::PrivateImage,
@@ -22902,12 +22906,12 @@ impl Connection {
         let mut env = self.attach_env.clone();
         env.set_page_buffer_max(validation_page_limit);
         env.set_strict_multi_process(true);
-        let validation = Self::open_schema_only_with_expected_identity_and_env(
-            path.to_owned(),
-            expected.identity(),
-            env,
-        )
-        .await?;
+        // bd-1jve4: a private-image open, so a WAL-format image is validated
+        // without creating `-wal`/`-shm` beside the caller's image (which
+        // `finish`'s self-contained receipt would then refuse).
+        let validation =
+            Self::open_private_image_schema_only(path.to_owned(), Some(expected.identity()), env)
+                .await?;
 
         // The spool lives beside the image, which is already a real directory
         // the caller can write; `PrivatePageOwnership` unlinks it immediately.
@@ -23149,20 +23153,24 @@ impl Connection {
                 .ok_or_else(|| FrankenError::CannotOpen {
                     path: candidate_path.to_owned(),
                 })?;
-            let validation = if let Some(page_limit) = validation_page_limit {
+            // bd-1jve4: a private-image open, so validating a WAL-format
+            // candidate does not create the `-wal`/`-shm` pair that `commit`'s
+            // self-contained receipt refuses, nor leave it beside the
+            // caller's image after a refusal.
+            let env = if let Some(page_limit) = validation_page_limit {
                 let mut env = self.attach_env.clone();
                 env.set_page_buffer_max(page_limit);
                 env.set_strict_multi_process(true);
-                Self::open_schema_only_with_expected_identity_and_env(
-                    path.to_owned(),
-                    repaired.identity(),
-                    env,
-                )
-                .await
+                env
             } else {
-                Self::open_schema_only_with_expected_identity(path.to_owned(), repaired.identity())
-                    .await
-            }
+                ConnectionEnv::default()
+            };
+            let validation = Self::open_private_image_schema_only(
+                path.to_owned(),
+                Some(repaired.identity()),
+                env,
+            )
+            .await
             .inspect_err(|error| {
                 tracing::warn!(
                     error = %error,
@@ -80671,6 +80679,7 @@ impl Connection {
         let validation_conn = Self::open_private_image_schema_only(
             rebuild_path_text.to_owned(),
             Some(rebuild_target.identity()),
+            ConnectionEnv::default(),
         )
         .await
         .map_err(|err| {
@@ -80679,13 +80688,17 @@ impl Connection {
             ))
         })?;
         #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
-        let validation_conn = Self::open_private_image_schema_only(rebuild_path_text.to_owned(), None)
-            .await
-            .map_err(|err| {
-                FrankenError::Internal(format!(
-                    "VACUUM rebuilt image failed pre-publication schema reload: {err}"
-                ))
-            })?;
+        let validation_conn = Self::open_private_image_schema_only(
+            rebuild_path_text.to_owned(),
+            None,
+            ConnectionEnv::default(),
+        )
+        .await
+        .map_err(|err| {
+            FrankenError::Internal(format!(
+                "VACUUM rebuilt image failed pre-publication schema reload: {err}"
+            ))
+        })?;
 
         let validation_result = async {
             for pragma in ["quick_check", "integrity_check"] {
