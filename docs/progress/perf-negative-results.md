@@ -94,6 +94,67 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-26 - WIN (landed as 56e28f1df; exact instruction counts, inside its prediction, past its gain kill line: -2,969 Ir per FULL autocommit INSERT, x8.46 -> x8.32 stock 3.54.1; time cells VOID under the powersave governor, no replicated judge v2b LOSE): the pager's group-commit queue hashes its process-minted keys (epochs, batch ids, handle addresses) with foldhash instead of SipHash (bd-fuwx0, commit-path lane rounds 1-2, lever L1 = option O-C1, hashing)
+
+- Target: the autocommit one-row INSERT's commit path. On origin/main bc49ec280 about 21 SipHash-1-3 lookups (146 Ir
+  each, std RandomState) per commit landed in the group-commit queue: epoch evidence (failed / persisted), epoch
+  consumer counts, pending transaction attempts, in-doubt epochs, the exact-handle lock-coordination sets, the epoch
+  member set and the authorized pager-inner set: about 3.07k Ir per INSERT (callgrind --tree=caller).
+- Ledger preflight: no entry rejects it; bd-i3csr.4 F2 (rowid allocator maps) and bd-w4pr1.13.18 lever 3 (page-miss
+  maps) are the foldhash precedent; O-B1 (79c965065) and bd-2uxuh phase 0 are other mechanisms.
+- Files: crates/fsqlite-pager/src/pager.rs only (GroupCommitKeyedMap / GroupCommitKeyedSet aliases; two test
+  constructors move from HashSet::from to collect; no assertion changes).
+- Soundness: same maps, keys and operations; keys are minted by the process; every iteration is order-free
+  (retain of dead slots, collect-then-handle-each of in-doubt epochs and pending attempts, a filter-count, members
+  sorted before display). Concurrency defaults, certificates (v5) and on-disk bytes unchanged.
+- Evidence: arms A (origin/main) and B in ONE rch job on vmi1153651 (CLI d062d8fddddc968a / de32c27735ac3267,
+  mt-mvcc-bench 550738d46f1e77b8 / b1ba4bd7abf8ecfb); thinkstation1, governor powersave; stock 3.54.1 (84a5d033)
+  live. Callgrind per unit (N800 - N400)/400: FULL 7 pairs median -2,969 (-1.65%), pairwise -3,022; NORMAL -4.0k
+  (3 pairs); txn10 -4.1k per commit (-0.72%); point SELECT -0.9k (-1.24%; prediction "0" missed: read
+  transactions take the lock-coordination sets too). Judge v2b x2 (both nulls valid): no replicated LOSE (bulk cpu
+  1.0109 LOSE in run 1 only). mt-mvcc FULL separate, rows-per-transaction 5, A/B/Q: 4w 0.976 / 0.988 TIE, 8w
+  0.947 / 1.025 TIE.
+- Gate (bc49ec280 + L1): clippy -D warnings fsqlite-pager --all-targets rc 0; pager lib 1155/0; core keepers (18)
+  375/0; core lib 4221/1 and fsqlite batches 1-7 green except main reds (the 272e49c55 HAVING flips, bd-mhat4, gh444
+  exact_shapes_drop_the_fallback_scan, bd-05el4's stale nonagg pin); e2e concurrent + cross-process 256/0;
+  multiprocess 11/1 (bd-ze4zu). Re-gate on the rebased tree ce18cf445 + L1, each red rerun on lever and parent in
+  the same job: clippy rc 0, pager lib 1159/0/13 (hz2); core keepers 20 (r1's 18 + bd_emim5_b1_lease_tail 1/1 +
+  bd_ioq6x_hole_reclaim 7/7) 361/1/5 (hz2), the red gh441_vacuum_leaves_no_free_pages_with_overflow_rows lever 4/4
+  and parent 3/3 alike (bd-gfx4q, VACUUM rebuild candidate's -shm companion); e2e cross-process 111/0/3 and
+  multiprocess 11/1 (vmi1153651), the red bd-ze4zu's class, paired in one job: lever 3/20, parent 5/20. Not re-run on
+  the rebased tree: core lib, e2e concurrent, fsqlite batches.
+- Retry / widen: the SipHash left on this path after L1 is the vfs -shm maps (about 1.0k, lever L3 of the same
+  round) and the mvcc/core concurrent registry (about 2.0k: ConcurrentRegistry.active / active_snapshot_highs and
+  core's session maps). The registry needs its own order argument first: prune_committed_conflict_history picks
+  the oldest active session with a strict `<`, so ties break in iteration order.
+
+## 2026-11-26 - REJECTED on its time kill line (order_by_text_limit10 cycles a replicated judge v2b LOSE, 1.0115 / 1.0186, at Ir 1.0000; re-judge under bd-j0jc0/bd-gvews), with its gain line cleared: -1,422 Ir per FULL autocommit INSERT (x8.44 -> x8.38 stock 3.54.1): the WAL-index header copy is stored as one locked run of word stores instead of 12 separately locked stores (bd-fuwx0, commit-path lane round 1, lever L2 = a piece of option O-C3)
+
+- Target: the commit's WAL-index publication. publish_shared_wal_index_header wrote each 48-byte header copy with
+  12 ShmRegion::atomic_store_u32_ne calls, each taking the mapping's local mutex and range-checking its word: 2,319
+  Ir per FULL INSERT inclusive on origin/main bc49ec280 (stock's whole walIndexAppend is about 1.05k).
+- Change (not landed; patch kept as scripts/cm1/lever2.patch in /data/projects/frankensqlite-perf-ds, untracked):
+  crates/fsqlite-vfs/src/shm.rs ShmRegion::atomic_store_words_u32_ne, the store-side mirror of atomic_copy_u32_ne
+  (one range check, one mutex hold, each word still its own aligned AtomicU32 store at the given ordering,
+  ascending); crates/fsqlite-wal/src/wal_index.rs write_shared_header_copy calls it with Release. Keeper
+  assert_atomic_store_words_and_bounds (heap and real mmap'd -shm) and mutants m2a (drops the last word) and m2b
+  (heap prefix lands before the refusal) were written; their runs were not needed once the lever died.
+- Evidence: arms A / B in ONE rch job on vmi1153651 (CLI d062d8fddddc968a / aaadd87ddb485a80, mt-mvcc-bench
+  550738d46f1e77b8 / 18f0cd62b86b864b); thinkstation1, governor powersave; stock 3.54.1 (84a5d033) live.
+  Callgrind per unit (N800 - N400)/400: publish_shared_wal_index_header 2,319 -> 362 (-1,957, the predicted
+  mechanism); whole process FULL 7 pairs median -1,422 (-0.79%), pairwise -1,541 (prediction -1.6k to -2.0k, gain
+  kill -1.0k: past the line, under the band: glibc malloc-state noise of +-0.5k per pair dilutes it); NORMAL -2.9k;
+  txn10 -3.9k per commit; point SELECT +40 (+0.05%; one replicate +658, all of it _int_malloc / unlink_chunk).
+  Judge v2b x2, both nulls valid (max |z| 2.08, 2.79): order_by_text_limit10 cycles LOSE 1.0115 (T 1.14%) and
+  1.0186 (T 1.00%), Ir 1.0000 -> KILL. Unreplicated: bulk cpu LOSE 1.0415 run 1 only; gb_id_mod100k and
+  rowid_lookups_200k cpu LOSE run 2 only. mt-mvcc pass 1: 4w VOID (null 1.079), 8w 0.960 TIE; pass 2: 4w VOID
+  (null 1.071), 8w VOID (null 1.103).
+- Retry condition: re-judge under bd-j0jc0 / bd-gvews once the host governor is fixed (thinkstation1 runs
+  powersave; owner chose "fix host, retest"), rebuilding both arms from the same patch: the change cannot touch an
+  ORDER BY ... LIMIT read (no header store runs there; Ir 1.0000), so a replicated cycles LOSE there is the layout
+  class those beads describe. Or stack it with another WAL-index publication cut (the header read path,
+  read_shared_wal_index_header, about 4.2k per INSERT over ~10 reads) so one lever clears a time-resolvable line.
+
 ## 2026-11-23 - WIN (landed as f96d616e9; inside its prediction on gb_id_mod100k, beyond its first band on gb_a_sum_c; gb_id_mod100k x3.77 -> x1.39 and gb_a_sum_c x4.27 -> x1.51 stock 3.54.1 in instructions): a spilled sorter merges its runs over a winner tree and compares INTEGER run heads as integers (bd-ku484, serial read lane rounds 14-16, lever SM1)
 
 - Target: the spilled-sorter GROUP BY regression bd-ku484.
