@@ -236,12 +236,22 @@ struct CaseBuild {
     whens: Vec<(ParsedExpr, ParsedExpr)>,
 }
 
+pub(crate) const fn compound_op_name(op: CompoundOp) -> &'static str {
+    match op {
+        CompoundOp::Union => "UNION",
+        CompoundOp::UnionAll => "UNION ALL",
+        CompoundOp::Intersect => "INTERSECT",
+        CompoundOp::Except => "EXCEPT",
+    }
+}
+
 struct SelectBuild {
     with: Option<WithClause>,
     first: SelectCore,
     compounds: Vec<(CompoundOp, SelectCore)>,
     height: u32,
     order_by: Vec<OrderingTerm>,
+    misplaced_clause_before_compound: Option<(&'static str, CompoundOp)>,
 }
 
 struct CoreBuild {
@@ -2946,6 +2956,7 @@ impl<'a> ParseMachine<'a> {
                     first: core.value,
                     compounds: Vec::new(),
                     order_by: Vec::new(),
+                    misplaced_clause_before_compound: None,
                 });
                 Ok(())
             }
@@ -3295,8 +3306,8 @@ impl<'a> ParseMachine<'a> {
         }
     }
 
-    fn continue_select_body(&mut self, build: SelectBuild) {
-        let op = if self.parser.eat_kind(&TokenKind::KwUnion) {
+    fn eat_compound_op(&mut self) -> Option<CompoundOp> {
+        if self.parser.eat_kind(&TokenKind::KwUnion) {
             Some(if self.parser.eat_kind(&TokenKind::KwAll) {
                 CompoundOp::UnionAll
             } else {
@@ -3308,8 +3319,11 @@ impl<'a> ParseMachine<'a> {
             Some(CompoundOp::Except)
         } else {
             None
-        };
-        if let Some(op) = op {
+        }
+    }
+
+    fn continue_select_body(&mut self, build: SelectBuild) {
+        if let Some(op) = self.eat_compound_op() {
             self.controls
                 .push(ParseControl::SelectCompoundDone { build, op });
             self.controls.push(ParseControl::CoreStart);
@@ -3351,6 +3365,49 @@ impl<'a> ParseMachine<'a> {
             return Err(self
                 .parser
                 .err_here("ORDER BY / LIMIT clause is not allowed after a VALUES term"));
+        }
+        // bd-92pxs: SQLite's grammar accepts ORDER BY / LIMIT on each
+        // non-VALUES arm of a compound SELECT and raises the misplaced-clause
+        // diagnostic only after the compound SELECT parses cleanly, reporting
+        // the rightmost offending arm (`ORDER BY` takes precedence over
+        // `LIMIT`) while letting syntax errors in later arms or trailing
+        // tokens take precedence.
+        if (!build.order_by.is_empty() || limit.value.is_some())
+            && let Some(op) = self.eat_compound_op()
+        {
+            let clause = if !build.order_by.is_empty() {
+                "ORDER BY"
+            } else {
+                "LIMIT"
+            };
+            build.misplaced_clause_before_compound = Some((clause, op));
+            build.order_by.clear();
+            self.controls
+                .push(ParseControl::SelectCompoundDone { build, op });
+            self.controls.push(ParseControl::CoreStart);
+            return Ok(());
+        }
+        if let Some((clause, op)) = build.misplaced_clause_before_compound {
+            let valid_follow = if self.controls.items.is_empty() {
+                matches!(
+                    self.parser.peek_kind(),
+                    TokenKind::Eof
+                        | TokenKind::Semicolon
+                        | TokenKind::KwOn
+                        | TokenKind::KwReturning
+                )
+            } else {
+                self.parser.at_kind(&TokenKind::RightParen)
+            };
+            if !valid_follow {
+                return Err(self
+                    .parser
+                    .err_here("unexpected token after SELECT statement"));
+            }
+            return Err(self.parser.err_semantic(format!(
+                "{clause} clause should come after {} not before",
+                compound_op_name(op),
+            )));
         }
         self.values.push(MachineValue::Select(HeightTracked {
             value: SelectStatement {

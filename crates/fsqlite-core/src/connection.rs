@@ -143204,15 +143204,14 @@ fn select_requires_column_reference_preflight(select: &SelectStatement, conn: &C
             if columns.iter().any(|column| matches!(column,
                 ResultColumn::Expr { expr, .. } if expr_has_window_function(expr))))
     }
+    // Compound SELECTs validate every arm right-to-left (plus LIMIT/OFFSET) at
+    // prepare time before arity and compound-ORDER-BY checks, matching stock
+    // SQLite's error text, arm precedence, and prepare-vs-step timing (bd-92pxs).
     select.with.is_some()
+        || !select.body.compounds.is_empty()
         || core_has_grouping_clause(&select.body.select)
         || select_core_has_derived_source(&select.body.select)
         || core_has_window_function(&select.body.select)
-        || select.body.compounds.iter().any(|(_, core)| {
-            core_has_grouping_clause(core)
-                || select_core_has_derived_source(core)
-                || core_has_window_function(core)
-        })
         || select_contains_subquery_matching(select, conn, &|_, _| true)
 }
 

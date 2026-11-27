@@ -1078,86 +1078,108 @@ impl Parser {
         &mut self,
         with: Option<WithClause>,
     ) -> Result<HeightTracked<SelectStatement>, ParseError> {
-        let body = self.parse_select_body_tracked()?;
-        let mut height = body.height;
-        let final_core = body
-            .value
-            .compounds
-            .last()
-            .map_or(&body.value.select, |(_, core)| core);
-        if matches!(final_core, SelectCore::Values(_))
-            && matches!(self.peek(), TokenKind::KwOrder | TokenKind::KwLimit)
-        {
-            return Err(
-                self.err_unexpected("ORDER BY / LIMIT clause is not allowed after a VALUES term")
-            );
-        }
-        let order_by = if self.eat_kw(&TokenKind::KwOrder) {
-            self.expect_kw(&TokenKind::KwBy)?;
-            let parsed = self.parse_comma_sep(Self::parse_ordering_term_tracked)?;
-            let mut terms = Vec::with_capacity(parsed.len());
-            for tracked in parsed {
-                height = height.max(tracked.height);
-                terms.push(tracked.value);
+        let first = self.parse_select_core_tracked()?;
+        let mut height = first.height;
+        let mut compounds = Vec::new();
+        let mut misplaced_clause_before_compound: Option<(&'static str, CompoundOp)> = None;
+        loop {
+            while let Some(op) = self.eat_compound_op() {
+                let core = self.parse_select_core_tracked()?;
+                height = height.max(core.height);
+                compounds.push((op, core.value));
             }
-            terms
-        } else {
-            vec![]
-        };
-        let limit = self.parse_limit_tracked()?;
-        height = height.max(limit.height);
-        // bd-tp6ia: SQLite's grammar attaches ORDER BY / LIMIT to a SELECT,
-        // but a final VALUES term has no such slot. This rejects both standalone
-        // `VALUES (1) ORDER BY 1` and compounds such as
-        // `SELECT 1 UNION VALUES (2),(3) ORDER BY 1`.
-        if matches!(final_core, SelectCore::Values(_))
-            && (!order_by.is_empty() || limit.value.is_some())
-        {
-            return Err(
-                self.err_unexpected("ORDER BY / LIMIT clause is not allowed after a VALUES term")
-            );
+            let final_core = compounds.last().map_or(&first.value, |(_, core)| core);
+            if matches!(final_core, SelectCore::Values(_))
+                && matches!(self.peek(), TokenKind::KwOrder | TokenKind::KwLimit)
+            {
+                return Err(self
+                    .err_unexpected("ORDER BY / LIMIT clause is not allowed after a VALUES term"));
+            }
+            let order_by = if self.eat_kw(&TokenKind::KwOrder) {
+                self.expect_kw(&TokenKind::KwBy)?;
+                let parsed = self.parse_comma_sep(Self::parse_ordering_term_tracked)?;
+                let mut terms = Vec::with_capacity(parsed.len());
+                for tracked in parsed {
+                    height = height.max(tracked.height);
+                    terms.push(tracked.value);
+                }
+                terms
+            } else {
+                vec![]
+            };
+            let limit = self.parse_limit_tracked()?;
+            height = height.max(limit.height);
+            // bd-tp6ia: SQLite's grammar attaches ORDER BY / LIMIT to a SELECT,
+            // but a final VALUES term has no such slot. This rejects both standalone
+            // `VALUES (1) ORDER BY 1` and compounds such as
+            // `SELECT 1 UNION VALUES (2),(3) ORDER BY 1`.
+            if matches!(final_core, SelectCore::Values(_))
+                && (!order_by.is_empty() || limit.value.is_some())
+            {
+                return Err(self
+                    .err_unexpected("ORDER BY / LIMIT clause is not allowed after a VALUES term"));
+            }
+            if (!order_by.is_empty() || limit.value.is_some())
+                && let Some(op) = self.eat_compound_op()
+            {
+                let clause = if !order_by.is_empty() {
+                    "ORDER BY"
+                } else {
+                    "LIMIT"
+                };
+                misplaced_clause_before_compound = Some((clause, op));
+                let core = self.parse_select_core_tracked()?;
+                height = height.max(core.height);
+                compounds.push((op, core.value));
+                continue;
+            }
+            if let Some((clause, op)) = misplaced_clause_before_compound {
+                let valid_follow = matches!(
+                    self.peek(),
+                    TokenKind::Eof
+                        | TokenKind::Semicolon
+                        | TokenKind::RightParen
+                        | TokenKind::KwOn
+                        | TokenKind::KwReturning
+                );
+                if !valid_follow {
+                    return Err(self.err_unexpected("unexpected token after SELECT statement"));
+                }
+                return Err(self.err_semantic(format!(
+                    "{clause} clause should come after {} not before",
+                    crate::expr::compound_op_name(op),
+                )));
+            }
+            return Ok(HeightTracked {
+                value: SelectStatement {
+                    with,
+                    body: SelectBody {
+                        select: first.value,
+                        compounds,
+                    },
+                    order_by,
+                    limit: limit.value,
+                },
+                height,
+            });
         }
-        Ok(HeightTracked {
-            value: SelectStatement {
-                with,
-                body: body.value,
-                order_by,
-                limit: limit.value,
-            },
-            height,
-        })
     }
 
     #[cfg(test)]
-    fn parse_select_body_tracked(&mut self) -> Result<HeightTracked<SelectBody>, ParseError> {
-        let select = self.parse_select_core_tracked()?;
-        let mut height = select.height;
-        let mut compounds = Vec::new();
-        loop {
-            let op = if self.eat_kw(&TokenKind::KwUnion) {
-                if self.eat_kw(&TokenKind::KwAll) {
-                    CompoundOp::UnionAll
-                } else {
-                    CompoundOp::Union
-                }
-            } else if self.eat_kw(&TokenKind::KwIntersect) {
-                CompoundOp::Intersect
-            } else if self.eat_kw(&TokenKind::KwExcept) {
-                CompoundOp::Except
+    fn eat_compound_op(&mut self) -> Option<CompoundOp> {
+        if self.eat_kw(&TokenKind::KwUnion) {
+            Some(if self.eat_kw(&TokenKind::KwAll) {
+                CompoundOp::UnionAll
             } else {
-                break;
-            };
-            let core = self.parse_select_core_tracked()?;
-            height = height.max(core.height);
-            compounds.push((op, core.value));
+                CompoundOp::Union
+            })
+        } else if self.eat_kw(&TokenKind::KwIntersect) {
+            Some(CompoundOp::Intersect)
+        } else if self.eat_kw(&TokenKind::KwExcept) {
+            Some(CompoundOp::Except)
+        } else {
+            None
         }
-        Ok(HeightTracked {
-            value: SelectBody {
-                select: select.value,
-                compounds,
-            },
-            height,
-        })
     }
 
     #[cfg(test)]
