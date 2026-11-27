@@ -1109,6 +1109,36 @@ mod peer_first_admission {
         })
     }
 
+    /// The waiting child's COMMIT retries WAL WRITE about every millisecond,
+    /// and each retry takes the main file's RESERVED byte first (fsqlite's
+    /// main-before-WAL order) and gives it back when WRITE is refused. These
+    /// are the write-side bytes it can hold for that moment: the main file's
+    /// PENDING and RESERVED bytes, and -shm's WRITE, CKPT and RECOVER slots
+    /// (bytes 120..=122). As above, only the waiting child takes OFD locks
+    /// at this point of the shape.
+    fn has_fsqlite_write_side_lock(db: &Path) -> bool {
+        file_locks_held(db).split(',').any(|lock| {
+            let fields: Vec<&str> = lock.splitn(5, ':').collect();
+            let [file, "OFDLCK", _, _, range] = fields[..] else {
+                return false;
+            };
+            let Some((start, end)) = range.split_once('-') else {
+                return false;
+            };
+            let start = start.parse::<u64>().expect("lock start");
+            let end = if end == "EOF" {
+                u64::MAX
+            } else {
+                end.parse::<u64>().expect("lock end")
+            };
+            match file {
+                "db" => start <= 0x4000_0001 && end >= 0x4000_0000,
+                "shm" => start <= 122 && end >= 120,
+                _ => false,
+            }
+        })
+    }
+
     #[test]
     fn fresh_generation_child() {
         let Ok(spec) = std::env::var(CHILD) else {
@@ -1211,10 +1241,33 @@ mod peer_first_admission {
             let pid = Pid::from_raw(
                 i32::try_from(waiting.0.as_ref().expect("waiting child").id()).expect("child pid"),
             );
-            kill(pid, Signal::SIGSTOP).expect("stop waiting writer");
-            assert_eq!(
-                waitpid(pid, Some(WaitPidFlag::WUNTRACED)).expect("observe stopped writer"),
-                WaitStatus::Stopped(pid, Signal::SIGSTOP)
+            // Stop it outside a WRITE retry. Stopped inside one, it keeps the
+            // main file's RESERVED byte, which the fresh peer's commit takes
+            // first, so the peer waits for the stopped writer and never
+            // commits (the "fresh peer never committed" failure; bd-30ip9,
+            // corruption lane r13).
+            let stopping = Instant::now();
+            loop {
+                kill(pid, Signal::SIGSTOP).expect("stop waiting writer");
+                assert_eq!(
+                    waitpid(pid, Some(WaitPidFlag::WUNTRACED)).expect("observe stopped writer"),
+                    WaitStatus::Stopped(pid, Signal::SIGSTOP)
+                );
+                if !has_fsqlite_write_side_lock(&db) {
+                    break;
+                }
+                kill(pid, Signal::SIGCONT).expect("let the writer finish its retry");
+                assert!(
+                    stopping.elapsed() < LIMIT,
+                    "the waiting COMMIT never stopped outside a WRITE retry: {}",
+                    file_locks_held(&db)
+                );
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            assert!(
+                !has_fsqlite_reader_mark(&db),
+                "the stopped COMMIT must not own a read mark: {}",
+                file_locks_held(&db)
             );
             assert!(
                 !dir.path().join("waiting-result").exists(),
