@@ -182,11 +182,9 @@ const WHERES: &[&str] = &[
 fn statements() -> Vec<String> {
     let mut sqls = Vec::new();
     for list in LISTS {
-        // Unconstrained min()/max() covering/index choice is bd-5kdea; unconstrained
-        // non-min/max covering-index scans (e.g. `SELECT id, count(*) FROM t`) are bd-1bs3h.
-        if list.contains("min(") || list.contains("max(") {
-            sqls.push(format!("SELECT {list} FROM t"));
-        }
+        // Both unconstrained min()/max() (bd-5kdea) and unconstrained covering-index
+        // non-min/max aggregates (bd-1bs3h) must match stock row choice.
+        sqls.push(format!("SELECT {list} FROM t"));
         for wh in WHERES {
             sqls.push(format!("SELECT {list} FROM t WHERE {wh}"));
         }

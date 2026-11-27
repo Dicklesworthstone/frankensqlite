@@ -527,3 +527,208 @@ fn insert_select_series_with_parameters_matches_stock() {
         );
     });
 }
+
+/// bd-1bs3h: unordered full scans and `INSERT ... SELECT` must pick the same
+/// strictly narrower covering index (estimated width, tie-broken by most
+/// recently created) as stock SQLite across `:memory:` and file-backed,
+/// direct and prepared execution, including EQP wording, `REAL`/`STRICT`
+/// storage classes, `VIRTUAL` generated columns, `DESC`, `NOT INDEXED`,
+/// `SELECT DISTINCT`, `PRAGMA reverse_unordered_selects`, `INSERT OR REPLACE`,
+/// and multi-chunk (>10,000 rows) `INSERT ... SELECT` sources.
+#[test]
+fn bd_1bs3h_covering_full_scan_and_insert_select_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let setup_sqls: &[&str] = &[
+            // Exact bd-1bs3h repro table: width(s) = 5+1 = 6, width(ib) = 5 < 6.
+            "CREATE TABLE s(a INTEGER PRIMARY KEY, b TEXT, c INT)",
+            "CREATE INDEX ib ON s(b)",
+            "INSERT INTO s VALUES (1,'z',10),(2,'y',20),(3,'x',30),(4,'w',40)",
+            "CREATE TABLE t2(x, y)",
+            "CREATE TABLE t_rep(k INT PRIMARY KEY, v TEXT)",
+            // Equal width (5 == 5) and full-row index (6 == 6) must keep table scan.
+            "CREATE TABLE s2(a INTEGER PRIMARY KEY, b TEXT)",
+            "CREATE INDEX s2_b ON s2(b)",
+            "INSERT INTO s2 VALUES (1,'z'),(2,'a')",
+            "CREATE TABLE s3(x INT, y TEXT)",
+            "CREATE INDEX s3_xy ON s3(x, y)",
+            "INSERT INTO s3 VALUES (2,'z'),(1,'a')",
+            // Tie-breaking (most recently created wins) and TEXT(5) vs INT(1) vs VARCHAR(100)(25).
+            "CREATE TABLE s4(id INTEGER PRIMARY KEY, a INT, b INT, c INT, t TEXT, v VARCHAR(100))",
+            "CREATE INDEX i_a ON s4(a)",
+            "CREATE INDEX i_c ON s4(c)",
+            "CREATE INDEX i_t ON s4(t)",
+            "CREATE INDEX i_v ON s4(v)",
+            "INSERT INTO s4 VALUES (1,30,1,20,'z','a'),(2,10,2,30,'y','b'),(3,20,3,10,'x','c')",
+            // DESC, partial, REAL/STRICT, VIRTUAL generated column.
+            "CREATE TABLE s5(id INTEGER PRIMARY KEY, a INT, b TEXT)",
+            "CREATE INDEX i5_desc ON s5(a DESC)",
+            "CREATE INDEX i5_part ON s5(a) WHERE a > 0",
+            "INSERT INTO s5 VALUES (1,10,'a'),(2,30,'b'),(3,20,'c')",
+            "CREATE TABLE s6(id INTEGER PRIMARY KEY, r REAL, x INT) STRICT",
+            "CREATE INDEX i6_r ON s6(r)",
+            "INSERT INTO s6 VALUES (1, 3, 10), (2, 1.5, 20), (3, 2, 30)",
+            "CREATE TABLE g1(id INTEGER PRIMARY KEY, a INT, b INT GENERATED ALWAYS AS (a + 1) VIRTUAL)",
+            "CREATE INDEX g1_a ON g1(a)",
+            "INSERT INTO g1(id, a) VALUES (1, 30), (2, 10), (3, 20)",
+            // Multi-chunk (>10,000 rows) INSERT ... SELECT with a narrower covering index.
+            "CREATE TABLE big_s(id INTEGER PRIMARY KEY, k TEXT, pad TEXT)",
+            "INSERT INTO big_s SELECT value, printf('%06d', 12005 - value), 'pad' || value \
+             FROM generate_series(1, 12005)",
+            "CREATE INDEX big_s_k ON big_s(k)",
+            "CREATE TABLE big_dst(src_id INT, k TEXT)",
+        ];
+
+        let queries: &[&str] = &[
+            "SELECT a, b FROM s",
+            "SELECT a, b FROM s WHERE length(b) > 0",
+            "SELECT a, upper(b) FROM s",
+            "SELECT a, b FROM s LIMIT 2 OFFSET 1",
+            "SELECT a, b FROM s NOT INDEXED",
+            "SELECT a, c FROM s",
+            "SELECT * FROM s",
+            "SELECT DISTINCT a, b FROM s",
+            "SELECT DISTINCT b FROM s",
+            "SELECT DISTINCT b, length(b) FROM s",
+            "SELECT DISTINCT length(b) FROM s",
+            "SELECT 1, a FROM s",
+            "SELECT a, count(*) FROM s",
+            "SELECT a, sum(length(b)) FROM s WHERE length(b) > 0",
+            "SELECT a, b FROM s2",
+            "SELECT x, y FROM s3",
+            "SELECT id FROM s4",
+            "SELECT id, a FROM s4",
+            "SELECT id, t FROM s4",
+            "SELECT id, a FROM s5",
+            "SELECT id, r, typeof(r) FROM s6",
+            "SELECT id, a FROM g1",
+            "SELECT id, b FROM g1",
+        ];
+
+        let mut diffs = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = if file_backed {
+                let fpath = dir.path().join("f_1bs3h.db");
+                let rpath = dir.path().join("r_1bs3h.db");
+                (
+                    Connection::open(fpath.to_str().unwrap()).await.unwrap(),
+                    rusqlite::Connection::open(rpath).unwrap(),
+                )
+            } else {
+                (
+                    Connection::open(":memory:").await.unwrap(),
+                    rusqlite::Connection::open_in_memory().unwrap(),
+                )
+            };
+            r.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            let label = if file_backed { "file" } else { "memory" };
+
+            for sql in setup_sqls {
+                f.execute(sql).await.unwrap();
+                r.execute_batch(&stock_sql(sql)).unwrap();
+            }
+
+            // 1. Direct & prepared SELECT rows + exact EXPLAIN QUERY PLAN parity.
+            for sql in queries {
+                let stock_rows = rq(&r, sql);
+                let direct_rows = fq(&f, sql).await;
+                if direct_rows != stock_rows {
+                    diffs.push(format!(
+                        "[{label} direct] `{sql}`\n  frank={direct_rows:?}\n  stock={stock_rows:?}"
+                    ));
+                }
+                let prep_rows = match f.prepare(sql).await.map_err(|e| e.to_string()) {
+                    Ok(st) => st
+                        .query()
+                        .await
+                        .map(|rows| {
+                            rows.iter()
+                                .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>())
+                                .collect::<Vec<_>>()
+                        })
+                        .map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                };
+                if prep_rows != stock_rows {
+                    diffs.push(format!(
+                        "[{label} prepared] `{sql}`\n  frank={prep_rows:?}\n  stock={stock_rows:?}"
+                    ));
+                }
+
+                let eqp_sql = format!("EXPLAIN QUERY PLAN {sql}");
+                let frank_eqp: Vec<String> = f
+                    .query(&eqp_sql)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| match &row.values()[3] {
+                        SqliteValue::Text(s) => s.to_string(),
+                        other => panic!("unexpected eqp detail {other:?}"),
+                    })
+                    .collect();
+                let stock_eqp: Vec<String> = r
+                    .prepare(&eqp_sql)
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                if frank_eqp != stock_eqp {
+                    diffs.push(format!(
+                        "[{label} EQP] `{sql}`\n  frank={frank_eqp:?}\n  stock={stock_eqp:?}"
+                    ));
+                }
+            }
+
+            // 2. Exact bd-1bs3h INSERT ... SELECT (target rowid order & INSERT OR REPLACE winner).
+            for dml in [
+                "INSERT INTO t2 SELECT a, b FROM s",
+                "INSERT INTO t2 SELECT a, b FROM s WHERE length(b) > 0",
+                "INSERT INTO t2 SELECT a, b FROM s NOT INDEXED",
+                "INSERT OR REPLACE INTO t_rep SELECT 1, b FROM s",
+                // Multi-chunk (>10,000 rows) INSERT ... SELECT must decline rowid keyset/streaming
+                // and preserve covering-index order across all 12,005 rows.
+                "INSERT INTO big_dst SELECT id, k FROM big_s",
+            ] {
+                let fr = f.execute(dml).await.map_err(|e| e.to_string());
+                let rr = r.execute(dml, []).map_err(stock_err);
+                if fr != rr {
+                    diffs.push(format!("[{label} DML] `{dml}` frank={fr:?} stock={rr:?}"));
+                }
+            }
+            for check in [
+                "SELECT rowid, x, y FROM t2 ORDER BY rowid",
+                "SELECT k, v FROM t_rep",
+                "SELECT count(*), sum(rowid * src_id) FROM big_dst",
+                "SELECT rowid, src_id, k FROM big_dst WHERE rowid IN (1, 2, 10000, 10001, 12005) ORDER BY rowid",
+            ] {
+                let fr = fq(&f, check).await;
+                let rr = rq(&r, check);
+                if fr != rr {
+                    diffs.push(format!(
+                        "[{label} check] `{check}`\n  frank={fr:?}\n  stock={rr:?}"
+                    ));
+                }
+            }
+
+            // 3. PRAGMA reverse_unordered_selects = ON still uses `ib`, walked in reverse.
+            f.execute("PRAGMA reverse_unordered_selects = ON").await.unwrap();
+            r.execute_batch("PRAGMA reverse_unordered_selects = ON").unwrap();
+            let rev_sql = "SELECT a, b FROM s";
+            let fr = fq(&f, rev_sql).await;
+            let rr = rq(&r, rev_sql);
+            if fr != rr {
+                diffs.push(format!(
+                    "[{label} reverse_unordered_selects] `{rev_sql}`\n  frank={fr:?}\n  stock={rr:?}"
+                ));
+            }
+            f.close().await.unwrap();
+        }
+        assert!(
+            diffs.is_empty(),
+            "bd-1bs3h {} divergence(s) from rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}

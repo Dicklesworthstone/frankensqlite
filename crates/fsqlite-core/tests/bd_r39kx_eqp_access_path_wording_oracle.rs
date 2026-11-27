@@ -408,19 +408,19 @@ fn bd_oi8tv_eqp_reports_scalar_list_and_correlated_subqueries() {
             assert_eq!(rows[4].1, rows[3].0);
             assert_eq!(details[0], "SCAN CONSTANT ROW", "{ctx}");
             assert_eq!(details[1], "SCALAR SUBQUERY 2", "{ctx}");
-            assert_eq!(details[2], "SCAN evidence", "{ctx}");
+            assert_eq!(
+                details[2], "SCAN evidence USING COVERING INDEX idx_ev_repo",
+                "{ctx}"
+            );
             assert_eq!(details[3], "CORRELATED SCALAR SUBQUERY 1", "{ctx}");
             assert_eq!(
                 details[4],
                 "SEARCH repos USING COVERING INDEX idx_repos_path (path=?)",
                 "{ctx}"
             );
-            // Stock also reports the same 5-node tree shape.
+            // Stock reports the exact same 5-node tree including the covering full scan (bd-1bs3h).
             let stock_details = stock_eqp(&stock, gh432);
-            assert_eq!(stock_details.len(), 5);
-            assert_eq!(stock_details[1], "SCALAR SUBQUERY 2");
-            assert_eq!(stock_details[3], "CORRELATED SCALAR SUBQUERY 1");
-            assert_eq!(stock_details[4], details[4]);
+            assert_eq!(details, stock_details, "{ctx}: gh432 exact stock EQP");
 
             // 2. Sibling uncorrelated scalar subqueries: numbering 1, 2.
             let siblings =
@@ -463,7 +463,7 @@ fn bd_oi8tv_eqp_reports_scalar_list_and_correlated_subqueries() {
             assert_eq!(
                 details,
                 vec![
-                    "SCAN e",
+                    "SCAN e USING COVERING INDEX idx_ev_repo",
                     "CORRELATED SCALAR SUBQUERY 1",
                     "SEARCH r USING COVERING INDEX sqlite_autoindex_repos_pk_1 (path=?)",
                 ],
@@ -477,7 +477,7 @@ fn bd_oi8tv_eqp_reports_scalar_list_and_correlated_subqueries() {
             assert_eq!(
                 details,
                 vec![
-                    "SCAN evidence",
+                    "SCAN evidence USING COVERING INDEX idx_ev_repo",
                     "CORRELATED SCALAR SUBQUERY 1",
                     "SEARCH repos3 USING INDEX repos3_path (path=?)",
                 ],

@@ -48982,6 +48982,12 @@ impl Connection {
         if table.without_rowid {
             return None;
         }
+        // bd-1bs3h: if the SELECT scans a narrower covering secondary index
+        // instead of the table b-tree, paging by rowid would return rows in
+        // rowid order rather than the covering index's order.
+        if self.select_uses_covering_full_scan(select_stmt) {
+            return None;
+        }
         if let Some(where_clause) = where_clause {
             if table
                 .indexes
@@ -49017,6 +49023,65 @@ impl Connection {
             },
             fsqlite_ast::Span::ZERO,
         ))
+    }
+
+    /// bd-1bs3h: true when an unordered single-table SELECT over a local rowid
+    /// table will walk a strictly narrower covering secondary index rather than
+    /// the table b-tree in rowid order. Rowid-order INSERT ... SELECT streaming
+    /// and keyset-chunking paths decline so insertion order matches stock.
+    fn select_uses_covering_full_scan(&self, select_stmt: &SelectStatement) -> bool {
+        if select_stmt.with.is_some()
+            || !select_stmt.body.compounds.is_empty()
+            || !select_stmt.order_by.is_empty()
+        {
+            return false;
+        }
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } = &select_stmt.body.select
+        else {
+            return false;
+        };
+        if !from.joins.is_empty() || !group_by.is_empty() || having.is_some() || !windows.is_empty()
+        {
+            return false;
+        }
+        let TableOrSubquery::Table {
+            name,
+            alias,
+            index_hint,
+            time_travel,
+        } = &from.source
+        else {
+            return false;
+        };
+        if time_travel.is_some()
+            || name
+                .schema
+                .as_deref()
+                .is_some_and(|schema| !is_builtin_schema(schema))
+            || self.has_live_vtab_instance(&name.name)
+            || self.view_index_of(&name.name).is_some()
+        {
+            return false;
+        }
+        let Some((table, _)) = self.local_join_binding_table(name) else {
+            return false;
+        };
+        fsqlite_vdbe::codegen::covering_full_scan_index(
+            &table,
+            alias.as_deref(),
+            columns,
+            where_clause.as_deref(),
+            index_hint.as_ref(),
+        )
+        .is_some()
     }
 
     /// bd-qdve2: `(start, stop, step)` when the SELECT reads nothing but
@@ -52863,6 +52928,16 @@ impl Connection {
             || having.is_some()
             || !windows.is_empty()
             || bound_select.limit.is_some()
+        {
+            return Ok(None);
+        }
+        // bd-1bs3h: unordered single-table SELECTs covered by a strictly
+        // narrower index walk that index rather than rowid order; decline the
+        // rowid-order streaming scanners so INSERT ... SELECT executes the
+        // covering-index scan and preserves stock insertion order.
+        if from.joins.is_empty()
+            && bound_select.order_by.is_empty()
+            && self.select_uses_covering_full_scan(&bound_select)
         {
             return Ok(None);
         }
@@ -121533,6 +121608,11 @@ impl Connection {
             let mut direct_subqueries = Vec::new();
             collect_direct_select_subqueries(source_select, &mut direct_subqueries);
             let has_direct_subqueries = !direct_subqueries.is_empty();
+            let fallback_reason = if has_direct_subqueries && depth < EQP_MAX_SUBQUERY_DEPTH {
+                self.select_correlated_subquery_fallback_reason(source_select)
+            } else {
+                None
+            };
 
             let mut rows = self
                 .build_select_outer_eqp_rows(
@@ -121540,6 +121620,7 @@ impl Connection {
                     parent_id,
                     state,
                     has_direct_subqueries,
+                    fallback_reason == Some("correlated_exists_fallback"),
                 )
                 .await;
 
@@ -121548,8 +121629,6 @@ impl Connection {
                 if let Some(own_scope) = self.eqp_outer_scope_for_select(source_select) {
                     child_scopes.push(own_scope);
                 }
-                let fallback_reason =
-                    self.select_correlated_subquery_fallback_reason(source_select);
                 self.append_eqp_subquery_rows(
                     &direct_subqueries,
                     parent_id,
@@ -121743,6 +121822,7 @@ impl Connection {
         parent_id: i32,
         state: &mut EqpWalkState,
         has_direct_subqueries: bool,
+        has_correlated_exists_fallback: bool,
     ) -> Vec<Row> {
         let mut emit_row = |detail: String| eqp_row(state.alloc_row_id(), parent_id, 0, detail);
 
@@ -121858,6 +121938,19 @@ impl Connection {
                             &directive.table_name,
                         )) && let Some(detail) =
                             rowid_range_eqp_detail(select, &self.schema.borrow())
+                        {
+                            let mut rows = vec![emit_row(detail)];
+                            push_temp_btree_eqp_rows(&mut rows, temp_btrees, &mut emit_row);
+                            return rows;
+                        }
+                        // bd-1bs3h: codegen may upgrade a FullTableScan
+                        // directive to a narrower covering-index full walk
+                        // (unless the query actually executes via the
+                        // rowid-order MemDB correlated-EXISTS fallback).
+                        if !has_correlated_exists_fallback
+                            && let Some(walk) = crate::explain::program_outer_index_walk(&program)
+                            && let Some(detail) =
+                                index_walk_eqp_detail(select, &walk, &self.schema.borrow())
                         {
                             let mut rows = vec![emit_row(detail)];
                             push_temp_btree_eqp_rows(&mut rows, temp_btrees, &mut emit_row);
@@ -165582,7 +165675,7 @@ fn index_walk_eqp_detail(
         "INDEX"
     };
     match walk.kind {
-        IndexWalkKind::Whole if where_clause.is_none() => {
+        IndexWalkKind::Whole if where_clause.is_none() || walk.covering => {
             Some(format!("SCAN {displayed} USING {using} {}", index.name))
         }
         IndexWalkKind::Count if walk.covering && where_clause.is_none() => Some(format!(

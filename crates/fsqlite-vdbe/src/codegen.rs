@@ -5039,6 +5039,48 @@ pub fn codegen_select(
                             &terms,
                         );
                     }
+                    // bd-1bs3h: when a strictly narrower covering secondary index
+                    // satisfies the projection and WHERE clause of an unordered
+                    // full scan, walk that covering index instead of the table so
+                    // row order and EQP match stock SQLite.
+                    if from_index_hint.is_none()
+                        && time_travel.is_none()
+                        && stmt.order_by.is_empty()
+                        && distinct == Distinctness::All
+                        && group_by.is_empty()
+                        && having.is_none()
+                        && let Some(cov_idx) = covering_full_scan_index(
+                            table,
+                            table_alias,
+                            columns,
+                            where_clause.as_deref(),
+                            from_index_hint,
+                        )
+                    {
+                        log_planner_select_directive_outcome(
+                            directive,
+                            "bypassed",
+                            "covering_index_full_scan",
+                            "covering_index_full_scan",
+                        );
+                        codegen_select_covering_index_full_scan(
+                            b,
+                            cursor,
+                            table,
+                            table_alias,
+                            schema,
+                            columns,
+                            where_clause.as_deref(),
+                            stmt.limit.as_ref(),
+                            out_regs,
+                            out_col_count,
+                            done_label,
+                            end_label,
+                            cov_idx,
+                            ctx.reverse_unordered_selects && stmt.order_by.is_empty(),
+                        );
+                        return Ok(());
+                    }
                     log_planner_select_directive_outcome(
                         directive,
                         "honored",
@@ -5850,21 +5892,88 @@ pub fn codegen_select(
                 end_label,
             );
         }
-        // --- Full table scan with DISTINCT ---
-        codegen_select_distinct_scan(
-            b,
-            cursor,
-            table,
-            table_alias,
-            schema,
-            columns,
-            where_clause.as_deref(),
-            stmt.limit.as_ref(),
-            out_regs,
-            out_col_count,
-            done_label,
-            end_label,
-        )
+        // --- Full table scan (or narrower covering index scan, bd-1bs3h) with DISTINCT ---
+        let covering_idx = if from_index_hint.is_none()
+            && time_travel.is_none()
+            && stmt.order_by.is_empty()
+        {
+            covering_full_scan_index(
+                table,
+                table_alias,
+                columns,
+                where_clause.as_deref(),
+                from_index_hint,
+            )
+        } else {
+            None
+        };
+        let rowid_guarantees_distinct = !table.without_rowid
+            && group_by.is_empty()
+            && columns.iter().any(|col| match col {
+                ResultColumn::Expr { expr, .. } => {
+                    matches!(
+                        resolve_column_ref(expr, table, table_alias),
+                        Some(SortKeySource::Rowid)
+                    )
+                }
+                ResultColumn::Star | ResultColumn::TableStar(_) => false,
+            });
+        let reverse_scan = ctx.reverse_unordered_selects && stmt.order_by.is_empty();
+        if rowid_guarantees_distinct {
+            if let Some(cov_idx) = covering_idx {
+                codegen_select_covering_index_full_scan(
+                    b,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    columns,
+                    where_clause.as_deref(),
+                    stmt.limit.as_ref(),
+                    out_regs,
+                    out_col_count,
+                    done_label,
+                    end_label,
+                    cov_idx,
+                    reverse_scan,
+                );
+                Ok(())
+            } else {
+                codegen_select_full_scan(
+                    b,
+                    cursor,
+                    table,
+                    table_alias,
+                    time_travel,
+                    schema,
+                    columns,
+                    where_clause.as_deref(),
+                    stmt.limit.as_ref(),
+                    out_regs,
+                    out_col_count,
+                    done_label,
+                    end_label,
+                    reverse_scan,
+                )
+            }
+        } else {
+            codegen_select_distinct_scan(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                columns,
+                where_clause.as_deref(),
+                stmt.limit.as_ref(),
+                out_regs,
+                out_col_count,
+                done_label,
+                end_label,
+                covering_idx,
+                reverse_scan,
+            )
+        }
     } else if let Some(fsqlite_ast::IndexHint::IndexedBy(hinted)) = from_index_hint
         && stmt.order_by.is_empty()
         && let Some(forced_idx) = table
@@ -5935,6 +6044,38 @@ pub fn codegen_select(
             end_label,
             &terms,
         )
+    } else if from_index_hint.is_none()
+        && time_travel.is_none()
+        && stmt.order_by.is_empty()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && let Some(cov_idx) = covering_full_scan_index(
+            table,
+            table_alias,
+            columns,
+            where_clause.as_deref(),
+            from_index_hint,
+        )
+    {
+        // --- Narrower covering index full scan (bd-1bs3h) ---
+        codegen_select_covering_index_full_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            where_clause.as_deref(),
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            cov_idx,
+            ctx.reverse_unordered_selects && stmt.order_by.is_empty(),
+        );
+        Ok(())
     } else {
         // --- Full table scan ---
         codegen_select_full_scan(
@@ -7944,6 +8085,167 @@ fn codegen_select_full_scan(
     b.resolve_label(end_label);
 
     Ok(())
+}
+
+/// Generate VDBE bytecode for an unordered full scan served from a strictly
+/// narrower covering secondary index (bd-1bs3h).
+///
+/// Opens ONLY the secondary index cursor (never the table b-tree), walks it
+/// in index order (`Rewind`/`Next`, or `Last`/`Prev` when
+/// `reverse_unordered_selects` is enabled), evaluates any loop-invariant and
+/// per-row WHERE predicates against the index entry, applies `OFFSET`/`LIMIT`,
+/// and restores `RealAffinity` on `'E'`-affinity columns so output storage
+/// classes match a table scan byte-for-byte.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn codegen_select_covering_index_full_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    limit_clause: Option<&LimitClause>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    index: &IndexSchema,
+    descending: bool,
+) {
+    let idx_cursor = cursor + 1;
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
+
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        index.root_page,
+        0,
+        P4::Index(index.name.clone()),
+        0,
+    );
+    let per_row_where = emit_loop_invariant_where_terms(b, where_clause, done_label);
+
+    let loop_start = b.current_addr();
+    b.emit_jump_to_label(
+        if descending {
+            Opcode::Last
+        } else {
+            Opcode::Rewind
+        },
+        idx_cursor,
+        0,
+        done_label,
+        P4::None,
+        0,
+    );
+
+    let skip_label = b.emit_label();
+    let direct_sources = per_row_where
+        .is_none()
+        .then(|| resolve_covering_output_sources(columns, table, table_alias, index))
+        .flatten();
+
+    if let Some(sources) = direct_sources {
+        if let Some(off_r) = offset_reg {
+            b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+        }
+        let needs_rowid = sources
+            .iter()
+            .any(|src| matches!(src, CoveringOutputSource::Rowid));
+        let rowid_reg = if needs_rowid {
+            let reg = b.alloc_reg();
+            b.emit_op(Opcode::IdxRowid, idx_cursor, reg, 0, P4::None, 0);
+            reg
+        } else {
+            0
+        };
+        for (offset, source) in sources.iter().enumerate() {
+            let target_reg = out_regs + offset as i32;
+            match source {
+                CoveringOutputSource::IndexColumn(index_col) => {
+                    b.emit_op(
+                        Opcode::Column,
+                        idx_cursor,
+                        *index_col,
+                        target_reg,
+                        P4::None,
+                        0,
+                    );
+                    if index
+                        .columns
+                        .get(*index_col as usize)
+                        .and_then(|name| table.column_index(name))
+                        .is_some_and(|col_idx| table.columns[col_idx].affinity == 'E')
+                    {
+                        b.emit_op(Opcode::RealAffinity, target_reg, 0, 0, P4::None, 0);
+                    }
+                }
+                CoveringOutputSource::Rowid => {
+                    b.emit_op(Opcode::Copy, rowid_reg, target_reg, 0, P4::None, 0);
+                }
+            }
+        }
+    } else {
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        let image = populate_index_entry_row_image(b, idx_cursor, rowid_reg, table, index);
+        let scan = ScanCtx {
+            cursor,
+            table,
+            table_alias,
+            schema: Some(schema),
+            register_base: Some(RegisterRow::with_rowid(image, rowid_reg)),
+            secondaries: &[],
+        };
+        if let Some(where_expr) = per_row_where.as_deref() {
+            let cond = b.alloc_temp();
+            emit_expr(b, where_expr, cond, Some(&scan));
+            b.emit_jump_to_label(Opcode::IfNot, cond, 1, skip_label, P4::None, 0);
+            b.free_temp(cond);
+        }
+        if let Some(off_r) = offset_reg {
+            b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+        }
+        let mut reg = out_regs;
+        for col in columns {
+            if let ResultColumn::Expr { expr, .. } = col {
+                emit_expr(b, expr, reg, Some(&scan));
+                reg += 1;
+            }
+        }
+    }
+
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+
+    b.resolve_label(skip_label);
+    let loop_body = (loop_start + 1) as i32;
+    b.emit_op(
+        if descending {
+            Opcode::Prev
+        } else {
+            Opcode::Next
+        },
+        idx_cursor,
+        loop_body,
+        0,
+        P4::None,
+        0,
+    );
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    b.resolve_label(end_label);
 }
 
 /// Split `expr` into its top-level OR terms, in written order.
@@ -11824,6 +12126,8 @@ fn codegen_select_distinct_scan(
     out_col_count: i32,
     done_label: crate::Label,
     end_label: crate::Label,
+    covering_index: Option<&IndexSchema>,
+    descending: bool,
 ) -> Result<(), CodegenError> {
     let num_data_cols = result_column_count_usize(columns, table);
     let distinct_cursor = cursor + 1;
@@ -11845,33 +12149,83 @@ fn codegen_select_distinct_scan(
         OPFLAG_MEMBERSHIP_SET,
     );
 
-    // Open table for reading.
-    b.emit_op(
-        Opcode::OpenRead,
-        cursor,
-        table.root_page,
-        0,
-        P4::Table(table.name.clone()),
-        0,
-    );
-
-    let scan_start = b.current_addr();
-    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
-
-    let skip_label = b.emit_label();
-    if let Some(where_expr) = where_clause {
-        emit_where_filter(
-            b,
-            where_expr,
+    // Open either the narrower covering index (bd-1bs3h) or the table for reading.
+    if let Some(cov_idx) = covering_index {
+        b.emit_op(
+            Opcode::OpenRead,
             cursor,
-            table,
-            table_alias,
-            schema,
-            skip_label,
+            cov_idx.root_page,
+            0,
+            P4::Index(cov_idx.name.clone()),
+            0,
+        );
+    } else {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
         );
     }
 
-    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    let use_desc = covering_index.is_some() && descending;
+    let scan_start = b.current_addr();
+    b.emit_jump_to_label(
+        if use_desc {
+            Opcode::Last
+        } else {
+            Opcode::Rewind
+        },
+        cursor,
+        0,
+        done_label,
+        P4::None,
+        0,
+    );
+
+    let skip_label = b.emit_label();
+    if let Some(cov_idx) = covering_index {
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, cursor, rowid_reg, 0, P4::None, 0);
+        let image = populate_index_entry_row_image(b, cursor, rowid_reg, table, cov_idx);
+        let scan = ScanCtx {
+            cursor,
+            table,
+            table_alias,
+            schema: Some(schema),
+            register_base: Some(RegisterRow::with_rowid(image, rowid_reg)),
+            secondaries: &[],
+        };
+        if let Some(where_expr) = where_clause {
+            let cond = b.alloc_temp();
+            emit_expr(b, where_expr, cond, Some(&scan));
+            b.emit_jump_to_label(Opcode::IfNot, cond, 1, skip_label, P4::None, 0);
+            b.free_temp(cond);
+        }
+        let mut reg = out_regs;
+        for col in columns {
+            if let ResultColumn::Expr { expr, .. } = col {
+                emit_expr(b, expr, reg, Some(&scan));
+                reg += 1;
+            }
+        }
+    } else {
+        if let Some(where_expr) = where_clause {
+            emit_where_filter(
+                b,
+                where_expr,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                skip_label,
+            );
+        }
+
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    }
 
     let distinct_record = b.alloc_temp();
     b.emit_op(
@@ -11914,7 +12268,18 @@ fn codegen_select_distinct_scan(
 
     b.resolve_label(skip_label);
     let scan_body = (scan_start + 1) as i32;
-    b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
+    b.emit_op(
+        if use_desc {
+            Opcode::Prev
+        } else {
+            Opcode::Next
+        },
+        cursor,
+        scan_body,
+        0,
+        P4::None,
+        0,
+    );
 
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
@@ -29297,6 +29662,65 @@ fn codegen_select_aggregate(
         skip_scan = true;
     }
 
+    // bd-1bs3h: when an ungrouped aggregate falls through to a full scan and a
+    // strictly narrower covering secondary index covers all aggregate arguments,
+    // bare columns, FILTERs, and WHERE predicates, walk that covering index so
+    // bare-column/group_concat scan order and EQP match stock SQLite.
+    if !skip_scan
+        && from_index_hint.is_none()
+        && let Some(cov_idx) = aggregate_covering_full_scan_index(
+            table,
+            table_alias,
+            &agg_columns,
+            where_clause,
+            from_index_hint,
+        )
+    {
+        let idx_cursor = 1_i32;
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            cov_idx.root_page,
+            0,
+            P4::Index(cov_idx.name.clone()),
+            0,
+        );
+        let idx_done_label = b.emit_label();
+        let per_row_where = emit_loop_invariant_where_terms(b, where_clause, idx_done_label);
+        b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, idx_done_label, P4::None, 0);
+        let idx_loop_top = b.current_addr();
+        let idx_skip_label = b.emit_label();
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        let image = populate_index_entry_row_image(b, idx_cursor, rowid_reg, table, cov_idx);
+        let scan_ctx = ScanCtx {
+            cursor,
+            table,
+            table_alias,
+            schema: Some(schema),
+            register_base: Some(RegisterRow::with_rowid(image, rowid_reg)),
+            secondaries: &[],
+        };
+        if let Some(where_expr) = per_row_where.as_deref() {
+            let cond = b.alloc_temp();
+            emit_expr(b, where_expr, cond, Some(&scan_ctx));
+            b.emit_jump_to_label(Opcode::IfNot, cond, 1, idx_skip_label, P4::None, 0);
+            b.free_temp(cond);
+        }
+        emit_aggregate_accumulate_body_with_ctx(b, &scan_ctx, &agg_columns, accum_base, bare_capture);
+        if lone_minmax_const_pinned {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, idx_done_label, P4::None, 0);
+        }
+        b.resolve_label(idx_skip_label);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let idx_loop_body = idx_loop_top as i32;
+        b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+        b.resolve_label(idx_done_label);
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        skip_scan = true;
+    }
+
     // bd-w4pr1.13.11: the full scan below may run on several threads.
     let mut parallel_plan = None;
     if !skip_scan {
@@ -45110,6 +45534,205 @@ fn resolve_covering_output_sources(
     Some(output)
 }
 
+/// Estimate a single column's storage width using stock SQLite's
+/// `build.c::estimateTableWidth` rule (bd-1bs3h).
+///
+/// Untyped columns and numeric/integer/real columns have width `1`. TEXT
+/// (`affinity == 'B'`) and BLOB columns default to `5` unless their declared
+/// type name includes a parenthesized length `(N)`, in which case the estimate
+/// is `(N / 4).clamp(1, 255)`.
+fn column_estimated_width(col: &ColumnInfo) -> u64 {
+    let Some(type_name) = col.type_name.as_deref() else {
+        return 1;
+    };
+    let is_text_or_blob = col.affinity.eq_ignore_ascii_case(&'B')
+        || type_name.to_ascii_uppercase().contains("BLOB");
+    if !is_text_or_blob {
+        return 1;
+    }
+    if let Some(open) = type_name.find('(') {
+        let digits: String = type_name[open + 1..]
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if let Ok(len) = digits.parse::<u64>()
+            && len > 0
+        {
+            return (len / 4).clamp(1, 255);
+        }
+    }
+    5
+}
+
+/// Estimated row width of a rowid table (excluding the `INTEGER PRIMARY KEY`
+/// alias stored in the B-tree key, including generated columns as in SQLite's
+/// `estimateTableWidth`, bd-1bs3h).
+fn table_estimated_row_width(table: &TableSchema) -> u64 {
+    table
+        .columns
+        .iter()
+        .filter(|col| !col.is_ipk)
+        .map(column_estimated_width)
+        .sum()
+}
+
+/// Estimated entry width of a secondary index's key columns (bd-1bs3h).
+fn index_estimated_row_width(index: &IndexSchema, table: &TableSchema) -> Option<u64> {
+    let mut total = 0_u64;
+    for col_name in &index.columns {
+        let col_idx = table.column_index(col_name)?;
+        total = total.saturating_add(column_estimated_width(&table.columns[col_idx]));
+    }
+    Some(total)
+}
+
+/// Choose the covering secondary index stock SQLite picks for an unordered full
+/// scan of a rowid table (bd-1bs3h).
+///
+/// Eligible indexes must be non-partial, non-expression, strictly narrower than
+/// the table (`index_est_width < table_est_width`), and must cover every column
+/// referenced by `columns` and `where_clause` (including `REAL` columns, whose
+/// SQL storage class is restored via `RealAffinity`, and excluding virtual
+/// generated columns). Among eligible indexes, picks the minimum estimated
+/// width, tie-breaking by most recently created (highest index ordinal,
+/// matching SQLite's prepended `Table.pIndex` list).
+#[must_use]
+pub fn covering_full_scan_index<'t>(
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    from_index_hint: Option<&fsqlite_ast::IndexHint>,
+) -> Option<&'t IndexSchema> {
+    if table.without_rowid || from_index_hint.is_some() || columns.is_empty() {
+        return None;
+    }
+    if columns
+        .iter()
+        .any(|col| matches!(col, ResultColumn::Star | ResultColumn::TableStar(_)))
+    {
+        return None;
+    }
+    let table_width = table_estimated_row_width(table);
+    let mut best: Option<(u64, usize, &'t IndexSchema)> = None;
+    for (ordinal, index) in table.indexes.iter().enumerate() {
+        if !index.supports_direct_column_lookup()
+            || index.columns.is_empty()
+            || index.columns.len() != index.key_term_count()
+        {
+            continue;
+        }
+        let Some(index_width) = index_estimated_row_width(index, table) else {
+            continue;
+        };
+        if index_width >= table_width {
+            continue;
+        }
+        let outputs_covered = columns.iter().all(|col| match col {
+            ResultColumn::Expr { expr, .. } => {
+                expr_reads_only_index_columns_mode(expr, table, table_alias, index, false, true)
+            }
+            ResultColumn::Star | ResultColumn::TableStar(_) => false,
+        });
+        if !outputs_covered {
+            continue;
+        }
+        let where_covered = where_clause.is_none_or(|w| {
+            expr_reads_only_index_columns_mode(w, table, table_alias, index, false, true)
+        });
+        if !where_covered {
+            continue;
+        }
+        if best.is_none_or(|(best_w, best_ord, _)| {
+            index_width < best_w || (index_width == best_w && ordinal > best_ord)
+        }) {
+            best = Some((index_width, ordinal, index));
+        }
+    }
+    best.map(|(_, _, index)| index)
+}
+
+/// Choose the covering secondary index stock SQLite picks for an ungrouped
+/// aggregate full scan of a rowid table (bd-1bs3h).
+fn aggregate_covering_full_scan_index<'t>(
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+    agg_columns: &[AggColumn],
+    where_clause: Option<&Expr>,
+    from_index_hint: Option<&fsqlite_ast::IndexHint>,
+) -> Option<&'t IndexSchema> {
+    if table.without_rowid || from_index_hint.is_some() {
+        return None;
+    }
+    let table_width = table_estimated_row_width(table);
+    let mut best: Option<(u64, usize, &'t IndexSchema)> = None;
+    for (ordinal, index) in table.indexes.iter().enumerate() {
+        if !index.supports_direct_column_lookup()
+            || index.columns.is_empty()
+            || index.columns.len() != index.key_term_count()
+        {
+            continue;
+        }
+        let Some(index_width) = index_estimated_row_width(index, table) else {
+            continue;
+        };
+        if index_width >= table_width {
+            continue;
+        }
+        let where_covered = where_clause.is_none_or(|w| {
+            expr_reads_only_index_columns_mode(w, table, table_alias, index, false, true)
+        });
+        if !where_covered {
+            continue;
+        }
+        let aggs_covered = agg_columns.iter().all(|agg| {
+            if agg.name.is_empty() && !agg.multi_agg_indices.is_empty() {
+                return true;
+            }
+            if let Some(bare) = agg.bare_expr.as_deref() {
+                return !expr_references_scan(bare, table, table_alias)
+                    || expr_reads_only_index_columns_mode(
+                        bare,
+                        table,
+                        table_alias,
+                        index,
+                        false,
+                        true,
+                    );
+            }
+            let filter_ok = agg.filter.as_deref().is_none_or(|f| {
+                expr_reads_only_index_columns_mode(f, table, table_alias, index, false, true)
+            });
+            let extra_ok = agg.extra_args.iter().all(|e| {
+                expr_reads_only_index_columns_mode(e, table, table_alias, index, false, true)
+            });
+            let arg_ok = if let Some(expr) = agg.arg_expr.as_deref() {
+                expr_reads_only_index_columns_mode(expr, table, table_alias, index, false, true)
+            } else {
+                agg.num_args == 0
+                    || agg.arg_is_rowid
+                    || agg.arg_col_index.is_some_and(|c| {
+                        table.columns.get(c).is_some_and(|col| {
+                            virtual_generated_column_expr(col, table).is_none()
+                                && index_key_position_of(index, table, c).is_some()
+                        })
+                    })
+            };
+            filter_ok && extra_ok && arg_ok
+        });
+        if !aggs_covered {
+            continue;
+        }
+        if best.is_none_or(|(best_w, best_ord, _)| {
+            index_width < best_w || (index_width == best_w && ordinal > best_ord)
+        }) {
+            best = Some((index_width, ordinal, index));
+        }
+    }
+    best.map(|(_, _, index)| index)
+}
+
 /// bd-y8zgm: whether every reference `expr` makes to the scanned `table` reads
 /// its rowid or one of `index`'s key columns, so that the expression can be
 /// evaluated from the index entry (`emit_index_entry_where_filter`) without
@@ -45128,12 +45751,25 @@ fn expr_reads_only_index_columns(
     index: &IndexSchema,
     in_exists: bool,
 ) -> bool {
-    let walk = |inner: &Expr| expr_reads_only_index_columns(inner, table, table_alias, index, in_exists);
+    expr_reads_only_index_columns_mode(expr, table, table_alias, index, in_exists, false)
+}
+
+fn expr_reads_only_index_columns_mode(
+    expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    index: &IndexSchema,
+    in_exists: bool,
+    allow_real: bool,
+) -> bool {
+    let walk = |inner: &Expr| {
+        expr_reads_only_index_columns_mode(inner, table, table_alias, index, in_exists, allow_real)
+    };
     match expr {
         Expr::Column(_, _) => match resolve_column_ref(expr, table, table_alias) {
             Some(SortKeySource::Rowid) => true,
             Some(SortKeySource::Column(col_idx)) => table.columns.get(col_idx).is_some_and(|column| {
-                !column.affinity.eq_ignore_ascii_case(&'E')
+                (allow_real || !column.affinity.eq_ignore_ascii_case(&'E'))
                     && virtual_generated_column_expr(column, table).is_none()
                     && index_column_position(index, &column.name).is_some()
             }),
@@ -45202,21 +45838,29 @@ fn expr_reads_only_index_columns(
         } => walk(inner) && walk(path),
         Expr::RowValue(items, _) => items.iter().all(walk),
         Expr::Exists { subquery, .. } => {
-            !in_exists && exists_reads_only_index_columns(subquery, table, table_alias, index)
+            !in_exists
+                && exists_reads_only_index_columns_mode(
+                    subquery,
+                    table,
+                    table_alias,
+                    index,
+                    allow_real,
+                )
         }
         Expr::Subquery(_, _) | Expr::Raise { .. } => false,
     }
 }
 
-/// [`expr_reads_only_index_columns`] for `EXISTS (subquery)`: a SELECT over one
-/// plain table with no WITH, compound, join, GROUP BY, HAVING or window, whose
-/// every expression reads `table` only through the rowid or `index`'s key
+/// [`expr_reads_only_index_columns_mode`] for `EXISTS (subquery)`: a SELECT over
+/// one plain table with no WITH, compound, join, GROUP BY, HAVING or window,
+/// whose every expression reads `table` only through the rowid or `index`'s key
 /// columns.
-fn exists_reads_only_index_columns(
+fn exists_reads_only_index_columns_mode(
     subquery: &SelectStatement,
     table: &TableSchema,
     table_alias: Option<&str>,
     index: &IndexSchema,
+    allow_real: bool,
 ) -> bool {
     let SelectCore::Select {
         columns,
@@ -45230,7 +45874,9 @@ fn exists_reads_only_index_columns(
     else {
         return false;
     };
-    let walk = |inner: &Expr| expr_reads_only_index_columns(inner, table, table_alias, index, true);
+    let walk = |inner: &Expr| {
+        expr_reads_only_index_columns_mode(inner, table, table_alias, index, true, allow_real)
+    };
     subquery.with.is_none()
         && subquery.body.compounds.is_empty()
         && from.joins.is_empty()
@@ -45271,25 +45917,7 @@ fn emit_index_entry_where_filter(
     index: &IndexSchema,
     skip_label: crate::Label,
 ) {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let image = b.alloc_regs(table.columns.len() as i32);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    for (position, name) in index.columns.iter().enumerate() {
-        if let Some(col_idx) = table.column_index(name) {
-            b.emit_op(
-                Opcode::Column,
-                idx_cursor,
-                position as i32,
-                image + col_idx as i32,
-                P4::None,
-                0,
-            );
-        }
-    }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    if let Some(ipk) = table.columns.iter().position(|column| column.is_ipk) {
-        b.emit_op(Opcode::Copy, rowid_reg, image + ipk as i32, 0, P4::None, 0);
-    }
+    let image = populate_index_entry_row_image(b, idx_cursor, rowid_reg, table, index);
     let scan = ScanCtx {
         cursor,
         table,
@@ -77326,5 +77954,176 @@ mod tests {
         );
         // Non-covering (`c` not in `t_ab`) stays on full table scan (no index opened).
         assert!(open_indexes("SELECT id, c, max(b) FROM t", &t_only_ab).is_empty());
+    }
+
+    #[test]
+    fn bd_1bs3h_covering_full_scan_width_and_tiebreak_rules() {
+        let mk_col = |name: &str, aff: char, ipk: bool, type_name: Option<&str>| ColumnInfo {
+            type_name: type_name.map(str::to_owned),
+            ..ColumnInfo::basic(name, aff, ipk)
+        };
+        let mk_idx = |name: &str, root: i32, cols: &[&str]| IndexSchema {
+            name: name.to_owned(),
+            root_page: root,
+            columns: cols.iter().map(|s| (*s).to_owned()).collect(),
+            key_sort_directions: Vec::new(),
+            key_collations: Vec::new(),
+            key_expressions: Vec::new(),
+            is_unique: false,
+            conflict_action: None,
+            where_clause: None,
+        };
+        let open_ops = |sql: &str, table: &TableSchema, rev: bool| -> Vec<(Opcode, P4)> {
+            let sel = select_sql(sql);
+            let mut b = ProgramBuilder::new();
+            let ctx = CodegenContext {
+                reverse_unordered_selects: rev,
+                ..CodegenContext::default()
+            };
+            codegen_select(&mut b, &sel, std::slice::from_ref(table), &ctx)
+                .unwrap_or_else(|e| panic!("codegen {sql}: {e:?}"));
+            b.finish()
+                .expect("finish")
+                .ops()
+                .iter()
+                .map(|op| (op.opcode, op.p4.clone()))
+                .collect()
+        };
+        let opened_indexes = |ops: &[(Opcode, P4)]| -> Vec<String> {
+            ops.iter()
+                .filter_map(|(op, p4)| match (op, p4) {
+                    (Opcode::OpenRead, P4::Index(name)) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let opened_tables = |ops: &[(Opcode, P4)]| -> Vec<String> {
+            ops.iter()
+                .filter_map(|(op, p4)| match (op, p4) {
+                    (Opcode::OpenRead, P4::Table(name)) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // 1. Exact bd-1bs3h schema: s(a IPK, b TEXT, c INT), ib(b) -> 5 < 6 -> covering index `ib`.
+        let s = TableSchema {
+            name: "s".to_owned(),
+            root_page: 2,
+            columns: vec![
+                mk_col("a", 'D', true, Some("INTEGER")),
+                mk_col("b", 'B', false, Some("TEXT")),
+                mk_col("c", 'D', false, Some("INT")),
+            ],
+            indexes: vec![mk_idx("ib", 3, &["b"])],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+        for sql in [
+            "SELECT a, b FROM s",
+            "SELECT a, b FROM s WHERE length(b) > 0",
+            "SELECT a, upper(b) FROM s",
+            "SELECT DISTINCT a, b FROM s",
+            "SELECT a, count(*) FROM s",
+        ] {
+            let ops = open_ops(sql, &s, false);
+            assert_eq!(opened_indexes(&ops), vec!["ib"], "{sql}");
+            assert!(opened_tables(&ops).is_empty(), "{sql} must not open table");
+        }
+        // `NOT INDEXED` and uncovered column `c` keep full table scan.
+        for sql in [
+            "SELECT a, b FROM s NOT INDEXED",
+            "SELECT a, c FROM s",
+            "SELECT * FROM s",
+        ] {
+            let ops = open_ops(sql, &s, false);
+            assert!(opened_indexes(&ops).is_empty(), "{sql}");
+            assert_eq!(opened_tables(&ops), vec!["s"], "{sql}");
+        }
+        // `reverse_unordered_selects` walks `ib` backwards with `Last`/`Prev`.
+        let rev_ops = open_ops("SELECT a, b FROM s", &s, true);
+        assert_eq!(opened_indexes(&rev_ops), vec!["ib"]);
+        assert!(rev_ops.iter().any(|(op, _)| *op == Opcode::Last));
+        assert!(rev_ops.iter().any(|(op, _)| *op == Opcode::Prev));
+
+        // 2. Strict narrowness: `s2(a IPK, b TEXT)` has table_width=5, index_width=5 -> table scan.
+        let s2 = TableSchema {
+            name: "s2".to_owned(),
+            root_page: 2,
+            columns: vec![
+                mk_col("a", 'D', true, Some("INTEGER")),
+                mk_col("b", 'B', false, Some("TEXT")),
+            ],
+            indexes: vec![mk_idx("s2_b", 3, &["b"])],
+            ..s.clone()
+        };
+        assert!(opened_indexes(&open_ops("SELECT a, b FROM s2", &s2, false)).is_empty());
+
+        // 3. TEXT(5) vs INT(1) width & most-recently-created tie-break:
+        // 5 INTs tie 1 TEXT (newer wins); 6 INTs lose to 1 TEXT.
+        let m_tie = TableSchema {
+            name: "m".to_owned(),
+            root_page: 2,
+            columns: vec![
+                mk_col("id", 'D', true, Some("INTEGER")),
+                mk_col("i1", 'D', false, Some("INT")),
+                mk_col("i2", 'D', false, Some("INT")),
+                mk_col("i3", 'D', false, Some("INT")),
+                mk_col("i4", 'D', false, Some("INT")),
+                mk_col("i5", 'D', false, Some("INT")),
+                mk_col("t", 'B', false, Some("TEXT")),
+            ],
+            indexes: vec![
+                mk_idx("idx_t", 3, &["t"]),
+                mk_idx("idx_5i", 4, &["i1", "i2", "i3", "i4", "i5"]),
+            ],
+            ..s.clone()
+        };
+        assert_eq!(
+            opened_indexes(&open_ops("SELECT id FROM m", &m_tie, false)),
+            vec!["idx_5i"]
+        );
+        // Flip creation order: `idx_t` now newer, so `idx_t` wins tie.
+        let mut m_tie_rev = m_tie.clone();
+        m_tie_rev.indexes.reverse();
+        assert_eq!(
+            opened_indexes(&open_ops("SELECT id FROM m", &m_tie_rev, false)),
+            vec!["idx_t"]
+        );
+        // VARCHAR(100) has width 25 > 5, so TEXT(5) beats VARCHAR(100).
+        let m_vc = TableSchema {
+            name: "mvc".to_owned(),
+            root_page: 2,
+            columns: vec![
+                mk_col("id", 'D', true, Some("INTEGER")),
+                mk_col("t", 'B', false, Some("TEXT")),
+                mk_col("v", 'B', false, Some("VARCHAR(100)")),
+            ],
+            indexes: vec![mk_idx("i_t", 3, &["t"]), mk_idx("i_v", 4, &["v"])],
+            ..s.clone()
+        };
+        assert_eq!(
+            opened_indexes(&open_ops("SELECT id FROM mvc", &m_vc, false)),
+            vec!["i_t"]
+        );
+
+        // 4. REAL column emits `RealAffinity` on covering scan.
+        let s_real = TableSchema {
+            name: "sr".to_owned(),
+            root_page: 2,
+            columns: vec![
+                mk_col("id", 'D', true, Some("INTEGER")),
+                mk_col("r", 'E', false, Some("REAL")),
+                mk_col("x", 'D', false, Some("INT")),
+            ],
+            indexes: vec![mk_idx("i_r", 3, &["r"])],
+            ..s.clone()
+        };
+        let real_ops = open_ops("SELECT id, r FROM sr", &s_real, false);
+        assert_eq!(opened_indexes(&real_ops), vec!["i_r"]);
+        assert!(real_ops.iter().any(|(op, _)| *op == Opcode::RealAffinity));
     }
 }

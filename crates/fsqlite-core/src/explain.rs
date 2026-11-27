@@ -1146,12 +1146,15 @@ fn program_index_walk_filtered(
             kind: IndexWalkKind::Whole,
         });
     }
-    if saw_seek_gt {
-        return None;
-    }
     let [(position_addr, position)] = positions[..] else {
         return None;
     };
+    // A loose-index DISTINCT scan (`SELECT DISTINCT col FROM t`) starts at
+    // `Rewind` and skips duplicate keys with `SeekGT`; any other combination of
+    // initial positioning and `SeekGT` is not a whole/bounded walk.
+    if saw_seek_gt && position != Opcode::Rewind {
+        return None;
+    }
     let extremum_steps = ops
         .iter()
         .filter(|op| op.opcode == Opcode::AggStep)
