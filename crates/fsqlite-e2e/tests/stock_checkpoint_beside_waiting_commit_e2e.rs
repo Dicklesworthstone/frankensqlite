@@ -1047,6 +1047,227 @@ fn a_transaction_that_read_is_refused_when_a_peer_compaction_tore_its_anchor() {
     refused_snapshot_shape(&COMPACTION_KILLED_IN_THE_ANCHOR, Txn::ReadsStockTable);
 }
 
+/// bd-30ip9: make the fresh peer win the new generation's first commit
+/// deterministically. The waiting writer is stopped only after it released
+/// its read mark, while stock still owns WRITE. No COMMIT result is discarded
+/// and no refused transaction can be replayed (`BEGIN CONCURRENT` is explicit).
+#[cfg(target_os = "linux")]
+mod peer_first_admission {
+    use super::*;
+    use nix::sys::signal::{Signal, kill};
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    use nix::unistd::Pid;
+
+    const CHILD: &str = "FSQLITE_30IP9_CHILD";
+    const LIMIT: Duration = Duration::from_secs(30);
+
+    fn spawn(dir: &Path, role: &str) -> ChildGuard {
+        ChildGuard(Some(
+            Command::new(std::env::current_exe().expect("test binary path"))
+                .args([
+                    "--exact",
+                    "peer_first_admission::fresh_generation_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, format!("{}|{role}", dir.display()))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn fsqlite child"),
+        ))
+    }
+
+    /// Only the waiting child has fsqlite/OFD reader locks in this shape;
+    /// the parent is stock and takes POSIX locks. Bytes 123..=127 are the
+    /// stock-visible WAL reader marks. DMS at byte 128 is not a read mark.
+    fn has_fsqlite_reader_mark(db: &Path) -> bool {
+        file_locks_held(db).split(',').any(|lock| {
+            let Some(range) = lock.strip_prefix("shm:OFDLCK:READ:-1:") else {
+                return false;
+            };
+            let Some((start, end)) = range.split_once('-') else {
+                return false;
+            };
+            let start = start.parse::<u64>().expect("lock start");
+            let end = if end == "EOF" {
+                u64::MAX
+            } else {
+                end.parse::<u64>().expect("lock end")
+            };
+            start <= 127 && end >= 123
+        })
+    }
+
+    #[test]
+    fn fresh_generation_child() {
+        let Ok(spec) = std::env::var(CHILD) else {
+            return;
+        };
+        let (dir, role) = spec.split_once('|').expect("child specification");
+        let dir = PathBuf::from(dir);
+        let db = dir.join("ckpt.db");
+        asupersync::test_utils::run_test(|| async {
+            let conn = open_frank(&db, usize::from(role == "waiting")).await;
+            // The parent briefly SIGSTOPs this child to establish ordering;
+            // the suspension must not consume the ordinary two-second budget.
+            conn.execute("PRAGMA busy_timeout=60000")
+                .await
+                .expect("child busy timeout");
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+                .await
+                .expect("disable automatic checkpoint");
+            if role == "waiting" {
+                conn.execute("BEGIN CONCURRENT").await.expect("begin");
+                let before = conn
+                    .query_row("SELECT count(*) FROM t")
+                    .await
+                    .expect("read before write");
+                assert_eq!(before.values(), &[fsqlite_types::SqliteValue::Integer(1)]);
+                conn.execute("INSERT INTO t(v) VALUES ('frank')")
+                    .await
+                    .expect("private write");
+                std::fs::write(dir.join("waiting-ready"), b"").expect("ready");
+                assert!(wait_for(&dir.join("waiting-go"), LIMIT), "no COMMIT signal");
+                let replays_before = fsqlite_core::connection::txn_replay_counts().attempts;
+                let commit = conn.execute("COMMIT").await;
+                let replays =
+                    fsqlite_core::connection::txn_replay_counts().attempts - replays_before;
+                std::fs::write(
+                    dir.join("waiting-result"),
+                    format!("{commit:?} replay_attempts={replays}"),
+                )
+                .expect("commit result");
+            } else {
+                assert_eq!(role, "peer");
+                conn.execute("INSERT INTO s(v) VALUES ('peer')")
+                    .await
+                    .expect("fresh peer's first commit");
+                std::fs::write(dir.join("peer-committed"), b"").expect("peer committed");
+            }
+            assert!(
+                wait_for(&dir.join(format!("{role}-close")), LIMIT),
+                "no close signal for {role}"
+            );
+            if conn.in_transaction() {
+                conn.execute("ROLLBACK")
+                    .await
+                    .expect("rollback failed commit");
+            }
+            conn.close().await.expect("child close");
+        });
+    }
+
+    #[test]
+    fn a_waiting_commit_admits_a_fresh_peers_first_commit_after_stock_truncate() {
+        if std::env::var_os(CHILD).is_some() {
+            return;
+        }
+        for attempt in 0..5 {
+            let dir = tempfile::tempdir().expect("shape directory");
+            let db = seed(dir.path());
+            // Keep this stock connection attached throughout: neither child's
+            // close can reset the WAL before the assertions below.
+            let stock = rusqlite::Connection::open(&db).expect("stock open");
+            stock.busy_timeout(LIMIT).expect("stock busy timeout");
+            stock
+                .execute_batch("PRAGMA wal_autocheckpoint=0")
+                .expect("disable automatic checkpoint");
+            let waiting = spawn(dir.path(), "waiting");
+            assert!(
+                wait_for(&dir.path().join("waiting-ready"), LIMIT),
+                "waiting writer never began"
+            );
+            assert!(
+                has_fsqlite_reader_mark(&db),
+                "the transaction must own an observable read mark: {}",
+                file_locks_held(&db)
+            );
+            stock
+                .execute_batch("BEGIN IMMEDIATE; INSERT INTO s(v) VALUES ('stock')")
+                .expect("stock owns WRITE");
+            std::fs::write(dir.path().join("waiting-go"), b"").expect("start COMMIT");
+            let started = Instant::now();
+            while has_fsqlite_reader_mark(&db) {
+                assert!(started.elapsed() < LIMIT, "COMMIT kept its read mark");
+                assert!(
+                    !dir.path().join("waiting-result").exists(),
+                    "COMMIT answered before releasing its read mark"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // WRITE is still stock's, so the child's COMMIT cannot pass its
+            // wait between the observation above and SIGSTOP taking effect.
+            let pid = Pid::from_raw(
+                i32::try_from(waiting.0.as_ref().expect("waiting child").id()).expect("child pid"),
+            );
+            kill(pid, Signal::SIGSTOP).expect("stop waiting writer");
+            assert_eq!(
+                waitpid(pid, Some(WaitPidFlag::WUNTRACED)).expect("observe stopped writer"),
+                WaitStatus::Stopped(pid, Signal::SIGSTOP)
+            );
+            assert!(
+                !dir.path().join("waiting-result").exists(),
+                "COMMIT must still be waiting for WRITE"
+            );
+            stock.execute_batch("COMMIT").expect("stock commit");
+            let checkpoint: (i64, i64, i64) = stock
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .expect("stock TRUNCATE");
+            assert_eq!(checkpoint, (0, 0, 0), "attempt {attempt}");
+            let peer = spawn(dir.path(), "peer");
+            assert!(
+                wait_for(&dir.path().join("peer-committed"), LIMIT),
+                "fresh peer never committed"
+            );
+            kill(pid, Signal::SIGCONT).expect("resume waiting writer");
+            assert!(
+                wait_for(&dir.path().join("waiting-result"), LIMIT),
+                "admitted COMMIT never answered"
+            );
+            let result = std::fs::read_to_string(dir.path().join("waiting-result"))
+                .expect("waiting writer's result");
+            assert_eq!(
+                result, "Ok(1) replay_attempts=0",
+                "attempt {attempt}: the original COMMIT must succeed without replay"
+            );
+
+            // The writes are on disjoint table pages. Their accepted outcome
+            // must equal this live stock serial order, including the row read
+            // before the waiting writer's private INSERT.
+            let oracle_dir = tempfile::tempdir().expect("oracle directory");
+            let oracle_db = seed(oracle_dir.path());
+            let oracle = rusqlite::Connection::open(&oracle_db).expect("oracle open");
+            oracle
+                .execute_batch(
+                    "INSERT INTO s(v) VALUES ('frank-seed');
+                     INSERT INTO s(v) VALUES ('stock');
+                     PRAGMA wal_checkpoint(TRUNCATE);
+                     INSERT INTO s(v) VALUES ('peer');
+                     BEGIN;",
+                )
+                .expect("oracle preceding commits");
+            let before: i64 = oracle
+                .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+                .expect("oracle read");
+            assert_eq!(before, 1);
+            oracle
+                .execute_batch("INSERT INTO t(v) VALUES ('frank'); COMMIT;")
+                .expect("oracle commit");
+            for table in ["t", "s"] {
+                assert_eq!(stock_values(&db, table), stock_values(&oracle_db, table));
+            }
+            assert_eq!(stock_integrity(&db), "ok");
+            std::fs::write(dir.path().join("waiting-close"), b"").expect("close writer");
+            waiting.finish();
+            std::fs::write(dir.path().join("peer-close"), b"").expect("close peer");
+            peer.finish();
+        }
+    }
+}
+
 const CHURN_CHILD_ENV: &str = "FSQLITE_557_CHURN_CHILD";
 /// The churn shape (scratchpad p8r3_fresh_churn.py, `2 60 300 10 5000`): one
 /// stock process commits `CHURN_STOCK_ROWS` autocommit rows into `s` and runs
