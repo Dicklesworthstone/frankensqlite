@@ -4456,6 +4456,35 @@ impl PagerBackend {
         }
     }
 
+    /// bd-reality-check-1022-llk6g.35: whether an existing `-wal` or `-shm`
+    /// companion for `path` exists on disk and cannot be opened for writing.
+    ///
+    /// Uses `access(2)` only (never opens a probe descriptor). Callers keep
+    /// the read-only fallback only when the opened database is actually in WAL
+    /// mode, so a stray read-only `-wal`/`-shm` beside a rollback-journal file
+    /// does not downgrade a writable rollback open.
+    fn wal_companion_is_read_only(path: &str, cx: &Cx) -> bool {
+        #[cfg(all(feature = "native", unix))]
+        {
+            let vfs = UnixVfs::new();
+            let wal_path = PathBuf::from(format!("{path}-wal"));
+            let shm_path = PathBuf::from(format!("{path}-shm"));
+            [wal_path, shm_path].iter().any(|companion| {
+                vfs.access(cx, companion, AccessFlags::EXISTS)
+                    .unwrap_or(false)
+                    && !vfs
+                        .access(cx, companion, AccessFlags::READWRITE)
+                        .unwrap_or(true)
+            })
+        }
+
+        #[cfg(not(all(feature = "native", unix)))]
+        {
+            let _ = (path, cx);
+            false
+        }
+    }
+
     /// Returns `true` if this backend uses the in-memory VFS (`:memory:`).
     #[must_use]
     pub fn is_memory(&self) -> bool {
@@ -18960,6 +18989,17 @@ impl Connection {
         Self::open_with_env_and_pager(path, env, pager, true).await
     }
 
+    async fn open_read_only_fallback_with_env(path: String, env: ConnectionEnv) -> Result<Self> {
+        if env.readonly_shm() {
+            Box::pin(Self::open_schema_only_with_env(path, env)).await
+        } else {
+            Box::pin(Self::open_schema_only_with_wal_index_recovery_and_env(
+                path, env,
+            ))
+            .await
+        }
+    }
+
     async fn open_existing_with_optional_expected_identity_and_env(
         path: impl Into<String>,
         expected_identity: Option<FileIdentity>,
@@ -18974,17 +19014,30 @@ impl Connection {
 
         let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
-        if expected_identity.is_none()
-            && PagerBackend::database_file_is_read_only(&path, &bootstrap_cx)
-        {
-            // Stock's SQLITE_OPEN_READWRITE falls back to read-only too.
-            if env.readonly_shm() {
-                return Box::pin(Self::open_schema_only_with_env(path, env)).await;
+        if expected_identity.is_none() {
+            if PagerBackend::database_file_is_read_only(&path, &bootstrap_cx) {
+                // Stock's SQLITE_OPEN_READWRITE falls back to read-only too.
+                return Self::open_read_only_fallback_with_env(path, env).await;
             }
-            return Box::pin(Self::open_schema_only_with_wal_index_recovery_and_env(
-                path, env,
-            ))
-            .await;
+            if PagerBackend::wal_companion_is_read_only(&path, &bootstrap_cx) {
+                // bd-reality-check-1022-llk6g.35: when a WAL database's `-shm`
+                // or `-wal` sidecar is unwritable (e.g. 0444 `-shm` beside a
+                // writable main file), stock falls back to a read-only WAL
+                // open (private heap index for unwritable `-shm`) rather than
+                // failing with PermissionDenied. Only keep the read-only open
+                // when the database itself is actually in WAL mode.
+                let mut conn =
+                    Self::open_read_only_fallback_with_env(path.clone(), env.clone()).await?;
+                if conn
+                    .pragma_state
+                    .borrow()
+                    .journal_mode
+                    .eq_ignore_ascii_case("wal")
+                {
+                    return Ok(conn);
+                }
+                conn.close_best_effort_in_place().await;
+            }
         }
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if let Some((key_envelope_path, locked_page_size)) = detect_locked_encrypted_database(&path)
@@ -19055,13 +19108,29 @@ impl Connection {
                 Err(_) => false,
             }
         };
-        if !storage_was_empty && PagerBackend::database_file_is_read_only(&path, &bootstrap_cx) {
-            // Like stock, an unwritable existing database opens read-only
-            // (writes fail with SQLITE_READONLY) instead of failing the open.
-            return Box::pin(Self::open_schema_only_with_wal_index_recovery_and_env(
-                path, env,
-            ))
-            .await;
+        if !storage_was_empty {
+            if PagerBackend::database_file_is_read_only(&path, &bootstrap_cx) {
+                // Like stock, an unwritable existing database opens read-only
+                // (writes fail with SQLITE_READONLY) instead of failing the open.
+                return Self::open_read_only_fallback_with_env(path, env).await;
+            }
+            if PagerBackend::wal_companion_is_read_only(&path, &bootstrap_cx) {
+                // bd-reality-check-1022-llk6g.35: mirror stock's read-only
+                // fallback when an existing WAL database's `-shm` or `-wal`
+                // sidecar is unwritable, without downgrading rollback files
+                // that merely sit beside a stray read-only sidecar.
+                let mut conn =
+                    Self::open_read_only_fallback_with_env(path.clone(), env.clone()).await?;
+                if conn
+                    .pragma_state
+                    .borrow()
+                    .journal_mode
+                    .eq_ignore_ascii_case("wal")
+                {
+                    return Ok(conn);
+                }
+                conn.close_best_effort_in_place().await;
+            }
         }
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if let Some((key_envelope_path, locked_page_size)) = detect_locked_encrypted_database(&path)
