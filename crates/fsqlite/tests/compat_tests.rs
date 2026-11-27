@@ -805,20 +805,37 @@ fn open_with_flags_read_write_without_create_does_not_create_missing_db() {
     });
 }
 
+/// A READ_WRITE open without CREATE must accept an existing zero-length file
+/// as an empty SQLite database. A crash before the creator's page-1 write
+/// leaves this exact state; the new writer bootstraps it under EXCLUSIVE.
 #[test]
-fn open_with_flags_read_write_without_create_preserves_empty_db() {
+fn open_with_flags_read_write_without_create_opens_empty_db_as_stock() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("empty.db");
         std::fs::write(&path, []).unwrap();
-        let before = std::fs::read(&path).unwrap();
 
-        let error = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+        let conn = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
             .await
-            .expect_err("READ_WRITE without CREATE must not initialize an empty database");
+            .expect("READ_WRITE without CREATE opens an existing zero-byte main database");
+        let tables = conn
+            .query("SELECT name FROM sqlite_master")
+            .await
+            .expect("read the initially empty schema");
+        assert!(tables.is_empty(), "zero-byte database initially has no tables");
+        conn.execute("CREATE TABLE t(x INTEGER)")
+            .await
+            .expect("first write initializes the empty database");
+        conn.execute("INSERT INTO t VALUES (7)")
+            .await
+            .expect("write an interoperable row");
+        conn.close().await.expect("close the initialized database");
 
-        assert!(matches!(error, FrankenError::CannotOpen { .. }));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let stock = RusqliteConnection::open(&path).unwrap();
+        let value: i64 = stock
+            .query_row("SELECT x FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 7, "stock SQLite must read the new database");
     });
 }
 
