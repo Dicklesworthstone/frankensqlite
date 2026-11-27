@@ -676,6 +676,15 @@ fn assert_rows_as_stock_leaves_them(
 }
 
 fn assert_checkpoint_finished(context: &str, checkpoint: (i64, i64, i64, Duration)) {
+    assert_checkpoint_finished_within(context, checkpoint, PROMPT);
+}
+
+/// The stock checkpoint finished (not busy, not partial) within `bound`.
+fn assert_checkpoint_finished_within(
+    context: &str,
+    checkpoint: (i64, i64, i64, Duration),
+    bound: Duration,
+) {
     let (busy, log, checkpointed, took) = checkpoint;
     assert_eq!(
         busy, 0,
@@ -686,8 +695,8 @@ fn assert_checkpoint_finished(context: &str, checkpoint: (i64, i64, i64, Duratio
         "{context}: the stock checkpoint was partial"
     );
     assert!(
-        took < PROMPT,
-        "{context}: the stock checkpoint took {took:?}"
+        took < bound,
+        "{context}: the stock checkpoint took {took:?} (bound {bound:?})"
     );
 }
 
@@ -1359,9 +1368,28 @@ mod peer_first_admission {
 // discarded, and the keeper fails if no attempt reached the interleaving.
 
 const PEER_CHILD_ENV: &str = "FSQLITE_30IP9_PEER_CHILD";
-/// Each attempt reaches the interleaving about half the time: P and T both
-/// wait for WRITE across the reset.
-const ADMIT_ATTEMPTS: usize = 8;
+/// How many fresh databases the keeper below tries for its interleaving.
+/// When the stock child's ROLLBACK frees WRITE, T and P retry it about every
+/// millisecond, so one of them often takes it before the stock checkpoint
+/// does and commits in the old generation; after the reset, T often takes
+/// WRITE first. Only an attempt in which P committed first in the new
+/// generation counts: 33 of 77 attempts on the fix and 35 of 83 with it
+/// removed (bd-9e768, job A, ovh-a, load 12-16), fewer under heavier load,
+/// where 8 attempts all missed in some runs. 32 attempts make a run that
+/// never gets the shape rare (0.6^32 is about 1e-7; at 1 in 10, about 3%),
+/// and such a run still fails: a missed attempt is never a pass.
+const ADMIT_ATTEMPTS: usize = 32;
+/// The stock checkpoint's bound in that keeper. A stall of the
+/// bd-reality-check-1022-llk6g.5.7 class (a waiting COMMIT that keeps its
+/// read mark) makes the stock TRUNCATE wait out its whole 2 s busy_timeout:
+/// it then answers busy, or finishes only when the mark holder gives up at
+/// its own 2 s timeout. This bound stays well under that, so either fails.
+/// It is wider than `PROMPT` because in this shape the checkpoint may also
+/// wait, under its busy handler's backoff (up to 100 ms a sleep), for T's or
+/// P's whole commit when one took WRITE first: 1.007 s on the fix (bd-9e768,
+/// job A, ovh-a, the job's first run), 1.188 s on the fix and 1.143 s on its
+/// parent (corruption lane r13, jobs A and E).
+const ADMIT_CHECKPOINT_BOUND: Duration = Duration::from_millis(BUSY_TIMEOUT_MS * 3 / 4);
 
 /// The fsqlite peer P. "armed": BEGIN and write `s`, say `peer-armed`, then
 /// COMMIT on `peer-go` (it waits for the stock child's WRITE, as T does).
@@ -1618,7 +1646,7 @@ fn a_waiting_commit_is_admitted_when_a_peer_made_the_new_generations_first_commi
             .take()
             .expect("the shape ran");
         let took = outcome.took;
-        assert_checkpoint_finished(context, outcome.checkpoint);
+        assert_checkpoint_finished_within(context, outcome.checkpoint, ADMIT_CHECKPOINT_BOUND);
         let t_before_reset = outcome.commit_done_us <= outcome.checkpoint_done_us
             && outcome.commit.is_ok()
             && took < limit;
