@@ -1322,6 +1322,31 @@ pub trait VfsFile: Send + Sync {
         offset: u64,
     ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a;
 
+    /// Fill a fixed-size record across positive short reads. Return the actual
+    /// byte count at EOF so the caller can distinguish a torn record from a
+    /// complete one. A later I/O error propagates even after partial progress.
+    fn read_fully<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            let mut total = self.read(cx, buf, offset).await?;
+            while total != 0 && total < buf.len() {
+                let next = offset
+                    .checked_add(u64::try_from(total).map_err(|_| FrankenError::DatabaseFull)?)
+                    .ok_or(FrankenError::DatabaseFull)?;
+                let count = self.read(cx, &mut buf[total..], next).await?;
+                if count == 0 {
+                    break;
+                }
+                total += count;
+            }
+            Ok(total)
+        }
+    }
+
     /// The descriptor this handle reads through, for positional reads by
     /// threads outside the connection while the handle stays open: readers
     /// of one committed snapshot of the file (bd-w4pr1.13.11).

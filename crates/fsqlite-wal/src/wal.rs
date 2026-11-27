@@ -53,32 +53,6 @@ const WAL_APPEND_BUFFER_BYTES: usize = 1024 * 1024;
 /// one indivisible frame (page plus header) larger than this budget.
 const WAL_REPLAY_READ_BYTES: usize = 64 * 1024;
 
-/// Read as much of the buffer as the VFS returns in one operation. If its
-/// per-read limit splits the first required record, finish that record at
-/// successive offsets. A zero return is EOF; propagate I/O errors even after
-/// a partial read.
-async fn read_at_least<F: VfsFile>(
-    file: &F,
-    cx: &Cx,
-    buf: &mut [u8],
-    offset: u64,
-    minimum: usize,
-) -> Result<usize> {
-    debug_assert!(minimum <= buf.len());
-    let mut read = file.read(cx, buf, offset).await?;
-    while read != 0 && read < minimum {
-        let next_offset = offset
-            .checked_add(u64::try_from(read).map_err(|_| FrankenError::DatabaseFull)?)
-            .ok_or(FrankenError::DatabaseFull)?;
-        let more = file.read(cx, &mut buf[read..minimum], next_offset).await?;
-        if more == 0 {
-            break;
-        }
-        read += more;
-    }
-    Ok(read)
-}
-
 /// Sequential, bounded reads of a previously sampled frame range.
 ///
 /// This only amortizes I/O. Callers still validate every frame's salt and
@@ -135,14 +109,17 @@ impl WalFrameReader {
                         .unwrap_or(u64::MAX)
                         .saturating_mul(u64::try_from(self.frame_size).unwrap_or(u64::MAX)),
                 );
-            self.available = read_at_least(
-                file,
-                cx,
-                &mut self.buffer[..wanted],
-                offset,
-                self.frame_size,
-            )
-            .await?;
+            self.available = file.read(cx, &mut self.buffer[..wanted], offset).await?;
+            if self.available != 0 && self.available < self.frame_size {
+                let next = offset
+                    .checked_add(
+                        u64::try_from(self.available).map_err(|_| FrankenError::DatabaseFull)?,
+                    )
+                    .ok_or(FrankenError::DatabaseFull)?;
+                self.available += file
+                    .read_fully(cx, &mut self.buffer[self.available..self.frame_size], next)
+                    .await?;
+            }
             self.position = 0;
             if self.available < self.frame_size {
                 return Ok(None);
@@ -192,7 +169,7 @@ async fn read_wal_header_torn_tolerant<F: VfsFile>(
     const MAX_ATTEMPTS: usize = 2;
     for attempt in 1..=MAX_ATTEMPTS {
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
-        let header_read = read_at_least(file, cx, &mut header_buf, 0, WAL_HEADER_SIZE).await?;
+        let header_read = file.read_fully(cx, &mut header_buf, 0).await?;
         if header_read < WAL_HEADER_SIZE {
             log_replay_decision(context, 0, frame_count, "header_short_read");
             return Ok(None);
@@ -1689,8 +1666,7 @@ impl<F: VfsFile> WalFile<F> {
         }
 
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
-        let header_read =
-            read_at_least(&self.file, cx, &mut header_buf, 0, WAL_HEADER_SIZE).await?;
+        let header_read = self.file.read_fully(cx, &mut header_buf, 0).await?;
         if header_read < WAL_HEADER_SIZE {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
@@ -2602,8 +2578,7 @@ impl<F: VfsFile> WalFile<F> {
         }
 
         let offset = self.frame_offset(frame_index);
-        let bytes_read =
-            read_at_least(&self.file, cx, &mut buf[..frame_size], offset, frame_size).await?;
+        let bytes_read = self.file.read_fully(cx, &mut buf[..frame_size], offset).await?;
         if bytes_read < frame_size {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
@@ -2655,14 +2630,7 @@ impl<F: VfsFile> WalFile<F> {
 
         let mut header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
         let offset = self.frame_offset(frame_index);
-        let bytes_read = read_at_least(
-            &self.file,
-            cx,
-            &mut header_buf,
-            offset,
-            WAL_FRAME_HEADER_SIZE,
-        )
-        .await?;
+        let bytes_read = self.file.read_fully(cx, &mut header_buf, offset).await?;
         if bytes_read < WAL_FRAME_HEADER_SIZE {
             return Err(FrankenError::WalCorrupt {
                 detail: format!("short header read at frame {frame_index}: got {bytes_read}"),
@@ -2700,8 +2668,7 @@ impl<F: VfsFile> WalFile<F> {
             // A run's last frame needs only its header.
             let wanted = (frames - 1) * frame_size + WAL_FRAME_HEADER_SIZE;
             let bytes = &mut buf[..wanted];
-            let bytes_read =
-                read_at_least(&self.file, cx, bytes, self.frame_offset(frame), wanted).await?;
+            let bytes_read = self.file.read_fully(cx, bytes, self.frame_offset(frame)).await?;
             if bytes_read < wanted {
                 return Err(FrankenError::WalCorrupt {
                     detail: format!(
@@ -2927,7 +2894,7 @@ impl<F: VfsFile> WalFile<F> {
             let len = frames * frame_size;
             bytes.resize(len, 0);
             let offset = self.frame_offset(index);
-            let bytes_read = read_at_least(&self.file, cx, &mut bytes, offset, len).await?;
+            let bytes_read = self.file.read_fully(cx, &mut bytes, offset).await?;
             if bytes_read != len {
                 return Err(FrankenError::WalCorrupt {
                     detail: format!(

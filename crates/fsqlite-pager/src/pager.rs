@@ -6210,7 +6210,7 @@ async fn cipher_read_page<F: VfsFile>(
     buf: &mut [u8],
 ) -> Result<usize> {
     let offset = u64::from(page_no.saturating_sub(1)) * buf.len() as u64;
-    let bytes_read = file.read(cx, buf, offset).await?;
+    let bytes_read = file.read_fully(cx, buf, offset).await?;
     if bytes_read == buf.len()
         && let Some(active) = page_cipher.get()
     {
@@ -6230,7 +6230,7 @@ async fn cipher_read_pages<F: VfsFile>(
     buf: &mut [u8],
 ) -> Result<usize> {
     let offset = u64::from(first_page.get().saturating_sub(1)) * page_size as u64;
-    let bytes_read = file.read(cx, buf, offset).await?;
+    let bytes_read = file.read_fully(cx, buf, offset).await?;
     if let Some(active) = page_cipher.get() {
         let full_bytes = (bytes_read / page_size) * page_size;
         for (idx, chunk) in buf[..full_bytes].chunks_exact_mut(page_size).enumerate() {
@@ -6260,10 +6260,10 @@ async fn cipher_read_header<F: VfsFile>(
     out: &mut [u8; DATABASE_HEADER_SIZE],
 ) -> Result<usize> {
     let Some(active) = page_cipher.get() else {
-        return file.read(cx, out, 0).await;
+        return file.read_fully(cx, out, 0).await;
     };
     let mut page1 = vec![0_u8; active.page_size];
-    let bytes_read = file.read(cx, &mut page1, 0).await?;
+    let bytes_read = file.read_fully(cx, &mut page1, 0).await?;
     if bytes_read < active.page_size {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -8741,7 +8741,7 @@ async fn local_journal_marker_present<F: VfsFile>(
         return Ok(false);
     }
     let mut marker = [0_u8; LOCAL_JOURNAL_MARKER.len()];
-    let bytes_read = journal_file.read(cx, &mut marker, marker_start).await?;
+    let bytes_read = journal_file.read_fully(cx, &mut marker, marker_start).await?;
     if bytes_read != marker.len() {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -8791,7 +8791,7 @@ async fn durable_invalidate_journal<F: VfsFile>(
                 .await?;
             journal_file.durable_sync(cx, SyncKind::FullDurable)?;
             let mut observed = [0_u8; JOURNAL_MAGIC.len()];
-            let bytes_read = journal_file.read(cx, &mut observed, 0).await?;
+            let bytes_read = journal_file.read_fully(cx, &mut observed, 0).await?;
             if bytes_read != observed.len() || observed.iter().any(|byte| *byte != 0) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -8824,7 +8824,7 @@ async fn durable_write_and_verify_journal_header<F: VfsFile>(
     journal_file.write(cx, header, 0).await?;
     journal_file.durable_sync(cx, SyncKind::FullDurable)?;
     let mut observed = vec![0_u8; header.len()];
-    let bytes_read = journal_file.read(cx, &mut observed, 0).await?;
+    let bytes_read = journal_file.read_fully(cx, &mut observed, 0).await?;
     if bytes_read != header.len() || observed != header {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -8848,7 +8848,7 @@ async fn classify_rollback_journal_prefix<F: VfsFile>(
     let prefix_len = usize::try_from(journal_size.min(JOURNAL_MAGIC.len() as u64))
         .expect("rollback-journal magic length fits usize");
     let mut prefix = [0_u8; JOURNAL_MAGIC.len()];
-    let bytes_read = journal_file.read(cx, &mut prefix[..prefix_len], 0).await?;
+    let bytes_read = journal_file.read_fully(cx, &mut prefix[..prefix_len], 0).await?;
     if bytes_read != prefix_len {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -16731,7 +16731,7 @@ async fn database_image_receipt_for_open_file_with_extent<F: VfsFile>(
     })?;
     let file_size = file.file_size(cx)?;
     let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-    let header_read = file.read(cx, &mut header_bytes, 0).await?;
+    let header_read = file.read_fully(cx, &mut header_bytes, 0).await?;
     if header_read != DATABASE_HEADER_SIZE {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -16790,7 +16790,7 @@ async fn database_image_receipt_for_open_file_with_extent<F: VfsFile>(
             continue;
         }
         let offset = u64::from(page_no - 1) * u64::from(header.page_size.get());
-        let bytes_read = file.read(cx, &mut page, offset).await?;
+        let bytes_read = file.read_fully(cx, &mut page, offset).await?;
         if bytes_read != page_size {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -16809,7 +16809,7 @@ async fn database_image_receipt_for_open_file_with_extent<F: VfsFile>(
         let tail_len = usize::try_from(file_size - whole_pages_len)
             .map_err(|_| FrankenError::internal("trailing slack length exceeds usize"))?;
         let mut tail = vec![0_u8; tail_len];
-        let bytes_read = file.read(cx, &mut tail, whole_pages_len).await?;
+        let bytes_read = file.read_fully(cx, &mut tail, whole_pages_len).await?;
         if bytes_read != tail_len {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -19034,7 +19034,7 @@ where
 
             let page_size = provisional.header.page_size.as_usize();
             let mut page_one = vec![0_u8; page_size];
-            let bytes_read = file.read(cx, &mut page_one, 0).await?;
+            let bytes_read = file.read_fully(cx, &mut page_one, 0).await?;
             if bytes_read != page_size {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -19050,7 +19050,7 @@ where
             file.durable_sync(cx, SyncKind::FullDurable)?;
 
             let mut verified_page_one = vec![0_u8; page_size];
-            let verified_read = file.read(cx, &mut verified_page_one, 0).await?;
+            let verified_read = file.read_fully(cx, &mut verified_page_one, 0).await?;
             if verified_read != page_size || verified_page_one != expected_page_one {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: "VACUUM candidate page 1 changed outside the intended counter fields"
@@ -19480,7 +19480,7 @@ where
                             what: "VACUUM source page offset".to_owned(),
                             value: raw_page_no.to_string(),
                         })?;
-                    let bytes_read = db_file.read(cx, &mut page, offset).await?;
+                    let bytes_read = db_file.read_fully(cx, &mut page, offset).await?;
                     if bytes_read != page_size_usize {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -19564,7 +19564,7 @@ where
                             value: raw_page_no.to_string(),
                         })?;
                     let bytes_read = candidate_file
-                        .read(&cleanup_cx, &mut candidate_page, offset)
+                        .read_fully(&cleanup_cx, &mut candidate_page, offset)
                         .await?;
                     if bytes_read != page_size_usize {
                         return Err(FrankenError::DatabaseCorrupt {
@@ -22551,7 +22551,7 @@ where
                     }
                     let header_bytes = if file_size >= DATABASE_HEADER_SIZE as u64 {
                         let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-                        let bytes_read = db_file.read(cx, &mut header_bytes, 0).await?;
+                        let bytes_read = db_file.read_fully(cx, &mut header_bytes, 0).await?;
                         if bytes_read != DATABASE_HEADER_SIZE {
                             return Err(FrankenError::DatabaseCorrupt {
                                 detail: format!(
@@ -22856,7 +22856,7 @@ where
                             return Err(FrankenError::BusyRecovery);
                         }
                         let mut observed_header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-                        let bytes_read = db_file.read(cx, &mut observed_header_bytes, 0).await?;
+                        let bytes_read = db_file.read_fully(cx, &mut observed_header_bytes, 0).await?;
                         if bytes_read != DATABASE_HEADER_SIZE
                             || observed_header_bytes != *expected_header_bytes
                         {
@@ -23343,7 +23343,7 @@ where
                         }
 
                         let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-                        let bytes_read = db_file.read(cx, &mut header_bytes, 0).await?;
+                        let bytes_read = db_file.read_fully(cx, &mut header_bytes, 0).await?;
                         if bytes_read != DATABASE_HEADER_SIZE {
                             return Err(FrankenError::DatabaseCorrupt {
                                 detail: format!(
@@ -24082,7 +24082,7 @@ where
                     let remaining = usize::try_from(staged_len - offset)
                         .unwrap_or(buf.len())
                         .min(buf.len());
-                    let read = staged_file.read(cx, &mut buf[..remaining], offset).await?;
+                    let read = staged_file.read_fully(cx, &mut buf[..remaining], offset).await?;
                     if read != remaining {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -24267,7 +24267,7 @@ where
 
         // Read and parse the journal header.
         let mut hdr_buf = vec![0u8; crate::journal::JOURNAL_HEADER_SIZE];
-        let header_read = jrnl_file.read(cx, &mut hdr_buf, 0).await?;
+        let header_read = jrnl_file.read_fully(cx, &mut hdr_buf, 0).await?;
         if header_read != hdr_buf.len() {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -24461,7 +24461,7 @@ where
             }
             let mut next_header_bytes = vec![0_u8; crate::journal::JOURNAL_HEADER_SIZE];
             let next_header_read = jrnl_file
-                .read(cx, &mut next_header_bytes, next_header_offset)
+                .read_fully(cx, &mut next_header_bytes, next_header_offset)
                 .await?;
             if next_header_read != next_header_bytes.len() {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -24511,7 +24511,7 @@ where
             let mut validation_offset = section.records_offset;
             for _ in 0..section.page_count {
                 let mut rec_buf = vec![0u8; record_size];
-                let bytes_read = jrnl_file.read(cx, &mut rec_buf, validation_offset).await?;
+                let bytes_read = jrnl_file.read_fully(cx, &mut rec_buf, validation_offset).await?;
                 if bytes_read != record_size {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -24574,7 +24574,7 @@ where
             let mut offset = section.records_offset;
             for _ in 0..section.page_count {
                 let mut rec_buf = vec![0u8; record_size];
-                let bytes_read = jrnl_file.read(cx, &mut rec_buf, offset).await?;
+                let bytes_read = jrnl_file.read_fully(cx, &mut rec_buf, offset).await?;
                 if bytes_read != record_size {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -24660,7 +24660,7 @@ where
                 for _ in 0..section.page_count {
                     let mut rec_buf = vec![0_u8; record_size];
                     let bytes_read = jrnl_file
-                        .read(cx, &mut rec_buf, verification_offset)
+                        .read_fully(cx, &mut rec_buf, verification_offset)
                         .await?;
                     if bytes_read != record_size {
                         return Err(FrankenError::DatabaseCorrupt {
@@ -24709,7 +24709,7 @@ where
                             value: page_no.get().to_string(),
                         })?;
                     let restored_read = db_file
-                        .read(cx, &mut restored_page, page_offset)
+                        .read_fully(cx, &mut restored_page, page_offset)
                         .await?;
                     if restored_read != ps || restored_page != record.content {
                         return Err(FrankenError::DatabaseCorrupt {
@@ -27734,7 +27734,7 @@ where
                 && original_db_size >= PageNumber::ONE.get()
             {
                 let mut raw_image = vec![0u8; ps];
-                let bytes_read = db_file.read(cx, &mut raw_image, 0).await?;
+                let bytes_read = db_file.read_fully(cx, &mut raw_image, 0).await?;
                 if bytes_read < ps {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -27889,7 +27889,7 @@ where
                 } else {
                     let mut pre_image = vec![0u8; ps];
                     let disk_offset = u64::from(page_no.get() - 1) * ps as u64;
-                    let bytes_read = db_file.read(cx, &mut pre_image, disk_offset).await?;
+                    let bytes_read = db_file.read_fully(cx, &mut pre_image, disk_offset).await?;
                     if bytes_read < ps {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -41509,6 +41509,7 @@ mod tests {
     #[allow(clippy::struct_excessive_bools)]
     #[derive(Debug, Clone, Copy, Default)]
     struct JournalDurabilityFaultPlan {
+        read_limit: Option<usize>,
         ignore_zero_magic_write: bool,
         ignore_truncate: bool,
         corrupt_hot_header_activation: bool,
@@ -41651,7 +41652,15 @@ mod tests {
             buf: &'a mut [u8],
             offset: u64,
         ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
-            self.inner.read(cx, buf, offset)
+            let cap = self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .plan
+                .read_limit
+                .unwrap_or(buf.len());
+            let (readable, tail) = buf.split_at_mut(cap.min(buf.len()));
+            tail.fill(0);
+            self.inner.read(cx, readable, offset)
         }
 
         fn write<'a>(
@@ -45866,9 +45875,9 @@ mod tests {
     fn stock_two_section_hot_journal_replays_every_preimage() {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
-            let vfs = MemoryVfs::new();
             let path = PathBuf::from("/stock_two_section_hot_journal.db");
             let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+            let vfs = JournalDurabilityFaultVfs::new(journal_path.clone());
             let page_size = PageSize::DEFAULT;
             let ps = page_size.as_usize();
 
@@ -45970,6 +45979,12 @@ mod tests {
                 .unwrap();
             journal.close(&cx).unwrap();
 
+            // Split headers, pre-images, and checksums across VFS reads.
+            vfs.arm(JournalDurabilityFaultPlan {
+                read_limit: Some(13),
+                ..JournalDurabilityFaultPlan::default()
+            });
+
             drop(
                 SimplePager::open_existing_with_cx_and_page_buffer_max(
                     &cx,
@@ -45982,6 +45997,7 @@ mod tests {
                 .await
                 .expect("stock two-section hot journal should recover"),
             );
+            vfs.disarm();
 
             let (mut restored, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
             let mut restored_page_one = vec![0_u8; ps];
