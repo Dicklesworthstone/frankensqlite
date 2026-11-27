@@ -213,7 +213,7 @@ rusqlite = { version = "0.41.1", features = ["bundled", "backup"] }
 # uses Asupersync 0.6 throughout (the published 0.4 line uses 0.5), so a
 # release built from this pin is breaking for callers. Allowing older runtime
 # minors here would split those types across consumers.
-asupersync = { version = "0.6.2", default-features = false }
+asupersync = { version = "0.7.0", default-features = false }
 futures-lite = "2.6.1"
 
 # Dev dependencies

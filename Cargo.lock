@@ -156,9 +156,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "asupersync"
-version = "0.6.2"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5b2e20bf4312b9fedbc06d6c7244e994119b987946f44f82a447e3bc3c9bb03"
+checksum = "dd9be531765145b804069bc42322f736ef5b03e73717f0ff139110126eca7bf2"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -182,9 +182,9 @@ dependencies = [
  "parking_lot 0.12.5",
  "pin-project",
  "polling",
+ "portable-atomic",
  "prost",
  "rmp-serde",
- "semver",
  "serde",
  "serde_json",
  "sha1",
@@ -1067,9 +1067,9 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "956e18ba3100209106f822c5c2c461ec3b7593e6e3c6aeca42ace2f4b9030d8f"
+checksum = "890e526005830aa9e8421e0bff6d5ff5c9b373670717d8d3144d993f31a1dff1"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -1078,9 +1078,9 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1739367640cb3e46f5b90a5cdf6ccf5a3352298ac335e55d161a786ab8c11a90"
+checksum = "a39a2796f4da0f2b58a9102f6418e5f910f6bb4db6f1a74094ba90d0ca2d9504"
 dependencies = [
  "serde",
  "serde_json",
@@ -1088,9 +1088,9 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "613cf2a909466f1d8964018860814c64e959f2bef28289b0e6f56b247aeaaaed"
+checksum = "e5f87b64b45bc3951dc602ec21e0f9f92c8a924ee9db8a97730030a743386947"
 dependencies = [
  "serde",
 ]
@@ -2831,6 +2831,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3240,10 +3246,6 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-dependencies = [
- "serde",
- "serde_core",
-]
 
 [[package]]
 name = "serde"
@@ -3557,9 +3559,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.39.6"
+version = "0.40.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2071df9448915b71c4fe6d25deaf1c22f12bd234f01540b77312bb8e41361e6"
+checksum = "3e80749408e2d8bec0ffa303012cf4e1b3b355f4a09087b4fdf7473680f6a2de"
 dependencies = [
  "libc",
  "memchr",
