@@ -790,6 +790,29 @@ ALTER TABLE t RENAME COLUMN a TO a2;
 UPDATE t SET c = id WHERE id < 10;",
         ),
         Case::new(
+            "alter_rename_and_drop_formatted_schema",
+            "",
+            format!(
+                "CREATE TABLE t(
+  id INTEGER PRIMARY KEY, -- row id
+  a TEXT,   /* alpha */
+  b BLOB,   /* note */
+  key TEXT  /* soft keyword */
+);
+CREATE TABLE log(x TEXT);
+CREATE TABLE child(cid INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) /* fk */);
+CREATE INDEX t_a ON t(a);
+CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES(NEW.a); END;
+CREATE VIEW v AS SELECT a, key FROM t /* view note */;
+{}INSERT INTO t(a, b, key) SELECT printf('v%05d', x), randomblob(x % 64), printf('k%d', x) FROM c;",
+                rows(40)
+            ),
+            "ALTER TABLE t RENAME COLUMN key TO label;
+ALTER TABLE t RENAME TO t2;
+ALTER TABLE t2 DROP COLUMN b;
+INSERT INTO t2(a, label) VALUES ('after-rename', 'lbl');",
+        ),
+        Case::new(
             "drop_objects",
             "",
             base.clone(),
@@ -819,6 +842,49 @@ INSERT INTO t(a, b) VALUES ('big', zeroblob(1000000));",
     for case in &cases {
         run_case(case);
     }
+}
+
+#[test]
+fn alter_rename_refuses_broken_trigger_and_preserves_stock_file() {
+    let dir = TempDir::new().unwrap();
+    let base = dir.path().join("base.db");
+    let fsq = dir.path().join("fsqlite.db");
+    let stock = dir.path().join("stock.db");
+    {
+        let conn = rusqlite::Connection::open(&base).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT /* note */);
+             CREATE TABLE p(x INTEGER);
+             CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO nosuch VALUES(NEW.a); END;
+             INSERT INTO p VALUES (1), (2);",
+        )
+        .unwrap();
+    }
+    copy_database(&base, &fsq);
+    copy_database(&base, &stock);
+
+    for alter_sql in ["ALTER TABLE t RENAME TO u;", "ALTER TABLE p RENAME TO p2;"] {
+        let Err(f_err) = fsqlite_execute(&fsq, alter_sql) else {
+            panic!("FrankenSQLite must refuse `{alter_sql}`");
+        };
+        let Err(s_err) = rusqlite::Connection::open(&stock)
+            .unwrap()
+            .execute_batch(alter_sql)
+        else {
+            panic!("stock refuses `{alter_sql}`");
+        };
+        let s_msg = match s_err {
+            rusqlite::Error::SqliteFailure(_, Some(msg)) => msg,
+            other => other.to_string(),
+        };
+        assert_eq!(
+            f_err,
+            format!("write: {s_msg}"),
+            "`{alter_sql}` error must match stock"
+        );
+    }
+    assert_eq!(stock_integrity(&fsq), "ok");
+    assert_eq!(stock_contents(&fsq), stock_contents(&stock));
 }
 
 #[test]

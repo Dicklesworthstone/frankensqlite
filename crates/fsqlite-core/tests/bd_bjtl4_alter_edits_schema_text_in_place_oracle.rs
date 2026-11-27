@@ -356,3 +356,245 @@ fn only_the_renamed_identifiers_change_and_failures_change_nothing() {
         );
     });
 }
+
+fn stock_exec_outcome(r: &rusqlite::Connection, sql: &str) -> Result<(), String> {
+    r.execute_batch(sql).map_err(|err| match err {
+        rusqlite::Error::SqliteFailure(_, Some(msg)) => msg,
+        other => other.to_string(),
+    })
+}
+
+/// bd-w4pr1.29: SQLite validates every view and trigger in the target database
+/// (and TEMP when altering a non-TEMP database) during RENAME TO and RENAME
+/// COLUMN — even when renaming an unrelated table — and leaves the schema
+/// unchanged on refusal.
+#[test]
+fn rename_refuses_broken_triggers_and_views_like_stock() {
+    struct RefusalCase {
+        name: &'static str,
+        setup: &'static [&'static str],
+        alters: &'static [&'static str],
+    }
+    const CASES: &[RefusalCase] = &[
+        RefusalCase {
+            name: "broken trigger INSERT INTO nosuch blocks target and unrelated table rename",
+            setup: &[
+                "CREATE TABLE t(a INT, b INT)",
+                "CREATE TABLE p(x INT, y INT)",
+                "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO nosuch VALUES(NEW.a); END",
+            ],
+            alters: &[
+                "ALTER TABLE t RENAME TO u",
+                "ALTER TABLE p RENAME TO p2",
+                "ALTER TABLE t RENAME COLUMN a TO a2",
+                "ALTER TABLE p RENAME COLUMN x TO x2",
+            ],
+        },
+        RefusalCase {
+            name: "broken trigger UPDATE/DELETE/SELECT on missing table",
+            setup: &[
+                "CREATE TABLE t(a INT)",
+                "CREATE TABLE p(x INT)",
+                "CREATE TRIGGER tr_upd AFTER INSERT ON t BEGIN UPDATE nosuch_u SET k = 1; END",
+            ],
+            alters: &["ALTER TABLE t RENAME TO u", "ALTER TABLE p RENAME TO p2"],
+        },
+        RefusalCase {
+            name: "broken trigger DELETE FROM missing table",
+            setup: &[
+                "CREATE TABLE t(a INT)",
+                "CREATE TABLE p(x INT)",
+                "CREATE TRIGGER tr_del AFTER INSERT ON t BEGIN DELETE FROM nosuch_d WHERE k = 1; END",
+            ],
+            alters: &["ALTER TABLE t RENAME TO u", "ALTER TABLE p RENAME TO p2"],
+        },
+        RefusalCase {
+            name: "broken trigger SELECT FROM missing table",
+            setup: &[
+                "CREATE TABLE t(a INT)",
+                "CREATE TABLE p(x INT)",
+                "CREATE TRIGGER tr_sel AFTER INSERT ON t BEGIN SELECT * FROM nosuch_s; END",
+            ],
+            alters: &["ALTER TABLE t RENAME TO u", "ALTER TABLE p RENAME TO p2"],
+        },
+        RefusalCase {
+            name: "broken trigger WHEN / body missing column",
+            setup: &[
+                "CREATE TABLE t(a INT)",
+                "CREATE TABLE log(v INT)",
+                "CREATE TABLE p(x INT)",
+                "CREATE TRIGGER tr_when AFTER INSERT ON t WHEN NEW.missing > 0 BEGIN INSERT INTO log VALUES(NEW.a); END",
+            ],
+            alters: &["ALTER TABLE t RENAME TO u", "ALTER TABLE p RENAME TO p2"],
+        },
+        RefusalCase {
+            name: "broken trigger body NEW.missing column",
+            setup: &[
+                "CREATE TABLE t(a INT)",
+                "CREATE TABLE log(v INT)",
+                "CREATE TABLE p(x INT)",
+                "CREATE TRIGGER tr_body AFTER INSERT ON t BEGIN INSERT INTO log VALUES(NEW.missing); END",
+            ],
+            alters: &["ALTER TABLE t RENAME TO u", "ALTER TABLE p RENAME TO p2"],
+        },
+        RefusalCase {
+            name: "trigger with missing INSERT/UPDATE target column name still allows rename like stock",
+            setup: &[
+                "CREATE TABLE t(a INT)",
+                "CREATE TABLE log(v INT)",
+                "CREATE TABLE p(x INT)",
+                "CREATE TRIGGER tr_ins_col AFTER INSERT ON t BEGIN INSERT INTO log(nosuch_col) VALUES(NEW.a); END",
+                "CREATE TRIGGER tr_upd_col AFTER UPDATE ON t BEGIN UPDATE log SET nosuch_col = NEW.a; END",
+            ],
+            alters: &["ALTER TABLE p RENAME TO p2", "ALTER TABLE t RENAME TO u"],
+        },
+        RefusalCase {
+            name: "broken view missing table blocks rename",
+            setup: &[
+                "CREATE TABLE t(a INT)",
+                "CREATE TABLE p(x INT)",
+                "CREATE VIEW bad_v AS SELECT a FROM nosuch_v",
+            ],
+            alters: &[
+                "ALTER TABLE t RENAME TO u",
+                "ALTER TABLE p RENAME TO p2",
+                "ALTER TABLE p RENAME COLUMN x TO x2",
+            ],
+        },
+        RefusalCase {
+            name: "broken view missing column blocks rename",
+            setup: &[
+                "CREATE TABLE t(a INT)",
+                "CREATE TABLE p(x INT)",
+                "CREATE VIEW bad_vc AS SELECT missing_col FROM t",
+            ],
+            alters: &["ALTER TABLE t RENAME TO u", "ALTER TABLE p RENAME TO p2"],
+        },
+        RefusalCase {
+            name: "broken main trigger does not block TEMP table rename, but broken TEMP trigger blocks both",
+            setup: &[
+                "CREATE TABLE t(a INT)",
+                "CREATE TEMP TABLE tt(k INT)",
+                "CREATE TRIGGER tr_main AFTER INSERT ON t BEGIN INSERT INTO nosuch_m VALUES(NEW.a); END",
+            ],
+            alters: &[
+                "ALTER TABLE tt RENAME TO tt2",
+                "ALTER TABLE t RENAME TO t2",
+            ],
+        },
+        RefusalCase {
+            name: "broken TEMP trigger blocks both main and TEMP renames",
+            setup: &[
+                "CREATE TABLE t(a INT)",
+                "CREATE TEMP TABLE tt(k INT)",
+                "CREATE TEMP TRIGGER tr_temp AFTER INSERT ON tt BEGIN INSERT INTO nosuch_t VALUES(NEW.k); END",
+            ],
+            alters: &[
+                "ALTER TABLE t RENAME TO t2",
+                "ALTER TABLE tt RENAME TO tt2",
+            ],
+        },
+        RefusalCase {
+            name: "broken trigger in attached schema blocks attached rename only",
+            setup: &[
+                "CREATE TABLE m(a INT)",
+                "ATTACH ':memory:' AS aux",
+                "CREATE TABLE aux.at(a INT)",
+                "CREATE TABLE aux.ap(x INT)",
+                "CREATE TRIGGER aux.atr AFTER INSERT ON at BEGIN INSERT INTO nosuch_aux VALUES(NEW.a); END",
+            ],
+            alters: &[
+                "ALTER TABLE aux.at RENAME TO at2",
+                "ALTER TABLE aux.ap RENAME TO ap2",
+                "ALTER TABLE m RENAME TO m2",
+            ],
+        },
+    ];
+
+    asupersync::test_utils::run_test(|| async {
+        let mut failures = Vec::new();
+        for case in CASES {
+            let f = Connection::open(":memory:").await.expect("frank open");
+            let r = rusqlite::Connection::open_in_memory().expect("stock open");
+            for sql in case.setup {
+                f.execute(sql).await.unwrap_or_else(|e| panic!("[{}] setup `{sql}`: {e}", case.name));
+                r.execute_batch(sql).unwrap_or_else(|e| panic!("[{}] stock setup `{sql}`: {e}", case.name));
+            }
+            for sql in case.alters {
+                let fo = f.execute(sql).await.map(|_| ()).map_err(|e| e.to_string());
+                let so = stock_exec_outcome(&r, sql);
+                if fo != so {
+                    failures.push(format!(
+                        "[{}] `{sql}`:\n  frank {fo:?}\n  stock {so:?}",
+                        case.name
+                    ));
+                }
+                compare_schema(&f, &r, &format!("[{}] after `{sql}`", case.name), &mut failures)
+                    .await;
+            }
+            f.close().await.expect("close");
+        }
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+/// bd-w4pr1.29: formatted, commented schemas containing unquoted SQL soft
+/// keywords as table or column names (`key`, `action`, `offset`, `plan`) keep
+/// their whitespace, comments and stock quoting on RENAME COLUMN, RENAME TO
+/// and DROP COLUMN.
+#[test]
+fn rename_preserves_formatted_schema_with_soft_keyword_identifiers_like_stock() {
+    const STATEMENTS: &[&str] = &[
+        "CREATE TABLE key (\n  id INTEGER PRIMARY KEY /* pk */,\n  action TEXT,   /* act */\n  offset INT,    /* off */\n  note TEXT\n)",
+        "CREATE TABLE log(x TEXT)",
+        "CREATE TABLE child(cid INTEGER PRIMARY KEY, pid INTEGER REFERENCES key(id) /* fk */)",
+        "CREATE INDEX ix_key ON key ( action , offset ) WHERE offset > 0",
+        "CREATE VIEW vw_key AS SELECT id , action , offset FROM key /* view note */",
+        "CREATE TRIGGER tr_key AFTER INSERT ON key BEGIN INSERT INTO log VALUES(NEW.action); END",
+        "INSERT INTO key VALUES (1, 'go', 10, 'n')",
+        "ALTER TABLE key RENAME COLUMN action TO act",
+        "ALTER TABLE key RENAME COLUMN offset TO off_val",
+        "ALTER TABLE key RENAME TO key2",
+        "ALTER TABLE key2 DROP COLUMN note",
+        // Unrenamed soft-keyword columns present in a table undergoing RENAME TO.
+        "CREATE TABLE t (\n  id INTEGER PRIMARY KEY, -- id\n  a TEXT,   /* alpha */\n  b BLOB,   /* note */\n  key TEXT, /* soft kw */\n  plan INT\n)",
+        "CREATE INDEX t_a ON t(a)",
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES(NEW.a); END",
+        "CREATE VIEW v AS SELECT a, key FROM t /* v */",
+        "INSERT INTO t VALUES (1, 'hi', x'aa', 'k', 7)",
+        "ALTER TABLE t RENAME TO t2",
+        "ALTER TABLE t2 DROP COLUMN b",
+    ];
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fpath = dir.path().join("frank_kw.db");
+        let spath = dir.path().join("stock_kw.db");
+        let f = Connection::open(fpath.to_str().expect("utf-8"))
+            .await
+            .expect("open");
+        let r = rusqlite::Connection::open(&spath).expect("stock open");
+        let mut failures = Vec::new();
+        for sql in STATEMENTS {
+            let fo = f.execute(sql).await.map(|_| ()).map_err(|e| e.to_string());
+            let so = stock_exec_outcome(&r, sql);
+            if fo != so {
+                failures.push(format!("`{sql}`:\n  frank {fo:?}\n  stock {so:?}"));
+            }
+            if sql.trim_start().to_ascii_uppercase().starts_with("ALTER") {
+                compare_schema(&f, &r, &format!("after `{sql}`"), &mut failures).await;
+            }
+        }
+        f.close().await.expect("close");
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}

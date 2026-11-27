@@ -16302,6 +16302,11 @@ pub struct Connection {
     /// written (bd-i95tk). Separate from `pending_ddl_source`, which nested
     /// statements run by DDL handlers reset; taken before any of them run.
     pending_alter_source: RefCell<Option<String>>,
+    /// Schema label (`"main"` or attached alias such as `"aux"`) for an
+    /// `ALTER TABLE` delegated to an attached connection (bd-w4pr1.29), so
+    /// persistent view/trigger validation names the attached database in
+    /// diagnostics (`no such table: aux.nosuch`).
+    pending_alter_owner_schema: RefCell<Option<String>>,
     /// Set of main table names (lowercased) declared as
     /// `INTEGER PRIMARY KEY AUTOINCREMENT`.
     autoincrement_tables: TxnRestorableCell<HashSet<String>>,
@@ -18644,6 +18649,7 @@ impl Connection {
             original_ddl_sql: TxnRestorableCell::new(HashMap::new()),
             pending_ddl_source: RefCell::new(None),
             pending_alter_source: RefCell::new(None),
+            pending_alter_owner_schema: RefCell::new(None),
             autoincrement_tables: TxnRestorableCell::new(HashSet::new()),
             sqlite_sequence_cache: RefCell::new(HashMap::new()),
             temp_sqlite_sequence: RefCell::new(HashMap::new()),
@@ -19328,6 +19334,7 @@ impl Connection {
             original_ddl_sql: TxnRestorableCell::new(HashMap::new()),
             pending_ddl_source: RefCell::new(None),
             pending_alter_source: RefCell::new(None),
+            pending_alter_owner_schema: RefCell::new(None),
             autoincrement_tables: TxnRestorableCell::new(HashSet::new()),
             sqlite_sequence_cache: RefCell::new(HashMap::new()),
             temp_sqlite_sequence: RefCell::new(HashMap::new()),
@@ -24045,12 +24052,15 @@ impl Connection {
     {
         let ddl_source = self.pending_ddl_source.borrow().clone();
         let alter_source = self.pending_alter_source.borrow().clone();
+        let owner_schema = schema.to_owned();
         self.with_attached_connection_async(schema, async move |conn| {
             *conn.pending_ddl_source.borrow_mut() = ddl_source;
             *conn.pending_alter_source.borrow_mut() = alter_source;
+            *conn.pending_alter_owner_schema.borrow_mut() = Some(owner_schema);
             let result = f(conn).await;
             conn.pending_ddl_source.borrow_mut().take();
             conn.pending_alter_source.borrow_mut().take();
+            conn.pending_alter_owner_schema.borrow_mut().take();
             result
         })
         .await
@@ -79929,6 +79939,11 @@ impl Connection {
         // bd-i95tk: the ADD COLUMN statement's own text, taken before any
         // nested statement this handler runs can reset it.
         let alter_source = self.pending_alter_source.borrow_mut().take();
+        let owner_schema = self
+            .pending_alter_owner_schema
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| "main".to_owned());
         let added_column_source = alter_source
             .as_deref()
             .and_then(alter_add_column_definition_source);
@@ -79955,7 +79970,7 @@ impl Connection {
                 && let AlterTableAction::RenameTo(new_name) = &alter.action
             {
                 return self
-                    .execute_alter_table_rename_fts5(table_name, new_name)
+                    .execute_alter_table_rename_fts5(table_name, new_name, &owner_schema)
                     .await;
             }
             return Err(FrankenError::Unsupported);
@@ -80122,36 +80137,46 @@ impl Connection {
         let mut renamed_autoindex_master_rows = Vec::new();
         let new_schema = match &alter.action {
             AlterTableAction::RenameTo(new_name) => {
-                let mut schema = self.schema.borrow_mut();
-                let table_idx = schema
-                    .iter()
-                    .position(|t| t.name.eq_ignore_ascii_case(table_name))
-                    .ok_or_else(|| FrankenError::NoSuchTable {
-                        name: table_name.clone(),
-                    })?;
-                let views = self.views.borrow();
-                let name_conflicts = if alters_temp_table {
-                    let temp = self.temp_table_names.borrow();
-                    schema.iter().filter(|t| temp.contains(&t.name.to_ascii_lowercase())).any(|t| {
-                        t.name.eq_ignore_ascii_case(new_name)
-                            || t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(new_name))
-                    }) || views.iter().any(|v| v.temporary && v.name.eq_ignore_ascii_case(new_name))
-                } else {
-                    schema_table_index_or_view_name_exists(&schema, &views, new_name)
+                let table_idx = {
+                    let schema = self.schema.borrow();
+                    let table_idx = schema
+                        .iter()
+                        .position(|t| t.name.eq_ignore_ascii_case(table_name))
+                        .ok_or_else(|| FrankenError::NoSuchTable {
+                            name: table_name.clone(),
+                        })?;
+                    let views = self.views.borrow();
+                    let name_conflicts = if alters_temp_table {
+                        let temp = self.temp_table_names.borrow();
+                        schema
+                            .iter()
+                            .filter(|t| temp.contains(&t.name.to_ascii_lowercase()))
+                            .any(|t| {
+                                t.name.eq_ignore_ascii_case(new_name)
+                                    || t.indexes
+                                        .iter()
+                                        .any(|i| i.name.eq_ignore_ascii_case(new_name))
+                            })
+                            || views
+                                .iter()
+                                .any(|v| v.temporary && v.name.eq_ignore_ascii_case(new_name))
+                    } else {
+                        schema_table_index_or_view_name_exists(&schema, &views, new_name)
+                    };
+                    if name_conflicts {
+                        // Stock sqlite3 reports SQLITE_ERROR with this exact message
+                        // for any rename onto an existing table/index/view name,
+                        // including a case-only (`t` -> `T`) or identical rename
+                        // (`name_conflicts` is computed case-insensitively). Verified
+                        // vs 3.46.1 CLI and bundled 3.53.2. `FunctionError` renders it
+                        // verbatim under SQLITE_ERROR; `Internal` would prefix
+                        // "internal error:" under SQLITE_INTERNAL. bd-3nppp.
+                        return Err(FrankenError::FunctionError(format!(
+                            "there is already another table or index with this name: {new_name}"
+                        )));
+                    }
+                    table_idx
                 };
-                drop(views);
-                if name_conflicts {
-                    // Stock sqlite3 reports SQLITE_ERROR with this exact message
-                    // for any rename onto an existing table/index/view name,
-                    // including a case-only (`t` -> `T`) or identical rename
-                    // (`name_conflicts` is computed case-insensitively). Verified
-                    // vs 3.46.1 CLI and bundled 3.53.2. `FunctionError` renders it
-                    // verbatim under SQLITE_ERROR; `Internal` would prefix
-                    // "internal error:" under SQLITE_INTERNAL. bd-3nppp.
-                    return Err(FrankenError::FunctionError(format!(
-                        "there is already another table or index with this name: {new_name}"
-                    )));
-                }
                 // SQLite reparses TEMP triggers during a rename and rejects a
                 // same-named target explicitly pinned to a different database.
                 if alters_temp_table && let Some(trigger) = self.triggers.borrow().iter().find(|t|
@@ -80162,6 +80187,12 @@ impl Connection {
                         "error in trigger {} after rename: ", trigger.name
                     )));
                 }
+                // bd-w4pr1.29: SQLite validates every view and trigger in the
+                // altered database (and TEMP for non-TEMP renames) before
+                // committing RENAME TO, refusing the rename if any object fails
+                // to resolve — even when renaming an unrelated table.
+                self.validate_schema_objects_for_alter_rename(alters_temp_table, &owner_schema)?;
+                let mut schema = self.schema.borrow_mut();
                 let mut renamed_table = schema[table_idx].clone();
                 for fk in &mut renamed_table.foreign_keys {
                     rename_fk_parent_table(fk, &old_name, new_name);
@@ -80209,35 +80240,41 @@ impl Connection {
                 renamed_table
             }
             AlterTableAction::RenameColumn { old, new } => {
+                let (table_idx, col_idx) = {
+                    let schema = self.schema.borrow();
+                    let table_idx = schema
+                        .iter()
+                        .position(|t| t.name.eq_ignore_ascii_case(table_name))
+                        .ok_or_else(|| FrankenError::NoSuchTable {
+                            name: table_name.clone(),
+                        })?;
+                    let table = &schema[table_idx];
+                    let col_idx = table
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(old))
+                        .ok_or_else(|| {
+                            FrankenError::FunctionError(format!("no such column: \"{old}\""))
+                        })?;
+                    if table.columns.iter().enumerate().any(|(idx, column)| {
+                        idx != col_idx && column.name.eq_ignore_ascii_case(new)
+                    }) {
+                        // Stock: SQLITE_ERROR verbatim, not an internal error
+                        // (bd-ttof2), raised by the schema check of the renamed
+                        // table, which names it (bd-nnnd8).
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after rename: duplicate column name: {new}",
+                            table.name
+                        )));
+                    }
+                    (table_idx, col_idx)
+                };
+                // bd-w4pr1.29: SQLite validates every view and trigger in the
+                // altered database (and TEMP for non-TEMP renames) before
+                // committing RENAME COLUMN.
+                self.validate_schema_objects_for_alter_rename(alters_temp_table, &owner_schema)?;
                 let mut schema = self.schema.borrow_mut();
-                let table_idx = schema
-                    .iter()
-                    .position(|t| t.name.eq_ignore_ascii_case(table_name))
-                    .ok_or_else(|| FrankenError::NoSuchTable {
-                        name: table_name.clone(),
-                    })?;
                 let table = &schema[table_idx];
-                let col_idx = table
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(old))
-                    .ok_or_else(|| {
-                        FrankenError::FunctionError(format!("no such column: \"{old}\""))
-                    })?;
-                if table
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .any(|(idx, column)| idx != col_idx && column.name.eq_ignore_ascii_case(new))
-                {
-                    // Stock: SQLITE_ERROR verbatim, not an internal error
-                    // (bd-ttof2), raised by the schema check of the renamed
-                    // table, which names it (bd-nnnd8).
-                    return Err(FrankenError::FunctionError(format!(
-                        "error in table {} after rename: duplicate column name: {new}",
-                        table.name
-                    )));
-                }
                 let mut renamed_table = table.clone();
                 renamed_table.columns[col_idx].name.clone_from(new);
                 for column in &mut renamed_table.columns {
@@ -81179,7 +81216,12 @@ impl Connection {
     /// so once the schema entries and the live-registry key are renamed the
     /// instance self-heals. GH #209.
     #[cfg(feature = "ext-fts5")]
-    async fn execute_alter_table_rename_fts5(&self, old_name: &str, new_name: &str) -> Result<()> {
+    async fn execute_alter_table_rename_fts5(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        owner_schema: &str,
+    ) -> Result<()> {
         // Reject a rename onto an existing table/index/view, mirroring the
         // generic rename path's precedence. A case-only (`t` -> `T`) or an
         // identical (`t` -> `t`) rename collides with the vtab's own name and
@@ -81201,6 +81243,7 @@ impl Connection {
                 )));
             }
         }
+        self.validate_schema_objects_for_alter_rename(false, owner_schema)?;
 
         // Recover the CREATE VIRTUAL TABLE args from the persisted DDL so the
         // shadow-name derivation matches exactly what CREATE produced (the
@@ -87263,6 +87306,163 @@ impl Connection {
         Ok(())
     }
 
+    /// bd-w4pr1.29: SQLite's `sqlite_rename_table` / `sqlite_rename_column`
+    /// resolve every view and trigger in the altered database (and in `temp`
+    /// whenever the altered table is not itself in `temp`) before committing a
+    /// rename. Any unresolvable view or trigger — even on an unrelated table —
+    /// refuses the `ALTER TABLE` with `error in <view|trigger> <name>: <msg>`
+    /// and leaves the schema unchanged.
+    fn validate_schema_objects_for_alter_rename(
+        &self,
+        alters_temp_table: bool,
+        owner_schema: &str,
+    ) -> Result<()> {
+        if !alters_temp_table {
+            self.validate_views_for_alter_rename(false, Some(owner_schema))?;
+            self.validate_triggers_for_alter_rename(false, Some(owner_schema))?;
+        }
+        self.validate_views_for_alter_rename(true, None)?;
+        self.validate_triggers_for_alter_rename(true, None)?;
+        Ok(())
+    }
+
+    fn validate_views_for_alter_rename(
+        &self,
+        temp_only: bool,
+        owner_label: Option<&str>,
+    ) -> Result<()> {
+        let views: Vec<ViewDef> = self
+            .views
+            .borrow()
+            .iter()
+            .filter(|view| view.temporary == temp_only)
+            .cloned()
+            .collect();
+        for view in &views {
+            let scope = if view.temporary {
+                PragmaSchemaScope::Temp
+            } else {
+                PragmaSchemaScope::Main
+            };
+            let mut active_views = HashSet::new();
+            active_views.insert(format!(
+                "{:p}:{scope:?}:{}",
+                self,
+                view.name.to_ascii_lowercase()
+            ));
+            let column_view_state = Rc::new(RefCell::new(SelectViewValidationState::default()));
+            let mut resolver = match owner_label {
+                Some(owner) => SelectRelationResolver::for_persistent_owner(
+                    self,
+                    owner.to_owned(),
+                    active_views,
+                    Rc::clone(&column_view_state),
+                ),
+                None => SelectRelationResolver::with_active_views(
+                    self,
+                    active_views,
+                    Rc::clone(&column_view_state),
+                ),
+            };
+            let validation = with_view_expansion_stack(|| {
+                self.with_fallback_function_registry(|| resolver.validate_select(&view.query))
+                    .and_then(|()| {
+                        let mut query = view.query.clone();
+                        if !view.temporary {
+                            qualify_persistent_view_relations(&mut query);
+                        }
+                        self.with_fallback_function_registry(|| {
+                            SelectColumnReferenceResolver::with_view_state(
+                                self,
+                                column_view_state,
+                            )
+                            .validate_select(&query)
+                        })
+                    })
+            });
+            if let Err(err) = validation {
+                return Err(FrankenError::FunctionError(format!(
+                    "error in view {}: {err}",
+                    view.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_triggers_for_alter_rename(
+        &self,
+        temp_only: bool,
+        owner_label: Option<&str>,
+    ) -> Result<()> {
+        let triggers: Vec<Arc<TriggerDef>> = self
+            .triggers
+            .borrow()
+            .iter()
+            .filter(|trigger| trigger.temporary == temp_only)
+            .cloned()
+            .collect();
+        for trigger in &triggers {
+            if let Err(err) = self.validate_single_trigger_for_alter_rename(trigger, owner_label) {
+                return Err(FrankenError::FunctionError(format!(
+                    "error in trigger {}: {err}",
+                    trigger.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_single_trigger_for_alter_rename(
+        &self,
+        trigger: &TriggerDef,
+        owner_label: Option<&str>,
+    ) -> Result<()> {
+        let mut resolver = match owner_label {
+            Some(owner) => SelectRelationResolver::for_persistent_owner(
+                self,
+                owner.to_owned(),
+                HashSet::new(),
+                Rc::new(RefCell::new(SelectViewValidationState::default())),
+            ),
+            None => SelectRelationResolver::new(self),
+        };
+        let frame = self.trigger_compile_frame(trigger);
+        if frame.is_none() && trigger.timing != fsqlite_ast::TriggerTiming::InsteadOf {
+            let target = QualifiedName {
+                schema: trigger.table_schema.clone(),
+                name: trigger.table_name.clone(),
+            };
+            self.with_fallback_function_registry(|| resolver.validate_catalog_relation(&target))?;
+        }
+        if let Some(when) = &trigger.when_clause {
+            self.with_fallback_function_registry(|| resolver.validate_expr(when))?;
+            if let Some(frame) = &frame {
+                let mut bound = when.clone();
+                bind_trigger_columns_in_expr(&mut bound, frame);
+                self.resolve_trigger_when_dqs(trigger, &mut bound);
+                let select =
+                    select_of_result_exprs(vec![bound], Some(compile_check_empty_source()));
+                self.validate_trigger_select_names(&select)?;
+            }
+        }
+        for (index, statement) in trigger.body.iter().enumerate() {
+            self.with_fallback_function_registry(|| {
+                resolver.validate_trigger_body_statement(statement)
+            })?;
+            if let Some(frame) = &frame {
+                let (mut bound, _) =
+                    bind_trigger_body_statement(statement, frame, !trigger.temporary);
+                self.resolve_trigger_statement_dqs_mode(trigger, index, &mut bound, false);
+                let bound_qualified = self.bind_schema_qualified_columns(&bound)?;
+                let check_stmt = bound_qualified.as_ref().unwrap_or(&bound);
+                self.validate_trigger_statement_names_with_span_mode(check_stmt, false)
+                    .map_err(|(err, _)| err)?;
+            }
+        }
+        Ok(())
+    }
+
     /// bd-w78tx: every relation one trigger's WHEN and body name, resolved
     /// as stock resolves them when it compiles the trigger.
     ///
@@ -87358,6 +87558,16 @@ impl Connection {
         index: usize,
         bound_stmt: &mut Statement,
     ) {
+        self.resolve_trigger_statement_dqs_mode(trigger, index, bound_stmt, true);
+    }
+
+    fn resolve_trigger_statement_dqs_mode(
+        &self,
+        trigger: &TriggerDef,
+        index: usize,
+        bound_stmt: &mut Statement,
+        check_target_assignments: bool,
+    ) {
         if !self.dqs_enabled.get() {
             return;
         }
@@ -87368,8 +87578,11 @@ impl Connection {
             return;
         }
         for _ in 0..quoted_spans.len() {
-            let Err((_, Some(missing_span))) =
-                self.validate_trigger_statement_names_with_span(bound_stmt)
+            let Err((_, Some(missing_span))) = self
+                .validate_trigger_statement_names_with_span_mode(
+                    bound_stmt,
+                    check_target_assignments,
+                )
             else {
                 return;
             };
@@ -87423,14 +87636,15 @@ impl Connection {
     /// UPDATE's FROM); an INSERT's columns and value counts against its
     /// target table, then its VALUES or SELECT.
     fn validate_trigger_statement_names(&self, statement: &Statement) -> Result<()> {
-        self.validate_trigger_statement_names_with_span(statement)
+        self.validate_trigger_statement_names_with_span_mode(statement, true)
             .map_err(|(err, _)| err)
     }
 
     #[allow(clippy::too_many_lines)]
-    fn validate_trigger_statement_names_with_span(
+    fn validate_trigger_statement_names_with_span_mode(
         &self,
         statement: &Statement,
+        check_target_assignments: bool,
     ) -> std::result::Result<(), (FrankenError, Option<Span>)> {
         let bound_qualified = self
             .bind_schema_qualified_columns(statement)
@@ -87442,7 +87656,9 @@ impl Connection {
                     .map_err(|err| (err, None))?;
                 self.validate_trigger_select_names_with_span(select)
             }
-            Statement::Insert(insert) => self.validate_trigger_insert_names_with_span(insert),
+            Statement::Insert(insert) => {
+                self.validate_trigger_insert_names_with_span(insert, check_target_assignments)
+            }
             Statement::Update(update) => {
                 if with_defines_relation(update.with.as_ref(), &update.table.name) {
                     return Ok(());
@@ -87463,7 +87679,11 @@ impl Connection {
                     });
                     from.joins.extend(update_from.joins.iter().cloned());
                 }
-                let columns = self.dml_target_column_names(&update.table.name);
+                let columns = if check_target_assignments {
+                    self.dml_target_column_names(&update.table.name)
+                } else {
+                    None
+                };
                 for assignment in &update.assignments {
                     // A row-value SET supplies one value per target; a
                     // subquery source is checked whole, as EXISTS reads it.
@@ -87539,11 +87759,16 @@ impl Connection {
     fn validate_trigger_insert_names_with_span(
         &self,
         insert: &fsqlite_ast::InsertStatement,
+        check_target_assignments: bool,
     ) -> std::result::Result<(), (FrankenError, Option<Span>)> {
         if with_defines_relation(insert.with.as_ref(), &insert.table) {
             return Ok(());
         }
-        let target = self.dml_target_column_info(&insert.table);
+        let target = if check_target_assignments {
+            self.dml_target_column_info(&insert.table)
+        } else {
+            None
+        };
         if let Some((columns, _)) = &target {
             for name in &insert.columns {
                 if !columns.iter().any(|column| column.eq_ignore_ascii_case(name))
@@ -138432,19 +138657,156 @@ fn same_schema_statement(a: &str, b: &str) -> bool {
     }
 }
 
-/// bd-bjtl4: edit `original`, a stored schema statement, the way stock's
-/// `sqlite_rename_table` / `sqlite_rename_column` do. `rendered` is this
-/// connection's semantic rewrite of the same statement and says which
-/// identifiers the rename reaches: the identifier tokens of the two texts must
-/// pair up one to one, each pair naming the same identifier, except the
-/// renamed ones (the old name in `original`, the new one in `rendered`). The
-/// edited text must parse to the same statement as `rendered`. `None` when
-/// either fails, and the caller keeps `rendered`.
-fn edit_schema_text_for_rename(
+fn token_ident_name(kind: &fsqlite_parser::TokenKind) -> Option<&str> {
+    use fsqlite_parser::TokenKind;
+
+    match kind {
+        TokenKind::Id(name) | TokenKind::QuotedId(name, _) => Some(name.as_ref()),
+        _ => None,
+    }
+}
+
+fn token_ident_or_keyword_name(kind: &fsqlite_parser::TokenKind) -> Option<&str> {
+    token_ident_name(kind).or_else(|| kind.keyword_str())
+}
+
+fn pair_schema_tokens_for_rename(
+    original: &str,
+    orig_token: &fsqlite_parser::Token,
+    rend_token: &fsqlite_parser::Token,
+    rename: SchemaTextRename<'_>,
+) -> Option<(i32, bool)> {
+    if let Some(now) = token_ident_name(&rend_token.kind) {
+        let was = token_ident_or_keyword_name(&orig_token.kind)?;
+        let orig_is_ident = token_ident_name(&orig_token.kind).is_some();
+        let score = if orig_is_ident { 4 } else { 3 };
+        let orig_raw = original.get(orig_token.span.start as usize..orig_token.span.end as usize)?;
+        let exact_was = if orig_is_ident { was } else { orig_raw };
+        if was.eq_ignore_ascii_case(rename.old) && now == rename.new && exact_was != now {
+            return Some((score, true));
+        }
+        if was.eq_ignore_ascii_case(now) {
+            return Some((score, false));
+        }
+        return None;
+    }
+    if token_ident_name(&orig_token.kind).is_some() {
+        return None;
+    }
+    (orig_token.kind == rend_token.kind).then_some((4, false))
+}
+
+/// Token-stream alignment fallback for `edit_schema_text_for_rename` when
+/// `original` contains unquoted soft SQL keywords (such as `key`, `action`,
+/// `offset`, `plan`) in identifier positions that `Display` quotes in
+/// `rendered`. Every `Id`/`QuotedId` token in both streams must pair, exact
+/// keyword matches outrank soft-keyword identifier pairings so `PRIMARY KEY`
+/// never steals a column named `key`, and `same_schema_statement` verifies the
+/// final edited SQL.
+fn align_schema_text_tokens_for_rename(
     original: &str,
     rendered: &str,
     rename: SchemaTextRename<'_>,
-) -> Option<String> {
+) -> Option<Vec<(usize, usize)>> {
+    use fsqlite_parser::TokenKind;
+
+    let orig: Vec<_> = Lexer::tokenize(original)
+        .into_iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Eof | TokenKind::Semicolon))
+        .collect();
+    let rend: Vec<_> = Lexer::tokenize(rendered)
+        .into_iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Eof | TokenKind::Semicolon))
+        .collect();
+    let n = orig.len();
+    let m = rend.len();
+    if n.saturating_mul(m) > 250_000 {
+        return None;
+    }
+    let orig_is_ident: Vec<bool> = orig
+        .iter()
+        .map(|token| token_ident_name(&token.kind).is_some())
+        .collect();
+    let rend_is_ident: Vec<bool> = rend
+        .iter()
+        .map(|token| token_ident_name(&token.kind).is_some())
+        .collect();
+
+    let cols = m + 1;
+    let neg_inf = i32::MIN / 4;
+    let mut dp = vec![neg_inf; (n + 1) * cols];
+    let mut choice = vec![0_u8; (n + 1) * cols];
+    dp[0] = 0;
+
+    for i in 0..=n {
+        for j in 0..=m {
+            let cur = dp[i * cols + j];
+            if cur <= neg_inf / 2 {
+                continue;
+            }
+            if i < n
+                && j < m
+                && let Some((weight, is_renamed)) =
+                    pair_schema_tokens_for_rename(original, &orig[i], &rend[j], rename)
+            {
+                let next = (i + 1) * cols + (j + 1);
+                let cand = cur + weight;
+                if cand > dp[next] {
+                    dp[next] = cand;
+                    choice[next] = if is_renamed { 2 } else { 1 };
+                }
+            }
+            if i < n && !orig_is_ident[i] {
+                let next = (i + 1) * cols + j;
+                if cur > dp[next] {
+                    dp[next] = cur;
+                    choice[next] = 3;
+                }
+            }
+            if j < m && !rend_is_ident[j] {
+                let next = i * cols + (j + 1);
+                if cur > dp[next] {
+                    dp[next] = cur;
+                    choice[next] = 4;
+                }
+            }
+        }
+    }
+
+    if dp[n * cols + m] < 0 {
+        return None;
+    }
+    let mut renamed = Vec::new();
+    let (mut i, mut j) = (n, m);
+    while i > 0 || j > 0 {
+        match choice[i * cols + j] {
+            1 => {
+                i -= 1;
+                j -= 1;
+            }
+            2 => {
+                i -= 1;
+                j -= 1;
+                renamed.push((orig[i].span.start as usize, orig[i].span.end as usize));
+            }
+            3 => {
+                i -= 1;
+            }
+            4 => {
+                j -= 1;
+            }
+            _ => return None,
+        }
+    }
+    renamed.reverse();
+    Some(renamed)
+}
+
+fn find_renamed_spans_fast(
+    original: &str,
+    rendered: &str,
+    rename: SchemaTextRename<'_>,
+) -> Option<Vec<(usize, usize)>> {
     let before = schema_text_identifier_tokens(original);
     let after = schema_text_identifier_tokens(rendered);
     if before.len() != after.len() {
@@ -138458,6 +138820,24 @@ fn edit_schema_text_for_rename(
             return None;
         }
     }
+    Some(renamed)
+}
+
+/// bd-bjtl4 / bd-w4pr1.29: edit `original`, a stored schema statement, the way
+/// stock's `sqlite_rename_table` / `sqlite_rename_column` do. `rendered` is
+/// this connection's semantic rewrite of the same statement and says which
+/// identifiers the rename reaches: the identifier tokens of the two texts pair
+/// up one to one (falling back to full token-stream alignment when `original`
+/// uses bare soft SQL keywords like `key`/`action`/`offset` that `Display`
+/// quotes in `rendered`). The edited text must parse to the same statement as
+/// `rendered`. `None` when either fails, and the caller keeps `rendered`.
+fn edit_schema_text_for_rename(
+    original: &str,
+    rendered: &str,
+    rename: SchemaTextRename<'_>,
+) -> Option<String> {
+    let renamed = find_renamed_spans_fast(original, rendered, rename)
+        .or_else(|| align_schema_text_tokens_for_rename(original, rendered, rename))?;
     let bytes = original.as_bytes();
     let mut edited = String::with_capacity(original.len() + renamed.len() * (rename.new.len() + 3));
     let mut cursor = 0;
