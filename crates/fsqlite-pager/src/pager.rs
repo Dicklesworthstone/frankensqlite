@@ -1266,15 +1266,30 @@ impl KeyedWaitSlot {
     }
 }
 
+/// A map of the group-commit queue, keyed by an identifier this process mints
+/// itself: an epoch, a batch id, or the address of a shared file handle or a
+/// pager's inner state (bd-fuwx0, O-C1).
+///
+/// No key comes from input a caller chooses, so SipHash's flooding resistance
+/// buys nothing here, while it costs about 140 instructions per lookup and an
+/// autocommit write makes about twenty such lookups. Nothing reads these
+/// collections in iteration order: their few iterations count, filter or
+/// collect entries that are then handled one at a time, or sort before they
+/// display, as they already had to under the randomly seeded std hasher.
+type GroupCommitKeyedMap<K, V> = HashMap<K, V, foldhash::fast::FixedState>;
+
+/// The set form of [`GroupCommitKeyedMap`], under the same argument.
+type GroupCommitKeyedSet<K> = HashSet<K, foldhash::fast::FixedState>;
+
 #[derive(Debug, Default)]
 struct KeyedWaitRegistry {
-    slots: Mutex<HashMap<u64, Weak<KeyedWaitSlot>>>,
+    slots: Mutex<GroupCommitKeyedMap<u64, Weak<KeyedWaitSlot>>>,
 }
 
 impl KeyedWaitRegistry {
     fn new() -> Self {
         Self {
-            slots: Mutex::new(HashMap::new()),
+            slots: Mutex::new(GroupCommitKeyedMap::default()),
         }
     }
 
@@ -1359,8 +1374,8 @@ struct PendingEpochResolutionClaim {
 
 #[derive(Default)]
 struct GroupCommitExternalLockCoordination {
-    physical_lock_windows: HashSet<SharedDbFileKey>,
-    logical_exit_in_flight: HashSet<SharedDbFileKey>,
+    physical_lock_windows: GroupCommitKeyedSet<SharedDbFileKey>,
+    logical_exit_in_flight: GroupCommitKeyedSet<SharedDbFileKey>,
 }
 
 trait PendingGroupCommitTxnAttemptOperation: Send + Sync {
@@ -1419,20 +1434,20 @@ struct GroupCommitQueue {
     completed_epoch: AtomicU64,
     /// Failure outcomes by epoch. Kept so late-scheduled waiters cannot miss
     /// a failed flush after a newer epoch completes successfully.
-    failed_epochs: Mutex<HashMap<u64, GroupCommitEpochFailure>>,
+    failed_epochs: Mutex<GroupCommitKeyedMap<u64, GroupCommitEpochFailure>>,
     /// Certificate-backed durable membership by completed epoch.
     ///
     /// Unlike the former trace-only map, this is part of the publication
     /// handoff: every waiter must bind its batch id to the certificate before
     /// Phase C may expose pager visibility.
-    persisted_epochs: Mutex<HashMap<u64, PersistedGroupCommitEpoch>>,
+    persisted_epochs: Mutex<GroupCommitKeyedMap<u64, PersistedGroupCommitEpoch>>,
     /// Active batch owners that can still consume terminal evidence by epoch.
     ///
     /// Registration happens while the consolidator mutex still owns admission,
     /// so publication cannot overtake a newly admitted consumer. The matching
     /// RAII lease releases on success, error, or cancellation. Terminal
     /// evidence is reclaimed only after this count reaches zero.
-    epoch_consumer_counts: Mutex<HashMap<u64, usize>>,
+    epoch_consumer_counts: Mutex<GroupCommitKeyedMap<u64, usize>>,
     /// Stable per-queue ordering for deferred finalization lanes. A record
     /// keeps its first sequence across claims and cancellation requeues.
     next_finalization_sequence: AtomicU64,
@@ -1441,7 +1456,7 @@ struct GroupCommitQueue {
     /// A single physical flush can contain transactions from several pager
     /// handles. Recovery therefore cannot safely finalize only the flusher's
     /// local transaction state; it must address each admitted batch member.
-    pending_txn_attempts: Mutex<HashMap<u64, PendingGroupCommitTxnAttemptRegistration>>,
+    pending_txn_attempts: Mutex<GroupCommitKeyedMap<u64, PendingGroupCommitTxnAttemptRegistration>>,
     /// Lazily seeded from the pager's current visible commit clock at the
     /// first physical flush for this database identity.
     durability_combiner: Mutex<Option<Arc<ParallelWalDurabilityCombiner>>>,
@@ -1490,7 +1505,7 @@ struct GroupCommitQueue {
     /// record: without this set, a second claimant could lease the next record
     /// for the same handle and restore the two baselines concurrently. Claims
     /// for unrelated handles remain independent.
-    exact_external_unlock_claims_in_flight: Mutex<HashSet<SharedDbFileKey>>,
+    exact_external_unlock_claims_in_flight: Mutex<GroupCommitKeyedSet<SharedDbFileKey>>,
     /// Serializes external-lock transitions on each exact open file handle.
     ///
     /// The flusher clones its `SharedDbFile` while briefly holding
@@ -1511,7 +1526,7 @@ struct GroupCommitQueue {
     /// These remain fail-closed in FLUSHING. The shared completion signal is
     /// retained so a waiter, subsequent commit, or future lower-layer
     /// reconciler can publish the epoch once durability becomes terminal.
-    in_doubt_epochs: Mutex<HashMap<u64, RootedPendingEpochResolution>>,
+    in_doubt_epochs: Mutex<GroupCommitKeyedMap<u64, RootedPendingEpochResolution>>,
     /// Resolution records temporarily removed from `in_doubt_epochs` while a
     /// claimant performs the terminal consolidator transition.
     epoch_resolution_claims_in_flight: AtomicUsize,
@@ -1608,7 +1623,7 @@ fn trace_group_commit(args: std::fmt::Arguments<'_>) {
 
 #[derive(Debug, Clone)]
 struct PersistedGroupCommitEpoch {
-    members: HashSet<u64>,
+    members: GroupCommitKeyedSet<u64>,
     frames_start: u64,
     frames_end: u64,
     fsync_seq: u64,
@@ -1649,7 +1664,7 @@ struct PersistedGroupCommitInput<'a> {
 
 struct PreparedPersistedGroupCommitEpoch {
     epoch: u64,
-    members: HashSet<u64>,
+    members: GroupCommitKeyedSet<u64>,
     frames_start: u64,
     frames_end: u64,
     fsync_seq: u64,
@@ -2017,11 +2032,11 @@ impl GroupCommitQueue {
             consolidator: Mutex::new(GroupCommitConsolidator::new(config)),
             flush_complete: Condvar::new(),
             completed_epoch: AtomicU64::new(0),
-            failed_epochs: Mutex::new(HashMap::new()),
-            persisted_epochs: Mutex::new(HashMap::new()),
-            epoch_consumer_counts: Mutex::new(HashMap::new()),
+            failed_epochs: Mutex::new(GroupCommitKeyedMap::default()),
+            persisted_epochs: Mutex::new(GroupCommitKeyedMap::default()),
+            epoch_consumer_counts: Mutex::new(GroupCommitKeyedMap::default()),
             next_finalization_sequence: AtomicU64::new(1),
-            pending_txn_attempts: Mutex::new(HashMap::new()),
+            pending_txn_attempts: Mutex::new(GroupCommitKeyedMap::default()),
             durability_combiner: Mutex::new(None),
             epoch_waiters: KeyedWaitRegistry::new(),
             commit_service_control_epoch: AtomicU64::new(0),
@@ -2032,10 +2047,10 @@ impl GroupCommitQueue {
             pending_external_unlocks: Mutex::new(VecDeque::new()),
             external_unlock_claims_in_flight: AtomicUsize::new(0),
             identity_wide_external_unlock_claims_in_flight: AtomicUsize::new(0),
-            exact_external_unlock_claims_in_flight: Mutex::new(HashSet::new()),
+            exact_external_unlock_claims_in_flight: Mutex::new(GroupCommitKeyedSet::default()),
             external_lock_coordination: Mutex::new(GroupCommitExternalLockCoordination::default()),
             external_lock_waiters: KeyedWaitSlot::default(),
-            in_doubt_epochs: Mutex::new(HashMap::new()),
+            in_doubt_epochs: Mutex::new(GroupCommitKeyedMap::default()),
             epoch_resolution_claims_in_flight: AtomicUsize::new(0),
             pending_logical_cleanups: Mutex::new(VecDeque::new()),
             disowned_pages: Arc::new(Mutex::new(HashSet::new())),
@@ -2182,7 +2197,7 @@ impl GroupCommitQueue {
             .batches
             .iter()
             .map(|batch| batch.context.batch_id)
-            .collect::<HashSet<_>>();
+            .collect::<GroupCommitKeyedSet<_>>();
         let max_lane_id = input
             .batches
             .iter()
@@ -2376,7 +2391,7 @@ impl GroupCommitQueue {
         batches: &[TransactionFrameBatch],
         durability_receipt: &ParallelWalDurabilityReceipt,
         complete_group_pages: &HashMap<PageNumber, &[u8]>,
-    ) -> Result<HashSet<*const ()>> {
+    ) -> Result<GroupCommitKeyedSet<*const ()>> {
         let (attempts, registered_for_epoch) = {
             #[cfg(test)]
             record_commit_fast_path_lock(CommitFastPathLockClass::QueueEpochState);
@@ -2420,7 +2435,7 @@ impl GroupCommitQueue {
         }
         group_allocator_delta.normalize();
 
-        let mut normalized_pager_inners = HashSet::new();
+        let mut normalized_pager_inners = GroupCommitKeyedSet::default();
         for (batch_id, registered_epoch, operation) in &attempts {
             if *registered_epoch != epoch {
                 return Err(FrankenError::internal(format!(
@@ -37820,7 +37835,7 @@ mod tests {
                 .insert(
                     epoch,
                     PersistedGroupCommitEpoch {
-                        members: HashSet::from([batch_id]),
+                        members: std::iter::once(batch_id).collect(),
                         frames_start: 1,
                         frames_end: 2,
                         fsync_seq: 1,
@@ -75905,7 +75920,7 @@ mod tests {
             .insert(
                 1,
                 PersistedGroupCommitEpoch {
-                    members: HashSet::from([authorization.batch_id]),
+                    members: std::iter::once(authorization.batch_id).collect(),
                     frames_start: 1,
                     frames_end: 1,
                     fsync_seq: 1,
