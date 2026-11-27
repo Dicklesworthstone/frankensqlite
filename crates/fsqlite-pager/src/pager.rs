@@ -13519,13 +13519,18 @@ fn commit_read_claim_source<F: VfsFile + 'static>(
 ///
 /// Same generation: the batch's conflict snapshot still names the original
 /// horizon, so the append's own conflict scan covers every commit since.
-/// A generation changed by a reset is accepted only with proof that no
-/// fsqlite commit happened since the claim was released (the certificate
-/// sidecar is unchanged and no commit was in flight past the checked
-/// horizon): only an fsqlite writer makes byte-identical structural claims
-/// (bd-73pfl), so every hidden commit was a stock one, and the append's
-/// conflict scan compares each candidate page with the database file byte for
-/// byte. Without the proof the transaction is refused with `BusySnapshot`.
+/// A generation changed by a reset is accepted only with proof that every
+/// fsqlite commit since the claim was released lies in the current
+/// generation's WAL, and that no commit was in flight past the checked
+/// horizon. The certificate sidecar proves it (bd-5eult, c9c513a65) when it is
+/// unchanged since the capture, or when it now starts with a byte-identical
+/// copy of the captured record (the anchor a new generation's first append
+/// keeps) followed only by current-generation records. Only an fsqlite writer
+/// makes byte-identical structural claims (bd-73pfl), so every commit the WAL
+/// no longer shows was a stock one; the append's conflict scan reads the
+/// current generation's frames and compares each candidate page with the
+/// database file byte for byte. Without the proof the transaction is refused
+/// with `BusySnapshot`.
 async fn readmit_commit_read_claim<F: VfsFile + 'static>(
     cx: &Cx,
     wal_backend: &SharedWalBackend,
