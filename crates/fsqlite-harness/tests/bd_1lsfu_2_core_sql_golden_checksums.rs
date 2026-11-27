@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 const BEAD_ID: &str = "bd-1lsfu.2";
 const GOLDEN_MANIFEST_RELATIVE: &str = "conformance/core_sql_golden_blake3.json";
 const UPDATE_ENV_VAR: &str = "FSQLITE_UPDATE_GOLDEN";
+const AUDIT_ENV_VAR: &str = "FSQLITE_AUDIT_GOLDEN";
 const SCHEMA_VERSION: u32 = 1;
 const HASH_ALGORITHM: &str = "blake3";
 const FUZZ_SQL_CORPUS_RELATIVE: &str = "../../fuzz/corpus/fuzz_sql_parser";
@@ -123,6 +124,13 @@ fn load_fuzz_query_corpus(limit: usize) -> Result<Vec<(String, String)>, String>
 
 fn update_requested() -> bool {
     std::env::var(UPDATE_ENV_VAR).is_ok_and(|raw| {
+        let normalized = raw.trim();
+        normalized == "1" || normalized.eq_ignore_ascii_case("true")
+    })
+}
+
+fn audit_requested() -> bool {
+    std::env::var(AUDIT_ENV_VAR).is_ok_and(|raw| {
         let normalized = raw.trim();
         normalized == "1" || normalized.eq_ignore_ascii_case("true")
     })
@@ -561,6 +569,298 @@ fn test_bd_1lsfu_2_core_sql_golden_checksums() -> Result<(), String> {
                 ));
             }
 
+            Ok(())
+        }
+        .await;
+    });
+    outcome
+}
+
+fn rusqlite_error_category(err: &rusqlite::Error) -> ErrorCategory {
+    if let rusqlite::Error::SqliteFailure(ffi_err, _) = err {
+        return match ffi_err.code {
+            rusqlite::ErrorCode::DatabaseBusy => ErrorCategory::Busy,
+            rusqlite::ErrorCode::DatabaseLocked => ErrorCategory::Locked,
+            rusqlite::ErrorCode::ConstraintViolation => ErrorCategory::Constraint,
+            rusqlite::ErrorCode::DatabaseCorrupt => ErrorCategory::Corrupt,
+            rusqlite::ErrorCode::SchemaChanged => ErrorCategory::Schema,
+            rusqlite::ErrorCode::SystemIoFailure => ErrorCategory::IoErr,
+            rusqlite::ErrorCode::AuthorizationForStatementDenied => ErrorCategory::Auth,
+            rusqlite::ErrorCode::OperationAborted => ErrorCategory::Abort,
+            rusqlite::ErrorCode::ReadOnly => ErrorCategory::ReadOnly,
+            rusqlite::ErrorCode::CannotOpen => ErrorCategory::CantOpen,
+            rusqlite::ErrorCode::DiskFull => ErrorCategory::Full,
+            rusqlite::ErrorCode::ParameterOutOfRange => ErrorCategory::Range,
+            rusqlite::ErrorCode::NotADatabase => ErrorCategory::NotADb,
+            _ => ErrorCategory::Error,
+        };
+    }
+    ErrorCategory::from_sqlite_error(&err.to_string())
+}
+
+fn canonical_rusqlite_value(value: rusqlite::types::ValueRef<'_>) -> String {
+    match value {
+        rusqlite::types::ValueRef::Null => "n:NULL".to_owned(),
+        rusqlite::types::ValueRef::Integer(v) => format!("i:{v}"),
+        rusqlite::types::ValueRef::Real(v) => canonical_float(v),
+        rusqlite::types::ValueRef::Text(bytes) => {
+            let text = String::from_utf8_lossy(bytes);
+            format!("t:{text:?}")
+        }
+        rusqlite::types::ValueRef::Blob(bytes) => format!("b:{}", hex_encode(bytes)),
+    }
+}
+
+fn exec_rusqlite(conn: &rusqlite::Connection, sql: &str) -> Result<usize, (ErrorCategory, String)> {
+    match conn.prepare(sql) {
+        Ok(mut stmt) => {
+            if stmt.column_count() > 0 {
+                let mut rows = stmt
+                    .query([])
+                    .map_err(|err| (rusqlite_error_category(&err), err.to_string()))?;
+                while rows
+                    .next()
+                    .map_err(|err| (rusqlite_error_category(&err), err.to_string()))?
+                    .is_some()
+                {}
+            } else {
+                stmt.execute([])
+                    .map_err(|err| (rusqlite_error_category(&err), err.to_string()))?;
+            }
+            Ok(usize::try_from(conn.changes()).unwrap_or(0))
+        }
+        Err(err) => Err((rusqlite_error_category(&err), err.to_string())),
+    }
+}
+
+fn query_rusqlite(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    ordered: bool,
+) -> Result<Vec<String>, (ErrorCategory, String)> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|err| (rusqlite_error_category(&err), err.to_string()))?;
+    let col_count = stmt.column_count();
+    let mut rows = stmt
+        .query([])
+        .map_err(|err| (rusqlite_error_category(&err), err.to_string()))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|err| (rusqlite_error_category(&err), err.to_string()))?
+    {
+        let mut cols = Vec::with_capacity(col_count);
+        for idx in 0..col_count {
+            let val = row
+                .get_ref(idx)
+                .map_err(|err| (rusqlite_error_category(&err), err.to_string()))?;
+            cols.push(canonical_rusqlite_value(val));
+        }
+        out.push(cols.join("|"));
+    }
+    if !ordered {
+        out.sort();
+    }
+    Ok(out)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_bd_1lsfu_2_core_sql_fixtures_match_stock_rusqlite_oracle() -> Result<(), String> {
+    let audit = audit_requested();
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let fixtures = oracle::load_fixtures_from_dir(&fixture_dir()?)
+                .map_err(|error| format!("bead_id={BEAD_ID} case=load_fixtures error={error}"))?;
+            let mut mismatches = Vec::new();
+
+            for fixture in &fixtures {
+                let mut fconn = Connection::open(":memory:").await.map_err(|error| {
+                    format!("bead_id={BEAD_ID} case=open_connection error={error}")
+                })?;
+                let mut sconn = rusqlite::Connection::open_in_memory().map_err(|error| {
+                    format!("bead_id={BEAD_ID} case=open_stock_connection error={error}")
+                })?;
+
+                for (op_idx, op) in fixture.ops.iter().enumerate() {
+                    match op {
+                        FixtureOp::Open { path } => {
+                            fconn = Connection::open(path).await.map_err(|error| {
+                                format!(
+                                    "bead_id={BEAD_ID} case=open_fixture fixture={} path={} error={error}",
+                                    fixture.id, path
+                                )
+                            })?;
+                            sconn = if path == ":memory:" {
+                                rusqlite::Connection::open_in_memory()
+                            } else {
+                                rusqlite::Connection::open(path)
+                            }
+                            .map_err(|error| {
+                                format!(
+                                    "bead_id={BEAD_ID} case=open_stock_fixture fixture={} path={} error={error}",
+                                    fixture.id, path
+                                )
+                            })?;
+                        }
+                        FixtureOp::Exec { sql, expect_error } => {
+                            let f_res = fconn.execute(sql).await;
+                            let s_res = exec_rusqlite(&sconn, sql);
+                            if audit {
+                                eprintln!(
+                                    "AUDIT_EXEC|{}|op={}|sql={}|fsqlite={:?}|stock={:?}",
+                                    fixture.id,
+                                    op_idx,
+                                    sql.trim(),
+                                    f_res.as_ref().map_err(|e| (
+                                        ErrorCategory::from_franken_error(e),
+                                        e.error_code(),
+                                        e.to_string()
+                                    )),
+                                    s_res,
+                                );
+                            }
+                            match (&f_res, &s_res) {
+                                (Ok(f_changes), Ok(s_changes)) => {
+                                    if expect_error.is_some() {
+                                        mismatches.push(format!(
+                                            "{} op#{op_idx} EXEC expected error {:?}, both succeeded: {sql}",
+                                            fixture.id, expect_error
+                                        ));
+                                    }
+                                    if f_changes != s_changes {
+                                        mismatches.push(format!(
+                                            "{} op#{op_idx} EXEC changes mismatch: fsqlite={f_changes} stock={s_changes} sql={sql}",
+                                            fixture.id
+                                        ));
+                                    }
+                                }
+                                (Err(f_err), Err((s_cat, _))) => {
+                                    let f_cat = ErrorCategory::from_franken_error(f_err);
+                                    if f_cat != *s_cat {
+                                        mismatches.push(format!(
+                                            "{} op#{op_idx} EXEC error category mismatch: fsqlite={f_cat} ({f_err}) stock={s_cat} sql={sql}",
+                                            fixture.id
+                                        ));
+                                    }
+                                }
+                                _ => {
+                                    mismatches.push(format!(
+                                        "{} op#{op_idx} EXEC ok/err mismatch: fsqlite={f_res:?} stock={s_res:?} sql={sql}",
+                                        fixture.id
+                                    ));
+                                }
+                            }
+                        }
+                        FixtureOp::Query { sql, expect } => {
+                            let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+                            if audit {
+                                let f_plan = fconn
+                                    .query(&explain_sql)
+                                    .await
+                                    .map(|r| canonical_rows(&r, true))
+                                    .map_err(|e| (ErrorCategory::from_franken_error(&e), e.error_code()));
+                                let s_plan = query_rusqlite(&sconn, &explain_sql, true);
+                                eprintln!(
+                                    "AUDIT_PLAN|{}|op={}|sql={}|fsqlite={:?}|stock={:?}",
+                                    fixture.id,
+                                    op_idx,
+                                    sql.trim(),
+                                    f_plan,
+                                    s_plan,
+                                );
+                            }
+                            let f_res = fconn
+                                .query(sql)
+                                .await
+                                .map(|rows| canonical_rows(&rows, expect.ordered));
+                            let s_res = query_rusqlite(&sconn, sql, expect.ordered);
+                            if audit {
+                                eprintln!(
+                                    "AUDIT_QUERY|{}|op={}|sql={}|fsqlite={:?}|stock={:?}",
+                                    fixture.id,
+                                    op_idx,
+                                    sql.trim(),
+                                    f_res.as_ref().map_err(|e| (
+                                        ErrorCategory::from_franken_error(e),
+                                        e.error_code(),
+                                        e.to_string()
+                                    )),
+                                    s_res,
+                                );
+                            }
+                            match (&f_res, &s_res) {
+                                (Ok(f_rows), Ok(s_rows)) => {
+                                    if f_rows != s_rows {
+                                        mismatches.push(format!(
+                                            "{} op#{op_idx} QUERY rows mismatch:\n  sql: {sql}\n  fsqlite: {f_rows:?}\n  stock:   {s_rows:?}",
+                                            fixture.id
+                                        ));
+                                    }
+                                }
+                                (Err(f_err), Err((s_cat, _))) => {
+                                    let f_cat = ErrorCategory::from_franken_error(f_err);
+                                    if f_cat != *s_cat {
+                                        mismatches.push(format!(
+                                            "{} op#{op_idx} QUERY error category mismatch: fsqlite={f_cat} ({f_err}) stock={s_cat} sql={sql}",
+                                            fixture.id
+                                        ));
+                                    }
+                                }
+                                _ => {
+                                    mismatches.push(format!(
+                                        "{} op#{op_idx} QUERY ok/err mismatch: fsqlite={f_res:?} stock={s_res:?} sql={sql}",
+                                        fixture.id
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Also verify core_sql_edge_cases against bundled rusqlite 3.54.1.
+            let fconn = Connection::open(":memory:").await.map_err(|error| {
+                format!("bead_id={BEAD_ID} case=open_edge_connection error={error}")
+            })?;
+            let sconn = rusqlite::Connection::open_in_memory().map_err(|error| {
+                format!("bead_id={BEAD_ID} case=open_stock_edge_connection error={error}")
+            })?;
+            let mut dummy_hasher = Hasher::new();
+            seed_execution_database(&fconn, &mut dummy_hasher).await;
+            for sql in [
+                "CREATE TABLE IF NOT EXISTS __seed_numbers(id INTEGER PRIMARY KEY, x INTEGER, y REAL, tag TEXT)",
+                "DELETE FROM __seed_numbers",
+                "INSERT INTO __seed_numbers VALUES(1, 10, 1.5, 'alpha')",
+                "INSERT INTO __seed_numbers VALUES(2, 20, 2.5, 'beta')",
+                "INSERT INTO __seed_numbers VALUES(3, NULL, 3.5, NULL)",
+            ] {
+                let _ = exec_rusqlite(&sconn, sql);
+            }
+            for sql in edge_case_queries() {
+                let f_rows = fconn
+                    .query(sql)
+                    .await
+                    .map(|rows| canonical_rows(&rows, true))
+                    .map_err(|error| format!("core_sql_edge_cases fsqlite error on {sql}: {error}"))?;
+                let s_rows = query_rusqlite(&sconn, sql, true)
+                    .map_err(|error| format!("core_sql_edge_cases stock error on {sql}: {error:?}"))?;
+                if f_rows != s_rows {
+                    mismatches.push(format!(
+                        "core_sql_edge_cases mismatch:\n  sql: {sql}\n  fsqlite: {f_rows:?}\n  stock:   {s_rows:?}"
+                    ));
+                }
+            }
+
+            if !mismatches.is_empty() {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=stock_oracle_mismatch count={}\n{}",
+                    mismatches.len(),
+                    mismatches.join("\n")
+                ));
+            }
             Ok(())
         }
         .await;
