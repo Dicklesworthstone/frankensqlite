@@ -984,6 +984,87 @@ fn gh543_immutable_open_of_zero_length_db_reads_empty_and_ignores_sidecars() {
 
 #[cfg(all(feature = "native", any(unix, windows)))]
 #[test]
+fn gh543_existing_identity_bound_writable_open_bootstraps_zero_length_main() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("identity-empty.db");
+        std::fs::write(&path, []).unwrap();
+        let guard = std::fs::File::open(&path).unwrap();
+        let identity = fsqlite::FileIdentity::from_file(&guard)
+            .unwrap()
+            .expect("native identity");
+        let path_str = path.to_str().unwrap();
+
+        // The identity-bound API must not silently turn an existing-only
+        // open into an unguarded create or accept a different file.
+        let other_path = dir.path().join("other");
+        std::fs::write(&other_path, []).unwrap();
+        let other = std::fs::File::open(&other_path).unwrap();
+        let other_identity = fsqlite::FileIdentity::from_file(&other)
+            .unwrap()
+            .expect("native identity");
+        assert!(
+            Connection::open_existing_with_expected_identity_and_env(
+                path_str,
+                other_identity,
+                ConnectionEnv::default()
+            )
+            .await
+            .is_err(),
+            "an unrelated identity must be refused"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        let conn = Connection::open_existing_with_expected_identity_and_env(
+            path_str,
+            identity,
+            ConnectionEnv::default(),
+        )
+        .await
+        .expect("matching identity bootstraps the empty existing database");
+        conn.execute("CREATE TABLE t(x INTEGER NOT NULL)")
+            .await
+            .expect("write the initialized main file");
+        conn.execute("INSERT INTO t VALUES (91)")
+            .await
+            .expect("insert after bootstrap");
+        conn.close().await.unwrap();
+        drop(guard);
+
+        let stock = RusqliteConnection::open(&path).unwrap();
+        let actual: i64 = stock.query_row("SELECT x FROM t", [], |row| row.get(0)).unwrap();
+        assert_eq!(actual, 91);
+    });
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn gh543_existing_writable_open_refuses_sidecars_on_empty_main() {
+    asupersync::test_utils::run_test(|| async {
+        for suffix in ["-journal", "-wal", "-wal-fec", "-shm"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("zero.db");
+            std::fs::write(&path, []).unwrap();
+            std::fs::write(suffixed_path(&path, suffix), b"untrusted recovery artifact")
+                .unwrap();
+            let before = snapshot_directory_files(dir.path());
+            assert!(
+                open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+                    .await
+                    .is_err(),
+                "{suffix}: empty-main writable admission must not recover a sidecar"
+            );
+            assert_eq!(
+                snapshot_directory_files(dir.path()),
+                before,
+                "{suffix}: a refused admission must not touch the main or sidecar"
+            );
+        }
+    });
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
 fn gh543_read_only_open_of_zero_length_db_refuses_recovery_sidecars() {
     asupersync::test_utils::run_test(|| async {
         for suffix in ["-journal", "-wal", "-wal-fec", "-shm"] {
