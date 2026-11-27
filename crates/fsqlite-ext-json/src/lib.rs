@@ -14131,22 +14131,34 @@ mod multi_path_lexical_parity_tests {
 
     #[test]
     fn json_extract_preserves_escaped_string_tokens_across_json5_translation() {
-        let input = r#"{first:'Infini\\u0074y', second:'plain', n:1E+2}"#;
+        let input = r#"{first:'Infini\u0074y', second:'plain', n:1E+2}"#;
         let result = json_extract(input, &["$.first", "$.second", "$.n"]).unwrap();
         assert_eq!(
             result,
-            SqliteValue::Text(SmallText::new(r#"["Infini\\u0074y","plain",1E+2]"#))
+            SqliteValue::Text(SmallText::new(r#"["Infini\u0074y","plain",1E+2]"#))
         );
     }
 
     #[test]
     fn json_extract_preserves_strict_json_subtrees_and_missing_paths() {
-        let input = r#"{ "a": { "text": "a\\u002fb", "n": 1.50 }, "b": null }"#;
+        let input = r#"{ "a": { "text": "a\u002fb", "n": 1.50 }, "b": null }"#;
         let result = json_extract(input, &["$.a", "$.missing", "$.b"]).unwrap();
         assert_eq!(
             result,
             SqliteValue::Text(SmallText::new(
-                r#"[{"text":"a\\u002fb","n":1.50},null,null]"#
+                r#"[{"text":"a\u002fb","n":1.50},null,null]"#
+            ))
+        );
+    }
+
+    #[test]
+    fn json_extract_preserves_duplicate_source_values_and_whitespace() {
+        let input = r#"{ "items": [ 1E+2, "a\\u0062" ], "x": -0 }"#;
+        let result = json_extract(input, &["$.items", "$.x", "$.items[1]"]).unwrap();
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::new(
+                r#"[[1E+2,"a\\u0062"],-0,"a\\u0062"]"#
             ))
         );
     }
