@@ -8690,6 +8690,56 @@ fn record_prepared_update_delete_fallback(reason: PreparedUpdateDeleteFallbackRe
     }
 }
 
+/// bd-7dris: SQLite `mayAbort` classification for a DML statement so explicit-
+/// transaction execution matches stock's `usesStmtJournal = isMultiWrite && mayAbort`
+/// even when runtime PRAGMAs (`foreign_keys`, `ignore_check_constraints`,
+/// `recursive_triggers`) toggle between `prepare()` and `execute()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+struct StmtJournalAbortProfile {
+    /// Unconditionally invokes `sqlite3MayAbort()` (e.g. `OP_MustBeInt`,
+    /// `OP_Function`/`OP_PureFunc`, `NOT NULL`/`UNIQUE`/`PK` with `OE_Abort`,
+    /// virtual-table write, `UPSERT DO UPDATE` abort, or aborting trigger).
+    always_may_abort: bool,
+    /// Invokes `sqlite3MayAbort()` unless `PRAGMA ignore_check_constraints = ON`
+    /// (`CHECK` resolving with `OE_Abort`/`OE_Replace`, or function in `CHECK`).
+    check_may_abort: bool,
+    /// Invokes `sqlite3MayAbort()` when `PRAGMA foreign_keys = ON` (immediate
+    /// outbound/inbound FK check or cascading FK action).
+    fk_may_abort: bool,
+    /// Invokes `sqlite3MayAbort()` when `PRAGMA recursive_triggers = ON`
+    /// (e.g. `REPLACE` firing DELETE triggers and rechecking uniqueness with ABORT).
+    recursive_triggers_may_abort: bool,
+}
+
+impl StmtJournalAbortProfile {
+    const ALWAYS: Self = Self {
+        always_may_abort: true,
+        check_may_abort: false,
+        fk_may_abort: false,
+        recursive_triggers_may_abort: false,
+    };
+
+    const fn merge(&mut self, other: Self) {
+        self.always_may_abort |= other.always_may_abort;
+        self.check_may_abort |= other.check_may_abort;
+        self.fk_may_abort |= other.fk_may_abort;
+        self.recursive_triggers_may_abort |= other.recursive_triggers_may_abort;
+    }
+
+    const fn may_abort_now(
+        self,
+        foreign_keys: bool,
+        ignore_check_constraints: bool,
+        recursive_triggers: bool,
+    ) -> bool {
+        self.always_may_abort
+            || (self.check_may_abort && !ignore_check_constraints)
+            || (self.fk_may_abort && foreign_keys)
+            || (self.recursive_triggers_may_abort && recursive_triggers)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PreparedUpdateDeleteFastPath {
     kind: PreparedDmlKind,
@@ -8697,6 +8747,7 @@ struct PreparedUpdateDeleteFastPath {
     rollback_on_constraint_violation: bool,
     preserve_prior_changes_on_constraint_violation: bool,
     skip_statement_savepoint_in_explicit_txn: bool,
+    stmt_journal_abort_profile: StmtJournalAbortProfile,
     runtime_requirements: TableExecutionRuntimeRequirements,
     static_runtime_inputs: Option<TableExecutionRuntimeInputs>,
     static_fallback_reason: Option<PreparedUpdateDeleteFallbackReason>,
@@ -9725,6 +9776,7 @@ struct PreparedPrecompiledDml {
     rollback_on_constraint_violation: bool,
     preserve_prior_changes_on_constraint_violation: bool,
     skip_statement_savepoint_in_explicit_txn: bool,
+    stmt_journal_abort_profile: StmtJournalAbortProfile,
     runtime_requirements: TableExecutionRuntimeRequirements,
     static_runtime_inputs: Option<TableExecutionRuntimeInputs>,
     direct_simple_insert: Option<PreparedDirectSimpleInsert>,
@@ -11061,6 +11113,7 @@ impl PreparedStatement<'_> {
             self.conn.statement_parallel_workers(),
             self.conn.build_temp_store_runtime(),
             false,
+            self.conn.statement_elides_stmt_journal.get(),
         )
         .await;
         let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -11242,6 +11295,7 @@ impl PreparedStatement<'_> {
                 true,
                 cached,
                 self.conn.build_temp_store_runtime(),
+                self.conn.statement_elides_stmt_journal.get(),
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -11298,6 +11352,7 @@ impl PreparedStatement<'_> {
                 true,
                 cached,
                 self.conn.build_temp_store_runtime(),
+                self.conn.statement_elides_stmt_journal.get(),
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -11441,6 +11496,7 @@ impl PreparedStatement<'_> {
                 self.conn.statement_parallel_workers(),
                 self.conn.build_temp_store_runtime(),
                 false,
+                self.conn.statement_elides_stmt_journal.get(),
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -11503,6 +11559,7 @@ impl PreparedStatement<'_> {
                 self.conn.statement_parallel_workers(),
                 self.conn.build_temp_store_runtime(),
                 false,
+                self.conn.statement_elides_stmt_journal.get(),
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -16109,6 +16166,12 @@ pub struct Connection {
     /// statement can protect all nested trigger/FK work without per-substatement
     /// savepoint churn.
     internal_statement_savepoint_depth: Cell<usize>,
+    /// bd-7dris: true while the active outermost DML statement inside an explicit
+    /// transaction (`!was_auto`) matches stock SQLite's `usesStmtJournal == 0`
+    /// (`!mayAbort`) condition, so a non-ROLLBACK, non-special ABORT failure
+    /// (such as STRICT `OP_TypeCheck`) leaves earlier rows written by the
+    /// statement in the open transaction while still resetting `changes()` to 0.
+    statement_elides_stmt_journal: Cell<bool>,
     /// bd-8a8pr: the innermost statement savepoint of a concurrent transaction
     /// (0 outside one). Its programs allocate implicit rowids in its name, so
     /// its rollback can give them back to the shared allocator.
@@ -18553,6 +18616,7 @@ impl Connection {
             constraint_failure_action: RefCell::new(None),
             dml_conflict_clause: Cell::new(None),
             internal_statement_savepoint_depth: Cell::new(0),
+            statement_elides_stmt_journal: Cell::new(false),
             concurrent_rowid_statement: Cell::new(0),
             last_concurrent_rowid_statement: Cell::new(0),
             implicit_txn: Cell::new(false),
@@ -19236,6 +19300,7 @@ impl Connection {
             constraint_failure_action: RefCell::new(None),
             dml_conflict_clause: Cell::new(None),
             internal_statement_savepoint_depth: Cell::new(0),
+            statement_elides_stmt_journal: Cell::new(false),
             concurrent_rowid_statement: Cell::new(0),
             last_concurrent_rowid_statement: Cell::new(0),
             implicit_txn: Cell::new(false),
@@ -24839,6 +24904,8 @@ impl Connection {
                                 source_select = %select_stmt,
                                 "materializing INSERT ... SELECT source rows before attached-target dispatch"
                             );
+                            let source_may_abort =
+                                self.select_stmt_may_abort(select_stmt, &mut HashSet::new());
                             let source_rows = self
                                 .materialize_insert_select_source_rows(insert, select_stmt, params)
                                 .await?;
@@ -24848,6 +24915,7 @@ impl Connection {
                                         .execute_materialized_insert_select_statement(
                                             &rewritten,
                                             &source_rows,
+                                            source_may_abort,
                                         )
                                         .await;
                                     if let Err(error) = result.as_ref() {
@@ -28041,6 +28109,1318 @@ impl Connection {
             self.recorded_constraint_failure_action(error),
             statement_or_rollback,
         )
+    }
+
+    /// bd-7dris: inside an explicit transaction whose statement matches stock
+    /// SQLite's `usesStmtJournal == 0` (`!mayAbort`), a non-ROLLBACK,
+    /// non-special ABORT error (such as STRICT `OP_TypeCheck`) has no statement
+    /// journal to roll back, so earlier rows written by the statement remain in
+    /// the open transaction while `changes()` is still reset to 0.
+    fn statement_failure_keeps_rows_via_elided_stmt_journal(&self, error: &FrankenError) -> bool {
+        self.statement_elides_stmt_journal.get()
+            && error_keeps_rows_when_stmt_journal_elided(error)
+    }
+
+    fn stmt_journal_abort_profile_may_abort_now(&self, profile: StmtJournalAbortProfile) -> bool {
+        let pragma = self.pragma_state.borrow();
+        profile.may_abort_now(
+            pragma.foreign_keys,
+            pragma.ignore_check_constraints,
+            pragma.recursive_triggers,
+        )
+    }
+
+    fn statement_may_abort_now(&self, statement: &Statement) -> bool {
+        let mut visited_triggers = HashSet::new();
+        let profile = self.statement_stmt_journal_abort_profile(
+            statement,
+            None,
+            &mut visited_triggers,
+        );
+        self.stmt_journal_abort_profile_may_abort_now(profile)
+    }
+
+    fn statement_stmt_journal_abort_profile(
+        &self,
+        statement: &Statement,
+        override_conflict: Option<fsqlite_ast::ConflictAction>,
+        visited_triggers: &mut HashSet<String>,
+    ) -> StmtJournalAbortProfile {
+        match statement {
+            Statement::Insert(insert) => {
+                self.insert_stmt_journal_abort_profile(insert, override_conflict, visited_triggers)
+            }
+            Statement::Update(update) => {
+                self.update_stmt_journal_abort_profile(update, override_conflict, visited_triggers)
+            }
+            Statement::Delete(delete) => {
+                self.delete_stmt_journal_abort_profile(delete, override_conflict, visited_triggers)
+            }
+            Statement::Select(select) => {
+                if self.select_stmt_may_abort(select, &mut HashSet::new()) {
+                    StmtJournalAbortProfile::ALWAYS
+                } else {
+                    StmtJournalAbortProfile::default()
+                }
+            }
+            _ => StmtJournalAbortProfile::ALWAYS,
+        }
+    }
+
+    fn parse_sql_expr_for_abort_analysis(sql: &str) -> Option<Expr> {
+        let select_sql = format!("SELECT ({sql})");
+        let Statement::Select(select) = parse_single_statement(&select_sql).ok()? else {
+            return None;
+        };
+        let SelectCore::Select { mut columns, .. } = select.body.select else {
+            return None;
+        };
+        match columns.pop()? {
+            ResultColumn::Expr { expr, .. } => Some(expr),
+            ResultColumn::Star | ResultColumn::TableStar(_) => None,
+        }
+    }
+
+    fn parse_sql_expr_may_abort(&self, sql: &str) -> bool {
+        Self::parse_sql_expr_for_abort_analysis(sql)
+            .is_none_or(|expr| self.expr_may_abort(&expr, &mut HashSet::new()))
+    }
+
+    fn expr_is_sqlite_inline_builtin(&self, name: &str) -> bool {
+        !self.scalar_function_overridden.get()
+            && matches!(
+                name.to_ascii_lowercase().as_str(),
+                "unlikely"
+                    | "likelihood"
+                    | "likely"
+                    | "sqlite_offset"
+                    | "ifnull"
+                    | "coalesce"
+                    | "iif"
+                    | "if"
+            )
+    }
+
+    fn expr_may_abort(&self, expr: &Expr, visited_views: &mut HashSet<String>) -> bool {
+        match expr {
+            Expr::Literal(
+                Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp,
+                _,
+            )
+            | Expr::Like { .. }
+            | Expr::JsonAccess { .. }
+            | Expr::Raise {
+                action: fsqlite_ast::RaiseAction::Abort,
+                ..
+            } => true,
+            Expr::Literal(_, _)
+            | Expr::BoundOuterValue { .. }
+            | Expr::Column(_, _)
+            | Expr::Placeholder(_, _)
+            | Expr::Raise { .. } => false,
+            Expr::BinaryOp { left, right, .. } => {
+                self.expr_may_abort(left, visited_views)
+                    || self.expr_may_abort(right, visited_views)
+            }
+            Expr::UnaryOp { expr: inner, .. }
+            | Expr::Cast { expr: inner, .. }
+            | Expr::Collate { expr: inner, .. }
+            | Expr::IsNull { expr: inner, .. } => self.expr_may_abort(inner, visited_views),
+            Expr::Between {
+                expr: target,
+                low,
+                high,
+                ..
+            } => {
+                self.expr_may_abort(target, visited_views)
+                    || self.expr_may_abort(low, visited_views)
+                    || self.expr_may_abort(high, visited_views)
+            }
+            Expr::In { expr: lhs, set, .. } => {
+                self.expr_may_abort(lhs, visited_views)
+                    || match set {
+                        fsqlite_ast::InSet::List(items) => {
+                            items.iter().any(|item| self.expr_may_abort(item, visited_views))
+                        }
+                        fsqlite_ast::InSet::Subquery(subquery) => {
+                            self.select_stmt_may_abort(subquery, visited_views)
+                        }
+                        fsqlite_ast::InSet::Table(name) => {
+                            self.view_may_abort(&name.name, visited_views)
+                        }
+                    }
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                ..
+            } => {
+                operand
+                    .as_deref()
+                    .is_some_and(|op| self.expr_may_abort(op, visited_views))
+                    || whens.iter().any(|(w, t)| {
+                        self.expr_may_abort(w, visited_views)
+                            || self.expr_may_abort(t, visited_views)
+                    })
+                    || else_expr
+                        .as_deref()
+                        .is_some_and(|e| self.expr_may_abort(e, visited_views))
+            }
+            Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+                self.select_stmt_may_abort(subquery, visited_views)
+            }
+            Expr::FunctionCall {
+                name,
+                args,
+                order_by,
+                filter,
+                over,
+                ..
+            } => {
+                if over.is_some()
+                    || filter.is_some()
+                    || !order_by.is_empty()
+                    || !self.expr_is_sqlite_inline_builtin(name)
+                {
+                    return true;
+                }
+                match args {
+                    fsqlite_ast::FunctionArgs::Star => true,
+                    fsqlite_ast::FunctionArgs::List(items) => {
+                        items.iter().any(|arg| self.expr_may_abort(arg, visited_views))
+                    }
+                }
+            }
+            Expr::RowValue(items, _) => {
+                items.iter().any(|item| self.expr_may_abort(item, visited_views))
+            }
+        }
+    }
+
+    fn view_may_abort(&self, name: &str, visited_views: &mut HashSet<String>) -> bool {
+        let key = name.to_ascii_lowercase();
+        let query = {
+            let views = self.views.borrow();
+            views
+                .iter()
+                .find(|v| v.name.eq_ignore_ascii_case(name))
+                .map(|v| v.query.clone())
+        };
+        let Some(query) = query else {
+            return false;
+        };
+        if !visited_views.insert(key) {
+            return false;
+        }
+        self.select_stmt_may_abort(&query, visited_views)
+    }
+
+    fn stmt_from_clause_may_abort(
+        &self,
+        from: &fsqlite_ast::FromClause,
+        visited_views: &mut HashSet<String>,
+    ) -> bool {
+        if self.table_or_subquery_may_abort(&from.source, visited_views) {
+            return true;
+        }
+        from.joins.iter().any(|join| {
+            self.table_or_subquery_may_abort(&join.table, visited_views)
+                || matches!(
+                    &join.constraint,
+                    Some(fsqlite_ast::JoinConstraint::On(expr))
+                        if self.expr_may_abort(expr, visited_views)
+                )
+        })
+    }
+
+    fn table_or_subquery_may_abort(
+        &self,
+        source: &fsqlite_ast::TableOrSubquery,
+        visited_views: &mut HashSet<String>,
+    ) -> bool {
+        match source {
+            fsqlite_ast::TableOrSubquery::Table { name, .. } => {
+                self.view_may_abort(&name.name, visited_views)
+            }
+            fsqlite_ast::TableOrSubquery::Subquery { query, .. } => {
+                self.select_stmt_may_abort(query, visited_views)
+            }
+            fsqlite_ast::TableOrSubquery::TableFunction { args, .. } => {
+                args.iter().any(|arg| self.expr_may_abort(arg, visited_views))
+            }
+            fsqlite_ast::TableOrSubquery::ParenJoin(inner) => {
+                self.stmt_from_clause_may_abort(inner, visited_views)
+            }
+        }
+    }
+
+    fn select_core_may_abort(
+        &self,
+        core: &SelectCore,
+        visited_views: &mut HashSet<String>,
+    ) -> bool {
+        match core {
+            SelectCore::Select {
+                columns,
+                from,
+                where_clause,
+                group_by,
+                having,
+                windows,
+                ..
+            } => {
+                !windows.is_empty()
+                    || columns.iter().any(|col| match col {
+                        ResultColumn::Expr { expr, .. } => self.expr_may_abort(expr, visited_views),
+                        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+                    })
+                    || from
+                        .as_ref()
+                        .is_some_and(|f| self.stmt_from_clause_may_abort(f, visited_views))
+                    || where_clause
+                        .as_deref()
+                        .is_some_and(|w| self.expr_may_abort(w, visited_views))
+                    || group_by
+                        .iter()
+                        .any(|g| self.expr_may_abort(g, visited_views))
+                    || having
+                        .as_deref()
+                        .is_some_and(|h| self.expr_may_abort(h, visited_views))
+            }
+            SelectCore::Values(values) => values.iter().any(|row| {
+                row.iter().any(|expr| self.expr_may_abort(expr, visited_views))
+            }),
+        }
+    }
+
+    fn with_clause_may_abort(
+        &self,
+        with: &fsqlite_ast::WithClause,
+        visited_views: &mut HashSet<String>,
+    ) -> bool {
+        with.ctes
+            .iter()
+            .any(|cte| self.select_stmt_may_abort(&cte.query, visited_views))
+    }
+
+    fn expr_is_sqlite_i32_literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(Literal::Integer(v), _) => i32::try_from(*v).is_ok(),
+            Expr::UnaryOp {
+                op: fsqlite_ast::UnaryOp::Plus,
+                expr: inner,
+                ..
+            } => Self::expr_is_sqlite_i32_literal(inner),
+            Expr::UnaryOp {
+                op: fsqlite_ast::UnaryOp::Negate,
+                expr: inner,
+                ..
+            } => matches!(
+                inner.as_ref(),
+                Expr::Literal(Literal::Integer(v), _)
+                    if v.checked_neg().is_some_and(|n| i32::try_from(n).is_ok())
+            ),
+            _ => false,
+        }
+    }
+
+    fn limit_clause_may_abort(limit: &fsqlite_ast::LimitClause) -> bool {
+        // sqlite3.c computeLimitRegisters: a constant i32 LIMIT emits OP_Integer
+        // without sqlite3MayAbort(); any non-constant LIMIT or any OFFSET emits
+        // OP_MustBeInt + sqlite3MayAbort().
+        limit.offset.is_some() || !Self::expr_is_sqlite_i32_literal(&limit.limit)
+    }
+
+    fn select_stmt_may_abort(
+        &self,
+        select: &SelectStatement,
+        visited_views: &mut HashSet<String>,
+    ) -> bool {
+        if select
+            .limit
+            .as_ref()
+            .is_some_and(Self::limit_clause_may_abort)
+        {
+            return true;
+        }
+        if select
+            .with
+            .as_ref()
+            .is_some_and(|w| self.with_clause_may_abort(w, visited_views))
+        {
+            return true;
+        }
+        if self.select_core_may_abort(&select.body.select, visited_views) {
+            return true;
+        }
+        if select
+            .body
+            .compounds
+            .iter()
+            .any(|(_, core)| self.select_core_may_abort(core, visited_views))
+        {
+            return true;
+        }
+        select
+            .order_by
+            .iter()
+            .any(|term| self.expr_may_abort(&term.expr, visited_views))
+    }
+
+    fn collect_expr_column_refs(expr: &Expr, out: &mut Vec<String>) {
+        match expr {
+            Expr::Column(col_ref, _) => out.push(col_ref.column.to_string()),
+            Expr::BinaryOp { left, right, .. } => {
+                Self::collect_expr_column_refs(left, out);
+                Self::collect_expr_column_refs(right, out);
+            }
+            Expr::UnaryOp { expr: inner, .. }
+            | Expr::Cast { expr: inner, .. }
+            | Expr::Collate { expr: inner, .. }
+            | Expr::IsNull { expr: inner, .. } => Self::collect_expr_column_refs(inner, out),
+            Expr::Between {
+                expr: target,
+                low,
+                high,
+                ..
+            } => {
+                Self::collect_expr_column_refs(target, out);
+                Self::collect_expr_column_refs(low, out);
+                Self::collect_expr_column_refs(high, out);
+            }
+            Expr::In { expr: lhs, set, .. } => {
+                Self::collect_expr_column_refs(lhs, out);
+                if let fsqlite_ast::InSet::List(items) = set {
+                    for item in items {
+                        Self::collect_expr_column_refs(item, out);
+                    }
+                }
+            }
+            Expr::Like {
+                expr: target,
+                pattern,
+                escape,
+                ..
+            } => {
+                Self::collect_expr_column_refs(target, out);
+                Self::collect_expr_column_refs(pattern, out);
+                if let Some(esc) = escape {
+                    Self::collect_expr_column_refs(esc, out);
+                }
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                ..
+            } => {
+                if let Some(op) = operand {
+                    Self::collect_expr_column_refs(op, out);
+                }
+                for (w, t) in whens {
+                    Self::collect_expr_column_refs(w, out);
+                    Self::collect_expr_column_refs(t, out);
+                }
+                if let Some(e) = else_expr {
+                    Self::collect_expr_column_refs(e, out);
+                }
+            }
+            Expr::FunctionCall {
+                args: fsqlite_ast::FunctionArgs::List(items),
+                ..
+            }
+            | Expr::RowValue(items, _) => {
+                for item in items {
+                    Self::collect_expr_column_refs(item, out);
+                }
+            }
+            Expr::JsonAccess { expr: lhs, path, .. } => {
+                Self::collect_expr_column_refs(lhs, out);
+                Self::collect_expr_column_refs(path, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn trigger_stmt_journal_abort_profile(
+        &self,
+        trigger: &TriggerDef,
+        outer_conflict: Option<fsqlite_ast::ConflictAction>,
+        visited_triggers: &mut HashSet<String>,
+    ) -> StmtJournalAbortProfile {
+        let key = format!(
+            "{}:{}:{:?}",
+            trigger.bound_table_schema.to_ascii_lowercase(),
+            trigger.name.to_ascii_lowercase(),
+            outer_conflict
+        );
+        if !visited_triggers.insert(key) {
+            return StmtJournalAbortProfile::default();
+        }
+        let mut profile = StmtJournalAbortProfile::default();
+        if trigger
+            .when_clause
+            .as_ref()
+            .is_some_and(|when| self.expr_may_abort(when, &mut HashSet::new()))
+        {
+            profile.always_may_abort = true;
+            return profile;
+        }
+        for stmt in &trigger.body {
+            profile.merge(self.statement_stmt_journal_abort_profile(
+                stmt,
+                outer_conflict,
+                visited_triggers,
+            ));
+            if profile.always_may_abort {
+                return profile;
+            }
+        }
+        profile
+    }
+
+    fn matching_triggers_stmt_journal_abort_profile(
+        &self,
+        table_name: &str,
+        schema_name: Option<&str>,
+        event: &fsqlite_ast::TriggerEvent,
+        outer_conflict: Option<fsqlite_ast::ConflictAction>,
+        visited_triggers: &mut HashSet<String>,
+    ) -> StmtJournalAbortProfile {
+        let matching: Vec<Arc<TriggerDef>> = self
+            .triggers
+            .borrow()
+            .iter()
+            .filter(|trigger| {
+                self.trigger_matches_target(trigger, table_name, schema_name)
+                    && trigger_event_matches(&trigger.event, event)
+            })
+            .cloned()
+            .collect();
+        let mut profile = StmtJournalAbortProfile::default();
+        for trigger in &matching {
+            profile.merge(self.trigger_stmt_journal_abort_profile(
+                trigger,
+                outer_conflict,
+                visited_triggers,
+            ));
+            if profile.always_may_abort {
+                return profile;
+            }
+        }
+        profile
+    }
+
+    fn table_has_matching_delete_triggers(&self, table_name: &str, schema_name: Option<&str>) -> bool {
+        self.triggers.borrow().iter().any(|trigger| {
+            self.trigger_matches_target(trigger, table_name, schema_name)
+                && matches!(trigger.event, fsqlite_ast::TriggerEvent::Delete)
+        })
+    }
+
+    fn inbound_fk_may_abort(
+        &self,
+        parent: &TableSchema,
+        modified_parent_cols: Option<&[usize]>,
+        is_delete: bool,
+        visited_triggers: &mut HashSet<String>,
+    ) -> bool {
+        let children: Vec<TableSchema> = self
+            .schema
+            .borrow()
+            .iter()
+            .filter(|child| {
+                child
+                    .foreign_keys
+                    .iter()
+                    .any(|fk| fk.parent_table.eq_ignore_ascii_case(&parent.name))
+            })
+            .cloned()
+            .collect();
+        if children.is_empty() {
+            return false;
+        }
+        let implicit_parent_cols = Self::fk_implicit_parent_key_columns(Some(parent));
+        for child in &children {
+            for (fk_idx, fk) in child.foreign_keys.iter().enumerate() {
+                if !fk.parent_table.eq_ignore_ascii_case(&parent.name) {
+                    continue;
+                }
+                if let Some(modified) = modified_parent_cols {
+                    let parent_cols = if fk.parent_columns.is_empty() {
+                        &implicit_parent_cols
+                    } else {
+                        &fk.parent_columns
+                    };
+                    let touches_parent_key = parent_cols.iter().any(|col_name| {
+                        parent
+                            .column_index(col_name)
+                            .is_some_and(|idx| modified.contains(&idx))
+                    });
+                    if !touches_parent_key {
+                        continue;
+                    }
+                }
+                let action = if is_delete { fk.on_delete } else { fk.on_update };
+                if !fk.deferred
+                    && !matches!(
+                        action,
+                        fsqlite_vdbe::codegen::FkActionType::Cascade
+                            | fsqlite_vdbe::codegen::FkActionType::SetNull
+                    )
+                {
+                    return true;
+                }
+                // Guard against self-referencing or cyclic FK action graphs
+                // (mirrors SQLite's per-TriggerPrg compilation cache in
+                // sqlite3CodeRowTriggerDirect).
+                let fk_key = format!(
+                    "__fk__:{}:{}:{fk_idx}",
+                    child.name.to_ascii_lowercase(),
+                    if is_delete { "del" } else { "upd" }
+                );
+                if !visited_triggers.insert(fk_key) {
+                    continue;
+                }
+                // CASCADE / SET NULL runs an action trigger on the child table.
+                // Check whether that child DELETE or UPDATE itself may abort.
+                match action {
+                    fsqlite_vdbe::codegen::FkActionType::Cascade if is_delete => {
+                        let synth_delete = fsqlite_ast::DeleteStatement {
+                            with: None,
+                            table: fsqlite_ast::QualifiedTableRef {
+                                name: fsqlite_ast::QualifiedName::bare(child.name.clone()),
+                                alias: None,
+                                index_hint: None,
+                                time_travel: None,
+                            },
+                            where_clause: None,
+                            returning: Vec::new(),
+                            order_by: Vec::new(),
+                            limit: None,
+                        };
+                        let child_profile = self.delete_stmt_journal_abort_profile(
+                            &synth_delete,
+                            None,
+                            visited_triggers,
+                        );
+                        if child_profile.always_may_abort
+                            || child_profile.check_may_abort
+                            || child_profile.fk_may_abort
+                        {
+                            return true;
+                        }
+                    }
+                    fsqlite_vdbe::codegen::FkActionType::Cascade
+                    | fsqlite_vdbe::codegen::FkActionType::SetNull => {
+                        let assignments = fk
+                            .child_columns
+                            .iter()
+                            .filter_map(|&idx| child.columns.get(idx))
+                            .map(|col| fsqlite_ast::Assignment {
+                                target: fsqlite_ast::AssignmentTarget::Column(col.name.clone()),
+                                value: Expr::Literal(Literal::Null, fsqlite_ast::Span::new(0, 0)),
+                            })
+                            .collect();
+                        let synth_update = fsqlite_ast::UpdateStatement {
+                            with: None,
+                            or_conflict: None,
+                            table: fsqlite_ast::QualifiedTableRef {
+                                name: fsqlite_ast::QualifiedName::bare(child.name.clone()),
+                                alias: None,
+                                index_hint: None,
+                                time_travel: None,
+                            },
+                            assignments,
+                            from: None,
+                            where_clause: None,
+                            returning: Vec::new(),
+                            order_by: Vec::new(),
+                            limit: None,
+                        };
+                        let child_profile = self.update_stmt_journal_abort_profile(
+                            &synth_update,
+                            None,
+                            visited_triggers,
+                        );
+                        if child_profile.always_may_abort
+                            || child_profile.check_may_abort
+                            || child_profile.fk_may_abort
+                        {
+                            return true;
+                        }
+                    }
+                    fsqlite_vdbe::codegen::FkActionType::SetDefault
+                    | fsqlite_vdbe::codegen::FkActionType::NoAction
+                    | fsqlite_vdbe::codegen::FkActionType::Restrict => {
+                        if !fk.deferred {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn without_rowid_pk_column_indices(table: &TableSchema) -> Vec<usize> {
+        if !table.without_rowid {
+            return Vec::new();
+        }
+        let mut indices = Vec::new();
+        for group in &table.primary_key_constraints {
+            for col_name in group {
+                if let Some(idx) = table.column_index(col_name)
+                    && !indices.contains(&idx)
+                {
+                    indices.push(idx);
+                }
+            }
+        }
+        indices
+    }
+
+    fn upsert_matches_index_or_pk(
+        upsert: &[fsqlite_ast::UpsertClause],
+        table: &TableSchema,
+        target_columns: &[String],
+    ) -> Option<fsqlite_ast::ConflictAction> {
+        for clause in upsert {
+            let matches = match clause.target.as_ref() {
+                None => true,
+                Some(target) => {
+                    target.where_clause.is_none()
+                        && target.columns.len() == target_columns.len()
+                        && target.columns.iter().zip(target_columns).all(|(indexed, col)| {
+                            matches!(
+                                &indexed.expr,
+                                Expr::Column(col_ref, _)
+                                    if col_ref.table.is_none()
+                                        && col_ref.column.eq_ignore_ascii_case(col)
+                            )
+                        })
+                }
+            };
+            if matches {
+                return Some(match clause.action {
+                    fsqlite_ast::UpsertAction::Nothing => fsqlite_ast::ConflictAction::Ignore,
+                    fsqlite_ast::UpsertAction::Update { .. } => {
+                        // Handled separately as an ABORT-mode UPDATE; does not
+                        // itself emit a plain uniqueness Abort unless DO UPDATE aborts.
+                        let _ = table;
+                        fsqlite_ast::ConflictAction::Ignore
+                    }
+                });
+            }
+        }
+        None
+    }
+
+    fn insert_stmt_journal_abort_profile(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        override_conflict: Option<fsqlite_ast::ConflictAction>,
+        visited_triggers: &mut HashSet<String>,
+    ) -> StmtJournalAbortProfile {
+        let table_name = insert.table.name.as_str();
+        let schema_name = insert.table.schema.as_deref();
+        if self.table_name_is_virtual(table_name) {
+            return StmtJournalAbortProfile::ALWAYS;
+        }
+        let mut profile = StmtJournalAbortProfile::default();
+        let mut visited_views = HashSet::new();
+        if insert
+            .with
+            .as_ref()
+            .is_some_and(|w| self.with_clause_may_abort(w, &mut visited_views))
+            || insert.returning.iter().any(|col| match col {
+                ResultColumn::Expr { expr, .. } => self.expr_may_abort(expr, &mut visited_views),
+                ResultColumn::Star | ResultColumn::TableStar(_) => false,
+            })
+        {
+            return StmtJournalAbortProfile::ALWAYS;
+        }
+        match &insert.source {
+            fsqlite_ast::InsertSource::Values(rows) => {
+                if rows.iter().any(|row| {
+                    row.iter()
+                        .any(|expr| self.expr_may_abort(expr, &mut visited_views))
+                }) {
+                    return StmtJournalAbortProfile::ALWAYS;
+                }
+            }
+            fsqlite_ast::InsertSource::Select(select) => {
+                if self.select_stmt_may_abort(select, &mut visited_views) {
+                    return StmtJournalAbortProfile::ALWAYS;
+                }
+            }
+            fsqlite_ast::InsertSource::DefaultValues => {}
+        }
+
+        let stmt_or = override_conflict.or(insert.or_conflict);
+        let Some(table) = self
+            .local_dml_target_table(table_name, schema_name)
+            .map(|t| t.clone())
+        else {
+            // View (INSTEAD OF INSERT trigger) or attached/unknown table.
+            if self
+                .views
+                .borrow()
+                .iter()
+                .any(|v| v.name.eq_ignore_ascii_case(table_name))
+            {
+                return self.matching_triggers_stmt_journal_abort_profile(
+                    table_name,
+                    schema_name,
+                    &fsqlite_ast::TriggerEvent::Insert,
+                    stmt_or,
+                    visited_triggers,
+                );
+            }
+            return StmtJournalAbortProfile::ALWAYS;
+        };
+
+        // 1. Rowid / INTEGER PRIMARY KEY OP_MustBeInt (sqlite3.c:140861).
+        if !table.without_rowid {
+            let ipk_pos = if insert.columns.is_empty() {
+                if matches!(insert.source, fsqlite_ast::InsertSource::DefaultValues) {
+                    None
+                } else {
+                    table
+                        .columns
+                        .iter()
+                        .filter(|c| c.generated_expr.is_none())
+                        .position(|c| c.is_ipk)
+                }
+            } else {
+                insert.columns.iter().position(|col| {
+                    table
+                        .column_index(col)
+                        .is_some_and(|i| table.columns[i].is_ipk)
+                        || table.resolves_to_hidden_rowid(col)
+                })
+            };
+            if let Some(pos) = ipk_pos {
+                let single_row_literal_null = match &insert.source {
+                    fsqlite_ast::InsertSource::Values(rows) if rows.len() == 1 => {
+                        matches!(
+                            rows[0].get(pos),
+                            Some(Expr::Literal(Literal::Null, _))
+                        )
+                    }
+                    _ => false,
+                };
+                if !single_row_literal_null {
+                    return StmtJournalAbortProfile::ALWAYS;
+                }
+            }
+        }
+
+        // 2. Omitted DEFAULT expressions and GENERATED column expressions.
+        for col in &table.columns {
+            if let Some(gen_sql) = col.generated_expr.as_deref()
+                && self.parse_sql_expr_may_abort(gen_sql)
+            {
+                return StmtJournalAbortProfile::ALWAYS;
+            }
+            if let Some(default_sql) = col.default_value.as_deref() {
+                let omitted = matches!(insert.source, fsqlite_ast::InsertSource::DefaultValues)
+                    || (!insert.columns.is_empty()
+                        && !insert
+                            .columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&col.name)));
+                let replace_not_null = col.notnull
+                    && stmt_or.or(col.conflict_action) == Some(fsqlite_ast::ConflictAction::Replace);
+                if (omitted || replace_not_null) && self.parse_sql_expr_may_abort(default_sql) {
+                    return StmtJournalAbortProfile::ALWAYS;
+                }
+            }
+        }
+
+        // 3. NOT NULL constraints (sqlite3.c:141295-141376).
+        // Under OE_Replace with a DEFAULT, pass 1 substitutes the DEFAULT and
+        // increments nSeenReplace, which triggers pass 2 where OE_Replace is
+        // converted to OE_Abort (emitting OP_HaltIfNull + sqlite3MayAbort) in
+        // case the DEFAULT evaluates to NULL. Thus both Abort and Replace set
+        // mayAbort.
+        let wr_pk_cols = Self::without_rowid_pk_column_indices(&table);
+        for (idx, col) in table.columns.iter().enumerate() {
+            if col.is_ipk {
+                continue;
+            }
+            let is_not_null = col.notnull || wr_pk_cols.contains(&idx);
+            if !is_not_null {
+                continue;
+            }
+            let oe = stmt_or
+                .or(col.conflict_action)
+                .unwrap_or(fsqlite_ast::ConflictAction::Abort);
+            if matches!(
+                oe,
+                fsqlite_ast::ConflictAction::Abort | fsqlite_ast::ConflictAction::Replace
+            ) {
+                return StmtJournalAbortProfile::ALWAYS;
+            }
+        }
+
+        // 4. CHECK constraints (sqlite3.c:141395-141438).
+        for check in &table.check_constraints {
+            let oe = stmt_or.unwrap_or(fsqlite_ast::ConflictAction::Abort);
+            if matches!(
+                oe,
+                fsqlite_ast::ConflictAction::Abort | fsqlite_ast::ConflictAction::Replace
+            ) || self.parse_sql_expr_may_abort(&check.expr)
+            {
+                profile.check_may_abort = true;
+            }
+        }
+
+        // 5. Indexes and WITHOUT ROWID PK uniqueness.
+        let mut may_replace = false;
+        if table.without_rowid {
+            let pk_names: Vec<String> = wr_pk_cols
+                .iter()
+                .filter_map(|&idx| table.columns.get(idx).map(|c| c.name.clone()))
+                .collect();
+            let upsert_override = Self::upsert_matches_index_or_pk(&insert.upsert, &table, &pk_names);
+            let pk_col_conflict = (wr_pk_cols.len() == 1)
+                .then(|| table.columns[wr_pk_cols[0]].conflict_action)
+                .flatten();
+            let oe = upsert_override
+                .or(stmt_or)
+                .or(pk_col_conflict)
+                .unwrap_or(fsqlite_ast::ConflictAction::Abort);
+            if oe == fsqlite_ast::ConflictAction::Abort {
+                return StmtJournalAbortProfile::ALWAYS;
+            }
+            if oe == fsqlite_ast::ConflictAction::Replace {
+                may_replace = true;
+            }
+        }
+        for index in &table.indexes {
+            if index
+                .key_expressions
+                .iter()
+                .any(|expr_sql| self.parse_sql_expr_may_abort(expr_sql))
+                || index
+                    .where_clause
+                    .as_deref()
+                    .is_some_and(|w| self.parse_sql_expr_may_abort(w))
+            {
+                return StmtJournalAbortProfile::ALWAYS;
+            }
+            if !index.is_unique {
+                continue;
+            }
+            let upsert_override =
+                Self::upsert_matches_index_or_pk(&insert.upsert, &table, &index.columns);
+            let oe = upsert_override
+                .or(stmt_or)
+                .or(index.conflict_action)
+                .unwrap_or(fsqlite_ast::ConflictAction::Abort);
+            if oe == fsqlite_ast::ConflictAction::Abort {
+                return StmtJournalAbortProfile::ALWAYS;
+            }
+            if oe == fsqlite_ast::ConflictAction::Replace {
+                may_replace = true;
+            }
+        }
+
+        // 6. UPSERT DO UPDATE clauses (always coded with OE_Abort).
+        for clause in &insert.upsert {
+            if let Some(target) = &clause.target
+                && target
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(|w| self.expr_may_abort(w, &mut visited_views))
+            {
+                return StmtJournalAbortProfile::ALWAYS;
+            }
+            if let fsqlite_ast::UpsertAction::Update {
+                assignments,
+                where_clause,
+            } = &clause.action
+            {
+                let synth_update = fsqlite_ast::UpdateStatement {
+                    with: None,
+                    or_conflict: Some(fsqlite_ast::ConflictAction::Abort),
+                    table: fsqlite_ast::QualifiedTableRef {
+                        name: insert.table.clone(),
+                        alias: insert.alias.clone(),
+                        index_hint: None,
+                        time_travel: None,
+                    },
+                    assignments: assignments.clone(),
+                    from: None,
+                    where_clause: where_clause.as_deref().cloned(),
+                    returning: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                };
+                profile.merge(self.update_stmt_journal_abort_profile(
+                    &synth_update,
+                    Some(fsqlite_ast::ConflictAction::Abort),
+                    visited_triggers,
+                ));
+                if profile.always_may_abort {
+                    return profile;
+                }
+            }
+        }
+
+        // 7. Foreign keys (outbound immediate + inbound on REPLACE delete).
+        if table.foreign_keys.iter().any(|fk| !fk.deferred) {
+            profile.fk_may_abort = true;
+        }
+        if may_replace && self.inbound_fk_may_abort(&table, None, true, visited_triggers) {
+            profile.fk_may_abort = true;
+        }
+
+        // 8. Triggers (INSERT triggers + DELETE replace triggers under recursive_triggers).
+        profile.merge(self.matching_triggers_stmt_journal_abort_profile(
+            table_name,
+            schema_name,
+            &fsqlite_ast::TriggerEvent::Insert,
+            stmt_or,
+            visited_triggers,
+        ));
+        if may_replace && self.table_has_matching_delete_triggers(table_name, schema_name) {
+            profile.recursive_triggers_may_abort = true;
+        }
+        profile
+    }
+
+    fn update_stmt_journal_abort_profile(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        override_conflict: Option<fsqlite_ast::ConflictAction>,
+        visited_triggers: &mut HashSet<String>,
+    ) -> StmtJournalAbortProfile {
+        let table_name = update.table.name.name.as_str();
+        let schema_name = update.table.name.schema.as_deref();
+        if self.table_name_is_virtual(table_name)
+            || update
+                .limit
+                .as_ref()
+                .is_some_and(Self::limit_clause_may_abort)
+        {
+            return StmtJournalAbortProfile::ALWAYS;
+        }
+        let mut profile = StmtJournalAbortProfile::default();
+        let mut visited_views = HashSet::new();
+        if update
+            .with
+            .as_ref()
+            .is_some_and(|w| self.with_clause_may_abort(w, &mut visited_views))
+            || update
+                .from
+                .as_ref()
+                .is_some_and(|f| self.stmt_from_clause_may_abort(f, &mut visited_views))
+            || update
+                .where_clause
+                .as_ref()
+                .is_some_and(|w| self.expr_may_abort(w, &mut visited_views))
+            || update
+                .order_by
+                .iter()
+                .any(|term| self.expr_may_abort(&term.expr, &mut visited_views))
+            || update.returning.iter().any(|col| match col {
+                ResultColumn::Expr { expr, .. } => self.expr_may_abort(expr, &mut visited_views),
+                ResultColumn::Star | ResultColumn::TableStar(_) => false,
+            })
+            || update
+                .assignments
+                .iter()
+                .any(|a| self.expr_may_abort(&a.value, &mut visited_views))
+        {
+            return StmtJournalAbortProfile::ALWAYS;
+        }
+
+        let stmt_or = override_conflict.or(update.or_conflict);
+        let assigned_names: Vec<String> = update
+            .assignments
+            .iter()
+            .flat_map(|a| match &a.target {
+                fsqlite_ast::AssignmentTarget::Column(c) => vec![c.clone()],
+                fsqlite_ast::AssignmentTarget::ColumnList(cs) => cs.clone(),
+            })
+            .collect();
+        let Some(table) = self
+            .local_dml_target_table(table_name, schema_name)
+            .map(|t| t.clone())
+        else {
+            if self
+                .views
+                .borrow()
+                .iter()
+                .any(|v| v.name.eq_ignore_ascii_case(table_name))
+            {
+                return self.matching_triggers_stmt_journal_abort_profile(
+                    table_name,
+                    schema_name,
+                    &fsqlite_ast::TriggerEvent::Update(assigned_names),
+                    stmt_or,
+                    visited_triggers,
+                );
+            }
+            return StmtJournalAbortProfile::ALWAYS;
+        };
+
+        let mut assigned_cols: Vec<usize> = Vec::new();
+        let mut assigns_rowid_or_ipk = false;
+        for name in &assigned_names {
+            if let Some(idx) = table.column_index(name) {
+                if !assigned_cols.contains(&idx) {
+                    assigned_cols.push(idx);
+                }
+                if table.columns[idx].is_ipk {
+                    assigns_rowid_or_ipk = true;
+                }
+            } else if table.resolves_to_hidden_rowid(name) {
+                assigns_rowid_or_ipk = true;
+                if let Some(ipk_idx) = table.columns.iter().position(|c| c.is_ipk)
+                    && !assigned_cols.contains(&ipk_idx)
+                {
+                    assigned_cols.push(ipk_idx);
+                }
+            }
+        }
+        // Modifying rowid / INTEGER PRIMARY KEY emits OP_MustBeInt -> sqlite3MayAbort.
+        if assigns_rowid_or_ipk {
+            return StmtJournalAbortProfile::ALWAYS;
+        }
+
+        // Generated columns may recompute on UPDATE.
+        let mut effective_updated_cols = assigned_cols.clone();
+        for (idx, col) in table.columns.iter().enumerate() {
+            if let Some(gen_sql) = col.generated_expr.as_deref() {
+                if self.parse_sql_expr_may_abort(gen_sql) {
+                    return StmtJournalAbortProfile::ALWAYS;
+                }
+                if !effective_updated_cols.contains(&idx) {
+                    effective_updated_cols.push(idx);
+                }
+            }
+        }
+
+        // NOT NULL constraints on updated (or generated) non-IPK columns.
+        // See insert_stmt_journal_abort_profile: both Abort and Replace trigger
+        // sqlite3MayAbort (the latter on the 2nd pass in sqlite3.c:141317-141376).
+        let wr_pk_cols = Self::without_rowid_pk_column_indices(&table);
+        for &idx in &effective_updated_cols {
+            let col = &table.columns[idx];
+            if col.is_ipk {
+                continue;
+            }
+            let is_not_null = col.notnull || wr_pk_cols.contains(&idx);
+            if !is_not_null {
+                continue;
+            }
+            let oe = stmt_or
+                .or(col.conflict_action)
+                .unwrap_or(fsqlite_ast::ConflictAction::Abort);
+            if matches!(
+                oe,
+                fsqlite_ast::ConflictAction::Abort | fsqlite_ast::ConflictAction::Replace
+            ) {
+                return StmtJournalAbortProfile::ALWAYS;
+            }
+        }
+
+        // CHECK constraints referencing any updated column (sqlite3.c:141404).
+        for check in &table.check_constraints {
+            let parsed = Self::parse_sql_expr_for_abort_analysis(&check.expr);
+            let references_updated = match parsed.as_ref() {
+                None => true,
+                Some(expr) => {
+                    let mut refs = Vec::new();
+                    Self::collect_expr_column_refs(expr, &mut refs);
+                    refs.iter().any(|col_name| {
+                        table
+                            .column_index(col_name)
+                            .is_some_and(|idx| effective_updated_cols.contains(&idx))
+                    })
+                }
+            };
+            if !references_updated {
+                continue;
+            }
+            let oe = stmt_or.unwrap_or(fsqlite_ast::ConflictAction::Abort);
+            if matches!(
+                oe,
+                fsqlite_ast::ConflictAction::Abort | fsqlite_ast::ConflictAction::Replace
+            ) || parsed.is_none_or(|expr| self.expr_may_abort(&expr, &mut HashSet::new()))
+            {
+                profile.check_may_abort = true;
+            }
+        }
+
+        // Indexes and WITHOUT ROWID PK affected by the UPDATE.
+        let mut may_replace = false;
+        if table.without_rowid && wr_pk_cols.iter().any(|idx| effective_updated_cols.contains(idx)) {
+            let pk_col_conflict = (wr_pk_cols.len() == 1)
+                .then(|| table.columns[wr_pk_cols[0]].conflict_action)
+                .flatten();
+            let oe = stmt_or
+                .or(pk_col_conflict)
+                .unwrap_or(fsqlite_ast::ConflictAction::Abort);
+            if oe == fsqlite_ast::ConflictAction::Abort {
+                return StmtJournalAbortProfile::ALWAYS;
+            }
+            if oe == fsqlite_ast::ConflictAction::Replace {
+                may_replace = true;
+            }
+        }
+        for index in &table.indexes {
+            let touches_index = !index.supports_direct_column_lookup()
+                || index.columns.iter().any(|col_name| {
+                    table
+                        .column_index(col_name)
+                        .is_none_or(|idx| effective_updated_cols.contains(&idx))
+                });
+            if !touches_index {
+                continue;
+            }
+            if index
+                .key_expressions
+                .iter()
+                .any(|expr_sql| self.parse_sql_expr_may_abort(expr_sql))
+                || index
+                    .where_clause
+                    .as_deref()
+                    .is_some_and(|w| self.parse_sql_expr_may_abort(w))
+            {
+                return StmtJournalAbortProfile::ALWAYS;
+            }
+            if !index.is_unique {
+                continue;
+            }
+            let oe = stmt_or
+                .or(index.conflict_action)
+                .unwrap_or(fsqlite_ast::ConflictAction::Abort);
+            if oe == fsqlite_ast::ConflictAction::Abort {
+                return StmtJournalAbortProfile::ALWAYS;
+            }
+            if oe == fsqlite_ast::ConflictAction::Replace {
+                may_replace = true;
+            }
+        }
+
+        // Foreign keys: outbound immediate FKs on modified child cols + inbound FKs on modified parent cols.
+        if table.foreign_keys.iter().any(|fk| {
+            !fk.deferred
+                && fk
+                    .child_columns
+                    .iter()
+                    .any(|idx| effective_updated_cols.contains(idx))
+        }) {
+            profile.fk_may_abort = true;
+        }
+        if self.inbound_fk_may_abort(&table, Some(&effective_updated_cols), false, visited_triggers)
+            || (may_replace && self.inbound_fk_may_abort(&table, None, true, visited_triggers))
+        {
+            profile.fk_may_abort = true;
+        }
+
+        // Triggers (UPDATE triggers + DELETE replace triggers under recursive_triggers).
+        profile.merge(self.matching_triggers_stmt_journal_abort_profile(
+            table_name,
+            schema_name,
+            &fsqlite_ast::TriggerEvent::Update(assigned_names),
+            stmt_or,
+            visited_triggers,
+        ));
+        if may_replace && self.table_has_matching_delete_triggers(table_name, schema_name) {
+            profile.recursive_triggers_may_abort = true;
+        }
+        profile
+    }
+
+    fn delete_stmt_journal_abort_profile(
+        &self,
+        delete: &fsqlite_ast::DeleteStatement,
+        override_conflict: Option<fsqlite_ast::ConflictAction>,
+        visited_triggers: &mut HashSet<String>,
+    ) -> StmtJournalAbortProfile {
+        let table_name = delete.table.name.name.as_str();
+        let schema_name = delete.table.name.schema.as_deref();
+        if self.table_name_is_virtual(table_name)
+            || delete
+                .limit
+                .as_ref()
+                .is_some_and(Self::limit_clause_may_abort)
+        {
+            return StmtJournalAbortProfile::ALWAYS;
+        }
+        let mut profile = StmtJournalAbortProfile::default();
+        let mut visited_views = HashSet::new();
+        if delete
+            .with
+            .as_ref()
+            .is_some_and(|w| self.with_clause_may_abort(w, &mut visited_views))
+            || delete
+                .where_clause
+                .as_ref()
+                .is_some_and(|w| self.expr_may_abort(w, &mut visited_views))
+            || delete
+                .order_by
+                .iter()
+                .any(|term| self.expr_may_abort(&term.expr, &mut visited_views))
+            || delete.returning.iter().any(|col| match col {
+                ResultColumn::Expr { expr, .. } => self.expr_may_abort(expr, &mut visited_views),
+                ResultColumn::Star | ResultColumn::TableStar(_) => false,
+            })
+        {
+            return StmtJournalAbortProfile::ALWAYS;
+        }
+
+        let Some(table) = self
+            .local_dml_target_table(table_name, schema_name)
+            .map(|t| t.clone())
+        else {
+            if self
+                .views
+                .borrow()
+                .iter()
+                .any(|v| v.name.eq_ignore_ascii_case(table_name))
+            {
+                return self.matching_triggers_stmt_journal_abort_profile(
+                    table_name,
+                    schema_name,
+                    &fsqlite_ast::TriggerEvent::Delete,
+                    override_conflict,
+                    visited_triggers,
+                );
+            }
+            return StmtJournalAbortProfile::ALWAYS;
+        };
+
+        for index in &table.indexes {
+            if index
+                .key_expressions
+                .iter()
+                .any(|expr_sql| self.parse_sql_expr_may_abort(expr_sql))
+                || index
+                    .where_clause
+                    .as_deref()
+                    .is_some_and(|w| self.parse_sql_expr_may_abort(w))
+            {
+                return StmtJournalAbortProfile::ALWAYS;
+            }
+        }
+        if self.inbound_fk_may_abort(&table, None, true, visited_triggers) {
+            profile.fk_may_abort = true;
+        }
+        profile.merge(self.matching_triggers_stmt_journal_abort_profile(
+            table_name,
+            schema_name,
+            &fsqlite_ast::TriggerEvent::Delete,
+            override_conflict,
+            visited_triggers,
+        ));
+        profile
     }
 
     fn take_table_program_error_state(&self) -> Option<TableProgramErrorState> {
@@ -38924,6 +40304,7 @@ impl Connection {
         preserve_prior_changes_on_constraint_violation: bool,
         preserve_last_insert_rowid_on_immediate_fk_failure: bool,
         skip_statement_savepoint_in_explicit_txn: bool,
+        stmt_journal_abort_profile: StmtJournalAbortProfile,
         capture_time_travel_snapshot: bool,
         prebound_publication: Option<BoundPagerPublication>,
         autocommit_profile_mode: PreparedDmlAutocommitProfileMode,
@@ -38977,6 +40358,14 @@ impl Connection {
         let use_statement_savepoint = self.should_use_statement_savepoint(was_auto)
             && (!skip_statement_savepoint_in_explicit_txn
                 || self.retained_autocommit_batch_active());
+        let elides_stmt_journal = !was_auto
+            && !self.retained_autocommit_batch_active()
+            && self.internal_statement_savepoint_depth.get() == 0
+            && !self.stmt_journal_abort_profile_may_abort_now(stmt_journal_abort_profile);
+        let _elide_stmt_journal_guard = (self.internal_statement_savepoint_depth.get() == 0)
+            .then(|| {
+                BoolCellRestoreGuard::new(&self.statement_elides_stmt_journal, elides_stmt_journal)
+            });
         let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint_and_cx(
@@ -39239,6 +40628,11 @@ impl Connection {
         let preserve_last_insert_rowid_on_immediate_fk_failure = stmt
             .precompiled_dml()
             .is_some_and(|dml| dml.preserve_last_insert_rowid_on_immediate_fk_failure);
+        let stmt_journal_abort_profile = stmt
+            .precompiled_dml()
+            .map_or(StmtJournalAbortProfile::ALWAYS, |dml| {
+                dml.stmt_journal_abort_profile
+            });
         // Boxed: the general DML entry's 24 KB future would otherwise size the
         // direct paths that every prepared DML statement embeds.
         let outcome = Box::pin(self.execute_prepared_dml_entry(
@@ -39249,6 +40643,7 @@ impl Connection {
                 preserve_prior_changes_on_constraint_violation,
                 preserve_last_insert_rowid_on_immediate_fk_failure,
                 skip_statement_savepoint_in_explicit_txn,
+                stmt_journal_abort_profile,
                 capture_time_travel_snapshot,
                 prebound_publication,
                 PreparedDmlAutocommitProfileMode::None,
@@ -39521,6 +40916,11 @@ impl Connection {
         let preserve_last_insert_rowid_on_immediate_fk_failure = stmt
             .precompiled_dml()
             .is_some_and(|dml| dml.preserve_last_insert_rowid_on_immediate_fk_failure);
+        let stmt_journal_abort_profile = stmt
+            .precompiled_dml()
+            .map_or(StmtJournalAbortProfile::ALWAYS, |dml| {
+                dml.stmt_journal_abort_profile
+            });
         // Boxed: the general DML entry's 24 KB future would otherwise size the
         // direct-insert path above.
         let outcome = Box::pin(self.execute_prepared_dml_entry(
@@ -39531,6 +40931,7 @@ impl Connection {
                 preserve_prior_changes_on_constraint_violation,
                 preserve_last_insert_rowid_on_immediate_fk_failure,
                 skip_statement_savepoint_in_explicit_txn,
+                stmt_journal_abort_profile,
                 capture_time_travel_snapshot,
                 prebound_publication,
                 if direct_simple_insert_profile {
@@ -39627,8 +41028,22 @@ impl Connection {
         } else {
             self.clear_prepared_direct_insert_append_hint();
             // bd-perf: Skip memdb refresh — VDBE uses storage cursors
-            stmt.execute_table_program_dml_with_reuse(execution_cx, params, true)
-                .await?
+            match stmt
+                .execute_table_program_dml_with_reuse(execution_cx, params, true)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if self.statement_failure_keeps_rows_via_elided_stmt_journal(&error)
+                        && !self.suppress_inner_batched_insert_fk_check.get()
+                        && self.fk_enforcement_enabled()
+                        && self.table_has_outbound_foreign_keys(table_name)
+                    {
+                        self.queue_statement_fk_validation_table(table_name);
+                    }
+                    return Err(error);
+                }
+            }
         };
         // INSERT OR REPLACE may implicitly delete other rows through the
         // reusable table-program lanes, which do not route victim handoff.
@@ -39733,9 +41148,22 @@ impl Connection {
         let fallback_stmt = stmt.clone_with_program(program);
         // bd-perf: Skip memdb refresh — VDBE uses storage cursors and this
         // path only exists as a correctness fallback for the direct lane.
-        let outcome = fallback_stmt
+        let outcome = match fallback_stmt
             .execute_table_program_dml_with_reuse(execution_cx, params, true)
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if self.statement_failure_keeps_rows_via_elided_stmt_journal(&error)
+                    && !self.suppress_inner_batched_insert_fk_check.get()
+                    && self.fk_enforcement_enabled()
+                    && self.table_has_outbound_foreign_keys(&insert.table.name)
+                {
+                    self.queue_statement_fk_validation_table(&insert.table.name);
+                }
+                return Err(error);
+            }
+        };
         // s76h fix: this VDBE fallback runs the table program via reuse but
         // does not itself enforce FK. The non-prepared dispatch path enforces
         // FK after the table program (see Statement::Insert handler); mirror
@@ -42553,6 +43981,14 @@ impl Connection {
         // the original row inside an explicit transaction.
         let vdbe_skip_statement_savepoint_in_explicit_txn =
             skip_statement_savepoint_in_explicit_txn && kind != PreparedDmlKind::Update;
+        let stmt_journal_abort_profile = stmt
+            .precompiled_dml()
+            .map(|dispatch| dispatch.stmt_journal_abort_profile)
+            .or_else(|| {
+                stmt.prepared_update_delete_fast_path()
+                    .map(|fast_path| fast_path.stmt_journal_abort_profile)
+            })
+            .unwrap_or(StmtJournalAbortProfile::ALWAYS);
         if in_txn_confirmed
             && !stmt.may_observe_change_tracking
             && vdbe_skip_statement_savepoint_in_explicit_txn
@@ -42569,6 +44005,7 @@ impl Connection {
                     preserve_prior_changes_on_constraint_violation,
                     false,
                     vdbe_skip_statement_savepoint_in_explicit_txn,
+                    stmt_journal_abort_profile,
                     false,
                     entry_proof.publication,
                     PreparedDmlAutocommitProfileMode::None,
@@ -42639,6 +44076,7 @@ impl Connection {
                         preserve_prior_changes_on_constraint_violation,
                         false,
                         vdbe_skip_statement_savepoint_in_explicit_txn,
+                        stmt_journal_abort_profile,
                         false,
                         entry_proof.publication,
                         PreparedDmlAutocommitProfileMode::None,
@@ -42726,6 +44164,7 @@ impl Connection {
                 preserve_prior_changes_on_constraint_violation,
                 false,
                 vdbe_skip_statement_savepoint_in_explicit_txn,
+                stmt_journal_abort_profile,
                 false,
                 entry_proof.publication,
                 PreparedDmlAutocommitProfileMode::None,
@@ -44024,6 +45463,7 @@ impl Connection {
                     };
                 if matches!(statement_error, FrankenError::RaiseFail(_))
                     || preserve_constraint_failure
+                    || self.statement_failure_keeps_rows_via_elided_stmt_journal(&statement_error)
                 {
                     let pager_release_result = {
                         let mut active_txn = self.active_txn.borrow_mut();
@@ -45667,6 +47107,15 @@ impl Connection {
             statement.as_ref(),
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         );
+        let elides_stmt_journal = is_dml_statement
+            && !was_auto
+            && !self.retained_autocommit_batch_active()
+            && self.internal_statement_savepoint_depth.get() == 0
+            && !self.statement_may_abort_now(statement.as_ref());
+        let _elide_stmt_journal_guard = (self.internal_statement_savepoint_depth.get() == 0)
+            .then(|| {
+                BoolCellRestoreGuard::new(&self.statement_elides_stmt_journal, elides_stmt_journal)
+            });
         let preserve_prior_changes_on_constraint_violation =
             statement_preserves_prior_changes_on_constraint(statement.as_ref());
         let rollback_on_constraint_violation =
@@ -45727,7 +47176,8 @@ impl Connection {
                     );
                     if let Some(guard) = memdb_stmt_guard {
                         let unwind = !preserved_constraint_failure_rows
-                            && !matches!(error, FrankenError::RaiseFail(_));
+                            && !matches!(error, FrankenError::RaiseFail(_))
+                            && !self.statement_failure_keeps_rows_via_elided_stmt_journal(&error);
                         guard.finish(unwind);
                     }
                 }
@@ -48854,6 +50304,7 @@ impl Connection {
             .await;
         let unwind = outcome.as_ref().is_err_and(|error| {
             !self.statement_failure_keeps_rows(preserve_constraint_failure_rows, error)
+                && !self.statement_failure_keeps_rows_via_elided_stmt_journal(error)
         });
         self.db.borrow_mut().end_statement(unwind);
         outcome
@@ -49331,11 +50782,23 @@ impl Connection {
         &self,
         insert: &fsqlite_ast::InsertStatement,
         source_rows: &[Row],
+        source_may_abort: bool,
     ) -> Result<usize> {
         let was_auto = self.ensure_autocommit_txn().await?;
         let preserve_prior_changes_on_constraint_violation =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
         let use_statement_savepoint = self.should_use_statement_savepoint(was_auto);
+        let elides_stmt_journal = !was_auto
+            && !self.retained_autocommit_batch_active()
+            && self.internal_statement_savepoint_depth.get() == 0
+            && !source_may_abort
+            && !self.stmt_journal_abort_profile_may_abort_now(
+                self.insert_stmt_journal_abort_profile(insert, None, &mut HashSet::new()),
+            );
+        let _elide_stmt_journal_guard = (self.internal_statement_savepoint_depth.get() == 0)
+            .then(|| {
+                BoolCellRestoreGuard::new(&self.statement_elides_stmt_journal, elides_stmt_journal)
+            });
         let result = if use_statement_savepoint {
             let op_cx = self.op_cx()?;
             self.with_internal_statement_savepoint_and_cx(
@@ -52806,6 +54269,7 @@ impl Connection {
         };
         let unwind = outcome.as_ref().is_err_and(|error| {
             !self.statement_failure_keeps_rows(preserve_constraint_failure_rows, error)
+                && !self.statement_failure_keeps_rows_via_elided_stmt_journal(error)
         });
         memdb_stmt_guard.finish(unwind);
         outcome
@@ -54828,6 +56292,11 @@ impl Connection {
                                     .prepared_insert_can_skip_statement_savepoint_in_explicit_txn(
                                         insert,
                                     ),
+                                stmt_journal_abort_profile: self.insert_stmt_journal_abort_profile(
+                                    insert,
+                                    None,
+                                    &mut HashSet::new(),
+                                ),
                                 runtime_requirements,
                                 static_runtime_inputs: self
                                     .prepared_static_table_runtime_inputs(runtime_requirements),
@@ -56072,6 +57541,11 @@ impl Connection {
             preserve_prior_changes_on_constraint_violation: update.or_conflict
                 == Some(fsqlite_ast::ConflictAction::Fail),
             skip_statement_savepoint_in_explicit_txn,
+            stmt_journal_abort_profile: self.update_stmt_journal_abort_profile(
+                update,
+                None,
+                &mut HashSet::new(),
+            ),
             runtime_requirements,
             static_runtime_inputs: self.prepared_static_table_runtime_inputs(runtime_requirements),
             static_fallback_reason,
@@ -56113,6 +57587,11 @@ impl Connection {
             skip_statement_savepoint_in_explicit_txn: static_fallback_reason.is_none()
                 && !foreign_key_work
                 && self.prepared_delete_can_skip_statement_savepoint_in_explicit_txn(delete),
+            stmt_journal_abort_profile: self.delete_stmt_journal_abort_profile(
+                delete,
+                None,
+                &mut HashSet::new(),
+            ),
             runtime_requirements,
             static_runtime_inputs: self.prepared_static_table_runtime_inputs(runtime_requirements),
             static_fallback_reason,
@@ -63404,6 +64883,7 @@ impl Connection {
         .await;
         let unwind = result.as_ref().is_err_and(|error| {
             !self.statement_failure_keeps_rows(preserve_constraint_failure_rows, error)
+                && !self.statement_failure_keeps_rows_via_elided_stmt_journal(error)
         });
         memdb_stmt_guard.finish(unwind);
         result
@@ -83098,6 +84578,7 @@ impl Connection {
             Ok(_) => true,
             Err(error) => {
                 self.statement_failure_keeps_rows(preserve_constraint_failure_rows, error)
+                    || self.statement_failure_keeps_rows_via_elided_stmt_journal(error)
             }
         };
         if !validate_retained_rows {
@@ -83125,6 +84606,7 @@ impl Connection {
         let retained_changes = self.last_changes.get();
         let retained_total_changes = self.total_changes.get();
         let retained_last_insert_rowid = self.current_last_insert_rowid();
+        let saved_table_program_error_state = *self.last_table_program_error_state.borrow();
 
         self.last_fk_violation_was_deferred.set(false);
         let _rechecking_guard =
@@ -83176,6 +84658,7 @@ impl Connection {
             retained_total_changes,
             retained_last_insert_rowid,
         );
+        *self.last_table_program_error_state.borrow_mut() = saved_table_program_error_state;
 
         if let Some(suffix_guard) = suffix_guard.as_mut() {
             suffix_guard.discharge();
@@ -122768,6 +124251,7 @@ impl Connection {
             self.statement_parallel_workers(),
             self.build_temp_store_runtime(),
             stage_write_on_replace_victims,
+            self.statement_elides_stmt_journal.get(),
         )
         .await;
         let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -168667,6 +170151,7 @@ async fn execute_table_program_with_db(
     parallel_workers: usize,
     temp_store_runtime: TempStoreRuntime,
     stage_write_on_replace_victims: bool,
+    elide_stmt_journal_on_abort: bool,
 ) -> (TableProgramExecOutcome, Option<Box<VdbeEngine>>) {
     // bd-5bq6u: statement-scoped atomicity for the MemDatabase (TEMP) lane.
     //
@@ -168932,11 +170417,12 @@ async fn execute_table_program_with_db(
     // rule `with_statement_fk_validation_scope` applies to retained-row
     // validation.
     let unwind = result.as_ref().is_err_and(|failure| {
-        !constraint_failure_keeps_rows(
+        !(constraint_failure_keeps_rows(
             &failure.error,
             failure.constraint_failure_action,
             program.preserves_rows_on_constraint(),
-        )
+        ) || (elide_stmt_journal_on_abort
+            && error_keeps_rows_when_stmt_journal_elided(&failure.error)))
     });
     db.borrow_mut().end_statement(unwind);
     ((result, txn_back), Some(engine))
@@ -168973,6 +170459,7 @@ async fn execute_table_program_exactly_one_row_with_db(
     prepared_engine_reuse_profile: bool,
     cached_engine: Option<Box<VdbeEngine>>,
     temp_store_runtime: TempStoreRuntime,
+    elide_stmt_journal_on_abort: bool,
 ) -> (TableProgramSingleRowExecOutcome, Option<Box<VdbeEngine>>) {
     // bd-5bq6u: statement-scoped atomicity for the MemDatabase (TEMP) lane.
     //
@@ -169167,11 +170654,12 @@ async fn execute_table_program_exactly_one_row_with_db(
     // rule `with_statement_fk_validation_scope` applies to retained-row
     // validation.
     let unwind = result.as_ref().is_err_and(|failure| {
-        !constraint_failure_keeps_rows(
+        !(constraint_failure_keeps_rows(
             &failure.error,
             failure.constraint_failure_action,
             program.preserves_rows_on_constraint(),
-        )
+        ) || (elide_stmt_journal_on_abort
+            && error_keeps_rows_when_stmt_journal_elided(&failure.error)))
     });
     db.borrow_mut().end_statement(unwind);
     ((result, txn_back), Some(engine))
@@ -189523,6 +191011,19 @@ fn error_is_prepare_time(error: &FrankenError) -> bool {
         FrankenError::Internal(message) => message.starts_with("no such function: "),
         _ => false,
     }
+}
+
+/// bd-7dris: errors whose SQLite errorAction is `OE_Abort` even though
+/// SQLite's code generator does not call `sqlite3MayAbort()` for them
+/// (notably `OP_TypeCheck` on STRICT tables). When the enclosing explicit-
+/// transaction statement has `usesStmtJournal == 0` (`!mayAbort`), SQLite
+/// has no statement journal to roll back, so earlier rows written by the
+/// statement survive in the open transaction while `changes()` becomes 0.
+const fn error_keeps_rows_when_stmt_journal_elided(error: &FrankenError) -> bool {
+    matches!(
+        error,
+        FrankenError::DatatypeViolation { .. } | FrankenError::IntegerOverflow
+    )
 }
 
 /// bd-nn29x: does a statement that failed with `error` keep the rows it

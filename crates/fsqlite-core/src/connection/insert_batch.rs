@@ -1786,7 +1786,7 @@ impl Connection {
         let runtime_requirements = self.insert_runtime_requirements(insert)?;
         let vtab_instances = self.insert_program_vtab_instances(insert, program)?;
         let stage_replace_write = self.table_has_replace_victim_callbacks(table_name);
-        let (mut rows, mut affected, mut last_insert_rowid) = self
+        let (mut rows, mut affected, mut last_insert_rowid) = match self
             .execute_table_program_with_cx(
                 program,
                 params,
@@ -1798,7 +1798,20 @@ impl Connection {
                 None,
                 stage_replace_write,
             )
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if self.statement_failure_keeps_rows_via_elided_stmt_journal(&error)
+                    && !self.suppress_inner_batched_insert_fk_check.get()
+                    && self.fk_enforcement_enabled()
+                    && self.table_has_outbound_foreign_keys(table_name)
+                {
+                    self.queue_statement_fk_validation_table(table_name);
+                }
+                return Err(error);
+            }
+        };
 
         // Implicit REPLACE deletes are parent-row deletions for inbound
         // FK purposes. Enforce their exact OLD rows before the staged new row
