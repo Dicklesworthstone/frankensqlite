@@ -62578,7 +62578,8 @@ impl Connection {
             | SubqueryExprRef::In(inner)) = subquery;
             !rewrite_probe_is_correlated(conn, inner)
                 && (subquery_final_from_names_table(inner, table_name)
-                    || conn.subquery_reads_dml_write_set(inner, table_name))
+                    || conn.subquery_reads_dml_write_set(inner, table_name)
+                    || select_contains_dml_state_function(inner))
         })
     }
 
@@ -63066,6 +63067,11 @@ impl Connection {
             collations.push(None);
             affinities.push(TypeAffinity::Integer);
         }
+        // bd-u7sv8: publish the just-mutated row's change-tracking state
+        // (including `last_insert_rowid` updated via `set_last_insert_rowid_without_sync`
+        // and `total_changes` from BEFORE triggers / FK actions) before evaluating
+        // first-row RETURNING subqueries or per-row RETURNING expressions.
+        self.sync_change_tracking_context();
         // bd-j9tg3: fold the subqueries stock evaluates once, at the first
         // row's RETURNING. No row, no evaluation, as in stock.
         let first_row_columns = if projection.first_row_fold {
@@ -141277,11 +141283,21 @@ fn select_contains_bound_outer_value(select: &SelectStatement) -> bool {
     select_contains_expr_leaf(select, ExprLeaf::BoundOuterValue)
 }
 
+/// Returns true when any expression inside the SELECT calls a zero-argument
+/// DML change-tracking function (`last_insert_rowid()`, `total_changes()`, or
+/// `changes()`). An uncorrelated RETURNING subquery calling one must wait until
+/// the first row's mutation, BEFORE triggers, and FK actions have updated
+/// connection state rather than folding before the DML starts (bd-u7sv8).
+fn select_contains_dml_state_function(select: &SelectStatement) -> bool {
+    select_contains_expr_leaf(select, ExprLeaf::DmlStateFunction)
+}
+
 /// The leaf expression kinds [`select_contains_expr_leaf`] can search for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExprLeaf {
     Placeholder,
     BoundOuterValue,
+    DmlStateFunction,
 }
 
 fn select_contains_expr_leaf(select: &SelectStatement, leaf: ExprLeaf) -> bool {
@@ -141400,13 +141416,19 @@ fn select_contains_expr_leaf(select: &SelectStatement, leaf: ExprLeaf) -> bool {
             Expr::Exists { subquery, .. } => select_contains_expr_leaf(subquery, leaf),
             Expr::Subquery(query, _) => select_contains_expr_leaf(query, leaf),
             Expr::FunctionCall {
+                name,
                 args,
                 order_by,
                 filter,
                 over,
                 ..
             } => {
-                matches!(args, FunctionArgs::List(list) if list.iter().any(|e| expr(e, leaf)))
+                (leaf == ExprLeaf::DmlStateFunction
+                    && matches!(args, FunctionArgs::List(list) if list.is_empty())
+                    && (name.eq_ignore_ascii_case("last_insert_rowid")
+                        || name.eq_ignore_ascii_case("total_changes")
+                        || name.eq_ignore_ascii_case("changes")))
+                    || matches!(args, FunctionArgs::List(list) if list.iter().any(|e| expr(e, leaf)))
                     || order_by.iter().any(|ordering| expr(&ordering.expr, leaf))
                     || filter.as_deref().is_some_and(|e| expr(e, leaf))
                     || over.as_ref().is_some_and(|spec| window_spec(spec, leaf))

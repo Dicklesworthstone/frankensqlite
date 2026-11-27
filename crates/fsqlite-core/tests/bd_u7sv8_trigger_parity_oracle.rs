@@ -175,3 +175,247 @@ fn trigger_new_generated_columns_match_stock_file_backed() {
         .expect("integrity_check");
     assert_eq!(verdict, "ok", "stock integrity_check of the fsqlite file");
 }
+
+struct Scenario {
+    name: &'static str,
+    setup: &'static str,
+    statements: &'static [&'static str],
+    dumps: &'static [&'static str],
+}
+
+const RETURNING_AND_TRIGGER_SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "insert_correlated_returning_rowid",
+        setup: "\
+            CREATE TABLE k(g INTEGER PRIMARY KEY, label TEXT);\
+            INSERT INTO k VALUES (1, 'one'), (2, 'two'), (3, 'three');\
+            CREATE TABLE u(id INTEGER PRIMARY KEY, g INTEGER);\
+            CREATE VIEW vk AS SELECT g, label FROM k WHERE g > 0;",
+        statements: &[
+            "INSERT INTO u VALUES (10, 1), (20, 2) RETURNING id, (SELECT label FROM k WHERE k.g = u.g)",
+            "INSERT INTO u VALUES (30, 3) RETURNING id, (SELECT label FROM vk WHERE vk.g = u.g)",
+            "INSERT INTO u VALUES (40, 1), (50, 2) RETURNING id, (SELECT count(*) FROM u AS x WHERE x.id <= u.id)",
+            "INSERT INTO u SELECT g + 100, g FROM k ORDER BY g RETURNING id, (SELECT label FROM k AS x WHERE x.g = u.g)",
+        ],
+        dumps: &["SELECT id, g FROM u ORDER BY id"],
+    },
+    Scenario {
+        name: "insert_correlated_returning_without_rowid",
+        setup: "\
+            CREATE TABLE k(g INTEGER PRIMARY KEY, label TEXT);\
+            INSERT INTO k VALUES (1, 'one'), (2, 'two');\
+            CREATE TABLE u(id INTEGER NOT NULL PRIMARY KEY, g INTEGER) WITHOUT ROWID;",
+        statements: &[
+            "INSERT INTO u VALUES (10, 1), (20, 2) RETURNING id, (SELECT label FROM k WHERE k.g = u.g), (SELECT count(*) FROM u AS x WHERE x.id <= u.id)",
+        ],
+        dumps: &["SELECT id, g FROM u ORDER BY id"],
+    },
+    Scenario {
+        name: "insert_before_after_trigger_returning_subqueries",
+        setup: "\
+            CREATE TABLE log(x INTEGER);\
+            CREATE TABLE u(id INTEGER PRIMARY KEY, g INTEGER);\
+            CREATE TRIGGER bi BEFORE INSERT ON u BEGIN INSERT INTO log VALUES (NEW.id); END;\
+            CREATE TRIGGER ai AFTER INSERT ON u BEGIN INSERT INTO log VALUES (-NEW.id); END;",
+        statements: &[
+            "INSERT INTO u VALUES (10, 1), (20, 2) RETURNING id, (SELECT count(*) FROM log), (SELECT count(*) FROM log WHERE log.x = u.id)",
+            "INSERT INTO u VALUES (30, 3), (40, 4) RETURNING id, (SELECT total_changes()), (SELECT last_insert_rowid())",
+        ],
+        dumps: &[
+            "SELECT id, g FROM u ORDER BY id",
+            "SELECT x FROM log ORDER BY rowid",
+        ],
+    },
+    Scenario {
+        name: "insert_no_trigger_fromless_stateful_returning_subqueries",
+        setup: "CREATE TABLE u(id INTEGER PRIMARY KEY, g INTEGER);",
+        statements: &[
+            "INSERT INTO u VALUES (10, 1), (20, 2) RETURNING id, (SELECT last_insert_rowid()), (SELECT total_changes()), (SELECT changes())",
+            "INSERT INTO u VALUES (30, 3), (40, 4) RETURNING id, last_insert_rowid(), total_changes(), changes()",
+            "INSERT OR IGNORE INTO u VALUES (10, 99), (50, 5) RETURNING id, last_insert_rowid()",
+            "INSERT INTO u VALUES (10, 88) ON CONFLICT(id) DO UPDATE SET g = 88 RETURNING id, last_insert_rowid()",
+        ],
+        dumps: &["SELECT id, g FROM u ORDER BY id"],
+    },
+    Scenario {
+        name: "insert_upsert_and_replace_returning_subqueries_with_triggers",
+        setup: "\
+            CREATE TABLE log(tag TEXT, val INTEGER);\
+            CREATE TABLE k(g INTEGER PRIMARY KEY, label TEXT);\
+            INSERT INTO k VALUES (1, 'one'), (2, 'two'), (9, 'nine');\
+            CREATE TABLE u(id INTEGER PRIMARY KEY, g INTEGER);\
+            INSERT INTO u VALUES (10, 1), (20, 2);\
+            CREATE TRIGGER bi BEFORE INSERT ON u BEGIN INSERT INTO log VALUES ('bi', NEW.g); END;\
+            CREATE TRIGGER bu BEFORE UPDATE ON u BEGIN INSERT INTO log VALUES ('bu', NEW.g); END;\
+            CREATE TRIGGER bd BEFORE DELETE ON u BEGIN INSERT INTO log VALUES ('bd', OLD.g); END;",
+        statements: &[
+            "INSERT INTO u VALUES (10, 2) ON CONFLICT(id) DO UPDATE SET g = 9 RETURNING id, (SELECT label FROM k WHERE k.g = u.g), (SELECT count(*) FROM log)",
+            "INSERT OR REPLACE INTO u VALUES (20, 1) RETURNING id, (SELECT label FROM k WHERE k.g = u.g), (SELECT count(*) FROM log)",
+        ],
+        dumps: &[
+            "SELECT id, g FROM u ORDER BY id",
+            "SELECT tag, val FROM log ORDER BY rowid",
+        ],
+    },
+    Scenario {
+        name: "insert_generated_column_correlated_and_before_trigger_returning",
+        setup: "\
+            CREATE TABLE log(x INTEGER);\
+            CREATE TABLE k(g INTEGER PRIMARY KEY, label TEXT);\
+            INSERT INTO k VALUES (50, 'fifty'), (60, 'sixty');\
+            CREATE TABLE g(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 10) VIRTUAL, c TEXT GENERATED ALWAYS AS ('c' || a) STORED);\
+            CREATE TRIGGER bi BEFORE INSERT ON g BEGIN INSERT INTO log VALUES (NEW.b); END;",
+        statements: &[
+            "INSERT INTO g(id, a) VALUES (1, 5), (2, 6) RETURNING id, b, c, (SELECT label FROM k WHERE k.g = g.b), (SELECT count(*) FROM log)",
+        ],
+        dumps: &[
+            "SELECT id, a, b, c FROM g ORDER BY id",
+            "SELECT x FROM log ORDER BY rowid",
+        ],
+    },
+    Scenario {
+        name: "update_and_delete_before_triggers_returning_subqueries_and_with_cte",
+        setup: "\
+            CREATE TABLE log(x INTEGER);\
+            CREATE TABLE u(id INTEGER PRIMARY KEY, g INTEGER);\
+            INSERT INTO u VALUES (10, 1), (20, 2), (30, 3);\
+            CREATE TRIGGER bu BEFORE UPDATE ON u BEGIN INSERT INTO log VALUES (NEW.id); END;\
+            CREATE TRIGGER bd BEFORE DELETE ON u BEGIN INSERT INTO log VALUES (-OLD.id); END;",
+        statements: &[
+            "UPDATE u SET g = g + 1 WHERE id IN (10, 20) RETURNING id, (SELECT total_changes()), (SELECT last_insert_rowid()), (SELECT count(*) FROM log)",
+            "WITH c(x) AS (SELECT 100) UPDATE u SET g = (SELECT x FROM c) WHERE id IN (10, 20) RETURNING id, (SELECT count(*) FROM log)",
+            "WITH c(x) AS (SELECT 20) DELETE FROM u WHERE id <= (SELECT x FROM c) RETURNING id, (SELECT count(*) FROM log)",
+            "DELETE FROM u WHERE id = 30 RETURNING id, (SELECT count(*) FROM log), (SELECT total_changes())",
+        ],
+        dumps: &[
+            "SELECT id, g FROM u ORDER BY id",
+            "SELECT x FROM log ORDER BY rowid",
+        ],
+    },
+    Scenario {
+        name: "delete_before_and_after_trigger_last_insert_rowid",
+        setup: "\
+            CREATE TABLE aux(a INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);\
+            CREATE TABLE log(tag TEXT, lid INTEGER);\
+            CREATE TABLE u(id INTEGER PRIMARY KEY, g INTEGER);\
+            INSERT INTO u VALUES (10, 1), (20, 2), (30, 3);\
+            CREATE TRIGGER bd BEFORE DELETE ON u BEGIN \
+                INSERT INTO log VALUES ('bd1', last_insert_rowid()); \
+                INSERT INTO aux(v) VALUES ('bd' || OLD.id); \
+                INSERT INTO log VALUES ('bd2', last_insert_rowid()); \
+            END;\
+            CREATE TRIGGER ad AFTER DELETE ON u BEGIN \
+                INSERT INTO log VALUES ('ad1', last_insert_rowid()); \
+                INSERT INTO aux(v) VALUES ('ad' || OLD.id); \
+                INSERT INTO log VALUES ('ad2', last_insert_rowid()); \
+            END;",
+        statements: &[
+            "DELETE FROM u WHERE id = 10",
+            "DELETE FROM u WHERE id IN (20, 30)",
+        ],
+        dumps: &[
+            "SELECT tag, lid FROM log ORDER BY rowid",
+            "SELECT a, v FROM aux ORDER BY a",
+            "SELECT last_insert_rowid()",
+        ],
+    },
+];
+
+fn run_stock_scenario(scenario: &Scenario) -> Vec<String> {
+    let conn = rusqlite::Connection::open_in_memory().expect("stock open");
+    conn.execute_batch(scenario.setup).expect("stock setup");
+    let query = |sql: &str| -> Result<Vec<String>, String> {
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let width = stmt.column_count();
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            out.push(
+                (0..width)
+                    .map(|i| render_rusqlite(row.get_ref(i).expect("stock cell")))
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            );
+        }
+        Ok(out)
+    };
+    let mut out = Vec::new();
+    for sql in scenario.statements {
+        let res = match query(sql) {
+            Ok(rows) => format!("ok {rows:?}"),
+            Err(err) => format!("err:{err}"),
+        };
+        out.push(format!("{sql} => {res}"));
+    }
+    for sql in scenario.dumps {
+        out.push(format!("{sql} => {:?}", query(sql).expect("stock dump")));
+    }
+    out
+}
+
+async fn run_fsqlite_scenario(
+    conn: &Connection,
+    scenario: &Scenario,
+    prepared: bool,
+) -> Vec<String> {
+    conn.execute_batch(scenario.setup)
+        .await
+        .expect("fsqlite setup");
+    let mut out = Vec::new();
+    for sql in scenario.statements {
+        let result = if prepared {
+            match conn.prepare(sql).await {
+                Ok(stmt) => stmt.query().await,
+                Err(err) => Err(err),
+            }
+        } else {
+            conn.query(sql).await
+        };
+        let res = match result {
+            Ok(rows) => format!("ok {:?}", render_rows(&rows)),
+            Err(err) => format!("err:{err}"),
+        };
+        out.push(format!("{sql} => {res}"));
+    }
+    for sql in scenario.dumps {
+        let rows = conn.query(sql).await.expect("fsqlite dump");
+        out.push(format!("{sql} => {:?}", render_rows(&rows)));
+    }
+    out
+}
+
+#[test]
+fn trigger_and_returning_subquery_matrix_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = Vec::new();
+        for scenario in RETURNING_AND_TRIGGER_SCENARIOS {
+            let expected = run_stock_scenario(scenario);
+            for file_backed in [false, true] {
+                let mode = if file_backed { "file" } else { "mem" };
+                for prepared in [false, true] {
+                    let dir = file_backed.then(|| tempfile::tempdir().expect("tempdir"));
+                    let conn = if let Some(ref d) = dir {
+                        let p = d.path().join(format!("{}.db", scenario.name));
+                        Connection::open(p.to_str().unwrap()).await.expect("open")
+                    } else {
+                        Connection::open(":memory:").await.expect("open")
+                    };
+                    let got = run_fsqlite_scenario(&conn, scenario, prepared).await;
+                    if got != expected {
+                        diffs.push(format!(
+                            "[{}/{mode}/prepared={prepared}]\n  stock:   {expected:?}\n  fsqlite: {got:?}",
+                            scenario.name
+                        ));
+                    }
+                    conn.close().await.expect("close");
+                }
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "bd-u7sv8 trigger/RETURNING subquery mismatches ({}):\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}

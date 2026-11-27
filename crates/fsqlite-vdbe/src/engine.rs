@@ -18879,58 +18879,79 @@ impl VdbeEngine {
                     // register range is out of bounds or negative.
                     let subtype_varies = func.result_subtype_varies();
                     let mut call_subtype = None;
-                    let result = if first_arg_reg >= 0
-                        && (first_arg_reg as usize).saturating_add(arg_count)
-                            <= self.registers.len()
-                    {
-                        let start_idx = first_arg_reg as usize;
-                        let end_idx = start_idx + arg_count;
-                        let args = &self.registers[start_idx..end_idx];
-                        if let Some(context) = SchemaEvaluationContext::from_function_p1(op.p1) {
-                            validate_schema_function_invocation(
-                                context,
-                                func_name,
-                                schema_safety,
-                                args,
-                            )?;
-                        }
-                        observe_requested_execution_cancellation(&self.execution_cx)?;
-                        if function_consumes_argument_collation {
-                            func.invoke_with_collation(args, function_collation.as_deref())?
-                        } else if subtype_varies {
-                            let (value, subtype) =
-                                func.invoke_with_result_subtype(args, &arg_subtypes)?;
-                            call_subtype = subtype;
-                            value
-                        } else if any_arg_subtype {
-                            func.invoke_with_arg_subtypes(args, &arg_subtypes)?
-                        } else {
-                            func.invoke(args)?
-                        }
+                    // bd-u7sv8: if an earlier Opcode::Insert in this VDBE program
+                    // assigned a rowid, project it into the thread-local
+                    // `last_insert_rowid()` slot for the duration of this scalar
+                    // call (e.g. `INSERT ... RETURNING last_insert_rowid()`) and
+                    // restore the previous value immediately afterward so an
+                    // error or mid-statement rollback cannot leak it.
+                    let saved_last_insert_rowid = if self.last_insert_rowid_valid {
+                        let prev = fsqlite_func::get_last_insert_rowid();
+                        fsqlite_func::set_last_insert_rowid(self.last_insert_rowid);
+                        Some(prev)
                     } else {
-                        let args = self.collect_reg_range(first_arg_reg, arg_count);
-                        if let Some(context) = SchemaEvaluationContext::from_function_p1(op.p1) {
-                            validate_schema_function_invocation(
-                                context,
-                                func_name,
-                                schema_safety,
-                                &args,
-                            )?;
-                        }
-                        observe_requested_execution_cancellation(&self.execution_cx)?;
-                        if function_consumes_argument_collation {
-                            func.invoke_with_collation(&args, function_collation.as_deref())?
-                        } else if subtype_varies {
-                            let (value, subtype) =
-                                func.invoke_with_result_subtype(&args, &arg_subtypes)?;
-                            call_subtype = subtype;
-                            value
-                        } else if any_arg_subtype {
-                            func.invoke_with_arg_subtypes(&args, &arg_subtypes)?
-                        } else {
-                            func.invoke(&args)?
-                        }
+                        None
                     };
+                    let invoke_result: Result<SqliteValue> = (|| {
+                        if first_arg_reg >= 0
+                            && (first_arg_reg as usize).saturating_add(arg_count)
+                                <= self.registers.len()
+                        {
+                            let start_idx = first_arg_reg as usize;
+                            let end_idx = start_idx + arg_count;
+                            let args = &self.registers[start_idx..end_idx];
+                            if let Some(context) = SchemaEvaluationContext::from_function_p1(op.p1)
+                            {
+                                validate_schema_function_invocation(
+                                    context,
+                                    func_name,
+                                    schema_safety,
+                                    args,
+                                )?;
+                            }
+                            observe_requested_execution_cancellation(&self.execution_cx)?;
+                            if function_consumes_argument_collation {
+                                func.invoke_with_collation(args, function_collation.as_deref())
+                            } else if subtype_varies {
+                                let (value, subtype) =
+                                    func.invoke_with_result_subtype(args, &arg_subtypes)?;
+                                call_subtype = subtype;
+                                Ok(value)
+                            } else if any_arg_subtype {
+                                func.invoke_with_arg_subtypes(args, &arg_subtypes)
+                            } else {
+                                func.invoke(args)
+                            }
+                        } else {
+                            let args = self.collect_reg_range(first_arg_reg, arg_count);
+                            if let Some(context) = SchemaEvaluationContext::from_function_p1(op.p1)
+                            {
+                                validate_schema_function_invocation(
+                                    context,
+                                    func_name,
+                                    schema_safety,
+                                    &args,
+                                )?;
+                            }
+                            observe_requested_execution_cancellation(&self.execution_cx)?;
+                            if function_consumes_argument_collation {
+                                func.invoke_with_collation(&args, function_collation.as_deref())
+                            } else if subtype_varies {
+                                let (value, subtype) =
+                                    func.invoke_with_result_subtype(&args, &arg_subtypes)?;
+                                call_subtype = subtype;
+                                Ok(value)
+                            } else if any_arg_subtype {
+                                func.invoke_with_arg_subtypes(&args, &arg_subtypes)
+                            } else {
+                                func.invoke(&args)
+                            }
+                        }
+                    })();
+                    if let Some(prev) = saved_last_insert_rowid {
+                        fsqlite_func::set_last_insert_rowid(prev);
+                    }
+                    let result = invoke_result?;
                     observe_requested_execution_cancellation(&self.execution_cx)?;
 
                     // Propagate this function's result subtype (e.g. JSON) to the
