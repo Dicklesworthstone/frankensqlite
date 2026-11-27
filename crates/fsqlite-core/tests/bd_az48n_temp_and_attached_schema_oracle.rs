@@ -4,14 +4,16 @@
 //! COLUMN, DROP COLUMN, RENAME TO) runs on the attached connection, as every
 //! other attached write already did, instead of failing with "not yet
 //! supported", and inside an explicit transaction it commits and rolls back
-//! with it; and a TEMP table's `rootpage` in `sqlite_temp_master` is a
-//! positive integer. Compared with stock SQLite (rusqlite).
+//! with it; a TEMP table's `rootpage` in `sqlite_temp_master` is a positive
+//! integer; and schema-qualified table-valued functions / eponymous pragmas
+//! (`temp.pragma_table_info(...)`, `aux.json_each(...)`, `temp.pragma_database_list`)
+//! follow SQLite's `sqlite3LocateTable` catalog lookup and fallback semantics.
+//! Compared with stock SQLite (rusqlite).
 //!
-//! Not covered: schema-qualified table-valued pragmas
-//! (`temp.pragma_table_info(...)`) are still a syntax error; and after RENAME
-//! TO, stock stores every reference to the table as `"new"` (always quoted)
-//! where FrankenSQLite quotes it only when needed, in the MAIN schema too, so
-//! the stored text is compared only before the rename.
+//! Not covered: after RENAME TO, stock stores every reference to the table as
+//! `"new"` (always quoted) where FrankenSQLite quotes it only when needed, in
+//! the MAIN schema too (tracked separately under `bd-w4pr1.29`), so the stored
+//! text is compared only before the rename.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -192,6 +194,117 @@ fn temp_and_attached_schemas_match_stock() {
             for failure in run_phases(file_backed).await {
                 failures.push(format!("[file_backed={file_backed}] {failure}"));
             }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
+fn schema_qualified_tvf_and_attached_pragma_table_info_match_stock() {
+    let setup = [
+        "CREATE TABLE m(ma INT, mb TEXT)",
+        "CREATE TEMP TABLE tt(tx INTEGER PRIMARY KEY, ty TEXT)",
+        "CREATE INDEX tix ON tt(ty)",
+        "CREATE TEMP VIEW tv AS SELECT tx FROM tt",
+        "CREATE TEMP TRIGGER ttr AFTER INSERT ON tt BEGIN SELECT 1; END",
+        "ATTACH ':memory:' AS aux",
+        "CREATE TABLE aux.c(ax INT, ay TEXT)",
+        "CREATE INDEX aux.cix ON c(ax)",
+        "CREATE VIEW aux.cv AS SELECT ax FROM c",
+        "CREATE TABLE main.json_each(z INT)",
+        "INSERT INTO main.json_each VALUES (99)",
+        "CREATE TABLE main.pragma_database_list(z INT)",
+        "INSERT INTO main.pragma_database_list VALUES (77)",
+    ];
+    let queries = [
+        // Attached pragma_table_info / table_xinfo / index_list / index_info (qualified & unqualified).
+        "SELECT cid, name, type FROM pragma_table_info('c', 'aux') ORDER BY cid",
+        "SELECT cid, name, type FROM pragma_table_info('c') ORDER BY cid",
+        "SELECT cid, name, type FROM pragma_table_info('c', NULL) ORDER BY cid",
+        "SELECT cid, name, type FROM pragma_table_info('c', 'main') ORDER BY cid",
+        "SELECT cid, name, type FROM pragma_table_info('c', 'temp') ORDER BY cid",
+        "SELECT cid, name, type FROM pragma_table_info('tt', 'temp') ORDER BY cid",
+        "SELECT cid, name, type FROM pragma_table_info('m', 'main') ORDER BY cid",
+        "SELECT cid, name, type FROM pragma_table_info('c', 'nosuch') ORDER BY cid",
+        "SELECT cid, name, type FROM pragma_table_info('cv') ORDER BY cid",
+        "SELECT cid, name, type FROM pragma_table_xinfo('c') ORDER BY cid",
+        "SELECT name FROM pragma_index_list('c') ORDER BY name",
+        "SELECT seqno, cid, name FROM pragma_index_info('cix') ORDER BY seqno",
+        "PRAGMA table_info(c)",
+        "PRAGMA index_list(c)",
+        "PRAGMA index_info(cix)",
+        // Schema-qualified table-valued pragmas and json_each (matching SQLite's sqlite3LocateTable).
+        "SELECT cid, name, type FROM temp.pragma_table_info('c', 'aux') ORDER BY cid",
+        "SELECT cid, name, type FROM main.pragma_table_info('c', 'aux') ORDER BY cid",
+        "SELECT cid, name, type FROM aux.pragma_table_info('c') ORDER BY cid",
+        "SELECT cid, name, type FROM temp.pragma_table_info('tt') ORDER BY cid",
+        "SELECT cid, name, type FROM temp.pragma_table_info('m') ORDER BY cid",
+        "SELECT cid, name, type FROM nosuch.pragma_table_info('m') ORDER BY cid",
+        "SELECT value FROM temp.json_each('[1, 2]') ORDER BY value",
+        "SELECT value FROM aux.json_each('[3]')",
+        "SELECT value FROM nosuch.json_each('[4]')",
+        // Shadowing: real table in main blocks main.tvf(...), while temp.tvf(...) still hits eponymous.
+        "SELECT * FROM main.json_each('[1]')",
+        "SELECT * FROM json_each('[1]')",
+        "SELECT z FROM main.json_each",
+        "SELECT z FROM main.pragma_database_list",
+        "SELECT count(*) FROM temp.pragma_database_list",
+        "SELECT count(*) FROM aux.pragma_database_list",
+        "SELECT count(*) FROM nosuch.pragma_database_list",
+        "SELECT count(*) FROM temp.pragma_database_list()",
+        "SELECT * FROM main.pragma_database_list()",
+        // Non-vtab table called as TVF, and unknown schema-qualified TVF.
+        "SELECT * FROM main.m(1)",
+        "SELECT * FROM main.sqlite_master(1)",
+        "SELECT * FROM temp.sqlite_master(1)",
+        "SELECT * FROM aux.sqlite_master(1)",
+        "SELECT * FROM nosuch.sqlite_master(1)",
+        "SELECT * FROM nosuch.nosuch_tvf(1)",
+        // Subquery and CTE interaction with schema-qualified TVFs / parenless pragmas.
+        "SELECT (SELECT count(*) FROM temp.pragma_table_info('c', 'aux'))",
+        "SELECT (SELECT sum(value) FROM temp.json_each('[10, 20, 30]'))",
+        "WITH pragma_database_list(x) AS (SELECT 1) SELECT count(*) FROM temp.pragma_database_list",
+        // TEMP catalog rootpage checks across table, index, view, trigger.
+        "SELECT type, name, rootpage > 0, typeof(rootpage) FROM sqlite_temp_master ORDER BY type, name",
+        "SELECT type, name, rootpage > 0, typeof(rootpage) FROM temp.sqlite_master ORDER BY type, name",
+    ];
+
+    let r = rusqlite::Connection::open_in_memory().expect("stock open");
+    for sql in setup {
+        r.execute_batch(sql).expect(sql);
+    }
+
+    asupersync::test_utils::run_test(|| async {
+        let mut failures = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = if file_backed {
+                dir.path()
+                    .join("bd_az48n_tvf.db")
+                    .to_str()
+                    .expect("utf-8")
+                    .to_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let f = Connection::open(&path).await.expect("frank open");
+            for sql in setup {
+                f.execute(sql).await.expect(sql);
+            }
+            for sql in queries {
+                let (fv, sv) = (frank(&f, sql).await, stock(&r, sql));
+                if fv != sv {
+                    failures.push(format!(
+                        "[file_backed={file_backed}] `{sql}`:\n  frank {fv:?}\n  stock {sv:?}"
+                    ));
+                }
+            }
+            f.close().await.expect("close");
         }
         assert!(
             failures.is_empty(),

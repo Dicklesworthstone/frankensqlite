@@ -87807,7 +87807,7 @@ impl Connection {
         // This allocation-free preflight includes expression-position
         // subqueries. Scope/shadowing is checked by the rewrite itself.
         if !select_contains_relation_reference(select, &mut |name: &QualifiedName| {
-            name.schema.is_none() && pragma_table_function_is_no_arg(&name.name)
+            pragma_table_function_is_no_arg(&name.name)
         }) {
             return Cow::Borrowed(select);
         }
@@ -87844,6 +87844,40 @@ impl Connection {
             || cte_names
                 .iter()
                 .any(|cte_name| cte_name.eq_ignore_ascii_case(name))
+    }
+
+    /// SQLite's `sqlite3LocateTable` checks the named schema first and only
+    /// falls back to eponymous virtual tables (including parenless pragmas)
+    /// when that schema has no matching table or view — even if the schema
+    /// qualifier is `temp`, an attached schema, or unattached.
+    fn qualified_name_shadows_pragma_tvf(&self, schema: &str, name: &str) -> bool {
+        if schema.eq_ignore_ascii_case("main") {
+            return self.table_exists_for_scope(name, PragmaSchemaScope::Main)
+                || self
+                    .view_index_for_scope(name, PragmaSchemaScope::Main)
+                    .is_some()
+                || self.has_live_vtab_instance(name);
+        }
+        if schema.eq_ignore_ascii_case("temp") {
+            return self.table_exists_for_scope(name, PragmaSchemaScope::Temp)
+                || self
+                    .view_index_for_scope(name, PragmaSchemaScope::Temp)
+                    .is_some();
+        }
+        if self.attached_schemas.borrow().find(schema).is_some() {
+            return self
+                .with_attached_connection(schema, |attached| {
+                    Ok(
+                        attached.table_exists_for_scope(name, PragmaSchemaScope::Main)
+                            || attached
+                                .view_index_for_scope(name, PragmaSchemaScope::Main)
+                                .is_some()
+                            || attached.has_live_vtab_instance(name),
+                    )
+                })
+                .unwrap_or(false);
+        }
+        false
     }
 
     /// Rewrite bare pragma TVFs everywhere in a statement: its CTE definition
@@ -87927,15 +87961,20 @@ impl Connection {
                 index_hint,
                 time_travel,
             } => {
-                if name.schema.is_none()
-                    && index_hint.is_none()
+                let shadowed = match name.schema.as_deref() {
+                    Some(schema) => self.qualified_name_shadows_pragma_tvf(schema, &name.name),
+                    None => self.bare_name_shadows_pragma_tvf(&name.name, cte_names),
+                };
+                if index_hint.is_none()
                     && time_travel.is_none()
                     && pragma_table_function_is_no_arg(&name.name)
-                    && !self.bare_name_shadows_pragma_tvf(&name.name, cte_names)
+                    && !shadowed
                 {
+                    let tvf_schema = name.schema.take();
                     let tvf_name = std::mem::take(&mut name.name);
                     let tvf_alias = alias.take();
                     *source = TableOrSubquery::TableFunction {
+                        schema: tvf_schema,
                         name: tvf_name,
                         args: Vec::new(),
                         alias: tvf_alias,
@@ -156407,7 +156446,9 @@ fn collect_column_rename_bindings_from_table_or_subquery_with_outer(
                 bindings.add_matching_binding(alias.as_deref().unwrap_or("subquery"));
             }
         }
-        TableOrSubquery::TableFunction { name, args, alias } => {
+        TableOrSubquery::TableFunction {
+            name, args, alias, ..
+        } => {
             bindings.add_source();
             bindings.add_source_alias_or_name(alias.as_deref(), name);
             for expr in args {
@@ -158368,7 +158409,9 @@ fn rename_trigger_row_column_refs_in_table_or_subquery_with_scope(
             );
             changed
         }
-        TableOrSubquery::TableFunction { name, args, alias } => {
+        TableOrSubquery::TableFunction {
+            name, args, alias, ..
+        } => {
             let changed = args.iter_mut().fold(false, |changed, expr| {
                 rename_trigger_row_column_refs_in_expr_with_scope(
                     expr,
@@ -173239,15 +173282,24 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         match source {
             TableOrSubquery::Table { name, .. } => self.validate_relation(name),
             TableOrSubquery::Subquery { query, .. } => self.validate_select(query),
-            TableOrSubquery::TableFunction { name, args, .. } => {
-                self.validate_table_function_source(name, args.len())
-            }
+            TableOrSubquery::TableFunction {
+                schema, name, args, ..
+            } => self.validate_table_function_source(schema.as_deref(), name, args.len()),
             TableOrSubquery::ParenJoin(from) => self.validate_from_sources(from),
         }
     }
 
-    fn validate_table_function_source(&self, name: &str, arg_count: usize) -> Result<()> {
-        match self.unqualified_table_function_catalog_match(name)? {
+    fn validate_table_function_source(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        arg_count: usize,
+    ) -> Result<()> {
+        let catalog_match = match schema {
+            Some(schema_name) => self.qualified_table_function_catalog_match(schema_name, name)?,
+            None => self.unqualified_table_function_catalog_match(name)?,
+        };
+        match catalog_match {
             TableFunctionCatalogMatch::CallableVirtual => return Ok(()),
             TableFunctionCatalogMatch::Ordinary => {
                 return Err(FrankenError::FunctionError(format!(
@@ -173266,9 +173318,8 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         {
             Ok(())
         } else {
-            Err(FrankenError::NoSuchTable {
-                name: name.to_owned(),
-            })
+            let missing_name = schema.map_or_else(|| name.to_owned(), |s| format!("{s}.{name}"));
+            Err(FrankenError::NoSuchTable { name: missing_name })
         }
     }
 
@@ -173781,6 +173832,45 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
             .skip(2)
             .map(str::to_owned)
             .collect()
+    }
+
+    fn qualified_table_function_catalog_match(
+        &self,
+        schema_name: &str,
+        relation_name: &str,
+    ) -> Result<TableFunctionCatalogMatch> {
+        if let Some(owner) = self.persistent_owner_label.as_deref() {
+            return Ok(if schema_name.eq_ignore_ascii_case(owner) {
+                self.local_table_function_catalog_match(relation_name, PragmaSchemaScope::Main)
+            } else {
+                TableFunctionCatalogMatch::Missing
+            });
+        }
+        if schema_name.eq_ignore_ascii_case("main") {
+            return Ok(
+                self.local_table_function_catalog_match(relation_name, PragmaSchemaScope::Main)
+            );
+        }
+        if schema_name.eq_ignore_ascii_case("temp") {
+            return Ok(
+                self.local_table_function_catalog_match(relation_name, PragmaSchemaScope::Temp)
+            );
+        }
+        if self
+            .connection
+            .attached_schemas
+            .borrow()
+            .find(schema_name)
+            .is_some()
+        {
+            return self
+                .connection
+                .with_attached_connection(schema_name, |attached| {
+                    Ok(SelectRelationResolver::new(attached)
+                        .local_table_function_catalog_match(relation_name, PragmaSchemaScope::Main))
+                });
+        }
+        Ok(TableFunctionCatalogMatch::Missing)
     }
 
     fn unqualified_table_function_catalog_match(

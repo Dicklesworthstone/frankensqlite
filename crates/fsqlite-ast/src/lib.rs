@@ -1736,8 +1736,9 @@ pub enum TableOrSubquery {
         query: Box<SelectStatement>,
         alias: Option<String>,
     },
-    /// A table-valued function call: `func(args) [AS alias]`.
+    /// A table-valued function call: `[schema.]func(args) [AS alias]`.
     TableFunction {
+        schema: Option<String>,
         name: String,
         args: Vec<Expr>,
         alias: Option<String>,

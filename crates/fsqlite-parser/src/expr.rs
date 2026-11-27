@@ -602,6 +602,7 @@ enum ParseControl {
     TableSubqueryDone,
     TableParenJoinDone,
     TableFunctionArgDone {
+        schema: Option<String>,
         name: String,
         args: Vec<Expr>,
     },
@@ -3256,16 +3257,21 @@ impl<'a> ParseMachine<'a> {
                     ))));
                 Ok(())
             }
-            ParseControl::TableFunctionArgDone { name, mut args } => {
+            ParseControl::TableFunctionArgDone {
+                schema,
+                name,
+                mut args,
+            } => {
                 args.push(self.pop_expr()?.expr);
                 if self.parser.eat_kind(&TokenKind::Comma) {
                     self.controls
-                        .push(ParseControl::TableFunctionArgDone { name, args });
+                        .push(ParseControl::TableFunctionArgDone { schema, name, args });
                     self.controls.push(ParseControl::ExprStart { min_bp: 0 });
                 } else {
                     self.parser.expect_token(&TokenKind::RightParen)?;
                     self.values
                         .push(MachineValue::Table(TableOrSubquery::TableFunction {
+                            schema,
                             name,
                             args,
                             alias: self.parser.try_table_alias()?,
@@ -3633,16 +3639,18 @@ impl<'a> ParseMachine<'a> {
             return Ok(());
         }
         let name = self.parser.parse_qualified_name()?;
-        if name.schema.is_none() && self.parser.eat_kind(&TokenKind::LeftParen) {
+        if self.parser.eat_kind(&TokenKind::LeftParen) {
             if self.parser.eat_kind(&TokenKind::RightParen) {
                 self.values
                     .push(MachineValue::Table(TableOrSubquery::TableFunction {
+                        schema: name.schema,
                         name: name.name,
                         args: Vec::new(),
                         alias: self.parser.try_table_alias()?,
                     }));
             } else {
                 self.controls.push(ParseControl::TableFunctionArgDone {
+                    schema: name.schema,
                     name: name.name,
                     args: Vec::new(),
                 });

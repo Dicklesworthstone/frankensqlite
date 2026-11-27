@@ -843,7 +843,12 @@ fn write_expr_tasks(f: &mut fmt::Formatter<'_>, root: ExprWriteTask<'_>) -> fmt:
                     tasks.push(ExprWriteTask::Select(query));
                     tasks.push(ExprWriteTask::Text("("));
                 }
-                TableOrSubquery::TableFunction { name, args, alias } => {
+                TableOrSubquery::TableFunction {
+                    schema,
+                    name,
+                    args,
+                    alias,
+                } => {
                     if let Some(alias) = alias {
                         tasks.push(ExprWriteTask::Ident(alias));
                         tasks.push(ExprWriteTask::Text(" AS "));
@@ -852,6 +857,10 @@ fn write_expr_tasks(f: &mut fmt::Formatter<'_>, root: ExprWriteTask<'_>) -> fmt:
                     push_comma_separated_exprs(&mut tasks, args);
                     tasks.push(ExprWriteTask::Text("("));
                     tasks.push(ExprWriteTask::Ident(name));
+                    if let Some(schema) = schema {
+                        tasks.push(ExprWriteTask::Text("."));
+                        tasks.push(ExprWriteTask::Ident(schema));
+                    }
                 }
                 TableOrSubquery::ParenJoin(inner) => {
                     tasks.push(ExprWriteTask::Text(")"));

@@ -1403,8 +1403,8 @@ impl Parser {
 
         let name = self.parse_qualified_name()?;
 
-        // Table-valued function: name(args)
-        if self.check(&TokenKind::LeftParen) && name.schema.is_none() {
+        // Table-valued function: [schema.]name(args)
+        if self.check(&TokenKind::LeftParen) {
             self.advance();
             let args = if self.check(&TokenKind::RightParen) {
                 vec![]
@@ -1414,6 +1414,7 @@ impl Parser {
             self.expect_token(&TokenKind::RightParen)?;
             let alias = self.try_table_alias()?;
             return Ok(TableOrSubquery::TableFunction {
+                schema: name.schema,
                 name: name.name,
                 args,
                 alias,
@@ -5006,7 +5007,12 @@ mod tests {
             if let SelectCore::Select { from, .. } = &s.body.select {
                 let from = from.as_ref().expect("FROM clause");
                 match &from.source {
-                    TableOrSubquery::TableFunction { name, args, alias } => {
+                    TableOrSubquery::TableFunction {
+                        schema: None,
+                        name,
+                        args,
+                        alias,
+                    } => {
                         assert_eq!(name, "generate_series");
                         assert_eq!(args.len(), 2);
                         assert_eq!(alias.as_deref(), Some("gs"));
@@ -7189,7 +7195,12 @@ mod tests {
             if let SelectCore::Select { from, .. } = &s.body.select {
                 let from = from.as_ref().expect("FROM clause");
                 match &from.source {
-                    TableOrSubquery::TableFunction { name, args, alias } => {
+                    TableOrSubquery::TableFunction {
+                        schema: None,
+                        name,
+                        args,
+                        alias,
+                    } => {
                         assert_eq!(name, "generate_series");
                         assert_eq!(args.len(), 2);
                         assert_eq!(alias.as_deref(), Some("gs"));
@@ -7303,7 +7314,12 @@ mod tests {
                 if let SelectCore::Select { from, .. } = &select.body.select {
                     let from = from.as_ref().expect("FROM clause");
                     match &from.source {
-                        TableOrSubquery::TableFunction { name, args, alias } => {
+                        TableOrSubquery::TableFunction {
+                            schema: None,
+                            name,
+                            args,
+                            alias,
+                        } => {
                             assert_eq!(name, "generate_series");
                             assert_eq!(args.len(), 2);
                             assert_eq!(alias.as_deref(), Some("gs"));
@@ -7318,6 +7334,45 @@ mod tests {
             }
         } else {
             unreachable!("expected Insert");
+        }
+    }
+
+    #[test]
+    fn test_schema_qualified_table_function_and_subquery() {
+        let stmt = parse_one(
+            "SELECT p.name, (SELECT count(*) FROM aux.json_each('[1, 2]')) \
+             FROM temp.pragma_table_info('c', 'aux') AS p",
+        );
+        let rendered = stmt.to_string();
+        assert!(
+            rendered.contains("\"temp\".pragma_table_info('c', 'aux') AS p"),
+            "rendered SQL lost schema-qualified TVF: {rendered}"
+        );
+        assert!(
+            rendered.contains("aux.json_each('[1, 2]')"),
+            "rendered SQL lost subquery schema-qualified TVF: {rendered}"
+        );
+        assert_eq!(parse_one(&rendered).to_string(), rendered);
+        let Statement::Select(select) = stmt else {
+            unreachable!("expected Select");
+        };
+        let SelectCore::Select { from, .. } = &select.body.select else {
+            unreachable!("expected Select core");
+        };
+        let from = from.as_ref().expect("FROM clause");
+        match &from.source {
+            TableOrSubquery::TableFunction {
+                schema,
+                name,
+                args,
+                alias,
+            } => {
+                assert_eq!(schema.as_deref(), Some("temp"));
+                assert_eq!(name, "pragma_table_info");
+                assert_eq!(args.len(), 2);
+                assert_eq!(alias.as_deref(), Some("p"));
+            }
+            other => unreachable!("expected schema-qualified TableFunction, got {other:?}"),
         }
     }
 

@@ -34808,7 +34808,9 @@ fn codegen_insert_select(
         fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => {
             (find_table(schema, &name.name)?, alias.as_deref(), None)
         }
-        fsqlite_ast::TableOrSubquery::TableFunction { name, args, alias } => {
+        fsqlite_ast::TableOrSubquery::TableFunction {
+            name, args, alias, ..
+        } => {
             let Some(function_columns) = ctx.insert_select_function_columns.as_deref() else {
                 return Err(CodegenError::Unsupported(
                     "INSERT ... SELECT from non-table source".to_owned(),
