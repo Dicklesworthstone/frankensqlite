@@ -94,6 +94,36 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-27 - REJECTED (measurement host, not a lever): the performance governor alone does not make judge v2b time verdicts admissible; the host A/A failed on its void rule, 3 voids in 5 runs on byte-identical code (bd-j0jc0 / bd-gvews, judge retest lane round 1)
+
+- Question: the owner decided "fix host, retest" (2026-11-25). With thinkstation1 on the performance governor (64
+  of 64 CPUs, sampled every 20 s during every run), are judge v2b time verdicts admissible again? Three verdicts
+  waited on the answer: bd-2sf0f (cold_scan cycles), L3 (gb_a_sum_c) and L2 (order_by_text_limit10). All three are
+  read-row LOSEs at Ir 1.0000, with retry condition "re-judge once the host governor is fixed".
+- Design (declared on bd-j0jc0 before any data; amended in 7e04c0dd9 before any amended data):
+  - judge v2b, unchanged, reads half (`rj14/judge_run_v2b.sh ... reads`), K=6, 7 reps, stock 3.54.1 live;
+  - P, L and Q are byte-identical copies of ONE ELF: tip 891d64197, relink seed 1, sha256 4788b6b6, built on
+    vmi1227854;
+  - the F6 rule: at most 6 runs and 2 voids; every consecutive valid pair clean; PASS needs two non-overlapping
+    clean pairs.
+  - The write half cannot run this design: rl12/r10_ab354.py refuses two fsqlite arms with one sha256.
+- Result: null max |z| was 5.38, 5.90, 2.70, 1.87 and 3.51 in R1..R5. That is three voids, so FAIL; R6 never ran.
+  The one valid pair, R3+R4, was clean (no call at all). The void triggers are whole-group shifts on identical bytes:
+  - R1 gb_a_mod10 cpu Q/P 1.0304 (z 5.38);
+  - R2 group_by_1000_groups cpu 1.0346 (z 5.60) and gb_a_sum_c cycles:u 0.9922 (z -5.90);
+  - R5 group_by_1000_groups cpu 1.0107 and cycles:u 1.0115.
+  So the group-common shift of bd-gvews survives the governor change, and on read rows it reaches user cycles too.
+- Consequence: time cells stay VOID on read rows and on write rows (the latter untested). The re-judges did not run.
+  For bd-2sf0f, L3 (f3d7d812c) and L2 (ff82c2f0c), the retry condition "the host governor is fixed" was TESTED and is
+  NOT sufficient. Their other retry conditions stand: an owner decision on time policy (Ir-only, a wider band, or
+  another host), or a judge that passes an A/A.
+- Evidence: bd-j0jc0 comments of 2026-11-27 (declaration, amendment, result) and bd-gvews. Scratchpad jr1/aa:
+  decision_R.txt, verdict_R1..R5.txt, prov_R1..R5.txt, and the tools aa_decide_r.py and null_detail.py.
+- Retry: a time verdict on this host needs a judge change, adopted through bd-j0jc0's procedure, or another host.
+  Do not rerun this A/A on the same host and judge expecting a different answer. A write-half A/A
+  (code-identical independent draws, seeds 7-12 of one tip) was queued behind the re-judges and is moot after this
+  read-half FAIL, unless the owner asks for it.
+
 ## 2026-11-27 - WIN (landed as 2408be7c5; inside its prediction band, past its gain kill line: trig_cte_20000 -68.66M Ir, x8.88 -> x8.59 stock 3.54.1): a trigger WHEN guard of literals and operators evaluates on the synchronous truthiness twin (bd-fpr5g, trig lane round 10, lever W1)
 
 - Target:
