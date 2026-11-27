@@ -168,6 +168,7 @@ run_compile_step \
     RUST_LOG=warn,fsqlite::wal::durability_combiner=debug \
     FSQLITE_BD_3WOP3_1_3_RUN_ROOT="${RUN_ROOT}" \
     FSQLITE_BD_3WOP3_1_3_ARTIFACT="${REPORT_JSON}" \
+    FSQLITE_BD_3WOP3_1_3_ASSERT_PERF="${FSQLITE_BD_3WOP3_1_3_ASSERT_PERF:-1}" \
     cargo test -j 4 -p fsqlite-e2e --test bd_3wop3_1_3_parallel_wal_publication -- --nocapture --test-threads=1
 
 # Strict RCH executes the test on the worker, so its direct artifact path is
