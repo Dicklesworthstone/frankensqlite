@@ -94,6 +94,8 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-27 - CORRECTION to the bd-crzqa entry below (deab606c7): a SMALL WIN in real instructions. perf stat user instructions per autocommit point SELECT went 77,380 -> 76,139 (-1,241, -1.6%; x4.04 -> x3.97 against stock 3.54.1's 19,166). That is the real-instruction delta. Callgrind's -12,141 Ir (x4.52 -> x3.89) counts the removed ~11.7 KB rep movsb copy at about one Ir per byte, so it overstates the real change about 10x and is not a real change in the stock ratio. The time effect is pending bd-j0jc0 / bd-gvews.
+
 ## 2026-11-27 - WIN (landed as deab606c7; a regression fix measured like a lever, inside its prediction, past its gain kill line): one async executor layer instead of three gives back -12,141 Ir per autocommit point SELECT, x4.52 -> x3.89 stock 3.54.1 (bd-crzqa)
 
 - Target: every table program, through `Connection::execute_table_program_with_cx` in
