@@ -504,12 +504,23 @@ const STATEMENTS: &[(&str, &[i64])] = &[
          (SELECT max(m.c) FROM m WHERE m.a = u.n AND m.c > u.r) FROM u ORDER BY u.id",
         &[],
     ),
-    // `max`, not `group_concat`: a SELECT list visits an index range in rowid
-    // order, unlike stock (bd-c6b16).
+    // bd-c6b16: SELECT-list correlated aggregates walk index ranges and
+    // multi-column index equalities in index order, matching stock.
     (
         "SELECT u.id, (SELECT count(*) FROM t AS x WHERE x.g BETWEEN u.n AND u.n + 1), \
-         (SELECT max(x.id) FROM t AS x WHERE x.r > u.r AND x.r < u.r + 0.25) \
+         (SELECT group_concat(x.id) FROM t AS x WHERE x.r > u.r AND x.r < u.r + 0.25) \
          FROM u ORDER BY u.id",
+        &[],
+    ),
+    (
+        "SELECT u.id, (SELECT group_concat(m.id) FROM m WHERE m.a = u.n), \
+         (SELECT group_concat(m.id) FROM m WHERE m.a = u.n AND m.b = 'b0') \
+         FROM u ORDER BY u.id",
+        &[],
+    ),
+    (
+        "SELECT u.id FROM u WHERE (SELECT group_concat(m.id) FROM m \
+         WHERE m.a = u.n AND m.b = 'b0') IS NOT NULL ORDER BY u.id",
         &[],
     ),
     (
@@ -762,6 +773,154 @@ fn equality_with_an_uncorrelated_scalar_subquery_seeks_the_index() {
             wrong.is_empty(),
             "the seeks must stay at or under {SEEK_LIMIT} opcodes and the scans over it:\n{}",
             wrong.join("\n")
+        );
+    });
+}
+
+/// bd-c6b16: correlated aggregates (`group_concat`, float `sum`) in a SELECT
+/// list and in WHERE over an index range or a multi-column index equality must
+/// walk the index in stock SQLite 3.54.1's order rather than falling back to
+/// rowid order, on both `:memory:` and file-backed databases, direct and
+/// prepared.
+#[test]
+fn bd_c6b16_correlated_aggregate_index_order_matches_stock() {
+    const SETUP: &str = "\
+        CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, g INTEGER, n INTEGER, r REAL);\
+        INSERT INTO t VALUES \
+            (5, 'a', 1, 1, 0.5),\
+            (6, 'b', 1, 1, 0.6000000000000001),\
+            (9223372036854775807, 'm', 4, 4, 0.5),\
+            (4, 'c', 1, 1, 0.4),\
+            (2, 'z', 2, 1, -0.5),\
+            (9, 'y', 2, 2, -0.25),\
+            (1, 'n', NULL, 1, NULL);\
+        CREATE INDEX t_r ON t(r);\
+        CREATE TABLE u AS SELECT * FROM t;\
+        CREATE TABLE m(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL, d INTEGER);\
+        INSERT INTO m VALUES \
+            (10, 1, 'b2', 3.0, 1),\
+            (20, 1, 'b0', 9.0, 1),\
+            (30, 1, 'b0', 2.0, 2),\
+            (40, 1, 'b1', 1.0, 1),\
+            (50, 4, 'b0', 5.0, 4),\
+            (60, 2, 'b1', 0.2, 1),\
+            (70, 2, 'b0', 0.8, 2),\
+            (80, 1, '1', 0.1, 1);\
+        CREATE INDEX m_abc ON m(a, b, c);\
+        CREATE TABLE td(id INTEGER PRIMARY KEY, g INTEGER, r REAL);\
+        INSERT INTO td VALUES (10, 1, 0.2), (20, 1, 0.9), (30, 1, 0.5), (40, 4, 0.1);\
+        CREATE INDEX td_gr_desc ON td(g, r DESC);\
+        CREATE TABLE c(id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE);\
+        INSERT INTO c VALUES (1, 'a'), (2, 'B'), (3, 'b'), (4, 'C'), (5, 'A');\
+        CREATE INDEX c_s ON c(s);\
+        CREATE TABLE p(id INTEGER PRIMARY KEY, val);\
+        INSERT INTO p VALUES (1, 1), (2, '1'), (3, 1.0), (4, 'b0'), (5, NULL);";
+
+    const QUERIES: &[&str] = &[
+        // Exact bd-c6b16 repro: SELECT-list correlated group_concat over index range `t_r`.
+        "SELECT u.id, (SELECT group_concat(x.id) FROM t AS x \
+         WHERE x.r > u.r AND x.r < u.r + 0.25) FROM u ORDER BY u.id",
+        // Same range in WHERE.
+        "SELECT u.id FROM u WHERE (SELECT group_concat(x.id) FROM t AS x \
+         WHERE x.r > u.r AND x.r < u.r + 0.25) = '5,9223372036854775807,6' ORDER BY u.id",
+        // Index range with residual predicate (`x.n >= 1`) and float `sum` sensitivity.
+        "SELECT u.id, (SELECT group_concat(x.id) FROM t AS x \
+         WHERE x.r > u.r AND x.r < u.r + 0.25 AND x.n >= 1), \
+         (SELECT sum(x.r) FROM t AS x WHERE x.r > u.r AND x.r < u.r + 0.25) \
+         FROM u ORDER BY u.id",
+        // Reversed operand (`u.r < x.r`), BETWEEN, and negative / one-sided bounds.
+        "SELECT u.id, (SELECT group_concat(x.id) FROM t AS x \
+         WHERE u.r < x.r AND u.r + 0.25 > x.r), \
+         (SELECT group_concat(x.id) FROM t AS x WHERE x.r BETWEEN u.r AND u.r + 0.25) \
+         FROM u ORDER BY u.id",
+        "SELECT u.id FROM u WHERE (SELECT group_concat(x.id) FROM t AS x \
+         WHERE x.r BETWEEN u.r AND u.r + 0.25) = '4,5,9223372036854775807,6' ORDER BY u.id",
+        // CTE outer source (affinity=None, collation=Unspecified).
+        "WITH w(id, r) AS (VALUES (1, 0.4), (2, -0.6), (3, NULL)) \
+         SELECT w.id, (SELECT group_concat(x.id) FROM t AS x \
+         WHERE x.r > w.r AND x.r < w.r + 0.25) FROM w ORDER BY w.id",
+        // Multi-column index equality in SELECT list: 1-col prefix, 2-col prefix,
+        // expression equality, equality + residual, equality prefix + trailing range.
+        "SELECT u.id, (SELECT group_concat(m.id) FROM m WHERE m.a = u.g) FROM u ORDER BY u.id",
+        "SELECT u.id, (SELECT group_concat(m.id) FROM m WHERE m.a = u.g AND m.b = 'b0') \
+         FROM u ORDER BY u.id",
+        "SELECT u.id, (SELECT group_concat(m.id) FROM m \
+         WHERE m.a = u.g AND m.b = 'b' || (u.id % 3)) FROM u ORDER BY u.id",
+        "SELECT u.id, (SELECT group_concat(m.id) FROM m WHERE m.a = u.g AND m.d = u.n) \
+         FROM u ORDER BY u.id",
+        "SELECT u.id, (SELECT group_concat(m.id) FROM m \
+         WHERE m.a = u.g AND m.b = 'b0' AND m.c > u.r AND m.c < u.r + 10.0) \
+         FROM u ORDER BY u.id",
+        // Multi-column index equality in WHERE.
+        "SELECT u.id FROM u WHERE (SELECT group_concat(m.id) FROM m \
+         WHERE m.a = u.g) = '80,30,20,40,10' ORDER BY u.id",
+        "SELECT u.id FROM u WHERE (SELECT group_concat(m.id) FROM m \
+         WHERE m.a = u.g AND m.b = 'b0') = '30,20' ORDER BY u.id",
+        "SELECT u.id FROM u WHERE (SELECT group_concat(m.id) FROM m \
+         WHERE m.a = u.g AND m.d = u.n) = '80,20,40,10' ORDER BY u.id",
+        // Multi-column index with DESC trailing key (`td_gr_desc ON td(g, r DESC)`).
+        "SELECT u.id, (SELECT group_concat(td.id) FROM td WHERE td.g = u.g) \
+         FROM u ORDER BY u.id",
+        "SELECT u.id FROM u WHERE (SELECT group_concat(td.id) FROM td \
+         WHERE td.g = u.g) = '20,30,10' ORDER BY u.id",
+        // Affinity and collation negative controls (must stay identical to stock).
+        "SELECT u.id, (SELECT count(*) FROM m WHERE m.a = u.g AND m.b = u.g) \
+         FROM u ORDER BY u.id",
+        "SELECT p.id, (SELECT group_concat(m.id) FROM m WHERE m.a = 1 AND m.b = p.val), \
+         (SELECT group_concat(m.id) FROM m WHERE m.a = p.val) FROM p ORDER BY p.id",
+        "SELECT u.id, (SELECT group_concat(c.id) FROM c WHERE u.v < c.s) FROM u ORDER BY u.id",
+    ];
+
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = if file_backed {
+                (
+                    Connection::open(dir.path().join("c6b16_f.db").to_str().unwrap())
+                        .await
+                        .unwrap(),
+                    rusqlite::Connection::open(dir.path().join("c6b16_r.db")).unwrap(),
+                )
+            } else {
+                (
+                    Connection::open(":memory:").await.unwrap(),
+                    rusqlite::Connection::open_in_memory().unwrap(),
+                )
+            };
+            f.execute_batch(SETUP).await.unwrap();
+            r.execute_batch(SETUP).unwrap();
+            let db = if file_backed { "file" } else { "memory" };
+
+            // Pin the exact stock answer for row 4 of the bd-c6b16 repro so the
+            // comparison cannot pass vacuously if stock's index plan ever changed.
+            let repro_stock = rq(&r, QUERIES[0], &[]).unwrap();
+            assert!(
+                repro_stock.contains(&vec![
+                    "int:4".to_owned(),
+                    "text:5,9223372036854775807,6".to_owned(),
+                ]),
+                "stock repro row 4 changed: {repro_stock:?}"
+            );
+
+            for sql in QUERIES {
+                let rr = rq(&r, sql, &[]);
+                for prepared in [false, true] {
+                    let fr = fq(&f, sql, &[], prepared).await;
+                    if fr != rr {
+                        diffs.push(format!(
+                            "  [{db}, prepared={prepared}] `{sql}`\n     frank= {fr:?}\n     stock= {rr:?}"
+                        ));
+                    }
+                }
+            }
+            f.close().await.unwrap();
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} divergence(s) from rusqlite 3.54.1:\n{}",
+            diffs.len(),
+            diffs.join("\n")
         );
     });
 }

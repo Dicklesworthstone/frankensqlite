@@ -150891,13 +150891,17 @@ fn rewrite_in_expr<'a>(
 }
 
 /// Convert a `SqliteValue` into a synthetic `Expr::Literal`.
-/// Walk the AND-conjunction of an EXISTS subquery WHERE, relaxing each
-/// collation/affinity-safe `col = <bound outer value>` conjunct to `col =
-/// <literal>` so the compiled nested statement can seek (bd-nd2ju / #377, L3).
+/// Walk the AND-conjunction of a correlated subquery WHERE, relaxing each
+/// collation/affinity-safe equality, range comparison (`<`, `<=`, `>`, `>=`),
+/// or `BETWEEN` against a bound outer value (or pure constant expression over
+/// bound outer values and literals, e.g. `u.r + 0.25`) to a plain literal so
+/// the compiled nested statement can seek and walk the index in stock SQLite's
+/// order (bd-nd2ju / #377, L3; bd-c6b16).
 ///
-/// Only descends `AND` nodes and rewrites `Eq` leaves; every other shape (OR,
-/// comparisons other than `=`, nested subqueries) is left untouched, so a
-/// disjunction or a residual predicate keeps its exact semantics.
+/// Only descends `AND` nodes and rewrites comparison / non-negated `BETWEEN`
+/// leaves; disjunctions (`OR`), explicit `COLLATE`/`CAST`, and nested
+/// subqueries are left untouched so residual predicates keep their exact
+/// semantics.
 fn relax_eq_conjunct_bound_outer(expr: &mut Expr, table: &TableSchema, alias: Option<&str>) {
     match expr {
         Expr::BinaryOp {
@@ -150910,21 +150914,37 @@ fn relax_eq_conjunct_bound_outer(expr: &mut Expr, table: &TableSchema, alias: Op
             relax_eq_conjunct_bound_outer(right, table, alias);
         }
         Expr::BinaryOp {
-            op: BinaryOp::Eq,
+            op: BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge,
             left,
             right,
             ..
         } => {
-            // `col = bound` — relax the right operand.
+            // `col <op> bound` — relax the right operand.
             if let Some(col) = eq_seek_column(left, table, alias)
-                && let Some(literal) = bound_outer_relaxable_to_literal(right, col, true)
+                && let Some(literal) = relax_bound_outer_expr_for_column(right, col, true)
             {
                 **right = literal;
-            // `bound = col` — relax the left operand.
+            // `bound <op> col` — relax the left operand.
             } else if let Some(col) = eq_seek_column(right, table, alias)
-                && let Some(literal) = bound_outer_relaxable_to_literal(left, col, false)
+                && let Some(literal) = relax_bound_outer_expr_for_column(left, col, false)
             {
                 **left = literal;
+            }
+        }
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            not: false,
+            ..
+        } => {
+            if let Some(col) = eq_seek_column(operand, table, alias) {
+                if let Some(literal) = relax_bound_outer_expr_for_column(low, col, true) {
+                    **low = literal;
+                }
+                if let Some(literal) = relax_bound_outer_expr_for_column(high, col, true) {
+                    **high = literal;
+                }
             }
         }
         _ => {}
@@ -150947,19 +150967,35 @@ fn relax_eq_conjunct_bound_outer_in_join(expr: &mut Expr, tables: &[(TableSchema
             relax_eq_conjunct_bound_outer_in_join(right, tables);
         }
         Expr::BinaryOp {
-            op: BinaryOp::Eq,
+            op: BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge,
             left,
             right,
             ..
         } => {
             if let Some(col) = join_eq_seek_column(left, tables)
-                && let Some(literal) = bound_outer_relaxable_to_literal(right, col, true)
+                && let Some(literal) = relax_bound_outer_expr_for_column(right, col, true)
             {
                 **right = literal;
             } else if let Some(col) = join_eq_seek_column(right, tables)
-                && let Some(literal) = bound_outer_relaxable_to_literal(left, col, false)
+                && let Some(literal) = relax_bound_outer_expr_for_column(left, col, false)
             {
                 **left = literal;
+            }
+        }
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            not: false,
+            ..
+        } => {
+            if let Some(col) = join_eq_seek_column(operand, tables) {
+                if let Some(literal) = relax_bound_outer_expr_for_column(low, col, true) {
+                    **low = literal;
+                }
+                if let Some(literal) = relax_bound_outer_expr_for_column(high, col, true) {
+                    **high = literal;
+                }
             }
         }
         _ => {}
@@ -151018,10 +151054,87 @@ fn eq_seek_column<'a>(
         .find(|c| c.name.eq_ignore_ascii_case(column.column.as_ref()))
 }
 
+/// Relax a bare [`Expr::BoundOuterValue`] or a pure side-effect-free arithmetic/
+/// concat constant expression over bound outer values and literals (such as
+/// `u.r + 0.25` or `'b' || (u.id % 3)`) into an equivalent plain literal when
+/// comparing it against `col` is guaranteed identical under SQLite's affinity
+/// and collation rules (bd-nd2ju / #377, L3; bd-c6b16).
+fn relax_bound_outer_expr_for_column(
+    expr: &Expr,
+    col: &ColumnInfo,
+    column_on_left: bool,
+) -> Option<Expr> {
+    if matches!(expr, Expr::BoundOuterValue { .. }) {
+        return bound_outer_relaxable_to_literal(expr, col, column_on_left);
+    }
+    if !expr_is_pure_bound_outer_const_expr(expr) {
+        return None;
+    }
+    // Computed unary/binary arithmetic and concatenation expressions carry no
+    // column affinity (`ExprAffinity::None`) and no implicit collation in
+    // SQLite — identical to a plain literal. Fold to a non-NULL, finite
+    // literal so index range/equality seekers can plan over the bound.
+    let val = eval_join_expr(expr, &[], &[]).ok()?;
+    if matches!(val, SqliteValue::Null)
+        || matches!(val, SqliteValue::Float(f) if !f.is_finite())
+    {
+        return None;
+    }
+    Some(value_to_literal_expr(val))
+}
+
+fn expr_is_pure_bound_outer_const_expr(expr: &Expr) -> bool {
+    fn visit(expr: &Expr, saw_bound: &mut bool) -> bool {
+        match expr {
+            Expr::BoundOuterValue { .. } => {
+                *saw_bound = true;
+                true
+            }
+            Expr::Literal(
+                Literal::Integer(_)
+                | Literal::Float(_)
+                | Literal::String(_)
+                | Literal::Blob(_)
+                | Literal::True
+                | Literal::False,
+                _,
+            ) => true,
+            Expr::UnaryOp {
+                op: UnaryOp::Plus | UnaryOp::Negate | UnaryOp::BitNot | UnaryOp::Not,
+                expr: inner,
+                ..
+            } => visit(inner, saw_bound),
+            Expr::BinaryOp {
+                op:
+                    BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulo
+                    | BinaryOp::Concat
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::ShiftLeft
+                    | BinaryOp::ShiftRight,
+                left,
+                right,
+                ..
+            } => visit(left, saw_bound) && visit(right, saw_bound),
+            _ => false,
+        }
+    }
+
+    if !matches!(expr, Expr::BinaryOp { .. } | Expr::UnaryOp { .. }) {
+        return false;
+    }
+    let mut saw_bound = false;
+    visit(expr, &mut saw_bound) && saw_bound
+}
+
 /// If `expr` is a non-NULL [`Expr::BoundOuterValue`] whose donor collation,
 /// affinity, AND runtime storage class make a plain-literal comparison against
 /// `col` byte-identical to the bound comparison, return the equivalent literal
-/// (bd-nd2ju / #377, L3).
+/// (bd-nd2ju / #377, L3; bd-c6b16).
 ///
 /// The subtlety a plain literal loses is that a bound outer value CARRIES its
 /// donor affinity, so `col(A) = bound(A, v)` resolves to "no affinity applied"
@@ -151031,16 +151144,17 @@ fn eq_seek_column<'a>(
 /// `v` to `A` is not a no-op: e.g. `text_col = <bound TEXT-affinity value 1>`
 /// leaves the integer `1` uncoerced (no match against `'1'`), but `text_col = 1`
 /// coerces `1`→`'1'` (spurious match). So relaxation is admitted ONLY when:
-///   * the donor collation is known, and either the bare column is on the
-///     left (its implicit collation wins), or the donor matches the column's
-///     effective collation (default `BINARY`). Explicit COLLATE wrappers never
-///     match the bare-column / BoundOuterValue shape and remain untouched;
-///   * the donor affinity equals `col`'s affinity (so the bound comparison
-///     applies no affinity — the same treatment the coerced-literal path lands
-///     on once the next condition holds); AND
-///   * the runtime value's storage class is already in `col`'s affinity class,
-///     so `col`'s affinity coercion of the literal is a no-op and both paths
-///     compare the value as stored.
+///   * the donor collation is unspecified (no collation, like a plain literal),
+///     or the bare column is on the left (its implicit collation wins), or the
+///     donor matches the column's effective collation (default `BINARY`).
+///     Explicit COLLATE wrappers never match the bare-column / BoundOuterValue
+///     shape and remain untouched; AND
+///   * per SQLite's `ComparisonAffinity::from_operands` truth table, replacing
+///     the bound value with an affinity-less literal leaves the comparison
+///     coercion identical on both operands (either donor affinity is `None`, or
+///     `col` is numeric and `value` is already `Integer`/`Float`, or `col` is
+///     `Text` with `Text`/`Blob` donor and `Text` value, or `col` is `Blob`
+///     with `Blob`/`Text` donor).
 /// When any condition fails the bound value is left in place and the interpreted
 /// per-row fallback still evaluates it with full SQLite comparison semantics.
 fn bound_outer_relaxable_to_literal(
@@ -151057,35 +151171,38 @@ fn bound_outer_relaxable_to_literal(
     else {
         return None;
     };
-    if matches!(value, SqliteValue::Null) {
-        return None;
-    }
-    let col_collation = col.collation.as_deref().unwrap_or("BINARY");
-    if !collation
-        .as_name()
-        .is_some_and(|name| column_on_left || name.eq_ignore_ascii_case(col_collation))
+    if matches!(value, SqliteValue::Null)
+        || matches!(value, SqliteValue::Float(f) if !f.is_finite())
     {
         return None;
     }
-    let col_affinity = affinity_char_to_type(col.affinity);
-    // Donor affinity must equal the column's (a mismatch, or an absent donor
-    // affinity, can change which operand SQLite coerces).
-    if *affinity != Some(col_affinity) {
+    let col_collation = col.collation.as_deref().unwrap_or("BINARY");
+    let collation_ok = match collation.as_name() {
+        None => true,
+        Some(name) => column_on_left || name.eq_ignore_ascii_case(col_collation),
+    };
+    if !collation_ok {
         return None;
     }
-    // The value must already be in the column's affinity class, so applying that
-    // affinity is a no-op and the literal path compares the value as stored —
-    // matching the bound path's no-coercion comparison.
-    let value_in_affinity_class = match col_affinity {
-        TypeAffinity::Text => matches!(value, SqliteValue::Text(_)),
-        TypeAffinity::Integer | TypeAffinity::Real | TypeAffinity::Numeric => {
+    let col_affinity = affinity_char_to_type(col.affinity);
+    let col_is_numeric = matches!(
+        col_affinity,
+        TypeAffinity::Integer | TypeAffinity::Real | TypeAffinity::Numeric
+    );
+    let affinity_ok = match *affinity {
+        None => true,
+        Some(_) if col_is_numeric => {
             matches!(value, SqliteValue::Integer(_) | SqliteValue::Float(_))
         }
-        // A no-affinity (BLOB) column never coerces either operand, so the
-        // comparison is the value as stored on both paths regardless of class.
-        TypeAffinity::Blob => true,
+        Some(TypeAffinity::Text | TypeAffinity::Blob) if col_affinity == TypeAffinity::Text => {
+            matches!(value, SqliteValue::Text(_))
+        }
+        Some(TypeAffinity::Blob | TypeAffinity::Text) if col_affinity == TypeAffinity::Blob => {
+            true
+        }
+        _ => false,
     };
-    if !value_in_affinity_class {
+    if !affinity_ok {
         return None;
     }
     Some(value_to_literal_expr(value.clone()))

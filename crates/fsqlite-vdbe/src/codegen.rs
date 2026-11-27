@@ -26396,21 +26396,20 @@ fn aggregate_index_range_seek_target<'t, 'e>(
             continue;
         };
         // The seek is a SUPERSET (no affinity/collation miss) when the bound literals match the
-        // column's storage class: an INTEGER column + integer literals, or a BINARY-collation TEXT
-        // column + text literals (a bare `s <op> 'lit'` compares under the column collation, which
-        // equals the BINARY index collation, so the seek range matches the WHERE range). The residual
-        // filter narrows to exact.
-        let bound_is = |b: &ColumnRangeBound<'_>, want_text: bool| {
-            if want_text {
-                matches!(b.expr(), Expr::Literal(Literal::String(_), _))
-            } else {
-                matches!(b.expr(), Expr::Literal(Literal::Integer(_), _))
-            }
-        };
+        // column's storage class: a numeric (INTEGER/REAL/NUMERIC) column + numeric literals, or a
+        // BINARY-collation TEXT column + text literals (a bare `s <op> 'lit'` compares under the
+        // column collation, which equals the BINARY index collation, so the seek range matches the
+        // WHERE range). The residual filter narrows to exact.
         let bounds_ok = match affinity {
-            Some('D') => {
-                range.lower.as_ref().is_none_or(|b| bound_is(b, false))
-                    && range.upper.as_ref().is_none_or(|b| bound_is(b, false))
+            Some('D' | 'E' | 'C') => {
+                range
+                    .lower
+                    .as_ref()
+                    .is_none_or(|b| is_numeric_literal_bound(b.expr()))
+                    && range
+                        .upper
+                        .as_ref()
+                        .is_none_or(|b| is_numeric_literal_bound(b.expr()))
             }
             Some('B')
                 if column_uses_binary_collation
@@ -26418,8 +26417,14 @@ fn aggregate_index_range_seek_target<'t, 'e>(
                         .key_term_collation(0)
                         .is_none_or(|c| c.eq_ignore_ascii_case("BINARY")) =>
             {
-                range.lower.as_ref().is_none_or(|b| bound_is(b, true))
-                    && range.upper.as_ref().is_none_or(|b| bound_is(b, true))
+                range
+                    .lower
+                    .as_ref()
+                    .is_none_or(|b| is_text_literal_bound(b.expr()))
+                    && range
+                        .upper
+                        .as_ref()
+                        .is_none_or(|b| is_text_literal_bound(b.expr()))
             }
             _ => false,
         };
