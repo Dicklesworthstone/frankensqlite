@@ -151,14 +151,33 @@ fn agg_leading_eq_residual_matches_sqlite() {
             has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 7 AND x = 5", "SeekGE").await,
             "leading eq + literal residual must seek the prefix (SeekGE)"
         );
-        let rowid_residual_sql = "SELECT COUNT(*) FROM t WHERE a = 7 AND id = 7";
+        // bd-05cxn: a rowid EQUALITY outranks the index equality since 12ff9ab33 (bd-5kdea),
+        // as in stock's no-stat4 tiers (stock: SEARCH t USING INTEGER PRIMARY KEY (rowid=?)):
+        // the row is sought by rowid and `a = 7` checked on it. A rowid residual no seek
+        // serves (`id <> 7`) keeps the index prefix seek (stock: SEARCH t USING COVERING
+        // INDEX idx_a (a=?)).
+        let rowid_eq_sql = "SELECT COUNT(*) FROM t WHERE a = 7 AND id = 7";
+        assert!(
+            has_op(&f, rowid_eq_sql, "SeekRowid").await,
+            "a rowid equality must seek the row by rowid"
+        );
+        assert!(
+            !has_op(&f, rowid_eq_sql, "SeekGE").await,
+            "a rowid equality outranks the index equality: no index prefix seek"
+        );
+        assert!(
+            !has_op(&f, rowid_eq_sql, "Rewind").await,
+            "a rowid equality must not full-scan the table"
+        );
+        let rowid_residual_sql = "SELECT COUNT(*) FROM t WHERE a = 7 AND id <> 7";
+        assert_eq!(
+            frank_rows(&f, rowid_residual_sql).await,
+            sqlite_rows(&r, rowid_residual_sql),
+            "diverged: `{rowid_residual_sql}`"
+        );
         assert!(
             has_op(&f, rowid_residual_sql, "SeekGE").await,
             "leading eq + rowid residual must seek the index prefix"
-        );
-        assert!(
-            has_op(&f, rowid_residual_sql, "SeekRowid").await,
-            "leading eq + rowid residual must visit the candidate table row"
         );
         assert!(
             !has_op(&f, rowid_residual_sql, "Rewind").await,

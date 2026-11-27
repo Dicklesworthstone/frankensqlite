@@ -554,3 +554,50 @@ fn rowid_in_list_matches_sqlite() {
         }
     });
 }
+
+/// bd-05cxn: a rowid IN-list the seek declines (LIMIT, DISTINCT) is scanned in rowid order,
+/// the order stock's rowid seek returns, even when a narrower covering index exists. Here
+/// `idx_t_k` orders the rows in reverse rowid order (k = 100 - id), so an index walk
+/// (410d63a80) answered `... IN (5, 10) LIMIT 1` with 10 and the DISTINCT rows as 10, 5,
+/// where stock answers 5 and 5, 10. Compared exactly, order included. NOT IN is a full scan
+/// in stock too, of the covering index, and stays one.
+#[test]
+fn declined_rowid_in_list_scans_in_stock_row_order() {
+    asupersync::test_utils::run_test(|| async {
+        let mut schema = vec![
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);".to_owned(),
+            "CREATE INDEX idx_t_k ON t(k);".to_owned(),
+        ];
+        for id in 1..=50_i64 {
+            schema.push(format!(
+                "INSERT INTO t VALUES ({id}, {}, 'v{id}');",
+                100 - id
+            ));
+        }
+        let schema_refs: Vec<&str> = schema.iter().map(String::as_str).collect();
+        let (f, r) = setup(&schema_refs).await;
+        for sql in [
+            "SELECT id FROM t WHERE id IN (5, 10) LIMIT 1",
+            "SELECT id FROM t WHERE id IN (10, 5) LIMIT 1",
+            "SELECT id FROM t WHERE id IN (5, 10, 40) LIMIT 2",
+            "SELECT id FROM t WHERE id IN (5, 10) LIMIT 1 OFFSET 1",
+            "SELECT k FROM t WHERE id IN (5, 10) LIMIT 1",
+            "SELECT id FROM t WHERE id = 10 OR id = 5 LIMIT 1",
+            "SELECT id FROM t WHERE id IN (5, 10) AND k > 0 LIMIT 1",
+            "SELECT DISTINCT id FROM t WHERE id IN (10, 5)",
+            "SELECT DISTINCT id, k FROM t WHERE id IN (40, 5, 10)",
+            "SELECT id FROM t WHERE id NOT IN (5, 10) LIMIT 3",
+        ] {
+            let stock = sqlite_rows(&r, sql);
+            assert!(
+                stock.as_ref().is_ok_and(|rows| !rows.is_empty()),
+                "fixture must give `{sql}` rows"
+            );
+            assert_eq!(
+                frank_rows(&f, sql).await,
+                stock,
+                "declined rowid IN-list diverged from SQLite (rows or order) for `{sql}`"
+            );
+        }
+    });
+}

@@ -45806,6 +45806,13 @@ fn index_estimated_row_width(index: &IndexSchema, table: &TableSchema) -> Option
 /// generated columns). Among eligible indexes, picks the minimum estimated
 /// width, tie-breaking by most recently created (highest index ordinal,
 /// matching SQLite's prepended `Table.pIndex` list).
+///
+/// A WHERE that is a rowid IN-list (integer literals or bind-time constants,
+/// alone or in an AND chain) gets none (bd-05cxn): stock seeks it by rowid,
+/// in ascending rowid order. Where codegen declines that seek (a LIMIT or
+/// DISTINCT) and scans instead, only the table's own rowid-order scan returns
+/// stock's rows in stock's order; an index walk returned another row under
+/// `LIMIT 1` and DISTINCT rows in another order (410d63a80).
 #[must_use]
 pub fn covering_full_scan_index<'t>(
     table: &'t TableSchema,
@@ -45815,6 +45822,11 @@ pub fn covering_full_scan_index<'t>(
     from_index_hint: Option<&fsqlite_ast::IndexHint>,
 ) -> Option<&'t IndexSchema> {
     if table.without_rowid || from_index_hint.is_some() || columns.is_empty() {
+        return None;
+    }
+    if extract_rowid_in_list_residual_target(where_clause, table, table_alias).is_some()
+        || extract_rowid_in_const_list_residual_target(where_clause, table, table_alias).is_some()
+    {
         return None;
     }
     if columns
@@ -58172,8 +58184,10 @@ mod tests {
 
         // A secondary-index equality plus a rowid residual takes the later
         // equality-prefix residual path.  It must seek the index, visit the table row,
-        // re-apply the full WHERE, and never fall back to a table scan.
-        let residual_ops = bd_2dgf5_program("SELECT SUM(v) FROM t WHERE id = 2 AND k = 3");
+        // re-apply the full WHERE, and never fall back to a table scan. (bd-05cxn: the
+        // residual is `id <> 2`, which no seek can serve. With `id = 2` it was a rowid
+        // equality, which outranks the index equality since 12ff9ab33; see below.)
+        let residual_ops = bd_2dgf5_program("SELECT SUM(v) FROM t WHERE k = 3 AND id <> 2");
         assert!(
             residual_ops
                 .iter()
@@ -58195,6 +58209,36 @@ mod tests {
         assert!(
             !residual_ops.iter().any(|op| op.opcode == Opcode::Rewind),
             "indexed residual path must not full-scan the table"
+        );
+
+        // bd-05cxn: a rowid equality outranks a secondary-index equality, as in stock's
+        // no-stat4 tiers (rowid eq first; bd-5kdea, 12ff9ab33). Stock: SEARCH t USING
+        // INTEGER PRIMARY KEY (rowid=?). The row is sought by rowid, `k = 3` is checked
+        // on it before AggStep, idx_t_k is never opened, and nothing is scanned.
+        let rowid_tier_ops = bd_2dgf5_program("SELECT SUM(v) FROM t WHERE id = 2 AND k = 3");
+        let seek = rowid_tier_ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SeekRowid)
+            .expect("`id = 2 AND k = 3` must seek the row by rowid");
+        let agg_step = rowid_tier_ops
+            .iter()
+            .position(|op| op.opcode == Opcode::AggStep)
+            .expect("`id = 2 AND k = 3` must still accumulate the sought row");
+        assert!(
+            rowid_tier_ops[seek..agg_step].iter().any(|op| op.opcode == Opcode::Column
+                && op.p1 == rowid_tier_ops[seek].p1
+                && op.p2 == 1),
+            "`k = 3` must be re-checked on the sought row before AggStep"
+        );
+        assert!(
+            !rowid_tier_ops
+                .iter()
+                .any(|op| matches!(&op.p4, P4::Index(name) if name == "idx_t_k")),
+            "a rowid equality outranks the index equality: idx_t_k must not be opened"
+        );
+        assert!(
+            !rowid_tier_ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "`id = 2 AND k = 3` must not scan"
         );
 
         // Non-integer literal constants use the newer exact-or-reject rowid
@@ -58533,19 +58577,39 @@ mod tests {
         // GH #415: `2.0` / `-5` are not integer literals, so the unrolled path declines them —
         // but they are bind-time constants, so the probe-set path now seeks them (coercing
         // 2.0 -> 2 and evaluating the negation) instead of scanning.
+        // bd-05cxn: a declined rowid IN-list scans the TABLE, in rowid order, which is the
+        // order stock's rowid seek returns: an idx_t_k walk (410d63a80) returned id 10 for
+        // `... LIMIT 1` and DISTINCT rows as 10, 5, where stock returns 5 and 5, 10.
         for sql in [
             "SELECT id FROM t WHERE id IN (5, 10) LIMIT 1",
             "SELECT DISTINCT id FROM t WHERE id IN (5, 10)",
-            "SELECT id FROM t WHERE id NOT IN (5, 10)",
             "SELECT id FROM t NOT INDEXED WHERE id IN (5, 10)",
         ] {
+            let ops = bd_2dgf5_program(sql);
             assert!(
-                bd_2dgf5_program(sql)
-                    .iter()
-                    .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+                ops.iter().any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
                 "`{sql}` must decline the rowid IN-list seek (table Rewind present)"
             );
+            assert!(
+                !ops.iter()
+                    .any(|op| matches!(&op.p4, P4::Index(name) if name == "idx_t_k")),
+                "`{sql}` must scan the table in rowid order, not walk idx_t_k"
+            );
         }
+        // NOT IN is a full scan in stock too, of the narrower covering index (stock: SCAN t
+        // USING COVERING INDEX idx_t_k), which 410d63a80 (bd-1bs3h) now matches.
+        let not_in_ops = bd_2dgf5_program("SELECT id FROM t WHERE id NOT IN (5, 10)");
+        assert!(
+            !not_in_ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "NOT IN must decline the rowid IN-list seek"
+        );
+        assert!(
+            not_in_ops.iter().any(|op| op.opcode == Opcode::Rewind)
+                && not_in_ops
+                    .iter()
+                    .any(|op| matches!(&op.p4, P4::Index(name) if name == "idx_t_k")),
+            "NOT IN must scan the covering index idx_t_k, as stock does"
+        );
     }
 
     /// GH #415: a rowid membership test whose members are bind parameters (or any
