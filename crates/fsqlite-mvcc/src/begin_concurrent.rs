@@ -838,8 +838,10 @@ impl ConcurrentHandle {
     }
 
     /// Whether `page` is one of this transaction's private end-of-file pages.
-    /// A caller that also finds the page in this handle's lock set must treat
-    /// it as locked (a private page that was later freed is locked and freed).
+    /// Both writes and frees of an unlocked private page stay off the
+    /// in-process page lock table until COMMIT (bd-emim5 step 1 / bd-t26cs);
+    /// a caller that also finds the page in this handle's lock set must still
+    /// treat it as locked.
     #[must_use]
     pub fn is_private_eof_page(&self, page: PageNumber) -> bool {
         self.private_eof_pages.contains(&page)

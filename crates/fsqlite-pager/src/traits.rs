@@ -1721,11 +1721,17 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     ///
     /// Such a page lies above every page this transaction can see, so no peer
     /// holds it as a committed page; a peer can only hold the same number as
-    /// its own fresh page, in its own pager. The engine then writes it without
-    /// the in-process page lock; COMMIT still tracks and locks every page it
-    /// writes. A page reused from any freelist is a committed page and is never
-    /// private. The conservative default is `false`.
+    /// its own fresh page, in its own pager. The engine writes and frees it
+    /// without the in-process page lock; COMMIT still tracks and locks every
+    /// page it writes or frees. A page reused from any freelist is a committed
+    /// page and is never private. The conservative default is `false`.
     fn allocated_page_is_private_eof(&self, _page_no: PageNumber) -> bool {
+        false
+    }
+
+    /// Whether `page_no` is currently in this transaction's freed-page set
+    /// (automatically restored across savepoint rollbacks).
+    fn is_page_freed(&self, _page_no: PageNumber) -> bool {
         false
     }
 
@@ -2775,6 +2781,10 @@ impl TransactionHandle for TransactionKind {
 
     fn allocated_page_is_private_eof(&self, page_no: PageNumber) -> bool {
         dispatch_transaction_kind!(self, txn => txn.allocated_page_is_private_eof(page_no))
+    }
+
+    fn is_page_freed(&self, page_no: PageNumber) -> bool {
+        dispatch_transaction_kind!(self, txn => txn.is_page_freed(page_no))
     }
 
     fn set_auto_vacuum_state(

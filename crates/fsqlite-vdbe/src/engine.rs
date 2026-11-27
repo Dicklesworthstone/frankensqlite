@@ -3998,8 +3998,12 @@ impl SharedTxnPageIo {
         let Some(ctx) = concurrent.as_ref() else {
             return Ok(());
         };
-        let handle = ctx.handle.lock();
-        if concurrent_has_page_state(&handle) && concurrent_page_read_status(&handle, page_no).0 {
+        let is_freed = {
+            let handle = ctx.handle.lock();
+            (concurrent_has_page_state(&handle) && concurrent_page_read_status(&handle, page_no).0)
+                || (handle.is_private_eof_page(page_no) && self.txn.borrow().is_page_freed(page_no))
+        };
+        if is_freed {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "page {} was freed earlier in concurrent transaction {}",
@@ -4071,8 +4075,8 @@ impl SharedTxnPageIo {
     ) -> ConcurrentWriteTier {
         {
             let handle = ctx.handle.lock();
-            // A page this transaction locks keeps tier 0 even when it was
-            // private: freeing a private page locks it and marks it freed.
+            // A page this transaction already locked keeps tier 0 even if it
+            // was also marked private.
             if handle.holds_page_lock(page_no) {
                 return ConcurrentWriteTier::Tier0AlreadyOwned;
             }
@@ -4677,6 +4681,23 @@ impl SharedTxnPageIo {
         self.clear_stale_synthetic_pending_commit_surface(cx, "write_page_private_eof")
     }
 
+    /// bd-t26cs / bd-emim5 (b) step 1: free a fresh end-of-file page this
+    /// transaction owns privately. Just like `write_page_private_eof`, no peer
+    /// can hold this page number as a committed page from our snapshot; taking
+    /// an in-process page lock or checking `CommitIndex` mid-statement here
+    /// blocks a peer grower's COMMIT with `Busy` and aborts our own `DELETE`
+    /// mid-statement instead of deferring validation to COMMIT. The pager still
+    /// records `page_no` in `freed_pages`, so COMMIT's conservative conflict
+    /// surface tracks, locks, and checks it (and page 1 when in-range) before
+    /// publishing.
+    // bd-h9o9r: the RefCell borrow is held across the pager await, matching
+    // `write_page_private_eof`.
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn free_page_private_eof(&self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+        self.txn.borrow_mut().free_page(cx, page_no).await?;
+        self.clear_stale_synthetic_pending_commit_surface(cx, "free_page_private_eof")
+    }
+
     // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
     // await in this function's body. The engine executes strictly
     // sequentially per connection, but the reachable-reentrancy audit and
@@ -5186,6 +5207,9 @@ impl PageReader for SharedTxnPageIo {
                 } else {
                     (false, false)
                 };
+                let is_freed = is_freed
+                    || (handle.is_private_eof_page(page_no)
+                        && self.txn.borrow().is_page_freed(page_no));
                 if is_freed {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -5245,6 +5269,9 @@ impl PageReader for SharedTxnPageIo {
                 } else {
                     (false, false)
                 };
+                let is_freed = is_freed
+                    || (handle.is_private_eof_page(page_no)
+                        && self.txn.borrow().is_page_freed(page_no));
                 if is_freed {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -5396,9 +5423,13 @@ impl PageWriter for SharedTxnPageIo {
             let has_staged_write = {
                 let handle = ctx.handle.lock();
                 let (is_freed, has_staged_write) = concurrent_page_read_status(&handle, page_no);
-                // bd-emim5 (b) step 1: a private end-of-file page is staged in
-                // the pager's write set only (`write_page_private_eof`).
-                !is_freed && (has_staged_write || handle.is_private_eof_page(page_no))
+                // bd-emim5 (b) step 1 / bd-t26cs: a private end-of-file page
+                // is staged and freed in the pager only (`write_page_private_eof`
+                // / `free_page_private_eof`).
+                !is_freed
+                    && (has_staged_write
+                        || (handle.is_private_eof_page(page_no)
+                            && !self.txn.borrow().is_page_freed(page_no)))
             };
             if !has_staged_write {
                 return false;
@@ -5479,6 +5510,12 @@ impl PageWriter for SharedTxnPageIo {
     #[allow(clippy::await_holding_refcell_ref, clippy::await_holding_lock)]
     async fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
         let concurrent = self.concurrent_context();
+        if concurrent.as_ref().is_some_and(|ctx| {
+            let handle = ctx.handle.lock();
+            !handle.holds_page_lock(page_no) && handle.is_private_eof_page(page_no)
+        }) {
+            return self.free_page_private_eof(cx, page_no).await;
+        }
         let page_one_tracking_required = self
             .concurrent_context()
             .as_ref()

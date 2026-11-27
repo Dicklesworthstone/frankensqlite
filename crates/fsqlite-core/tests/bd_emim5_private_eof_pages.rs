@@ -26,6 +26,13 @@
 //!   committed freelist is a committed page, not a new one, so two transactions
 //!   that reuse the same freelist page still meet at its page lock. A version
 //!   that treats every page a transaction allocates as private fails this.
+//! - bd-t26cs `a_grower_that_freed_a_fresh_page_*`: freeing a fresh end-of-file
+//!   page must also stay off the in-process page lock table until COMMIT. Before
+//!   the fix, `free_page` took page locks and ran statement-time FCW checks on
+//!   private EOF pages, causing a peer grower's `COMMIT` to fail `Busy` (the
+//!   `c1e` failure) and rejecting a `DELETE` mid-statement after a peer grew.
+//!   COMMIT still refuses the stale grower with `BusySnapshot`, and its first
+//!   retry commits with stock SQLite `integrity_check == "ok"`.
 #![cfg(unix)]
 
 use std::path::Path;
@@ -371,5 +378,368 @@ fn a_reused_freelist_page_still_waits_for_its_peer_at_the_statement() {
         assert_eq!(stock.integrity, "ok", "K-S1c: stock integrity: {stock:?}");
         assert_eq!(stock.rows_a, ROWS / CHUNKS, "K-S1c: the first's rows");
         assert_eq!(stock.rows_b, 0, "K-S1c: the second rolled back");
+    });
+}
+
+/// bd-t26cs keeper (exact `c1e` freed-fresh-page shape): `second` grows table
+/// `b` with fresh EOF pages and deletes rows `> 20` (freeing most of those
+/// fresh pages); `first` grows table `a` into overlapping EOF page numbers and
+/// commits cleanly; `second`'s first COMMIT is refused `BusySnapshot` (negative
+/// case: must not commit over `first`'s growth); `second` rolls back, replays,
+/// and commits on its first retry with stock SQLite `integrity_check == "ok"`.
+#[test]
+fn a_grower_that_freed_a_fresh_page_stays_refused_and_retries() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("t26cs_freed.db");
+        let base_pages = create(&db).await;
+
+        let first = open(&db, 5000).await;
+        let second = open(&db, 5000).await;
+        first.execute("BEGIN CONCURRENT").await.expect("first begin");
+        second
+            .execute("BEGIN CONCURRENT")
+            .await
+            .expect("second begin");
+
+        let large_pad = "y".repeat(600);
+        for id in 1..=200_i64 {
+            second
+                .execute(&format!(
+                    "INSERT INTO b(id, pad) VALUES ({id}, '{large_pad}')"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("second insert b id {id}: {e:?}"));
+        }
+        second
+            .execute("DELETE FROM b WHERE id > 20")
+            .await
+            .expect("second delete b > 20");
+
+        let first_rows = 100_i64;
+        for id in 1..=first_rows {
+            first
+                .execute(&format!(
+                    "INSERT INTO a(id, pad) VALUES ({id}, '{large_pad}')"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("first insert a id {id}: {e:?}"));
+        }
+        first
+            .execute("COMMIT")
+            .await
+            .expect("bd-t26cs: peer grower's COMMIT must not fail Busy against freed private EOF pages");
+        let grown = scalar(&first, "PRAGMA page_count").await;
+        assert!(
+            grown > base_pages + 10,
+            "vacuity: first must grow past second's surviving prefix ({base_pages} -> {grown})"
+        );
+
+        let refused = second.execute("COMMIT").await;
+        assert!(
+            matches!(refused, Err(FrankenError::BusySnapshot { .. })),
+            "bd-t26cs negative case: first attempt of second must still be refused BusySnapshot, \
+             got {refused:?}"
+        );
+        second.execute("ROLLBACK").await.ok();
+
+        second
+            .execute("BEGIN CONCURRENT")
+            .await
+            .expect("second retry begin");
+        for id in 1..=200_i64 {
+            second
+                .execute(&format!(
+                    "INSERT INTO b(id, pad) VALUES ({id}, '{large_pad}')"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("second retry insert b id {id}: {e:?}"));
+        }
+        second
+            .execute("DELETE FROM b WHERE id > 20")
+            .await
+            .expect("second retry delete b > 20");
+        second
+            .execute("COMMIT")
+            .await
+            .expect("bd-t26cs: retried COMMIT after ROLLBACK must succeed on the first retry");
+
+        first.close().await.expect("close first");
+        second.close().await.expect("close second");
+
+        let stock = stock_read(&db);
+        assert_eq!(
+            stock.integrity, "ok",
+            "bd-t26cs stock integrity_check after retry: {stock:?}"
+        );
+        assert_eq!((stock.rows_a, stock.rows_b), (first_rows, 20));
+        let reopened = open(&db, 5000).await;
+        assert_eq!(fsqlite_integrity(&reopened).await, "ok");
+        reopened.close().await.expect("close reopened");
+    });
+}
+
+/// bd-t26cs symmetric keeper: when `first` commits overlapping EOF growth
+/// BEFORE `second` frees its private EOF pages via `DELETE`, `second`'s
+/// `DELETE` must not fail mid-statement against `CommitIndex`; refusal stays
+/// at `second`'s `COMMIT` (`BusySnapshot`), and the retry commits cleanly.
+#[test]
+fn a_grower_freeing_fresh_pages_after_peer_commits_defers_refusal_to_commit_and_retries() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("t26cs_delete_after_peer.db");
+        let base_pages = create(&db).await;
+
+        let first = open(&db, 5000).await;
+        let second = open(&db, 5000).await;
+        first.execute("BEGIN CONCURRENT").await.expect("first begin");
+        second
+            .execute("BEGIN CONCURRENT")
+            .await
+            .expect("second begin");
+
+        let large_pad = "y".repeat(600);
+        for id in 1..=200_i64 {
+            second
+                .execute(&format!(
+                    "INSERT INTO b(id, pad) VALUES ({id}, '{large_pad}')"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("second insert b id {id}: {e:?}"));
+        }
+
+        let first_rows = 100_i64;
+        for id in 1..=first_rows {
+            first
+                .execute(&format!(
+                    "INSERT INTO a(id, pad) VALUES ({id}, '{large_pad}')"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("first insert a id {id}: {e:?}"));
+        }
+        first.execute("COMMIT").await.expect("first commit");
+        let grown = scalar(&first, "PRAGMA page_count").await;
+        assert!(
+            grown > base_pages + 10,
+            "vacuity: first must overlap second's private EOF range ({base_pages} -> {grown})"
+        );
+
+        second
+            .execute("DELETE FROM b WHERE id > 20")
+            .await
+            .expect("bd-t26cs: freeing own private EOF pages must defer conflict check to COMMIT");
+
+        let refused = second.execute("COMMIT").await;
+        assert!(
+            matches!(refused, Err(FrankenError::BusySnapshot { .. })),
+            "bd-t26cs negative case: COMMIT must still be refused BusySnapshot, got {refused:?}"
+        );
+        second.execute("ROLLBACK").await.ok();
+
+        second
+            .execute("BEGIN CONCURRENT")
+            .await
+            .expect("second retry begin");
+        for id in 1..=200_i64 {
+            second
+                .execute(&format!(
+                    "INSERT INTO b(id, pad) VALUES ({id}, '{large_pad}')"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("second retry insert b id {id}: {e:?}"));
+        }
+        second
+            .execute("DELETE FROM b WHERE id > 20")
+            .await
+            .expect("second retry delete b > 20");
+        second
+            .execute("COMMIT")
+            .await
+            .expect("bd-t26cs: retry COMMIT must succeed");
+
+        first.close().await.expect("close first");
+        second.close().await.expect("close second");
+
+        let stock = stock_read(&db);
+        assert_eq!(stock.integrity, "ok", "bd-t26cs stock integrity: {stock:?}");
+        assert_eq!((stock.rows_a, stock.rows_b), (first_rows, 20));
+    });
+}
+
+/// bd-t26cs no-in-process-peer forced-conflict keeper: refuse `conn`'s first
+/// `COMMIT` itself (at the WAL append gate, via an external stock SQLite update
+/// to `c` with zero EOF growth), then ROLLBACK and retry. Separates leaked
+/// lock state from leaked freelist/pager state.
+#[test]
+fn a_grower_that_freed_a_fresh_page_refused_via_external_conflict_retries() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("t26cs_forced_external.db");
+        create(&db).await;
+
+        let conn = open(&db, 5000).await;
+        conn.execute("BEGIN CONCURRENT").await.expect("conn begin");
+
+        let large_pad = "z".repeat(600);
+        for id in 1..=200_i64 {
+            conn.execute(&format!(
+                "INSERT INTO b(id, pad) VALUES ({id}, '{large_pad}')"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("conn insert b id {id}: {e:?}"));
+        }
+        conn.execute("DELETE FROM b WHERE id > 20")
+            .await
+            .expect("conn delete b > 20");
+        conn.execute("UPDATE c SET v = 100 WHERE id = 1")
+            .await
+            .expect("conn update c");
+
+        // External stock SQLite writer updates committed row c(1) without
+        // growing the file, forcing conn's COMMIT (not a statement) to fail
+        // BusySnapshot at the WAL append gate with no in-process peer.
+        {
+            let ext = rusqlite::Connection::open(&db).expect("ext open");
+            ext.busy_timeout(BUSY_TIMEOUT).expect("ext busy");
+            ext.execute("UPDATE c SET v = 99 WHERE id = 1", [])
+                .expect("ext update c");
+        }
+
+        let refused = conn.execute("COMMIT").await;
+        assert!(
+            matches!(refused, Err(FrankenError::BusySnapshot { .. })),
+            "bd-t26cs forced-conflict: COMMIT must be refused BusySnapshot, got {refused:?}"
+        );
+        conn.execute("ROLLBACK").await.ok();
+
+        conn.execute("BEGIN CONCURRENT")
+            .await
+            .expect("conn retry begin");
+        for id in 1..=200_i64 {
+            conn.execute(&format!(
+                "INSERT INTO b(id, pad) VALUES ({id}, '{large_pad}')"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("conn retry insert b id {id}: {e:?}"));
+        }
+        conn.execute("DELETE FROM b WHERE id > 20")
+            .await
+            .expect("conn retry delete b > 20");
+        conn.execute("COMMIT")
+            .await
+            .expect("bd-t26cs forced-conflict retry COMMIT must succeed");
+
+        conn.close().await.expect("close conn");
+
+        let stock = stock_read(&db);
+        assert_eq!(
+            stock.integrity, "ok",
+            "bd-t26cs forced-conflict stock integrity: {stock:?}"
+        );
+        assert_eq!(stock.rows_b, 20, "bd-t26cs forced-conflict rows_b");
+        assert_eq!(stock.c_value, 99, "bd-t26cs forced-conflict c_value");
+    });
+}
+
+/// bd-t26cs savepoint + secure_delete keeper: freeing private EOF pages under
+/// `PRAGMA secure_delete = ON` inside a savepoint and rolling back to that
+/// savepoint must restore the pages as live without taking statement-time page
+/// locks, so a peer grower still commits and a subsequent retry succeeds.
+#[test]
+fn a_grower_freeing_fresh_pages_with_secure_delete_and_savepoint_rollback_works() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("t26cs_secure_delete_sp.db");
+        create(&db).await;
+
+        let first = open(&db, 5000).await;
+        let second = open(&db, 5000).await;
+        second
+            .execute("PRAGMA secure_delete = ON")
+            .await
+            .expect("secure_delete on");
+        first.execute("BEGIN CONCURRENT").await.expect("first begin");
+        second
+            .execute("BEGIN CONCURRENT")
+            .await
+            .expect("second begin");
+
+        let large_pad = "q".repeat(600);
+        for id in 1..=200_i64 {
+            second
+                .execute(&format!(
+                    "INSERT INTO b(id, pad) VALUES ({id}, '{large_pad}')"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("second insert b id {id}: {e:?}"));
+        }
+        second.execute("SAVEPOINT sp").await.expect("savepoint sp");
+        second
+            .execute("DELETE FROM b WHERE id > 20")
+            .await
+            .expect("second delete inside savepoint");
+        assert_eq!(scalar(&second, "SELECT count(*) FROM b").await, 20);
+        second
+            .execute("ROLLBACK TO sp")
+            .await
+            .expect("rollback to sp");
+        assert_eq!(
+            scalar(&second, "SELECT count(*) FROM b").await,
+            200,
+            "ROLLBACK TO sp must restore private EOF pages freed under secure_delete=ON"
+        );
+        // Re-mutate one of the restored private EOF rows to verify
+        // try_mutate_staged_page_data / write_page_private_eof still work.
+        second
+            .execute("UPDATE b SET pad = 'updated' WHERE id = 150")
+            .await
+            .expect("update restored private EOF row");
+        second.execute("RELEASE sp").await.expect("release sp");
+
+        let first_rows = 100_i64;
+        for id in 1..=first_rows {
+            first
+                .execute(&format!(
+                    "INSERT INTO a(id, pad) VALUES ({id}, '{large_pad}')"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("first insert a id {id}: {e:?}"));
+        }
+        first
+            .execute("COMMIT")
+            .await
+            .expect("first commit must succeed without hitting Busy on second's private pages");
+
+        let refused = second.execute("COMMIT").await;
+        assert!(
+            matches!(refused, Err(FrankenError::BusySnapshot { .. })),
+            "second's COMMIT must still be refused BusySnapshot, got {refused:?}"
+        );
+        second.execute("ROLLBACK").await.ok();
+
+        second
+            .execute("BEGIN CONCURRENT")
+            .await
+            .expect("retry begin");
+        for id in 1..=200_i64 {
+            second
+                .execute(&format!(
+                    "INSERT INTO b(id, pad) VALUES ({id}, '{large_pad}')"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("retry insert b id {id}: {e:?}"));
+        }
+        second
+            .execute("DELETE FROM b WHERE id > 20")
+            .await
+            .expect("retry delete");
+        second.execute("COMMIT").await.expect("retry commit");
+
+        first.close().await.expect("close first");
+        second.close().await.expect("close second");
+
+        let stock = stock_read(&db);
+        assert_eq!(stock.integrity, "ok", "stock integrity: {stock:?}");
+        assert_eq!((stock.rows_a, stock.rows_b), (first_rows, 20));
     });
 }

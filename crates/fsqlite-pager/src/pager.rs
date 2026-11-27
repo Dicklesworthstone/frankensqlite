@@ -34581,6 +34581,10 @@ where
             && page_no.get() > self.published_db_size.get()
     }
 
+    fn is_page_freed(&self, page_no: PageNumber) -> bool {
+        self.contains_freed_page(page_no)
+    }
+
     fn set_auto_vacuum_state(&mut self, mode: AutoVacuumMode, largest_root_page: u32) {
         self.pointer_map = PointerMapState {
             mode,
