@@ -800,9 +800,11 @@ pub trait WalBackend: Send + Sync {
     ///
     /// A current-generation record is authorized against its complete frame
     /// boundary and commit marker. After a checkpoint reset, a file-backed
-    /// backend may instead return the persisted certificate handoff from the
-    /// previous generation solely to continue the writer-side clock. That
-    /// handoff is not reader visibility; use
+    /// backend may instead return a previous generation's certificate solely
+    /// to continue the writer-side clock: the persisted checkpoint handoff,
+    /// or (bd-30ip9: a stock reset writes no handoff) the sidecar's newest
+    /// record when it is a reset generation's, whichever has the newer epoch.
+    /// That certificate is not reader visibility; use
     /// [`Self::pinned_logical_read_snapshot`] for a generation-bound reader
     /// horizon. Backends without a cross-process durable namespace have no
     /// seed.

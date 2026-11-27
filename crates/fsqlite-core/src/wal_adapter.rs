@@ -6509,6 +6509,60 @@ where
         }
     }
 
+    /// bd-30ip9: the certificate of the sidecar's newest complete record when
+    /// that record belongs to a reset WAL generation, as a writer-clock seed
+    /// only (never reader visibility).
+    ///
+    /// A stock `wal_checkpoint(TRUNCATE/RESTART)` resets the WAL without
+    /// writing the checkpoint handoff, so without this seed a process whose
+    /// first commit is the new generation's first restarts the certificate
+    /// epochs: it certified epoch 1 when the reset generation's newest record
+    /// already had epoch 1. A COMMIT that waited across that reset and was
+    /// admitted by c9c513a65's anchor proof keeps its process's older clock
+    /// and its pre-reset commit horizon, so it reconciles that record as a
+    /// newer interval with an epoch that is not newer and failed with
+    /// `Internal("... certificate epoch 1 is not newer than 1")`. This is the
+    /// record that first append keeps as its continuity anchor (bd-5eult), so
+    /// the new generation's epochs continue above it.
+    ///
+    /// No seed (today's answer) for an empty, legacy, torn or unreadable
+    /// sidecar, a current-generation tail (the authorized lookup already
+    /// judged it), or a record bound to a foreign database identity.
+    async fn retained_prior_generation_certificate(
+        &self,
+        cx: &Cx,
+    ) -> Option<ParallelWalCommitCertificate> {
+        let mut file = self.open_certificate_sidecar_for_horizon(cx).ok()??;
+        let newest: Result<Option<(u64, ParallelWalDurableCertificateRecord)>> = async {
+            let len = file.file_size(cx)?;
+            if len == 0 {
+                return Ok(None);
+            }
+            Self::read_certificate_record_ending_at(&file, cx, len).await
+        }
+        .await;
+        let cleanup_cx = cx.create_child();
+        let _cleanup_mask = cleanup_cx.masked();
+        let _ = file.close(&cleanup_cx);
+        let (_, record) = match newest {
+            Ok(newest) => newest?,
+            Err(error) => {
+                tracing::debug!(
+                    target: "fsqlite::wal::durability_combiner",
+                    %error,
+                    "no retained prior-generation certificate clock: the sidecar tail is unreadable"
+                );
+                return None;
+            }
+        };
+        if record.wal_generation == self.inner.inner().generation_identity()
+            || self.db_file_identity_rejects_record(&record)
+        {
+            return None;
+        }
+        Some(record.certificate)
+    }
+
     /// Recompute, with `record`'s digest algorithm, the frame-payload digest
     /// of `record`'s frame interval as the WAL now holds it.
     async fn wal_frame_payload_digest(
@@ -6841,7 +6895,8 @@ where
             // Append order is generation order. Once the newest tail
             // belongs to a prior reset generation, no earlier sidecar
             // record can authorize the current WAL; checkpoint clock
-            // continuation comes from the fixed handoff anchor instead.
+            // continuation comes from the fixed handoff anchor, or from
+            // that newest tail itself (bd-30ip9), instead.
             if record.wal_generation != wal_generation {
                 return Ok(None);
             }
@@ -7648,7 +7703,20 @@ where
             {
                 return Ok(Some(record.certificate));
             }
-            self.checkpoint_certificate_handoff(cx).await
+            // bd-30ip9: the clock continues from whichever reset-generation
+            // certificate is newer. fsqlite's own reset writes the handoff;
+            // a stock reset writes none, and the sidecar's newest record (the
+            // anchor the next append keeps) is then the only one.
+            let handoff = self.checkpoint_certificate_handoff(cx).await?;
+            let retained = self.retained_prior_generation_certificate(cx).await;
+            Ok(match (handoff, retained) {
+                (Some(handoff), Some(retained))
+                    if retained.certificate_epoch > handoff.certificate_epoch =>
+                {
+                    Some(retained)
+                }
+                (handoff, retained) => handoff.or(retained),
+            })
         })
     }
 
@@ -11585,6 +11653,189 @@ mod tests {
             // append compacts them to the newest complete anchor.
             assert_eq!(read_certificate_sidecar(&vfs, &cx).len(), sidecar_len);
         }
+    }
+
+    /// Reset the WAL generation and leave the checkpoint handoff as a stock
+    /// `wal_checkpoint(TRUNCATE)` would: absent (`None`), or still holding an
+    /// older fsqlite checkpoint's record (`Some(bytes)`). Stock never writes
+    /// the handoff; only fsqlite's own checkpoint does.
+    fn reset_as_stock_would(
+        backend: &mut PathRefreshingWalBackend<MemoryVfs>,
+        vfs: &MemoryVfs,
+        cx: &Cx,
+        handoff_left: Option<&[u8]>,
+    ) {
+        reset_continuity_fixture(backend, cx);
+        match handoff_left {
+            Some(bytes) => write_checkpoint_handoff(vfs, cx, bytes),
+            None => vfs
+                .delete(cx, std::path::Path::new("test.db-wal-cert-head"), false)
+                .expect("a stock reset leaves no checkpoint handoff"),
+        }
+    }
+
+    /// bd-30ip9, by run: a stock reset, a fresh process P makes the new
+    /// generation's first commit, then the process that certified the reset
+    /// generation's newest record reconciles P's certificate with its commit
+    /// horizon still from before the reset (what a COMMIT admitted by
+    /// c9c513a65's anchor proof does). P must continue the certificate clock
+    /// from the record the reset generation left, so its epoch is newer.
+    /// Red before the fix: P had no seed, certified epoch 1 beside the reset
+    /// generation's epoch 1, and the reconciliation failed with
+    /// `StaleCertificateEpoch { current: 1, proposed: 1 }`.
+    fn assert_fresh_process_continues_the_clock_across_a_stock_reset(
+        backend: &mut PathRefreshingWalBackend<MemoryVfs>,
+        cx: &Cx,
+        old_process: &fsqlite_wal::ParallelWalDurabilityCombiner,
+        newest_before_reset: &ParallelWalCommitCertificate,
+        batch_id: u64,
+    ) {
+        let seed = backend
+            .latest_authorized_parallel_wal_commit_certificate(cx)
+            .wait()
+            .expect("read the clock seed after a stock reset");
+        assert_eq!(
+            seed.as_ref(),
+            Some(newest_before_reset),
+            "the reset generation's newest record continues the clock"
+        );
+        let fresh_process = fsqlite_wal::ParallelWalDurabilityCombiner::new(
+            fsqlite_wal::ParallelWalVisibilitySnapshot {
+                visible_commit_seq: newest_before_reset.commit_seq_hi,
+                db_size_pages: newest_before_reset.db_size_pages,
+                ..fsqlite_wal::ParallelWalVisibilitySnapshot::default()
+            },
+        );
+        fresh_process
+            .reconcile_authorized_seed(seed.as_ref().expect("a seed"))
+            .expect("the fresh process seeds its clock");
+        let first_of_generation = publish_certified_commit(backend, cx, &fresh_process, batch_id);
+        assert!(
+            first_of_generation.certificate_epoch > newest_before_reset.certificate_epoch,
+            "the new generation's first epoch {} must be above the reset generation's {}",
+            first_of_generation.certificate_epoch,
+            newest_before_reset.certificate_epoch
+        );
+        old_process
+            .reconcile_authorized_seed(&first_of_generation)
+            .expect("the old process reconciles the new generation's first certificate");
+        let next = publish_certified_commit(backend, cx, old_process, batch_id + 1);
+        assert!(next.certificate_epoch > first_of_generation.certificate_epoch);
+        assert!(next.commit_seq_lo > first_of_generation.commit_seq_hi);
+    }
+
+    #[test]
+    fn bd_30ip9_stock_reset_without_a_handoff_continues_the_clock_from_the_retained_record() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut backend = make_path_refreshing_backend(&vfs, &cx);
+        let old_process = fsqlite_wal::ParallelWalDurabilityCombiner::default();
+        let newest = publish_certified_commit(&mut backend, &cx, &old_process, 1);
+        reset_as_stock_would(&mut backend, &vfs, &cx, None);
+        assert_fresh_process_continues_the_clock_across_a_stock_reset(
+            &mut backend,
+            &cx,
+            &old_process,
+            &newest,
+            2,
+        );
+    }
+
+    /// An older fsqlite checkpoint's handoff, left in place by a later stock
+    /// reset, is older than the retained record: the newer one seeds.
+    #[test]
+    fn bd_30ip9_stock_reset_beside_an_older_handoff_continues_the_clock_from_the_newer_record() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut backend = make_path_refreshing_backend(&vfs, &cx);
+        let old_process = fsqlite_wal::ParallelWalDurabilityCombiner::default();
+        let first = publish_certified_commit(&mut backend, &cx, &old_process, 1);
+        reset_continuity_fixture(&mut backend, &cx);
+        let older_handoff = {
+            let path = std::path::Path::new("test.db-wal-cert-head");
+            let flags = VfsOpenFlags::READONLY | VfsOpenFlags::WAL;
+            let (mut file, _) = vfs.open(&cx, Some(path), flags).expect("open the handoff");
+            let len = usize::try_from(file.file_size(&cx).expect("handoff size"))
+                .expect("handoff size fits usize");
+            let mut bytes = vec![0_u8; len];
+            assert_eq!(
+                file.read(&cx, &mut bytes, 0).expect("read the handoff"),
+                len
+            );
+            file.close(&cx).expect("close the handoff");
+            bytes
+        };
+        assert_eq!(
+            ParallelWalDurableCertificateRecord::from_bytes(&older_handoff)
+                .expect("the fsqlite checkpoint wrote a handoff")
+                .certificate,
+            first
+        );
+        let newest = publish_certified_commit(&mut backend, &cx, &old_process, 2);
+        assert!(newest.certificate_epoch > first.certificate_epoch);
+        reset_as_stock_would(&mut backend, &vfs, &cx, Some(&older_handoff));
+        assert_fresh_process_continues_the_clock_across_a_stock_reset(
+            &mut backend,
+            &cx,
+            &old_process,
+            &newest,
+            3,
+        );
+    }
+
+    /// bd-30ip9 negative keeper: the combiner's epoch check is what caught
+    /// the clock restart. A certificate whose interval is newer than this
+    /// process's horizon but whose epoch is not newer than its clock (two
+    /// processes certified the same epoch) is refused. A combiner that
+    /// accepts any epoch fails this test.
+    #[test]
+    fn bd_30ip9_a_newer_interval_without_a_newer_epoch_is_refused() {
+        let certify = |combiner: &fsqlite_wal::ParallelWalDurabilityCombiner, batch_id: u64| {
+            let page = sample_page(u8::try_from(batch_id).expect("batch id fits u8"));
+            combiner
+                .certify_and_publish(
+                    fsqlite_wal::ParallelWalDurabilityRequest {
+                        trace_id: batch_id,
+                        scenario_id: "bd-30ip9-epoch-check".to_owned(),
+                        certificate_epoch: 0,
+                        durable_segment_epoch: 0,
+                        batch_size: 1,
+                        batch_ids: vec![batch_id],
+                        lane_record_counts: vec![1],
+                        db_size_pages: 1,
+                        page_set_size: 1,
+                        control_mode: fsqlite_wal::ParallelWalOperatingMode::Auto,
+                        fallback_reason: None,
+                        checkpoint_active: false,
+                        wal_frame_payload_digest: test_frame_payload_digest(1, &page, 1),
+                    },
+                    |_| Ok(()),
+                )
+                .expect("certify")
+                .certificate
+        };
+        let old_process = fsqlite_wal::ParallelWalDurabilityCombiner::default();
+        let newest = certify(&old_process, 1);
+        let unseeded = fsqlite_wal::ParallelWalDurabilityCombiner::new(
+            fsqlite_wal::ParallelWalVisibilitySnapshot {
+                visible_commit_seq: newest.commit_seq_hi,
+                db_size_pages: newest.db_size_pages,
+                ..fsqlite_wal::ParallelWalVisibilitySnapshot::default()
+            },
+        );
+        let collided = certify(&unseeded, 2);
+        assert!(collided.commit_seq_hi > newest.commit_seq_hi);
+        assert_eq!(collided.certificate_epoch, newest.certificate_epoch);
+        assert!(
+            matches!(
+                old_process.reconcile_authorized_seed(&collided),
+                Err(fsqlite_wal::ParallelWalCombinerError::StaleCertificateEpoch {
+                    current,
+                    proposed,
+                }) if current == newest.certificate_epoch && proposed == collided.certificate_epoch
+            ),
+            "a newer interval with a reused epoch must be refused"
+        );
     }
 
     /// The certificate read holds no lock, so a peer can truncate the sidecar
