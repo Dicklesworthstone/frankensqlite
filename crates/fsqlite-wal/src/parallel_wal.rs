@@ -6075,6 +6075,98 @@ mod tests {
     }
 
     #[test]
+    fn authorized_tail_rejects_restarted_epoch_without_verified_visibility_floor() {
+        let combiner = ParallelWalDurabilityCombiner::default();
+        let first = combiner
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("original generation publishes");
+        let before = combiner.visibility_snapshot();
+        // A fresh process can start a new WAL generation at epoch 1. Its
+        // later interval alone cannot prove a reset to a combiner that still
+        // belongs to the original generation (bd-30ip9).
+        let fresh_process = ParallelWalDurabilityCombiner::new(ParallelWalVisibilitySnapshot {
+            visible_commit_seq: first.certificate.commit_seq_hi,
+            ..ParallelWalVisibilitySnapshot::default()
+        });
+        let peer = fresh_process
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("fresh process publishes epoch 1 at a later interval");
+        assert!(peer.certificate.commit_seq_hi > first.certificate.commit_seq_hi);
+        assert_eq!(peer.certificate.certificate_epoch, 1);
+        assert_eq!(
+            combiner.reconcile_authorized_seed(&peer.certificate),
+            Err(ParallelWalCombinerError::StaleCertificateEpoch {
+                current: 1,
+                proposed: 1,
+            }),
+            "accepting any epoch would permit a same-generation stale certificate"
+        );
+        assert_eq!(combiner.visibility_snapshot(), before);
+    }
+
+    #[test]
+    fn verified_visibility_floor_imports_restarted_epoch_without_lowering_clocks() {
+        let combiner = ParallelWalDurabilityCombiner::default();
+        for _ in 0..3 {
+            combiner
+                .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                    Ok(())
+                })
+                .expect("original generation publishes");
+        }
+        let before = combiner.visibility_snapshot();
+        assert_eq!(before.certificate_epoch, 3);
+        let fresh_process = ParallelWalDurabilityCombiner::new(ParallelWalVisibilitySnapshot {
+            visible_commit_seq: before.visible_commit_seq,
+            ..ParallelWalVisibilitySnapshot::default()
+        });
+        let peer = fresh_process
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("reset generation's first commit starts at epoch 1");
+        assert_eq!(peer.certificate.certificate_epoch, 1);
+
+        // The pager may raise this floor only after binding the logical
+        // horizon to the readmitted generation and final frame under WRITE.
+        combiner.reconcile_durable_visibility_floor(peer.certificate.commit_seq_hi);
+        let mut corrupt = peer.certificate.clone();
+        corrupt.certificate_crc32c ^= 1;
+        assert_eq!(
+            combiner.reconcile_authorized_seed(&corrupt),
+            Err(ParallelWalCombinerError::CertificateChecksumMismatch),
+            "a verified horizon does not authorize a corrupt seed"
+        );
+        combiner
+            .reconcile_authorized_seed(&peer.certificate)
+            .expect("the verified new horizon binds the fresh process's certificate");
+        let imported = combiner.visibility_snapshot();
+        assert_eq!(imported.certificate_epoch, before.certificate_epoch);
+        assert_eq!(imported.durability_seq, before.durability_seq);
+        assert_eq!(
+            imported.publication_generation,
+            before.publication_generation
+        );
+        assert_eq!(imported.visible_commit_seq, peer.certificate.commit_seq_hi);
+
+        let next = combiner
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("readmitted writer follows the peer's durable interval");
+        assert_eq!(next.certificate.certificate_epoch, 4);
+        assert_eq!(next.certificate.durable_segment_epoch, 4);
+        assert_eq!(
+            next.certificate.commit_seq_lo,
+            CommitSeq::new(peer.certificate.commit_seq_hi.get() + 1)
+        );
+    }
+
+    #[test]
     fn durable_certificate_record_roundtrips_frame_payload_digest_and_checksum() {
         let receipt = ParallelWalDurabilityCombiner::default()
             .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
