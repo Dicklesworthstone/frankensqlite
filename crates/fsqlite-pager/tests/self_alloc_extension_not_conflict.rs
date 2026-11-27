@@ -429,6 +429,74 @@ async fn wal_pager_pair(
 }
 
 #[test]
+fn traditional_writer_exit_preserves_a_concurrent_writers_pages() {
+    block_on_test(async {
+        for exit in ["rollback", "drop", "clean commit", "rollback to savepoint"] {
+            let cx = Cx::new();
+            let pager = SimplePager::open_with_cx(
+                &cx,
+                MemoryVfs::new(),
+                Path::new("/mixed-writers.db"),
+                PageSize::DEFAULT,
+            )
+            .await
+            .unwrap();
+            let mut traditional = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            traditional.savepoint(&cx, "before_peer").unwrap();
+            let mut peer = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let first = peer.allocate_page(&cx).await.unwrap();
+            let second = peer.allocate_page(&cx).await.unwrap();
+            let mut next = match exit {
+                "rollback to savepoint" => {
+                    traditional.rollback_to_savepoint(&cx, "before_peer").unwrap();
+                    traditional
+                }
+                _ => {
+                    match exit {
+                        "rollback" => traditional.rollback(&cx).await.unwrap(),
+                        "clean commit" => traditional.commit(&cx).await.unwrap(),
+                        "drop" => drop(traditional),
+                        _ => unreachable!(),
+                    }
+                    pager.begin(&cx, TransactionMode::Immediate).await.unwrap()
+                }
+            };
+            let new_page = next.allocate_page(&cx).await.unwrap();
+            let leased = peer.allocate_page(&cx).await.unwrap();
+            assert!(
+                ![first, second, leased].contains(&new_page),
+                "{exit}: allocator returned peer-owned page {new_page}"
+            );
+            next.rollback(&cx).await.unwrap();
+            peer.rollback(&cx).await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn savepoint_preserves_pages_committed_by_a_departed_writer() {
+    block_on_test(async {
+        let (cx, pager, _, state) = wal_pager_pair(Path::new("/departed-writer.db")).await;
+        let mut owner = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+        owner.savepoint(&cx, "before_peer").unwrap();
+        let mut peer = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+        let occupied = peer.allocate_page(&cx).await.unwrap();
+        let payload = vec![0x6a; PageSize::DEFAULT.as_usize()];
+        peer.write_page(&cx, occupied, &payload).await.unwrap();
+        peer.commit(&cx).await.unwrap();
+        drop(peer);
+
+        owner.rollback_to_savepoint(&cx, "before_peer").unwrap();
+        let next = owner.allocate_page(&cx).await.unwrap();
+        assert_ne!(next, occupied, "a savepoint reissued a committed page");
+        owner.rollback(&cx).await.unwrap();
+        let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+        assert_eq!(reader.get_page(&cx, occupied).await.unwrap().as_ref(), payload);
+        assert_no_pending_certificate(&state);
+    });
+}
+
+#[test]
 fn self_allocated_eof_page_stays_out_of_conflict_surface() {
     block_on_test(async {
         let cx = Cx::new();

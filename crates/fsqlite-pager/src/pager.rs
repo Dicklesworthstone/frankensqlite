@@ -9299,6 +9299,9 @@ pub(crate) struct PagerInner<F: VfsFile> {
     writer_active: bool,
     /// Number of active transactions (readers + writers).
     active_transactions: u32,
+    /// Sticky from the second admission until a new transaction starts on an
+    /// idle pager. A peer can change the allocator and exit before rollback.
+    shared_allocator_window: bool,
     /// Whether a checkpoint is currently running.
     checkpoint_active: bool,
     /// GH#399: the cross-process WAL reader slot (`WAL_READ_LOCK(i)`) this
@@ -10934,6 +10937,12 @@ impl Drop for PendingGroupCommitLogicalCleanupClaim {
 }
 
 impl<F: VfsFile> PagerInner<F> {
+    /// Rewinding a cursor or restoring an entire freelist is valid only if
+    /// this transaction had exclusive use of the allocator throughout.
+    fn can_restore_allocator_snapshot(&self, mode: TransactionMode) -> bool {
+        mode != TransactionMode::Concurrent && !self.shared_allocator_window
+    }
+
     fn image_replaced_by_peer(&self) -> bool {
         self.image_generation != self.maintenance_gate.image_generation.load(AtomicOrdering::Acquire)
     }
@@ -11733,7 +11742,7 @@ impl<F: VfsFile> PagerInner<F> {
         // we freed it, so we must NOT blindly return it to the freelist here).
         // Durable entries are preserved exactly by the assignment below. Only in
         // WAL mode: rollback-journal mode has no commit-fold to drain the pool
-        // (see restore_uncommitted_allocations_for_clean_commit), and its
+        // (see restore_uncommitted_allocations), and its
         // single-connection shapes do not hit this wholesale-replace path.
         // GH#399: never re-park across a WAL generation boundary — a
         // volatile-only entry may have been consumed and committed by a peer
@@ -17389,6 +17398,7 @@ where
                     admission.mark_writer_baton_owned();
                 }
                 inner.active_transactions = active_transactions_after_begin;
+                inner.shared_allocator_window = active_transactions_before_begin != 0;
                 let original_db_size = inner.db_size;
                 let journal_mode = inner.journal_mode;
                 let published_snapshot = self.published.snapshot();
@@ -17651,6 +17661,7 @@ where
                 inner.active_transactions.checked_add(1).ok_or_else(|| {
                     FrankenError::internal("active transaction count overflow during begin")
                 })?;
+            inner.shared_allocator_window = active_transactions_before_begin != 0;
             let original_db_size = inner.db_size;
             let journal_mode = inner.journal_mode;
             let pool = self.pool.clone();
@@ -22918,6 +22929,7 @@ where
                 next_page,
                 writer_active: false,
                 active_transactions: 0,
+                shared_allocator_window: false,
                 checkpoint_active: false,
                 access_mode: PagerAccessMode::Writable,
                 durable_freelist_view: freelist.iter().map(|page| page.get()).collect(),
@@ -23452,6 +23464,7 @@ where
                 next_page,
                 writer_active: false,
                 active_transactions: 0,
+                shared_allocator_window: false,
                 checkpoint_active: false,
                 durable_freelist_view: freelist
                     .iter()
@@ -27463,10 +27476,7 @@ where
         unstaged
     }
 
-    fn restore_uncommitted_allocations_for_clean_commit(
-        &mut self,
-        inner: &mut PagerInner<V::File>,
-    ) {
+    fn restore_uncommitted_allocations(&mut self, inner: &mut PagerInner<V::File>) {
         return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
         restore_quarantined_durable_freelist_pages(
             &mut inner.freelist,
@@ -27475,7 +27485,9 @@ where
         );
         self.allocated_from_durable_freelist.clear();
 
-        if self.mode == TransactionMode::Concurrent {
+        if !self.is_writer {
+            self.page_lease.clear();
+        } else if !inner.can_restore_allocator_snapshot(self.mode) {
             if self.journal_mode == JournalMode::Wal {
                 // bd-vnxjd: abandoned EOF reservations and quarantined savepoint
                 // pages must survive committed-state refresh (which rebuilds
@@ -27519,7 +27531,7 @@ where
                     self.savepoint_quarantined_allocations.drain(..),
                 );
             }
-        } else if inner.active_transactions <= 1 {
+        } else {
             return_pages_to_freelist(
                 &mut inner.freelist,
                 self.savepoint_quarantined_allocations.drain(..),
@@ -27528,27 +27540,6 @@ where
             self.allocated_from_eof.clear();
             inner.db_size = self.original_db_size;
             rewind_eof_allocation_to_db_size(inner);
-        } else {
-            // bd-0shxy: NEVER regress the shared EOF high-water mark while
-            // other transactions are live. `next_page` is monotonic across
-            // every transaction on this pager; concurrent peers may hold
-            // EOF allocations and page leases ABOVE this transaction's
-            // original_db_size, and resetting next_page here re-granted
-            // those exact page numbers to the next allocator — one physical
-            // page handed to two b-trees (index/table desync, LeafIndex
-            // pages reached through table roots, 0x00 page flags: the
-            // fleet corruption-epoch signatures). DROP this transaction's
-            // own EOF allocations instead: returning them to the shared
-            // freelist is equally unsafe here, because a detached-flushing
-            // peer's pages can reach the freelist while active_transactions
-            // has already been decremented, and the non-concurrent pop arm
-            // would hand them out again. A dropped EOF page above the
-            // committed db_size is a benign hole — it was never durable and
-            // the file never grows to include it unless something later
-            // re-allocates past it.
-            self.page_lease.clear();
-            self.allocated_from_eof.clear();
-            self.savepoint_quarantined_allocations.clear();
         }
     }
 }
@@ -32130,7 +32121,7 @@ where
                     &logical_exit_claim,
                 )
                 .await?;
-                self.restore_uncommitted_allocations_for_clean_commit(&mut inner);
+                self.restore_uncommitted_allocations(&mut inner);
                 drop(inner);
                 if notify_writer_idle {
                     self.writer_idle.notify_one();
@@ -34244,8 +34235,8 @@ where
             // write_set must not trip the defensive assertion.
             self.writes_observed = false;
             let restored_from_journal = self.recover_pending_rollback_journal(&cleanup_cx).await?;
-            let mut inner = self
-                .inner
+            let inner_arc = Arc::clone(&self.inner);
+            let mut inner = inner_arc
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
@@ -34266,72 +34257,7 @@ where
                 self.page_lease.clear();
                 self.savepoint_quarantined_allocations.clear();
             } else {
-                // Restore pages allocated from the freelist.
-                return_pages_to_freelist(
-                    &mut inner.freelist,
-                    self.allocated_from_freelist.drain(..),
-                );
-                restore_quarantined_durable_freelist_pages(
-                    &mut inner.freelist,
-                    &mut self.savepoint_quarantined_allocations,
-                    &self.allocated_from_durable_freelist,
-                );
-                self.allocated_from_durable_freelist.clear();
-
-                if self.is_writer && self.mode != TransactionMode::Concurrent {
-                    // Non-concurrent: next_page will be reset below, so lease
-                    // pages (which were EOF allocations) will be re-issued
-                    // naturally by future transactions. Just drop them — putting
-                    // them on the freelist would create sparse page holes since
-                    // the freelist consumer could pick a high page number while
-                    // next_page restarts from db_size+1.
-                    self.page_lease.clear();
-                    self.savepoint_quarantined_allocations.clear();
-
-                    inner.db_size = self.original_db_size;
-
-                    // Reset next_page to avoid holes if we allocated pages that are now discarded.
-                    // Logic matches SimplePager::open.
-                    rewind_eof_allocation_to_db_size(&mut inner);
-                } else if self.is_writer && self.mode == TransactionMode::Concurrent {
-                    // Concurrent: next_page is NOT reset, so lease pages and
-                    // aborted EOF allocations would become permanent holes once
-                    // a later commit grows page_count past them ("Page N:
-                    // never used"). bd-vnxjd: returning them to inner.freelist
-                    // did NOT survive: committed-state refresh wholesale-
-                    // replaces inner.freelist from durable state, silently
-                    // discarding these entries. Park them in the pager-level
-                    // abandonment pool instead — the next WAL commit folds
-                    // still-unwritten entries into its durable freelist
-                    // publication. Rollback-journal mode has no such fold, so
-                    // it keeps the volatile freelist return (see the matching
-                    // arm in restore_uncommitted_allocations_for_clean_commit).
-                    if self.journal_mode == JournalMode::Wal {
-                        inner
-                            .abandoned_eof_reservations
-                            .append(&mut self.page_lease);
-                        inner
-                            .abandoned_eof_reservations
-                            .append(&mut self.allocated_from_eof);
-                        inner
-                            .abandoned_eof_reservations
-                            .append(&mut self.savepoint_quarantined_allocations);
-                    } else {
-                        return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-                        return_pages_to_freelist(
-                            &mut inner.freelist,
-                            self.allocated_from_eof.drain(..),
-                        );
-                        return_pages_to_freelist(
-                            &mut inner.freelist,
-                            self.savepoint_quarantined_allocations.drain(..),
-                        );
-                    }
-                } else {
-                    // Read-only transaction: lease should be empty (only writers
-                    // allocate pages), but clear defensively.
-                    self.page_lease.clear();
-                }
+                self.restore_uncommitted_allocations(&mut inner);
             }
             notify_writer_idle |= coordinated_transaction_exit(
                 &self.group_commit_queue,
@@ -34456,7 +34382,7 @@ where
         }
 
         {
-            if self.mode != TransactionMode::Concurrent {
+            if inner.can_restore_allocator_snapshot(self.mode) {
                 inner.next_page = entry.next_page_snapshot;
                 inner.freelist.clone_from(&snapshot.freelist);
                 // Lease pages reference the rolled-back next_page range
@@ -34466,8 +34392,8 @@ where
             } else {
                 // bd-0shxy: post-savepoint allocations are QUARANTINED
                 // inside this transaction, never returned to the shared
-                // freelist mid-transaction (concurrent mode doesn't roll
-                // back next_page, so these stay valid page numbers). The
+                // freelist mid-transaction. The shared allocation cursor
+                // stays in place, so these remain valid page numbers. The
                 // former freelist return let this same transaction's next
                 // split re-acquire a page whose discarded parent link could
                 // still re-enter a later commit — one physical page in two
@@ -34476,7 +34402,6 @@ where
                 // are reused first by allocate_page and reach the freelist
                 // only at transaction end, when no live tree reference can
                 // persist.
-                let _ = &mut inner; // lock still held for sibling arms' symmetry
                 let eof_start = snapshot.allocated_from_eof.len();
                 let freelist_start = snapshot.allocated_from_freelist.len();
                 let lease: Vec<PageNumber> = std::mem::take(&mut self.page_lease);
@@ -34979,7 +34904,8 @@ where
         // ownership can be finalized synchronously.
         let cleanup_cx = self.cleanup_cx.clone();
         let _cleanup_mask = cleanup_cx.masked();
-        let mut inner = match self.inner.lock() {
+        let inner_arc = Arc::clone(&self.inner);
+        let mut inner = match inner_arc.lock() {
             Ok(inner) => inner,
             Err(error) => {
                 tracing::error!(
@@ -35014,49 +34940,7 @@ where
             self.page_lease.clear();
             self.savepoint_quarantined_allocations.clear();
         } else {
-            // Ordinary uncommitted drop: restore freelist allocations.
-            return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
-            restore_quarantined_durable_freelist_pages(
-                &mut inner.freelist,
-                &mut self.savepoint_quarantined_allocations,
-                &self.allocated_from_durable_freelist,
-            );
-            self.allocated_from_durable_freelist.clear();
-
-            if self.is_writer && self.mode != TransactionMode::Concurrent {
-                // Non-concurrent: next_page will be reset, so lease pages
-                // are re-issued naturally. Just drop them to avoid holes.
-                self.page_lease.clear();
-                self.savepoint_quarantined_allocations.clear();
-                inner.db_size = self.original_db_size;
-                rewind_eof_allocation_to_db_size(&mut inner);
-            } else if self.is_writer && self.mode == TransactionMode::Concurrent {
-                if self.journal_mode == JournalMode::Wal {
-                    // A peer may already have committed past these reservations.
-                    // Preserve ownership like explicit rollback: if this pager
-                    // closes next, its Drop hands the pool to the shared ledger
-                    // for a surviving pager's durable freelist fold.
-                    inner
-                        .abandoned_eof_reservations
-                        .append(&mut self.page_lease);
-                    inner
-                        .abandoned_eof_reservations
-                        .append(&mut self.allocated_from_eof);
-                    inner
-                        .abandoned_eof_reservations
-                        .append(&mut self.savepoint_quarantined_allocations);
-                } else {
-                    return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-                    return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
-                    return_pages_to_freelist(
-                        &mut inner.freelist,
-                        self.savepoint_quarantined_allocations.drain(..),
-                    );
-                }
-            } else {
-                // Read-only: lease should be empty, clear defensively.
-                self.page_lease.clear();
-            }
+            self.restore_uncommitted_allocations(&mut inner);
         }
 
         let retained_memory_overlay =
