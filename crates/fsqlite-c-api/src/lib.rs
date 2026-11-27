@@ -2792,62 +2792,96 @@ mod tests {
         value
     }
 
-    /// bd-b8cfq: these errors must be raised by the C prepare boundary,
-    /// before a caller can obtain a statement handle. Expected messages and
-    /// return codes were checked against the bundled SQLite 3.54.1 C API.
-    /// Each rejected prepare must leave the previous DML counters intact.
+    const SCHEMA_PREPARE_ERROR_CASES: &[(&str, &str)] = &[
+        ("CREATE TABLE t(z)", "table t already exists"),
+        ("CREATE TABLE T(z)", "table T already exists"),
+        ("CREATE TABLE main.t(z)", "table t already exists"),
+        ("CREATE TABLE v(z)", "view v already exists"),
+        ("CREATE TABLE ib(z)", "there is already an index named ib"),
+        (
+            "CREATE TABLE IF NOT EXISTS ib(z)",
+            "there is already an index named ib",
+        ),
+        (
+            "CREATE VIEW IF NOT EXISTS ib AS SELECT 1",
+            "there is already an index named ib",
+        ),
+        ("CREATE VIEW t AS SELECT 1", "table t already exists"),
+        ("CREATE VIEW v AS SELECT 1", "view v already exists"),
+        ("CREATE INDEX ib ON t(b)", "index ib already exists"),
+        ("CREATE INDEX t ON t(b)", "there is already a table named t"),
+        ("CREATE INDEX v ON t(b)", "there is already a table named v"),
+        (
+            "CREATE INDEX IF NOT EXISTS t ON t(b)",
+            "there is already a table named t",
+        ),
+        (
+            "CREATE INDEX ix ON missing(b)",
+            "no such table: main.missing",
+        ),
+        ("CREATE INDEX ix ON t(nosuch)", "no such column: nosuch"),
+        ("CREATE INDEX ix ON v(a)", "views may not be indexed"),
+        (
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+            "trigger tr already exists",
+        ),
+        (
+            "CREATE TRIGGER tr2 AFTER INSERT ON missing BEGIN SELECT 1; END",
+            "no such table: main.missing",
+        ),
+        (
+            "CREATE TRIGGER tr2 INSTEAD OF INSERT ON t BEGIN SELECT 1; END",
+            "cannot create INSTEAD OF trigger on table: t",
+        ),
+        (
+            "CREATE TRIGGER tr2 BEFORE INSERT ON v BEGIN SELECT 1; END",
+            "cannot create BEFORE trigger on view: v",
+        ),
+        (
+            "CREATE TABLE sqlite_x(a)",
+            "object name reserved for internal use: sqlite_x",
+        ),
+        (
+            "CREATE INDEX sqlite_i ON t(b)",
+            "object name reserved for internal use: sqlite_i",
+        ),
+        (
+            "CREATE VIEW sqlite_v AS SELECT 1",
+            "object name reserved for internal use: sqlite_v",
+        ),
+        (
+            "CREATE TEMP TABLE main.q(a)",
+            "temporary table name must be unqualified",
+        ),
+        ("CREATE TABLE aux.q(a)", "unknown database aux"),
+        ("CREATE VIEW aux.vv AS SELECT 1", "unknown database aux"),
+        ("DROP TABLE missing", "no such table: missing"),
+        ("DROP INDEX missing", "no such index: missing"),
+        ("DROP VIEW missing", "no such view: missing"),
+        ("DROP TRIGGER missing", "no such trigger: missing"),
+        ("DROP TABLE main.missing", "no such table: main.missing"),
+        ("DROP VIEW t", "use DROP TABLE to delete table t"),
+        ("DROP TABLE v", "use DROP VIEW to delete view v"),
+        ("ALTER TABLE missing ADD COLUMN c", "no such table: missing"),
+        ("ALTER TABLE missing RENAME TO m2", "no such table: missing"),
+        ("ALTER TABLE t ADD COLUMN b", "duplicate column name: b"),
+        (
+            "ALTER TABLE t RENAME TO v",
+            "there is already another table or index with this name: v",
+        ),
+        ("ANALYZE missing", "no such table: missing"),
+        (
+            "REINDEX missing",
+            "unable to identify the object to be reindexed",
+        ),
+    ];
+
+    /// bd-b8cfq: all 39 DDL prepare-error shapes from the `bd-nnnd8` live
+    /// bundled SQLite 3.54.1 oracle must be raised by the C `sqlite3_prepare_v2`
+    /// boundary before a caller can obtain a statement handle, with stock-exact
+    /// `SQLITE_ERROR` code and `sqlite3_errmsg`, leaving prior DML counters intact.
     #[test]
     fn test_prepare_schema_errors_match_stock_before_step() {
-        let cases = [
-            ("CREATE TABLE t(z)", "table t already exists"),
-            ("CREATE VIEW v AS SELECT 1", "view v already exists"),
-            ("CREATE TABLE ib(z)", "there is already an index named ib"),
-            ("CREATE INDEX ib ON t(b)", "index ib already exists"),
-            (
-                "CREATE INDEX ix ON missing(b)",
-                "no such table: main.missing",
-            ),
-            ("CREATE INDEX ix ON t(nosuch)", "no such column: nosuch"),
-            ("CREATE INDEX ix ON v(a)", "views may not be indexed"),
-            (
-                "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
-                "trigger tr already exists",
-            ),
-            (
-                "CREATE TRIGGER tr2 AFTER INSERT ON missing BEGIN SELECT 1; END",
-                "no such table: main.missing",
-            ),
-            (
-                "CREATE TRIGGER tr2 INSTEAD OF INSERT ON t BEGIN SELECT 1; END",
-                "cannot create INSTEAD OF trigger on table: t",
-            ),
-            (
-                "CREATE TABLE sqlite_x(a)",
-                "object name reserved for internal use: sqlite_x",
-            ),
-            (
-                "CREATE TEMP TABLE main.q(a)",
-                "temporary table name must be unqualified",
-            ),
-            ("CREATE TABLE aux.q(a)", "unknown database aux"),
-            ("DROP TABLE missing", "no such table: missing"),
-            ("DROP INDEX missing", "no such index: missing"),
-            ("DROP VIEW missing", "no such view: missing"),
-            ("DROP TRIGGER missing", "no such trigger: missing"),
-            ("DROP VIEW t", "use DROP TABLE to delete table t"),
-            ("DROP TABLE v", "use DROP VIEW to delete view v"),
-            ("ALTER TABLE missing ADD COLUMN c", "no such table: missing"),
-            ("ALTER TABLE t ADD COLUMN b", "duplicate column name: b"),
-            (
-                "ALTER TABLE t RENAME TO v",
-                "there is already another table or index with this name: v",
-            ),
-            ("ANALYZE missing", "no such table: missing"),
-            (
-                "REINDEX missing",
-                "unable to identify the object to be reindexed",
-            ),
-        ];
         for file_backed in [false, true] {
             let dir = tempfile::TempDir::new().unwrap();
             let path = if file_backed {
@@ -2866,7 +2900,7 @@ mod tests {
                      CREATE VIEW v AS SELECT a, b FROM t; \
                      CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;",
                 );
-                for (sql, expected) in cases {
+                for &(sql, expected) in SCHEMA_PREPARE_ERROR_CASES {
                     let source = CString::new(sql).unwrap();
                     let mut statement = ptr::null_mut();
                     let rc = sqlite3_prepare_v2(
@@ -2981,13 +3015,24 @@ mod tests {
             );
             schema_exec_ok(db, "DETACH aux");
 
-            let statement = prepare(db, "COMMIT");
-            assert_eq!(sqlite3_step(statement), SQLITE_ERROR);
-            assert_eq!(
-                CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap(),
-                "cannot commit - no transaction is active"
-            );
-            assert_eq!(sqlite3_finalize(statement), SQLITE_ERROR);
+            // Statements refused only at step time in stock SQLite 3.54.1
+            // must prepare cleanly and report stock's exact error on step.
+            for (sql, expected) in [
+                ("DETACH nosuch", "no such database: nosuch"),
+                ("COMMIT", "cannot commit - no transaction is active"),
+                ("ROLLBACK", "cannot rollback - no transaction is active"),
+                ("RELEASE nosuch", "no such savepoint: nosuch"),
+                ("ROLLBACK TO nosuch", "no such savepoint: nosuch"),
+            ] {
+                let statement = prepare(db, sql);
+                assert_eq!(sqlite3_step(statement), SQLITE_ERROR, "{sql}");
+                assert_eq!(
+                    CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap(),
+                    expected,
+                    "{sql}"
+                );
+                assert_eq!(sqlite3_finalize(statement), SQLITE_ERROR, "{sql}");
+            }
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }

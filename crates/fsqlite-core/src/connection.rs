@@ -59222,15 +59222,17 @@ impl Connection {
                 // refuses table-function arguments that reference tables to
                 // their right across an outer join boundary.
                 self.validate_select_table_function_forward_refs(select, &[])?;
-                // bd-pn6az: stock flattens once the names resolve, then
-                // plans the join.
-                Self::validate_join_term_limits(select)
+                // bd-pn6az / bd-b8cfq: stock flattens once the names resolve,
+                // then plans the join.
+                self.validate_join_term_limits(select)
             }
             Statement::Insert(insert) => {
                 if let InsertSource::Select(select) = &insert.source {
                     let scoped_select = insert_source_select_for_validation(insert, select);
+                    Self::validate_cte_cursor_budget(&scoped_select)?;
                     SelectRelationResolver::new(self).validate_select(&scoped_select)?;
                     self.validate_select_table_function_forward_refs(&scoped_select, &[])?;
+                    self.validate_join_term_limits(&scoped_select)?;
                 }
                 if insert_dml_clauses_have_subquery_or_in_table(insert) {
                     SelectRelationResolver::new(self).validate_dml_insert_relations(insert)?;
@@ -59270,8 +59272,10 @@ impl Connection {
                     {
                         return Ok(());
                     }
+                    Self::validate_cte_cursor_budget(select)?;
                     SelectRelationResolver::new(self).validate_select(select)?;
                     self.validate_select_table_function_forward_refs(select, &[])?;
+                    self.validate_join_term_limits(select)?;
                 }
                 Ok(())
             }

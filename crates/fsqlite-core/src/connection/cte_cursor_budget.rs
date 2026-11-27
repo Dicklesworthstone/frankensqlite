@@ -266,23 +266,22 @@ const MAX_FLATTENED_FROM_TERMS: usize = 200;
 const MAX_JOIN_TABLES: usize = 64;
 
 impl Connection {
-    /// bd-pn6az: stock's two limits on the tables one SELECT joins. Its
-    /// flattener splices each subquery and CTE reference it can flatten into
-    /// the enclosing FROM list (a copy per reference), and refuses a list that
-    /// grows past 200 terms ("too many FROM clause terms, max: 200"); the
-    /// where-planner then refuses a SELECT of more than 64 terms ("at most 64
-    /// tables in a join"). So a CTE joined to itself refuses at 7 levels (128
-    /// terms) and 8 (256), and a plain 65-table join refuses too.
+    /// bd-pn6az / bd-b8cfq: stock's two limits on the tables one SELECT joins.
+    /// Its flattener splices each subquery, view, and non-materialized CTE
+    /// reference it can flatten into the enclosing FROM list (a copy per
+    /// reference), and refuses a list that grows past 200 terms ("too many
+    /// FROM clause terms, max: 200"); the where-planner then refuses a SELECT
+    /// of more than 64 terms ("at most 64 tables in a join").
     ///
-    /// A reference counts as its body's terms only for a body stock certainly
-    /// flattens (see [`flattenable`]) that no outer join holds; anything else
-    /// (a view, a table-valued function, a materialized CTE) counts one term.
-    /// So this can miss a refusal stock makes, never invent one. Runs after
-    /// [`Self::validate_cte_cursor_budget`], whose refusal comes first in stock.
-    pub(super) fn validate_join_term_limits(select: &SelectStatement) -> Result<()> {
-        // The common statement, with no WITH, no subquery and at most 64 named
-        // tables or functions in each FROM, flattens nothing into them.
-        if select.with.is_none()
+    /// Runs after [`Self::validate_cte_cursor_budget`] and
+    /// `SelectRelationResolver`, so relation names are already valid and
+    /// circular views have already been rejected.
+    pub(super) fn validate_join_term_limits(&self, select: &SelectStatement) -> Result<()> {
+        // The common statement, with no views in scope, no WITH, no subquery,
+        // and at most 64 named tables or functions in each FROM, flattens
+        // nothing into them.
+        if !self.has_any_views_in_catalog()
+            && select.with.is_none()
             && std::iter::once(&select.body.select)
                 .chain(select.body.compounds.iter().map(|(_, core)| core))
                 .all(core_joins_named_sources_within_limit)
@@ -293,27 +292,42 @@ impl Connection {
         {
             return Ok(());
         }
-        let mut limits = JoinTermLimits::default();
-        limits.select(select);
-        if limits.most > MAX_FLATTENED_FROM_TERMS {
+        let most = self.with_fallback_function_registry(|| {
+            let mut limits = JoinTermLimits::new(self);
+            limits.select(select);
+            limits.most
+        });
+        if most > MAX_FLATTENED_FROM_TERMS {
             return Err(FrankenError::FunctionError(format!(
                 "too many FROM clause terms, max: {MAX_FLATTENED_FROM_TERMS}"
             )));
         }
-        if limits.most > MAX_JOIN_TABLES {
+        if most > MAX_JOIN_TABLES {
             return Err(FrankenError::FunctionError(format!(
                 "at most {MAX_JOIN_TABLES} tables in a join"
             )));
         }
         Ok(())
     }
+
+    fn has_any_views_in_catalog(&self) -> bool {
+        if !self.views.borrow().is_empty() {
+            return true;
+        }
+        self.attached_connections
+            .borrow()
+            .values()
+            .any(|attached| !attached.views.borrow().is_empty())
+    }
 }
 
-/// A subquery or CTE body stock's flattener certainly splices into its
-/// parent: one SELECT with a FROM and no outer join, with no WITH, DISTINCT,
-/// GROUP BY, HAVING, window, LIMIT or function call in its result columns
-/// (an aggregate cannot be told from a scalar function here). An ORDER BY
-/// does not stop it: stock drops a subquery's ORDER BY first.
+/// A subquery, view, or CTE body stock's flattener certainly splices into its
+/// parent: one SELECT with a FROM and no outer join, with no DISTINCT,
+/// GROUP BY, HAVING, window, LIMIT, or aggregate/window function in its result
+/// columns or ORDER BY. Scalar function calls (such as `abs(a.x)`) and an
+/// inner `WITH` clause do not prevent flattening in SQLite 3.54.1. An ORDER BY
+/// does not stop it either: stock drops a subquery's ORDER BY first when
+/// flattening into a join.
 fn flattenable(query: &SelectStatement) -> bool {
     let SelectCore::Select {
         distinct: fsqlite_ast::Distinctness::All,
@@ -327,16 +341,112 @@ fn flattenable(query: &SelectStatement) -> bool {
     else {
         return false;
     };
-    query.with.is_none()
-        && query.body.compounds.is_empty()
+    query.body.compounds.is_empty()
         && query.limit.is_none()
         && group_by.is_empty()
         && windows.is_empty()
         && !from_has_outer_join(from)
         && columns.iter().all(|column| match column {
-            ResultColumn::Expr { expr, .. } => !expr_contains_function_call(expr),
+            ResultColumn::Expr { expr, .. } => !expr_blocks_flattening(expr),
             ResultColumn::Star | ResultColumn::TableStar(_) => true,
         })
+        && query
+            .order_by
+            .iter()
+            .all(|term| !expr_blocks_flattening(&term.expr))
+}
+
+/// Whether `expr` contains an aggregate or window function at the current
+/// SELECT level (without crossing subquery boundaries), which forces
+/// `SF_Aggregate` or `pWin != NULL` and stops stock's flattener.
+fn expr_blocks_flattening(expr: &Expr) -> bool {
+    expr_has_aggregate(expr)
+        || expr_contains_registered_agg(expr)
+        || expr_has_direct_window_call(expr)
+}
+
+fn expr_has_direct_window_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { over: Some(_), .. } => true,
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            let in_args = match args {
+                FunctionArgs::List(exprs) => exprs.iter().any(expr_has_direct_window_call),
+                FunctionArgs::Star => false,
+            };
+            in_args
+                || order_by
+                    .iter()
+                    .any(|term| expr_has_direct_window_call(&term.expr))
+                || filter.as_deref().is_some_and(expr_has_direct_window_call)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_direct_window_call(left) || expr_has_direct_window_call(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => expr_has_direct_window_call(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            expr_has_direct_window_call(inner)
+                || expr_has_direct_window_call(low)
+                || expr_has_direct_window_call(high)
+        }
+        Expr::In { expr: inner, set, .. } => {
+            expr_has_direct_window_call(inner)
+                || match set {
+                    fsqlite_ast::InSet::List(items) => {
+                        items.iter().any(expr_has_direct_window_call)
+                    }
+                    fsqlite_ast::InSet::Subquery(_) | fsqlite_ast::InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_direct_window_call(inner)
+                || expr_has_direct_window_call(pattern)
+                || escape.as_deref().is_some_and(expr_has_direct_window_call)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_has_direct_window_call)
+                || whens.iter().any(|(when_expr, then_expr)| {
+                    expr_has_direct_window_call(when_expr)
+                        || expr_has_direct_window_call(then_expr)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_has_direct_window_call)
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            expr_has_direct_window_call(expr) || expr_has_direct_window_call(path)
+        }
+        Expr::RowValue(values, _) => values.iter().any(expr_has_direct_window_call),
+        Expr::BoundOuterValue { .. }
+        | Expr::Raise { .. }
+        | Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::Placeholder(_, _)
+        | Expr::Subquery(_, _)
+        | Expr::Exists { .. } => false,
+    }
 }
 
 /// Whether `core` joins at most 64 named tables or table-valued functions and
@@ -392,8 +502,13 @@ fn from_has_outer_join(from: &FromClause) -> bool {
     })
 }
 
-#[derive(Default)]
-struct JoinTermLimits {
+struct JoinTermLimits<'conn> {
+    /// Connection whose catalog is currently searched for views/tables.
+    conn: &'conn Connection,
+    /// Persistent view owner schema label (`main` or an attached alias).
+    /// `None` outside persistent views (and inside TEMP views), where the
+    /// normal TEMP -> MAIN -> attached search order applies.
+    persistent_owner_label: Option<String>,
     /// The most terms one SELECT joins, saturated just past the larger limit.
     most: usize,
     /// The WITH clauses in scope, outermost first.
@@ -401,33 +516,102 @@ struct JoinTermLimits {
     /// The CTEs being expanded: a reference to one is a recursive
     /// self-reference, which is not expanded.
     active: Vec<(usize, usize)>,
+    /// Memoized CTE term counts keyed by `(scope_index, cte_index)` within the
+    /// active `WITH` stack: `Some(n)` if the CTE is flattenable with `n`
+    /// flattened terms, `None` if non-flattenable (its own SELECT was already
+    /// folded into `most`). Cleared when leaving a scope.
+    cte_cache: HashMap<(usize, usize), Option<usize>>,
+    /// Views currently on the expansion stack (cycle guard).
+    active_views: HashSet<String>,
+    /// Memoized view term counts keyed by view identity: `Some(n)` if the view
+    /// is flattenable with `n` flattened terms, `None` if non-flattenable (its
+    /// own SELECT was already folded into `most`).
+    view_cache: HashMap<String, Option<usize>>,
 }
 
-impl JoinTermLimits {
+impl<'conn> JoinTermLimits<'conn> {
+    fn new(conn: &'conn Connection) -> Self {
+        Self {
+            conn,
+            persistent_owner_label: None,
+            most: 0,
+            scopes: Vec::new(),
+            active: Vec::new(),
+            cte_cache: HashMap::new(),
+            active_views: HashSet::new(),
+            view_cache: HashMap::new(),
+        }
+    }
+
     fn select(&mut self, select: &SelectStatement) {
-        let pushed = if let Some(with) = &select.with {
+        if self.most > MAX_FLATTENED_FROM_TERMS {
+            return;
+        }
+        let pushed_scope = if let Some(with) = &select.with {
+            let scope_idx = self.scopes.len();
             self.scopes.push(with.ctes.clone());
-            true
+            Some(scope_idx)
         } else {
-            false
+            None
         };
         for core in std::iter::once(&select.body.select)
             .chain(select.body.compounds.iter().map(|(_, core)| core))
         {
             let terms = self.core(core);
             self.most = self.most.max(terms);
+            if self.most > MAX_FLATTENED_FROM_TERMS {
+                break;
+            }
         }
-        for term in &select.order_by {
-            self.expr(&term.expr);
+        if self.most <= MAX_FLATTENED_FROM_TERMS {
+            for term in &select.order_by {
+                self.expr(&term.expr);
+            }
+            if let Some(limit) = &select.limit {
+                self.expr(&limit.limit);
+                if let Some(offset) = &limit.offset {
+                    self.expr(offset);
+                }
+            }
         }
-        if pushed {
+        if let Some(scope_idx) = pushed_scope {
             self.scopes.pop();
+            self.cte_cache.retain(|&(s, _), _| s < scope_idx);
         }
+    }
+
+    /// Count the flattened terms of a flattenable single-arm SELECT (which may
+    /// carry its own `WITH` clause and `ORDER BY` subqueries).
+    fn flattened_select(&mut self, select: &SelectStatement) -> usize {
+        if self.most > MAX_FLATTENED_FROM_TERMS {
+            return MAX_FLATTENED_FROM_TERMS + 1;
+        }
+        let pushed_scope = if let Some(with) = &select.with {
+            let scope_idx = self.scopes.len();
+            self.scopes.push(with.ctes.clone());
+            Some(scope_idx)
+        } else {
+            None
+        };
+        let terms = self.core(&select.body.select);
+        if self.most <= MAX_FLATTENED_FROM_TERMS {
+            for term in &select.order_by {
+                self.expr(&term.expr);
+            }
+        }
+        if let Some(scope_idx) = pushed_scope {
+            self.scopes.pop();
+            self.cte_cache.retain(|&(s, _), _| s < scope_idx);
+        }
+        terms
     }
 
     /// The terms `core` joins once the flattened subqueries are spliced in;
     /// the subqueries its expressions read are SELECTs of their own.
     fn core(&mut self, core: &SelectCore) -> usize {
+        if self.most > MAX_FLATTENED_FROM_TERMS {
+            return MAX_FLATTENED_FROM_TERMS + 1;
+        }
         match core {
             SelectCore::Values(rows) => {
                 for expr in rows.iter().flatten() {
@@ -444,18 +628,20 @@ impl JoinTermLimits {
                 ..
             } => {
                 let terms = from.as_ref().map_or(0, |from| self.list_terms(from));
-                for column in columns {
-                    if let ResultColumn::Expr { expr, .. } = column {
+                if self.most <= MAX_FLATTENED_FROM_TERMS {
+                    for column in columns {
+                        if let ResultColumn::Expr { expr, .. } = column {
+                            self.expr(expr);
+                        }
+                    }
+                    for expr in where_clause
+                        .as_deref()
+                        .into_iter()
+                        .chain(group_by)
+                        .chain(having.as_deref())
+                    {
                         self.expr(expr);
                     }
-                }
-                for expr in where_clause
-                    .as_deref()
-                    .into_iter()
-                    .chain(group_by)
-                    .chain(having.as_deref())
-                {
-                    self.expr(expr);
                 }
                 terms
             }
@@ -470,9 +656,15 @@ impl JoinTermLimits {
                 join.join_type.kind,
                 JoinKind::Left | JoinKind::Right | JoinKind::Full
             );
-            terms = terms.saturating_add(self.item_terms(&join.table, outer));
+            terms = terms
+                .saturating_add(self.item_terms(&join.table, outer))
+                .min(MAX_FLATTENED_FROM_TERMS + 1);
             if let Some(fsqlite_ast::JoinConstraint::On(expr)) = &join.constraint {
                 self.expr(expr);
+            }
+            if terms > MAX_FLATTENED_FROM_TERMS {
+                self.most = self.most.max(terms);
+                return terms;
             }
         }
         terms.min(MAX_FLATTENED_FROM_TERMS + 1)
@@ -480,16 +672,21 @@ impl JoinTermLimits {
 
     /// The terms one FROM item adds; `outer` when an outer join holds it.
     fn item_terms(&mut self, item: &TableOrSubquery, outer: bool) -> usize {
+        if self.most > MAX_FLATTENED_FROM_TERMS {
+            return MAX_FLATTENED_FROM_TERMS + 1;
+        }
         match item {
-            TableOrSubquery::Table { name, .. } if name.schema.is_none() => {
-                match self.visible_cte(&name.name) {
-                    Some(found) => self.cte_terms(found, outer),
-                    None => 1,
+            TableOrSubquery::Table { name, .. } => {
+                if name.schema.is_none()
+                    && let Some(found) = self.visible_cte(&name.name)
+                {
+                    return self.cte_terms(found, outer);
                 }
+                self.catalog_relation_terms(name, outer)
             }
             TableOrSubquery::Subquery { query, .. } => {
                 if !outer && flattenable(query) {
-                    self.core(&query.body.select)
+                    self.flattened_select(query)
                 } else {
                     self.select(query);
                     1
@@ -509,7 +706,230 @@ impl JoinTermLimits {
                 }
                 1
             }
-            TableOrSubquery::Table { .. } => 1,
+        }
+    }
+
+    /// Resolve a catalog relation (table or view) following SQLite's exact
+    /// scope precedence (TEMP -> MAIN -> attached, or pinned to the owning
+    /// persistent schema inside a persistent view). Ordinary tables and virtual
+    /// tables count 1 term; views expand under their own fresh CTE scope.
+    fn catalog_relation_terms(&mut self, name: &QualifiedName, outer: bool) -> usize {
+        if let Some(owner_label) = self.persistent_owner_label.clone() {
+            if let Some(schema) = name.schema.as_deref()
+                && !schema.eq_ignore_ascii_case(&owner_label)
+            {
+                return 1;
+            }
+            return self.local_catalog_relation_terms(
+                self.conn,
+                &name.name,
+                PragmaSchemaScope::Main,
+                &owner_label,
+                outer,
+            );
+        }
+
+        let Some(schema_name) = name.schema.as_deref() else {
+            if let Some(terms) = self.try_local_catalog_relation_terms(
+                self.conn,
+                &name.name,
+                PragmaSchemaScope::Unqualified,
+                "main",
+                outer,
+            ) {
+                return terms;
+            }
+            let attached_names: Vec<String> = self
+                .conn
+                .attached_schemas
+                .borrow()
+                .all_schemas()
+                .into_iter()
+                .skip(2)
+                .map(str::to_owned)
+                .collect();
+            for attached_schema in attached_names {
+                let mut resolved = None;
+                let _ = self
+                    .conn
+                    .with_attached_connection(&attached_schema, |attached| {
+                        resolved = self.try_local_catalog_relation_terms(
+                            attached,
+                            &name.name,
+                            PragmaSchemaScope::Main,
+                            &attached_schema,
+                            outer,
+                        );
+                        Ok(())
+                    });
+                if let Some(terms) = resolved {
+                    return terms;
+                }
+            }
+            return 1;
+        };
+
+        if schema_name.eq_ignore_ascii_case("main") {
+            return self.local_catalog_relation_terms(
+                self.conn,
+                &name.name,
+                PragmaSchemaScope::Main,
+                "main",
+                outer,
+            );
+        }
+        if schema_name.eq_ignore_ascii_case("temp") {
+            return self.local_catalog_relation_terms(
+                self.conn,
+                &name.name,
+                PragmaSchemaScope::Temp,
+                "main",
+                outer,
+            );
+        }
+        if self
+            .conn
+            .attached_schemas
+            .borrow()
+            .find(schema_name)
+            .is_some()
+        {
+            let mut terms = 1;
+            let _ = self.conn.with_attached_connection(schema_name, |attached| {
+                terms = self.local_catalog_relation_terms(
+                    attached,
+                    &name.name,
+                    PragmaSchemaScope::Main,
+                    schema_name,
+                    outer,
+                );
+                Ok(())
+            });
+            return terms;
+        }
+        1
+    }
+
+    fn local_catalog_relation_terms(
+        &mut self,
+        target_conn: &Connection,
+        relation_name: &str,
+        scope: PragmaSchemaScope,
+        main_label: &str,
+        outer: bool,
+    ) -> usize {
+        self.try_local_catalog_relation_terms(target_conn, relation_name, scope, main_label, outer)
+            .unwrap_or(1)
+    }
+
+    /// Returns `Some(terms)` if `relation_name` matches a table, vtab, or view
+    /// in `target_conn`/`scope`, or `None` if not present there (so unqualified
+    /// lookup can continue to attached schemas).
+    fn try_local_catalog_relation_terms(
+        &mut self,
+        target_conn: &Connection,
+        relation_name: &str,
+        scope: PragmaSchemaScope,
+        main_label: &str,
+        outer: bool,
+    ) -> Option<usize> {
+        if is_schema_relation_in_scope(relation_name, scope) {
+            return Some(1);
+        }
+        let resolved_scope = if scope == PragmaSchemaScope::Unqualified
+            && (target_conn.table_exists_for_scope(relation_name, PragmaSchemaScope::Temp)
+                || target_conn
+                    .view_index_for_scope(relation_name, PragmaSchemaScope::Temp)
+                    .is_some())
+        {
+            PragmaSchemaScope::Temp
+        } else if scope == PragmaSchemaScope::Unqualified {
+            PragmaSchemaScope::Main
+        } else {
+            scope
+        };
+        if target_conn.table_exists_for_scope(relation_name, resolved_scope)
+            || (resolved_scope == PragmaSchemaScope::Main
+                && target_conn.has_live_vtab_instance(relation_name))
+        {
+            return Some(1);
+        }
+        let view = target_conn
+            .view_index_for_scope(relation_name, resolved_scope)
+            .and_then(|index| target_conn.views.borrow().get(index).cloned())?;
+        Some(self.expand_view_terms(target_conn, &view, resolved_scope, main_label, outer))
+    }
+
+    fn expand_view_terms(
+        &mut self,
+        target_conn: &Connection,
+        view: &ViewDef,
+        resolved_scope: PragmaSchemaScope,
+        main_label: &str,
+        outer: bool,
+    ) -> usize {
+        let view_key = format!(
+            "{:p}:{resolved_scope:?}:{}",
+            target_conn,
+            view.name.to_ascii_lowercase()
+        );
+        if let Some(&cached) = self.view_cache.get(&view_key) {
+            return match cached {
+                Some(terms) if !outer => terms,
+                Some(terms) => {
+                    self.most = self.most.max(terms);
+                    1
+                }
+                None => 1,
+            };
+        }
+        if !self.active_views.insert(view_key.clone()) {
+            return 1;
+        }
+
+        let view_flattenable = flattenable(&view.query);
+        let next_owner = if view.temporary {
+            None
+        } else {
+            Some(
+                self.persistent_owner_label
+                    .clone()
+                    .unwrap_or_else(|| main_label.to_owned()),
+            )
+        };
+        // A view owns a fresh CTE scope: outer CTEs never leak into its body.
+        let mut child = JoinTermLimits {
+            conn: target_conn,
+            persistent_owner_label: next_owner,
+            most: self.most,
+            scopes: Vec::new(),
+            active: Vec::new(),
+            cte_cache: HashMap::new(),
+            active_views: std::mem::take(&mut self.active_views),
+            view_cache: std::mem::take(&mut self.view_cache),
+        };
+        let cached = with_view_expansion_stack(|| {
+            if view_flattenable {
+                let terms = child.flattened_select(&view.query);
+                Some(terms)
+            } else {
+                child.select(&view.query);
+                None
+            }
+        });
+        self.most = self.most.max(child.most);
+        self.active_views = child.active_views;
+        self.view_cache = child.view_cache;
+        self.active_views.remove(&view_key);
+        self.view_cache.insert(view_key, cached);
+
+        match cached {
+            Some(terms) if !outer => terms,
+            Some(terms) => {
+                self.most = self.most.max(terms);
+                1
+            }
+            None => 1,
         }
     }
 
@@ -532,35 +952,68 @@ impl JoinTermLimits {
         if self.active.contains(&found) {
             return 1;
         }
+        if let Some(&cached) = self.cte_cache.get(&found) {
+            return match cached {
+                Some(terms) if !outer => terms,
+                Some(terms) => {
+                    self.most = self.most.max(terms);
+                    1
+                }
+                None => 1,
+            };
+        }
         let (scope, index) = found;
         let cte = self.scopes[scope][index].clone();
-        let flattened = !outer
-            && cte.materialized != Some(fsqlite_ast::CteMaterialized::Materialized)
+        let can_flatten = cte.materialized != Some(fsqlite_ast::CteMaterialized::Materialized)
             && flattenable(&cte.query);
         // The body resolves in its own WITH and the ones around it.
         let hidden = self.scopes.split_off(scope + 1);
+        let saved_cte_cache = std::mem::take(&mut self.cte_cache);
+        let mut inner_cache = HashMap::new();
+        let mut hidden_cache = HashMap::new();
+        for (key, value) in saved_cte_cache {
+            if key.0 <= scope {
+                inner_cache.insert(key, value);
+            } else {
+                hidden_cache.insert(key, value);
+            }
+        }
+        self.cte_cache = inner_cache;
         self.active.push(found);
-        let terms = with_view_expansion_stack(|| {
-            if flattened {
-                self.core(&cte.query.body.select)
+        let cached = with_view_expansion_stack(|| {
+            if can_flatten {
+                let terms = self.flattened_select(&cte.query);
+                Some(terms)
             } else {
                 self.select(&cte.query);
-                1
+                None
             }
         });
         self.active.pop();
         self.scopes.extend(hidden);
-        terms
+        self.cte_cache.extend(hidden_cache);
+        self.cte_cache.insert(found, cached);
+        match cached {
+            Some(terms) if !outer => terms,
+            Some(terms) => {
+                self.most = self.most.max(terms);
+                1
+            }
+            None => 1,
+        }
     }
 
     /// The subqueries of `expr`, each a SELECT of its own.
     fn expr(&mut self, expr: &Expr) {
+        if self.most > MAX_FLATTENED_FROM_TERMS {
+            return;
+        }
         expr_contains_subquery_match(expr, &mut |subquery| {
             let (SubqueryExprRef::Scalar(select)
             | SubqueryExprRef::Exists(select)
             | SubqueryExprRef::In(select)) = subquery;
             self.select(select);
-            false
+            self.most > MAX_FLATTENED_FROM_TERMS
         });
     }
 }
@@ -630,7 +1083,10 @@ mod tests {
         let Statement::Select(select) = parse_single_statement(sql).expect("parses") else {
             panic!("not a SELECT: {sql}");
         };
-        Connection::validate_join_term_limits(&select)
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.expect("open memory db");
+            conn.validate_join_term_limits(&select)
+        })
     }
 
     fn refused_with(result: &Result<()>, message: &str) -> bool {

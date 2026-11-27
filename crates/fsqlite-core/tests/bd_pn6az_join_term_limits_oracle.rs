@@ -203,3 +203,277 @@ fn join_term_limits_match_stock() {
         );
     });
 }
+
+fn tvf_items(prefix: &str, n: usize) -> String {
+    let items: Vec<String> = (1..=n)
+        .map(|i| format!("json_each('[1]') AS {prefix}{i}"))
+        .collect();
+    items.join(", ")
+}
+
+const NESTED_TOO_DEEP: &str = "error: VIEWs and/or subqueries nested too deep";
+
+#[test]
+fn bd_b8cfq_views_tvf_functions_and_materialized_cte_limits_match_stock() {
+    let mut setup = vec![
+        "CREATE TABLE o(z)".to_owned(),
+        "INSERT INTO o VALUES (1)".to_owned(),
+        // View doubling chain: v0 = 1 term, v_k = 2^k flattened terms.
+        "CREATE VIEW v0 AS SELECT z AS x FROM o".to_owned(),
+    ];
+    for i in 1..=8 {
+        setup.push(format!(
+            "CREATE VIEW v{i} AS SELECT a.x FROM v{p} AS a, v{p} AS b",
+            p = i - 1
+        ));
+    }
+    // Non-flattenable view chains (DISTINCT, LEFT JOIN, LIMIT).
+    setup.push("CREATE VIEW vd0 AS SELECT z AS x FROM o".to_owned());
+    setup.push("CREATE VIEW vj0 AS SELECT z AS x FROM o".to_owned());
+    setup.push("CREATE VIEW vl0 AS SELECT z AS x FROM o".to_owned());
+    for i in 1..=8 {
+        let p = i - 1;
+        setup.push(format!(
+            "CREATE VIEW vd{i} AS SELECT DISTINCT a.x FROM vd{p} AS a, vd{p} AS b"
+        ));
+        setup.push(format!(
+            "CREATE VIEW vj{i} AS SELECT a.x FROM vj{p} AS a LEFT JOIN vj{p} AS b ON 1"
+        ));
+        setup.push(format!(
+            "CREATE VIEW vl{i} AS SELECT a.x FROM vl{p} AS a, vl{p} AS b LIMIT 5"
+        ));
+    }
+    // Plain wide views and TVF-rooted view chain.
+    setup.push(format!("CREATE VIEW v30 AS SELECT 1 AS x FROM {}", items("a", 30)));
+    setup.push(format!("CREATE VIEW v40 AS SELECT 1 AS x FROM {}", items("b", 40)));
+    setup.push(format!("CREATE VIEW v63 AS SELECT 1 AS x FROM {}", items("c", 63)));
+    setup.push(format!("CREATE VIEW v64 AS SELECT 1 AS x FROM {}", items("d", 64)));
+    setup.push(format!("CREATE VIEW v65 AS SELECT 1 AS x FROM {}", items("e", 65)));
+    setup.push("CREATE VIEW v_shadow AS SELECT 1 AS x FROM v65".to_owned());
+    setup.push("CREATE TEMP VIEW v_shadow AS SELECT 1 AS x FROM o".to_owned());
+    setup.push("CREATE VIEW vt0 AS SELECT value AS x FROM json_each('[1]')".to_owned());
+    for i in 1..=8 {
+        setup.push(format!(
+            "CREATE VIEW vt{i} AS SELECT a.x FROM vt{p} AS a, vt{p} AS b",
+            p = i - 1
+        ));
+    }
+    // View with scalar function in result column (stock flattens).
+    setup.push("CREATE VIEW vf0 AS SELECT z AS x FROM o".to_owned());
+    for i in 1..=8 {
+        setup.push(format!(
+            "CREATE VIEW vf{i} AS SELECT abs(a.x) AS x FROM vf{p} AS a, vf{p} AS b",
+            p = i - 1
+        ));
+    }
+    // Attached database with view chains on both sides of the limits.
+    setup.push("ATTACH ':memory:' AS aux".to_owned());
+    setup.push("CREATE TABLE aux.ao(z)".to_owned());
+    setup.push("INSERT INTO aux.ao VALUES (1)".to_owned());
+    setup.push("CREATE VIEW aux.av0 AS SELECT z AS x FROM ao".to_owned());
+    for i in 1..=8 {
+        setup.push(format!(
+            "CREATE VIEW aux.av{i} AS SELECT a.x FROM av{p} AS a, av{p} AS b",
+            p = i - 1
+        ));
+    }
+
+    let scalar_fn = |p: usize| format!("SELECT abs(a.x) AS x FROM c{p} AS a, c{p} AS b");
+    let agg_fn = |p: usize| format!("SELECT min(a.x) AS x FROM c{p} AS a, c{p} AS b");
+    let window_fn = |p: usize| format!("SELECT max(a.x) OVER () AS x FROM c{p} AS a, c{p} AS b");
+    let tvf_cte_chain = |levels: usize| {
+        let mut ctes = vec!["c0 AS (SELECT value AS x FROM json_each('[1]'))".to_owned()];
+        ctes.extend((1..=levels).map(|i| format!("c{i} AS ({})", self_join(i - 1))));
+        format!("WITH {} SELECT count(*) FROM c{levels}", ctes.join(", "))
+    };
+    let mat_base_chain = |levels: usize| {
+        let mut ctes = vec!["c0 AS MATERIALIZED (SELECT 1 AS x)".to_owned()];
+        ctes.extend((1..=levels).map(|i| format!("c{i} AS ({})", self_join(i - 1))));
+        format!("WITH {} SELECT count(*) FROM c{levels}", ctes.join(", "))
+    };
+    let unmat_into_mat = |levels: usize| {
+        let mut ctes = vec!["c0 AS (SELECT 1 AS x)".to_owned()];
+        for i in 1..levels {
+            ctes.push(format!("c{i} AS ({})", self_join(i - 1)));
+        }
+        ctes.push(format!(
+            "c{levels} AS MATERIALIZED ({})",
+            self_join(levels - 1)
+        ));
+        format!("WITH {} SELECT count(*) FROM c{levels}", ctes.join(", "))
+    };
+
+    let statements: Vec<(String, &'static str)> = vec![
+        // 1. View chains and wide views on both sides of 64 and 200.
+        ("SELECT count(*) FROM v6".to_owned(), ONE),
+        ("SELECT count(*) FROM v7".to_owned(), JOIN_64),
+        ("SELECT count(*) FROM v8".to_owned(), TERMS_200),
+        ("SELECT count(*) FROM vd8".to_owned(), ONE),
+        ("SELECT count(*) FROM vj8".to_owned(), ONE),
+        ("SELECT count(*) FROM vl8".to_owned(), ONE),
+        ("SELECT count(*) FROM v64".to_owned(), ONE),
+        ("SELECT count(*) FROM v65".to_owned(), JOIN_64),
+        ("SELECT count(*) FROM v40, v30".to_owned(), JOIN_64),
+        ("SELECT count(*) FROM o, v63".to_owned(), ONE),
+        ("SELECT count(*) FROM o, v64".to_owned(), JOIN_64),
+        ("SELECT count(*) FROM o LEFT JOIN v64 ON 1".to_owned(), ONE),
+        ("SELECT (SELECT count(*) FROM v65)".to_owned(), JOIN_64),
+        // CTE shadows unqualified view; main.v7 still resolves the view.
+        (
+            "WITH v7 AS (SELECT 1 AS x) SELECT count(*) FROM v7".to_owned(),
+            ONE,
+        ),
+        (
+            "WITH v7 AS (SELECT 1 AS x) SELECT count(*) FROM main.v7".to_owned(),
+            JOIN_64,
+        ),
+        // TEMP view shadows MAIN view; main.v_shadow still resolves MAIN.
+        ("SELECT count(*) FROM v_shadow".to_owned(), ONE),
+        ("SELECT count(*) FROM main.v_shadow".to_owned(), JOIN_64),
+        // Attached schema view chains.
+        ("SELECT count(*) FROM aux.av6".to_owned(), ONE),
+        ("SELECT count(*) FROM aux.av7".to_owned(), JOIN_64),
+        ("SELECT count(*) FROM aux.av8".to_owned(), TERMS_200),
+        // View referenced through a CTE.
+        (
+            "WITH c AS (SELECT a.x FROM v5 AS a, v5 AS b) SELECT count(*) FROM c".to_owned(),
+            ONE,
+        ),
+        (
+            "WITH c AS (SELECT a.x FROM v5 AS a, v5 AS b, o) SELECT count(*) FROM c".to_owned(),
+            JOIN_64,
+        ),
+        // 2. Scalar vs aggregate vs window functions in result columns.
+        (chain(6, "", &scalar_fn), ONE),
+        (chain(7, "", &scalar_fn), JOIN_64),
+        (chain(8, "", &scalar_fn), TERMS_200),
+        (chain(8, "", &agg_fn), ONE),
+        (chain(8, "", &window_fn), ONE),
+        ("SELECT count(*) FROM vf6".to_owned(), ONE),
+        ("SELECT count(*) FROM vf7".to_owned(), JOIN_64),
+        ("SELECT count(*) FROM vf8".to_owned(), TERMS_200),
+        // 3. Table-valued functions (json_each) directly, in CTEs, in views, and in TVF args.
+        (format!("SELECT count(*) FROM {}", tvf_items("j", 64)), ONE),
+        (
+            format!("SELECT count(*) FROM {}", tvf_items("j", 65)),
+            JOIN_64,
+        ),
+        ("SELECT count(*) FROM json_each('[1]'), v63".to_owned(), ONE),
+        (
+            "SELECT count(*) FROM json_each('[1]'), v64".to_owned(),
+            JOIN_64,
+        ),
+        (tvf_cte_chain(6), ONE),
+        (tvf_cte_chain(7), JOIN_64),
+        (tvf_cte_chain(8), TERMS_200),
+        ("SELECT count(*) FROM vt6".to_owned(), ONE),
+        ("SELECT count(*) FROM vt7".to_owned(), JOIN_64),
+        ("SELECT count(*) FROM vt8".to_owned(), TERMS_200),
+        (
+            format!(
+                "SELECT count(*) FROM json_each((SELECT '[1]' FROM {}))",
+                items("t", 64)
+            ),
+            ONE,
+        ),
+        (
+            format!(
+                "SELECT count(*) FROM json_each((SELECT '[1]' FROM {}))",
+                items("t", 65)
+            ),
+            JOIN_64,
+        ),
+        // 4. MATERIALIZED CTE chains on both sides of every limit.
+        (chain(6, "MATERIALIZED ", &self_join), ONE),
+        (chain(7, "MATERIALIZED ", &self_join), ONE),
+        (chain(8, "MATERIALIZED ", &self_join), ONE),
+        (chain(9, "MATERIALIZED ", &self_join), NESTED_TOO_DEEP),
+        (mat_base_chain(6), ONE),
+        (mat_base_chain(7), JOIN_64),
+        (mat_base_chain(8), TERMS_200),
+        (unmat_into_mat(6), ONE),
+        (unmat_into_mat(7), JOIN_64),
+        (unmat_into_mat(8), TERMS_200),
+        (
+            "WITH m AS MATERIALIZED (SELECT a.x FROM v5 AS a, v5 AS b) SELECT count(*) FROM m"
+                .to_owned(),
+            ONE,
+        ),
+        (
+            "WITH m AS MATERIALIZED (SELECT a.x FROM v5 AS a, v5 AS b, o) SELECT count(*) FROM m"
+                .to_owned(),
+            JOIN_64,
+        ),
+        (
+            format!(
+                "WITH m AS MATERIALIZED (SELECT 1 AS x FROM {}) SELECT count(*) FROM m",
+                items("m", 64)
+            ),
+            ONE,
+        ),
+        (
+            format!(
+                "WITH m AS MATERIALIZED (SELECT 1 AS x FROM {}) SELECT count(*) FROM m",
+                items("m", 65)
+            ),
+            JOIN_64,
+        ),
+        (
+            format!(
+                "SELECT count(*) FROM (WITH c AS (SELECT 1 AS x FROM {}) SELECT x FROM c), (SELECT 1 AS x FROM {})",
+                items("wa", 40),
+                items("wb", 30)
+            ),
+            JOIN_64,
+        ),
+    ];
+
+    let stock = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in &setup {
+        stock.execute_batch(sql).unwrap();
+    }
+    let expected: Vec<String> = statements
+        .iter()
+        .map(|(sql, _)| stock_outcome(&stock, sql))
+        .collect();
+    for ((sql, pinned), stock_gave) in statements.iter().zip(&expected) {
+        assert_eq!(stock_gave, pinned, "stock on `{sql}`");
+    }
+
+    asupersync::test_utils::run_test(|| async {
+        let mut mismatches = Vec::new();
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = if file_backed {
+                    dir.path()
+                        .join("bd_b8cfq.db")
+                        .to_str()
+                        .unwrap()
+                        .to_owned()
+                } else {
+                    ":memory:".to_owned()
+                };
+                let conn = Connection::open(&path).await.unwrap();
+                for sql in &setup {
+                    conn.execute(sql).await.unwrap();
+                }
+                for ((sql, _), expected) in statements.iter().zip(&expected) {
+                    let got = fsqlite_outcome(&conn, sql, prepared).await;
+                    if &got != expected {
+                        mismatches.push(format!(
+                            "file_backed={file_backed} prepared={prepared} `{sql}`:\n    \
+                             got  {got}\n    want {expected}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} outcome(s) differ from stock:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    });
+}
