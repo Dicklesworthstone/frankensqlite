@@ -127,6 +127,53 @@ const SHAPES: &[&str] = &[
 ];
 
 #[test]
+fn inner_where_keeps_its_result_alias_scope() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("aliases.db");
+            let path = if file_backed {
+                db.to_str().unwrap()
+            } else {
+                ":memory:"
+            };
+            let fconn = Connection::open(path).await.unwrap();
+            let rconn = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE s(p, q)",
+                "INSERT INTO s VALUES (8, 1), (2, 5)",
+            ] {
+                fconn.execute(sql).await.unwrap();
+                rconn.execute_batch(sql).unwrap();
+            }
+            for strict in ["OFF", "ON"] {
+                fconn
+                    .execute(&format!("PRAGMA fsqlite.parity_cert_strict = {strict}"))
+                    .await
+                    .unwrap();
+                for sql in [
+                    "SELECT y FROM (SELECT p AS x, q AS y FROM s WHERE X > 5)",
+                    "SELECT x AS z FROM (SELECT p AS x, q AS y FROM s WHERE x > 5)",
+                    "SELECT y AS x FROM (SELECT p AS x, q AS y FROM s WHERE x > 5)",
+                    "WITH w AS (SELECT p AS x, q AS y FROM s WHERE x > 5) SELECT y FROM w LIMIT 1",
+                    "SELECT y FROM (SELECT p AS x, q AS y FROM s WHERE x > 5 ORDER BY y)",
+                    "SELECT y FROM (SELECT p + 5 AS x, q AS y FROM s WHERE abs(x) > 9)",
+                    // The real source column p wins over the equally named inner alias.
+                    "SELECT y FROM (SELECT q AS p, q AS y FROM s WHERE p > 5)",
+                ] {
+                    let expected = stock(&rconn, sql).unwrap();
+                    assert_eq!(
+                        frank(&fconn, sql).await,
+                        Ok(expected),
+                        "file={file_backed} strict={strict}: {sql}"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
 fn from_subquery_aggregate_flattening_matches_stock() {
     asupersync::test_utils::run_test(|| async {
         for path in [":memory:", "file"] {

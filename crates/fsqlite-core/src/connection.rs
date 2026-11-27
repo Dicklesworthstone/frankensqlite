@@ -34302,23 +34302,15 @@ impl Connection {
         let SelectCore::Select { columns, .. } = &select.body.select else {
             return None;
         };
-        let aliases: Vec<(String, Expr)> = columns
-            .iter()
-            .filter_map(|column| match column {
-                ResultColumn::Expr {
-                    expr,
-                    alias: Some(alias),
-                } => Some((alias.clone(), expr.clone())),
-                _ => None,
-            })
-            .collect();
         let is_alias_expression_term = |term: &OrderingTerm| {
             !matches!(
                 strip_collate_wrappers(&term.expr),
                 Expr::Column(..) | Expr::Literal(..)
             )
         };
-        if aliases.is_empty() || !select.order_by.iter().any(is_alias_expression_term) {
+        if !select.order_by.iter().any(is_alias_expression_term)
+            || !columns.iter().any(|column| matches!(column, ResultColumn::Expr { alias: Some(_), .. }))
+        {
             return None;
         }
         let from_columns = self.select_from_column_names(select)?;
@@ -34326,7 +34318,7 @@ impl Connection {
         let mut changed = false;
         for term in &mut rewritten.order_by {
             if is_alias_expression_term(term) {
-                changed |= substitute_result_aliases_in_expr(&mut term.expr, &aliases, &from_columns);
+                changed |= substitute_result_aliases_in_expr(&mut term.expr, columns, &from_columns);
             }
         }
         changed.then_some(rewritten)
@@ -47142,7 +47134,9 @@ impl Connection {
         // (not a full `SelectStatement`) lives on this frame across the
         // recursive trigger-dispatch await below.
         let derived_storage_log_select: Option<Box<SelectStatement>> = match statement {
-            Statement::Select(select) if flatten_simple_from_subquery_select(select).is_some() => {
+            Statement::Select(select)
+                if flatten_simple_from_subquery_select(self, select).is_some() =>
+            {
                 Some(Box::new(select.clone()))
             }
             _ => None,
@@ -49945,7 +49939,7 @@ impl Connection {
         // in rewrite-covered locations, skip the clone/traversal rewrite pass.
         let has_flattenable_derived_table = matches!(
             statement,
-            Statement::Select(select) if flatten_simple_from_subquery_select(select).is_some()
+            Statement::Select(select) if flatten_simple_from_subquery_select(self, select).is_some()
         );
         // bd-kkfok / bd-8ewbk: an `UPDATE ... FROM (subquery)` carries its only
         // subquery in the FROM source (leading source or a JOIN arm), which
@@ -89995,7 +89989,7 @@ impl Connection {
                     alias: Some(alias.clone().unwrap_or_else(|| name.name.clone())),
                 };
             }
-            let Some(next) = flatten_from_subquery_select(&derived, true) else {
+            let Some(next) = flatten_from_subquery_select(self, &derived, true) else {
                 break;
             };
             flattened = Some(next);
@@ -90289,7 +90283,7 @@ impl Connection {
         if let Some(flattened) = self.flatten_simple_view_select(probe) {
             *probe = flattened;
         }
-        while let Some(flattened) = flatten_simple_from_subquery_select(probe) {
+        while let Some(flattened) = flatten_simple_from_subquery_select(self, probe) {
             *probe = flattened;
         }
     }
@@ -118305,7 +118299,7 @@ impl Connection {
         if let Some(limit) = result.limit.as_mut() {
             rewrite_in_limit_clause(limit, self, false, params).await?;
         }
-        while let Some(flattened) = flatten_simple_from_subquery_select(&result) {
+        while let Some(flattened) = flatten_simple_from_subquery_select(self, &result) {
             result = flattened;
         }
         Ok(result)
@@ -142502,14 +142496,18 @@ fn flatten_leading_paren_joins(select: &mut SelectStatement) {
     }
 }
 
-fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<SelectStatement> {
-    flatten_from_subquery_select(select, false)
+fn flatten_simple_from_subquery_select(
+    conn: &Connection,
+    select: &SelectStatement,
+) -> Option<SelectStatement> {
+    flatten_from_subquery_select(conn, select, false)
 }
 
 /// `flatten_simple_from_subquery_select`. With `always_strict`, every name
 /// resolves strictly (bd-5ap77), as an inlined view's must (bd-kef4m): a
 /// column its body does not expose is "no such column", not a base column.
 fn flatten_from_subquery_select(
+    conn: &Connection,
     select: &SelectStatement,
     always_strict: bool,
 ) -> Option<SelectStatement> {
@@ -142633,6 +142631,21 @@ fn flatten_from_subquery_select(
         outer_alias.as_deref(),
         &projection_map,
     )?;
+    // A bare name in the inner WHERE can resolve to an inner result alias.
+    // Hoisting that WHERE would resolve it against the outer projection,
+    // which may omit or redefine the alias (bd-rzsg2).
+    let mut inner_where = inner_where.clone();
+    if let Some(predicate) = inner_where.as_deref_mut() {
+        let mut uses_inner_alias = false;
+        for_each_column_ref_in_expr(predicate, &mut |column| {
+            uses_inner_alias = uses_inner_alias
+                || (column.table.is_none() && result_alias_expr(inner_columns, &column.column).is_some());
+        });
+        if uses_inner_alias {
+            let source_columns = conn.select_from_column_names(inner_query)?;
+            substitute_result_aliases_in_expr(predicate, inner_columns, &source_columns);
+        }
+    }
     let flattened_where = flatten_expr_option(
         outer_where.as_deref(),
         outer_alias.as_deref(),
@@ -142670,7 +142683,7 @@ fn flatten_from_subquery_select(
     {
         *columns = flattened_columns;
         *from = Some(inner_from.clone());
-        *where_clause = combine_where_clauses(inner_where.clone(), flattened_where);
+        *where_clause = combine_where_clauses(inner_where, flattened_where);
     }
     flattened.order_by = flattened_order_by;
     Some(flattened)
@@ -160945,16 +160958,23 @@ fn rename_column_refs_in_expr(expr: &mut Expr, old: &str, new: &str) -> bool {
     }
 }
 
+fn result_alias_expr<'a>(columns: &'a [ResultColumn], name: &str) -> Option<&'a Expr> {
+    columns.iter().find_map(|column| match column {
+        ResultColumn::Expr { expr, alias: Some(alias) } if alias.eq_ignore_ascii_case(name) => Some(expr),
+        _ => None,
+    })
+}
+
 /// bd-z0qqu: replace every unqualified name in `expr` that is not a FROM
 /// column (`from_columns`, lowercase) but is a result-column alias with that
 /// result expression, as SQLite resolves names inside an ORDER BY expression.
 /// Subqueries and window specifications keep their own name scopes.
 fn substitute_result_aliases_in_expr(
     expr: &mut Expr,
-    aliases: &[(String, Expr)],
+    columns: &[ResultColumn],
     from_columns: &HashSet<String>,
 ) -> bool {
-    let mut substitute = |expr: &mut Expr| substitute_result_aliases_in_expr(expr, aliases, from_columns);
+    let mut substitute = |expr: &mut Expr| substitute_result_aliases_in_expr(expr, columns, from_columns);
     match expr {
         Expr::BoundOuterValue { .. }
         | Expr::Literal(_, _)
@@ -160968,10 +160988,7 @@ fn substitute_result_aliases_in_expr(
             {
                 return false;
             }
-            let Some((_, aliased)) = aliases
-                .iter()
-                .find(|(alias, _)| alias.eq_ignore_ascii_case(&col_ref.column))
-            else {
+            let Some(aliased) = result_alias_expr(columns, &col_ref.column) else {
                 return false;
             };
             *expr = aliased.clone();
