@@ -8145,12 +8145,74 @@ fn codegen_select_covering_index_full_scan(
     );
 
     let skip_label = b.emit_label();
-    let direct_sources = per_row_where
-        .is_none()
-        .then(|| resolve_covering_output_sources(columns, table, table_alias, index))
-        .flatten();
+    let index_ordinal = table
+        .indexes
+        .iter()
+        .position(|candidate| std::ptr::eq(candidate, index) || candidate.name == index.name);
+    let direct_sources = resolve_covering_output_sources(columns, table, table_alias, index);
 
-    if let Some(sources) = direct_sources {
+    if let Some(index_ordinal) = index_ordinal {
+        // Evaluate WHERE and OFFSET directly against the covering index cursor
+        // without eagerly materializing a register row image or decoding
+        // IdxRowid/output columns for rejected rows (bd-wb3oi / bd-1bs3h).
+        let scan = ScanCtx {
+            cursor: idx_cursor,
+            table,
+            table_alias,
+            schema: Some(schema),
+            register_base: Some(RegisterRow::covering_index(index_ordinal)),
+            secondaries: &[],
+        };
+        if let Some(where_expr) = per_row_where.as_deref() {
+            emit_where_filter_with_ctx(b, where_expr, &scan, skip_label);
+        }
+        if let Some(off_r) = offset_reg {
+            b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+        }
+        if let Some(sources) = direct_sources {
+            let mut cached_rowid_reg: Option<i32> = None;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            for (offset, source) in sources.iter().enumerate() {
+                let target_reg = out_regs + offset as i32;
+                match source {
+                    CoveringOutputSource::IndexColumn(index_col) => {
+                        b.emit_op(
+                            Opcode::Column,
+                            idx_cursor,
+                            *index_col,
+                            target_reg,
+                            P4::None,
+                            0,
+                        );
+                        if index
+                            .columns
+                            .get(*index_col as usize)
+                            .and_then(|name| table.column_index(name))
+                            .is_some_and(|col_idx| table.columns[col_idx].affinity == 'E')
+                        {
+                            b.emit_op(Opcode::RealAffinity, target_reg, 0, 0, P4::None, 0);
+                        }
+                    }
+                    CoveringOutputSource::Rowid => {
+                        if let Some(prior_reg) = cached_rowid_reg {
+                            b.emit_op(Opcode::Copy, prior_reg, target_reg, 0, P4::None, 0);
+                        } else {
+                            b.emit_op(Opcode::IdxRowid, idx_cursor, target_reg, 0, P4::None, 0);
+                            cached_rowid_reg = Some(target_reg);
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut reg = out_regs;
+            for col in columns {
+                if let ResultColumn::Expr { expr, .. } = col {
+                    emit_expr(b, expr, reg, Some(&scan));
+                    reg += 1;
+                }
+            }
+        }
+    } else if let Some(sources) = per_row_where.is_none().then_some(direct_sources).flatten() {
         if let Some(off_r) = offset_reg {
             b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
         }
@@ -8164,6 +8226,7 @@ fn codegen_select_covering_index_full_scan(
         } else {
             0
         };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         for (offset, source) in sources.iter().enumerate() {
             let target_reg = out_regs + offset as i32;
             match source {
@@ -43626,10 +43689,24 @@ fn emit_having_filter(
         };
         emit_expr(b, &lowered, result_reg, Some(&empty_ctx));
     } else {
-        let slot_base = b.alloc_regs(slots.source_regs.len() as i32);
-        for (idx, &src_reg) in slots.source_regs.iter().enumerate() {
-            b.emit_op(Opcode::Copy, src_reg, slot_base + idx as i32, 0, P4::None, 0);
-        }
+        // When the referenced aggregate/key registers are already contiguous
+        // (including every single-slot HAVING predicate such as `HAVING sum(x) > 10`
+        // or `HAVING count(*) > 1`), bind `RegisterRow::columns` directly to
+        // `source_regs[0]` without copying into fresh temporary slots (bd-wb3oi).
+        // `emit_expr` treats `ScanCtx::register_base` as read-only.
+        let source_is_contiguous = slots
+            .source_regs
+            .windows(2)
+            .all(|pair| pair[1] == pair[0] + 1);
+        let slot_base = if source_is_contiguous {
+            slots.source_regs[0]
+        } else {
+            let base = b.alloc_regs(slots.source_regs.len() as i32);
+            for (idx, &src_reg) in slots.source_regs.iter().enumerate() {
+                b.emit_op(Opcode::Copy, src_reg, base + idx as i32, 0, P4::None, 0);
+            }
+            base
+        };
         let having_table = TableSchema {
             name: String::new(),
             root_page: 0,
@@ -44243,6 +44320,31 @@ enum SortKeySource {
     Expression(Box<Expr>),
 }
 
+/// Read a table column directly from a covering secondary index cursor,
+/// restoring `RealAffinity` for `REAL` (`'E'`) columns and reading IPK via
+/// `Opcode::IdxRowid`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_covering_index_table_column_read(
+    b: &mut ProgramBuilder,
+    idx_cursor: i32,
+    table: &TableSchema,
+    index: &IndexSchema,
+    col_idx: usize,
+    reg: i32,
+) {
+    let col = &table.columns[col_idx];
+    if col.is_ipk {
+        b.emit_op(Opcode::IdxRowid, idx_cursor, reg, 0, P4::None, 0);
+    } else if let Some(index_pos) = index_column_position(index, &col.name) {
+        b.emit_op(Opcode::Column, idx_cursor, index_pos as i32, reg, P4::None, 0);
+        if col.affinity == 'E' {
+            b.emit_op(Opcode::RealAffinity, reg, 0, 0, P4::None, 0);
+        }
+    } else {
+        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+    }
+}
+
 /// Emit bytecode to load a resolved column reference into a register.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_resolved_column(
@@ -44259,21 +44361,67 @@ fn emit_resolved_column(
             // computed on read. For other cursors (e.g. a sorter/join feed where
             // base columns are already materialized) keep the direct read.
             if cursor == scan.cursor && *idx < scan.table.columns.len() {
-                emit_table_column_read(
-                    b,
-                    cursor,
-                    scan.table,
-                    scan.table_alias,
-                    scan.schema,
-                    *idx,
-                    reg,
-                );
+                if let Some(RegisterRow {
+                    covering_index: Some(index_ordinal),
+                    ..
+                }) = scan.register_base
+                {
+                    emit_covering_index_table_column_read(
+                        b,
+                        cursor,
+                        scan.table,
+                        &scan.table.indexes[index_ordinal],
+                        *idx,
+                        reg,
+                    );
+                } else if let Some(RegisterRow {
+                    columns: reg_base,
+                    covering_index: None,
+                    ..
+                }) = scan.register_base
+                {
+                    emit_table_column_read_from_register_row(
+                        b,
+                        scan.table,
+                        scan.table_alias,
+                        scan.schema,
+                        reg_base,
+                        *idx,
+                        reg,
+                    );
+                } else {
+                    emit_table_column_read(
+                        b,
+                        cursor,
+                        scan.table,
+                        scan.table_alias,
+                        scan.schema,
+                        *idx,
+                        reg,
+                    );
+                }
             } else {
                 b.emit_op(Opcode::Column, cursor, *idx as i32, reg, P4::None, 0);
             }
         }
         SortKeySource::Rowid => {
-            b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+            if cursor == scan.cursor
+                && let Some(RegisterRow {
+                    rowid,
+                    covering_index,
+                    ..
+                }) = scan.register_base
+            {
+                if covering_index.is_some() {
+                    b.emit_op(Opcode::IdxRowid, cursor, reg, 0, P4::None, 0);
+                } else if let Some(rowid_reg) = rowid {
+                    b.emit_op(Opcode::Copy, rowid_reg, reg, 0, P4::None, 0);
+                } else {
+                    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                }
+            } else {
+                b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+            }
         }
         SortKeySource::Expression(expr) => {
             emit_expr(b, expr, reg, Some(scan));
@@ -48667,6 +48815,12 @@ struct RegisterRow {
     /// NULL. bd-q6sdy: an index-maintenance image without its rowid made every
     /// `WHERE rowid > 0` partial-index predicate NULL, so the entry was skipped.
     rowid: Option<i32>,
+    /// When set, the row lives directly under `ScanCtx::cursor` as an entry of
+    /// `ScanCtx::table.indexes[index_ordinal]`. Column reads decode straight
+    /// from the covering index cursor (`Opcode::Column` + `RealAffinity` for
+    /// `'E'`, or `Opcode::IdxRowid` for rowid/IPK) without eagerly copying into
+    /// a register image before `WHERE`/`OFFSET` (bd-wb3oi).
+    covering_index: Option<usize>,
 }
 
 impl RegisterRow {
@@ -48675,6 +48829,7 @@ impl RegisterRow {
         Self {
             columns,
             rowid: None,
+            covering_index: None,
         }
     }
 
@@ -48683,6 +48838,16 @@ impl RegisterRow {
         Self {
             columns,
             rowid: Some(rowid),
+            covering_index: None,
+        }
+    }
+
+    /// A row backed directly by a covering index cursor at `ScanCtx::cursor`.
+    const fn covering_index(index_ordinal: usize) -> Self {
+        Self {
+            columns: 0,
+            rowid: None,
+            covering_index: Some(index_ordinal),
         }
     }
 }
@@ -51086,14 +51251,31 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                 return;
             }
-            // Register-based resolution for a row being written: copy from the
-            // register holding that column's value.
+            // Register-based or direct covering-index resolution for the current row.
             if let Some(RegisterRow {
                 columns: reg_base,
                 rowid,
+                covering_index,
             }) = sc.register_base
             {
-                if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
+                if let Some(index_ordinal) = covering_index {
+                    let index = &sc.table.indexes[index_ordinal];
+                    if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
+                        if let Some(gen_expr) =
+                            virtual_generated_column_expr(&sc.table.columns[col_idx], sc.table)
+                        {
+                            emit_virtual_generated_column(b, col_idx, &gen_expr, reg, sc);
+                        } else {
+                            emit_covering_index_table_column_read(
+                                b, sc.cursor, sc.table, index, col_idx, reg,
+                            );
+                        }
+                    } else if sc.table.resolves_to_hidden_rowid(&col_ref.column) {
+                        b.emit_op(Opcode::IdxRowid, sc.cursor, reg, 0, P4::None, 0);
+                    } else {
+                        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                    }
+                } else if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                     if let Some(gen_expr) =
                         virtual_generated_column_expr(&sc.table.columns[col_idx], sc.table)
@@ -54552,7 +54734,11 @@ fn register_row_operand(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> Option<i32> {
     let RegisterRow {
         columns: reg_base,
         rowid,
-    } = sc.register_base?;
+        covering_index: None,
+    } = sc.register_base?
+    else {
+        return None;
+    };
     if let Some(qualifier) = &col_ref.table
         && !matches_table_or_alias(qualifier, sc.table, sc.table_alias)
     {

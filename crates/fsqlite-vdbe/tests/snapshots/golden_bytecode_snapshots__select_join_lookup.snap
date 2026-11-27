@@ -5,44 +5,37 @@ expression: join_lookup
 case: join_lookup
 sql: SELECT docs.id, categories.name FROM docs JOIN categories ON docs.category_id = categories.id WHERE docs.category_id = 7
 status: ok
-registers: 14
+registers: 15
 bind_parameters: 0
 requires_attached_memdb: false
 requires_version_store: false
 
 addr  opcode           p1    p2    p3    p4                 p5
 ----  ---------------  ----  ----  ----  -----------------  --
-0     Init             0     34    0                        0 
+0     Init             0     27    0                        0 
 1     Transaction      0     0     0                        0 
-2     OpenRead         0     2     0     (tbl)docs          0 
-3     OpenRead         1     3     0     (tbl)categories    0 
-4     Integer          7     3     0                        0 
-5     IsNull           3     30    0                        0 
-6     Int64            0     4     0     (i64)-9223372036854775808  0 
-7     MakeRecord       3     2     5                        0 
-8     OpenRead         16384  10    0     (idx)idx_docs_category  0 
-9     SeekGE           16384  30    5                        0 
-10    Column           16384  0     6                        0 
-11    Ne               3     30    6                        16
-12    IdxRowid         16384  7     0                        0 
-13    SeekRowid        0     29    7                        0 
-14    Column           0     1     9                        0 
-15    Integer          7     10    0                        0 
-16    Eq               10    8     9     (coll)BINARY       99
-17    IfNot            8     29    1                        0 
-18    Column           0     1     11                       0 
-19    IsNull           11    29    0                        0 
-20    MustBeInt        11    29    0                        0 
-21    SeekRowid        1     29    11                       0 
-22    Column           0     1     13                       0 
-23    Integer          7     14    0                        0 
-24    Eq               14    12    13    (coll)BINARY       99
-25    IfNot            12    29    1                        0 
-26    Rowid            0     1     0                        0 
-27    Column           1     1     2                        0 
-28    ResultRow        1     2     0                        0 
-29    Next             16384  10    0                        0 
-30    Close            16384  0     0                        0 
-31    Close            1     0     0                        0 
-32    Close            0     0     0                        0 
-33    Halt             0     0     0                        0
+2     OpenRead         1     3     0     (tbl)categories    0 
+3     Integer          7     3     0                        0 
+4     IsNull           3     24    0                        0 
+5     Int64            0     4     0     (i64)-9223372036854775808  0 
+6     MakeRecord       3     2     5                        0 
+7     OpenRead         16384  10    0     (idx)idx_docs_category  0 
+8     SeekGE           16384  24    5                        0 
+9     Column           16384  0     7                        0 
+10    Ne               3     24    7                        16
+11    IdxRowid         16384  11    0                        0 
+12    SCopy            7     13    0                        0 
+13    Integer          7     14    0                        0 
+14    Eq               14    12    13    (coll)BINARY       99
+15    IfNot            12    23    1                        0 
+16    SCopy            7     15    0                        0 
+17    IsNull           15    23    0                        0 
+18    MustBeInt        15    23    0                        0 
+19    SeekRowid        1     23    15                       0 
+20    SCopy            11    1     0                        0 
+21    Column           1     1     2                        0 
+22    ResultRow        1     2     0                        0 
+23    Next             16384  9     0                        0 
+24    Close            16384  0     0                        0 
+25    Close            1     0     0                        0 
+26    Halt             0     0     0                        0

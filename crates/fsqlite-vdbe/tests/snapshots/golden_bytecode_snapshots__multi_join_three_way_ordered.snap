@@ -12,47 +12,50 @@ requires_version_store: false
 
 addr  opcode           p1    p2    p3    p4                 p5
 ----  ---------------  ----  ----  ----  -----------------  --
-0     Init             0     44    0                        0 
+0     Init             0     47    0                        0 
 1     Transaction      0     0     0                        0 
 2     OpenRead         0     2     0     (tbl)docs          0 
 3     OpenRead         1     3     0     (tbl)categories    0 
 4     OpenRead         2     4     0     (tbl)events        0 
-5     SorterOpen       3     1     0     (str)-             0 
-6     Rewind           0     33    0                        0 
-7     Rewind           1     32    0                        0 
-8     Rewind           2     31    0                        0 
-9     Column           0     1     10                       0 
-10    Rowid            1     11    0                        0 
-11    Eq               11    9     10    (coll)BINARY       32
-12    IfNot            9     30    1                        0 
-13    Column           2     1     13                       0 
-14    Rowid            1     14    0                        0 
-15    Eq               14    12    13    (coll)BINARY       32
-16    IfNot            12    30    1                        0 
-17    Column           0     1     16                       0 
-18    Integer          7     17    0                        0 
-19    Eq               17    15    16    (coll)BINARY       99
-20    IfNot            15    30    1                        0 
-21    Rowid            0     1     0                        0 
-22    Column           1     1     2                        0 
-23    Column           2     2     3                        0 
-24    Column           2     2     4                        0 
-25    SCopy            1     5     0                        0 
-26    SCopy            2     6     0                        0 
-27    SCopy            3     7     0                        0 
-28    MakeRecord       4     4     8                        0 
-29    SorterInsert     3     8     0                        0 
-30    Next             2     9     0                        0 
-31    Next             1     8     0                        0 
-32    Next             0     7     0                        0 
-33    SorterSort       3     40    0                        0 
-34    SorterData       3     4     0                        0 
-35    Column           3     1     1                        0 
-36    Column           3     2     2                        0 
-37    Column           3     3     3                        0 
-38    ResultRow        1     3     0                        0 
-39    SorterNext       3     34    0                        0 
-40    Close            1     0     0                        0 
-41    Close            2     0     0                        0 
-42    Close            0     0     0                        0 
-43    Halt             0     0     0                        0
+5     OpenRead         3     13    0     (idx)idx_events_category  0 
+6     SorterOpen       4     1     0     (str)-             0 
+7     Int64            0     11    0     (i64)-9223372036854775808  0 
+8     Rewind           0     34    0                        0 
+9     Column           0     1     13                       0 
+10    Integer          7     14    0                        0 
+11    Eq               14    12    13    (coll)BINARY       99
+12    IfNot            12    33    1                        0 
+13    Column           0     1     9                        0 
+14    SeekRowid        1     33    9                        0 
+15    Rowid            1     10    0                        0 
+16    IsNull           10    33    0                        0 
+17    MakeRecord       10    2     15                       0 
+18    SeekGE           3     33    15                       0 
+19    Column           3     0     16                       0 
+20    Ne               10    33    16                       0 
+21    IdxRowid         3     17    0                        0 
+22    SeekRowid        2     32    17                       0 
+23    Rowid            0     1     0                        0 
+24    Column           1     1     2                        0 
+25    Column           2     2     3                        0 
+26    Column           2     2     4                        0 
+27    SCopy            1     5     0                        0 
+28    SCopy            2     6     0                        0 
+29    SCopy            3     7     0                        0 
+30    MakeRecord       4     4     8                        0 
+31    SorterInsert     4     8     0                        0 
+32    Next             3     19    0                        0 
+33    Next             0     9     0                        0 
+34    SorterSort       4     41    0                        0 
+35    SorterData       4     4     0                        0 
+36    Column           4     1     1                        0 
+37    Column           4     2     2                        0 
+38    Column           4     3     3                        0 
+39    ResultRow        1     3     0                        0 
+40    SorterNext       4     35    0                        0 
+41    Close            4     0     0                        0 
+42    Close            3     0     0                        0 
+43    Close            1     0     0                        0 
+44    Close            2     0     0                        0 
+45    Close            0     0     0                        0 
+46    Halt             0     0     0                        0

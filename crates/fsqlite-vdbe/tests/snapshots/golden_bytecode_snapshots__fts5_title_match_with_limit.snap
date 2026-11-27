@@ -19,15 +19,15 @@ addr  opcode           p1    p2    p3    p4                 p5
 4     SorterOpen       1     1     3     (str)+             1 
 5     OpenRead         0     2     0     (tbl)docs          0 
 6     Rewind           0     18    0                        0 
-7     String8          0     5     0     (str)franken sqlite  0 
-8     Column           0     2     6                        0 
-9     PureFunc         0     5     4     (func)MATCH        2 
-10    IfNot            4     17    1                        0 
-11    Rowid            0     8     0                        0 
-12    Copy             8     7     0                        0 
-13    SorterCompare    1     17    7     (int)1             1 
-14    Column           0     2     9                        0 
-15    MakeRecord       7     3     10                       0 
+7     String8          0     8     0     (str)franken sqlite  0 
+8     Column           0     2     9                        0 
+9     PureFunc         0     8     7     (func)MATCH        2 
+10    IfNot            7     17    1                        0 
+11    Rowid            0     5     0                        0 
+12    Copy             5     4     0                        0 
+13    SorterCompare    1     17    4     (int)1             1 
+14    Column           0     2     6                        0 
+15    MakeRecord       4     3     10                       0 
 16    SorterInsert     1     10    0                        0 
 17    Next             0     7     0                        0 
 18    Close            0     0     0                        0 
