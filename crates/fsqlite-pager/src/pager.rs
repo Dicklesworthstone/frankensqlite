@@ -1389,6 +1389,7 @@ trait PendingGroupCommitTxnAttemptOperation: Send + Sync {
         complete_group_pages: &HashMap<PageNumber, &[u8]>,
         group_allocator_delta: &PendingGroupCommitAllocatorDelta,
         apply_allocator_delta: bool,
+        reconciled_durable_freelist: Option<&[u32]>,
     ) -> Result<()>;
 
     fn complete_not_committed_global(&self) -> Result<()>;
@@ -2459,6 +2460,11 @@ impl GroupCommitQueue {
         }
         group_allocator_delta.normalize();
 
+        let reconciled_durable_freelist: Option<&[u32]> = batches
+            .iter()
+            .rev()
+            .find_map(|batch| batch.published_durable_freelist.as_deref());
+
         let mut normalized_pager_inners = GroupCommitKeyedSet::default();
         for (batch_id, registered_epoch, operation) in &attempts {
             if *registered_epoch != epoch {
@@ -2485,6 +2491,7 @@ impl GroupCommitQueue {
                 complete_group_pages,
                 &group_allocator_delta,
                 apply_allocator_delta,
+                reconciled_durable_freelist,
             )?;
         }
 
@@ -10258,6 +10265,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
         complete_group_pages: &HashMap<PageNumber, &[u8]>,
         group_allocator_delta: &PendingGroupCommitAllocatorDelta,
         apply_allocator_delta: bool,
+        reconciled_durable_freelist: Option<&[u32]>,
     ) -> Result<()> {
         let mut state = self
             .state
@@ -10292,12 +10300,35 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut committed_freelist = if let Some(override_freelist) = &self.vacuum_override_freelist {
+        let reconciled_upper = reconciled_durable_freelist
+            .and_then(|list| list.iter().copied().max())
+            .unwrap_or(0);
+        let committed_db_size = self.explicit_db_size_shrink.unwrap_or_else(|| {
+            inner
+                .db_size
+                .max(self.committed_db_size)
+                .max(reconciled_upper)
+        });
+        let mut committed_freelist = if let Some(override_freelist) = &self.vacuum_override_freelist
+        {
             override_freelist.clone()
         } else {
             let mut list = inner.freelist.clone();
             if apply_allocator_delta {
                 group_allocator_delta.apply_to_freelist(&mut list);
+            }
+            if let Some(reconciled) = reconciled_durable_freelist
+                && self.explicit_db_size_shrink.is_none()
+            {
+                // bd-yh9gm: commit-planned freelist reconciliation may have
+                // merged a peer's concurrent frees/reuses into the durable
+                // freelist under the WAL append gate. Replace all in-range
+                // durable entries with that authoritative list while preserving
+                // any valid above-EOF volatile entries.
+                list.retain(|page| page.get() > committed_db_size);
+                list.extend(reconciled.iter().copied().filter_map(PageNumber::new));
+                let upper_bound = inner.next_page.saturating_sub(1).max(committed_db_size);
+                list = normalize_freelist(&list, upper_bound, inner.page_size);
             }
             list
         };
@@ -10309,9 +10340,6 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
                 "authorized group-commit returned allocations were already finalized",
             )
         })?;
-        let committed_db_size = self
-            .explicit_db_size_shrink
-            .unwrap_or_else(|| inner.db_size.max(self.committed_db_size));
         let publication_intent = parallel_wal_publication_intent(
             &authorization,
             committed_db_size,
@@ -10321,8 +10349,14 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
         )?;
 
         state.returned_allocations.take();
-        if apply_allocator_delta || self.vacuum_override_freelist.is_some() {
+        if apply_allocator_delta
+            || self.vacuum_override_freelist.is_some()
+            || reconciled_durable_freelist.is_some()
+        {
             inner.freelist = committed_freelist;
+        }
+        if let Some(reconciled) = reconciled_durable_freelist {
+            inner.durable_freelist_view = reconciled.iter().copied().collect();
         }
         state.pending_freed_pages.clear();
         state.reclaimed_abandoned_reservations.clear();
@@ -12611,12 +12645,12 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     phase_a_undo: Option<&PhaseAWriteSetUndo>,
     vacuum_override_freelist: Option<&[PageNumber]>,
     pointer_map_active: bool,
-) -> Result<Vec<PageNumber>> {
+) -> Result<(Vec<PageNumber>, Vec<PageNumber>)> {
     if committed_db_size == 0 {
         inner.freelist.clear();
         inner.freelist_repair_pending = false;
         inner.freelist_repair_dropped = 0;
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     // GH#410: this publication rewrites the whole trunk chain and page-1 count
     // from the sanitized list, which IS the repair. A failed commit leaves the
@@ -12792,9 +12826,14 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
         }
     }
 
-    // bd-gh302/bd-0shxy: hand the exact published durable list back so the
-    // commit can carry it to the append-gate resurrection/erasure guard.
-    Ok(durable_freelist)
+    // bd-gh302/bd-0shxy/bd-yh9gm: hand the exact published durable list and the
+    // Phase-A synthetic trunk pages back so the commit can carry them to the
+    // append-gate freelist validator/reconciler.
+    let synthetic_trunk_pages: Vec<PageNumber> = trunk_pages
+        .into_iter()
+        .filter_map(PageNumber::new)
+        .collect();
+    Ok((durable_freelist, synthetic_trunk_pages))
 }
 
 async fn ensure_page_one_in_write_set<F: VfsFile, S: std::hash::BuildHasher>(
@@ -14112,6 +14151,466 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
     offending.sort_unstable();
     offending.dedup();
     Ok(offending)
+}
+
+/// bd-yh9gm: commit-planned freelist reconciliation under `HeldAppendGate`.
+///
+/// Rebuilds the durable freelist trunk chain and page-1 freelist header from the
+/// CURRENT durable freelist (read under the serialized append gate) minus every
+/// batch's durably consumed freelist pages plus every batch's newly freed
+/// in-range pages.
+///
+/// Soundness invariants preserved fail-closed:
+/// - **Exact reuses:** every page in `consumed_durable_freelist_pages` (within
+///   the transaction's begin-time committed db size) MUST still be present in
+///   the current durable freelist (and not already consumed by an earlier batch
+///   in the same group). Otherwise a peer already took that page — a TRUE
+///   conflict — and this function returns `Err(BusySnapshot)`.
+/// - **No live/free overlap:** no batch may write a non-synthetic, non-freed
+///   frame for any page in the reconciled freelist.
+/// - **Schema-safe synthetic page 1:** batches whose page-1 frame is synthetic
+///   (not in `batch.conflict_pages`) refresh their base image from the current
+///   durable page 1 (or any direct page-1 writer in the same group) before
+///   stamping the reconciled header fields `[24..40]` and `[92..96]`.
+/// - **`secure_delete` preservation:** Phase-A synthetic trunks recorded in
+///   `zeroed_freelist_trunks` that are demoted to leaves have `[..usable]`
+///   zero-filled instead of dropped.
+///
+/// Returns `Ok(Some(reconciled_db_size))` when any batch frame was modified and
+/// `frame_refs` / payload digest / prepared batch must be rebuilt, or
+/// `Ok(None)` on the zero-overhead fast path when the Phase-A publication is
+/// already exact.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn reconcile_commit_planned_freelist_under_gate<F: VfsFile>(
+    cx: &Cx,
+    wal: &mut dyn WalBackend,
+    db_file: &SharedDbFile<F>,
+    page_cipher: &PageCipherSlot,
+    page_size: usize,
+    batches: &mut [TransactionFrameBatch],
+    effective_db_size: u32,
+) -> Result<Option<u32>> {
+    let Some(durable_page_one) =
+        read_durable_page_under_gate(cx, wal, db_file, page_cipher, page_size, 1).await?
+    else {
+        return Ok(None);
+    };
+    if durable_page_one.len() < DATABASE_HEADER_SIZE {
+        return Ok(None);
+    }
+
+    let mut current = HashSet::<u32>::new();
+    let mut trunk = u32::from_be_bytes(
+        durable_page_one[32..36]
+            .try_into()
+            .expect("header freelist trunk slice"),
+    );
+    let max_walk_entries = (page_size / 4).saturating_sub(2).max(1);
+    let mut walked = 0_u32;
+    while trunk != 0 {
+        walked = walked.saturating_add(1);
+        if walked > 65_536 || !current.insert(trunk) {
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages: trunk.to_string(),
+            });
+        }
+        let Some(image) =
+            read_durable_page_under_gate(cx, wal, db_file, page_cipher, page_size, trunk).await?
+        else {
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages: trunk.to_string(),
+            });
+        };
+        if image.len() < 8 {
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages: trunk.to_string(),
+            });
+        }
+        let next = u32::from_be_bytes(image[0..4].try_into().expect("trunk next slice"));
+        let leaf_count =
+            u32::from_be_bytes(image[4..8].try_into().expect("trunk count slice")) as usize;
+        for index in 0..leaf_count.min(max_walk_entries) {
+            let base = 8 + index * 4;
+            if base + 4 > image.len() {
+                break;
+            }
+            current.insert(u32::from_be_bytes(
+                image[base..base + 4].try_into().expect("trunk leaf slice"),
+            ));
+        }
+        trunk = next;
+    }
+
+    let durable_db_size = u32::from_be_bytes(
+        durable_page_one[28..32]
+            .try_into()
+            .expect("header database-size slice"),
+    );
+    let durable_change_counter = u32::from_be_bytes(
+        durable_page_one[24..28]
+            .try_into()
+            .expect("header change-counter slice"),
+    );
+    let durable_extent_is_valid =
+        durable_db_size != 0 && durable_page_one[24..28] == durable_page_one[92..96];
+    let target_db_size = effective_db_size.max(durable_db_size);
+    let reserved_page = crate::journal::PENDING_BYTE_OFFSET / page_size as u64 + 1;
+
+    let mut available = current.clone();
+    let mut union_freed_in_range = HashSet::<u32>::new();
+    let mut union_zeroed_trunks = HashSet::<u32>::new();
+    let mut double_consumed = Vec::<u32>::new();
+
+    for batch in batches.iter() {
+        let begin_committed = batch
+            .conflict_snapshot
+            .map_or(0, |snapshot| snapshot.snapshot_db_size);
+        for &page in &batch.consumed_durable_freelist_pages {
+            let in_memory_only = begin_committed > 0 && page > begin_committed;
+            if !in_memory_only && !available.remove(&page) {
+                double_consumed.push(page);
+            }
+        }
+        for &page in &batch.freed_pages {
+            if page > 1 && page <= target_db_size && u64::from(page) != reserved_page {
+                union_freed_in_range.insert(page);
+            }
+        }
+        union_zeroed_trunks.extend(batch.zeroed_freelist_trunks.iter().copied());
+    }
+
+    if !double_consumed.is_empty() {
+        double_consumed.sort_unstable();
+        double_consumed.dedup();
+        return Err(FrankenError::BusySnapshot {
+            conflicting_pages: double_consumed
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        });
+    }
+
+    // Preserve bd-fwsyc unclaimed EOF holes carried in a publisher's Phase-A list.
+    if durable_extent_is_valid {
+        for (batch_idx, batch) in batches.iter().enumerate() {
+            let Some(published) = batch.published_durable_freelist.as_ref() else {
+                continue;
+            };
+            for &page in published {
+                if page <= durable_db_size
+                    || page > target_db_size
+                    || u64::from(page) == reserved_page
+                    || current.contains(&page)
+                    || union_freed_in_range.contains(&page)
+                {
+                    continue;
+                }
+                let claimed_by_other = batches.iter().enumerate().any(|(other_idx, other)| {
+                    other_idx != batch_idx
+                        && (other.frames.iter().any(|frame| {
+                            frame.page_number == page
+                                && !other.synthetic_freelist_trunk_pages.contains(&page)
+                        }) || other.consumed_freelist_pages.contains(&page))
+                });
+                if !claimed_by_other
+                    && wal.read_page_at_appended_tail(cx, page).await?.is_none()
+                {
+                    union_freed_in_range.insert(page);
+                }
+            }
+        }
+    }
+
+    let mut reconciled_u32: Vec<u32> = available
+        .into_iter()
+        .chain(union_freed_in_range)
+        .filter(|&page| page > 1 && page <= target_db_size && u64::from(page) != reserved_page)
+        .collect();
+    reconciled_u32.sort_unstable_by_key(|&page| std::cmp::Reverse(page));
+    reconciled_u32.dedup();
+    let reconciled_set: HashSet<u32> = reconciled_u32.iter().copied().collect();
+
+    // Fail closed if any batch writes a live non-synthetic, non-freed frame for
+    // a page that belongs to the reconciled freelist.
+    let mut live_free_overlap = Vec::<u32>::new();
+    for batch in batches.iter() {
+        for frame in &batch.frames {
+            let pg = frame.page_number;
+            if reconciled_set.contains(&pg)
+                && !batch.synthetic_freelist_trunk_pages.contains(&pg)
+                && !batch.freed_pages.contains(&pg)
+            {
+                live_free_overlap.push(pg);
+            }
+        }
+    }
+    if !live_free_overlap.is_empty() {
+        live_free_overlap.sort_unstable();
+        live_free_overlap.dedup();
+        return Err(FrankenError::BusySnapshot {
+            conflicting_pages: live_free_overlap
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        });
+    }
+
+    let publisher_count = batches
+        .iter()
+        .filter(|batch| batch.published_durable_freelist.is_some())
+        .count();
+    let Some(last_pub_idx) = batches
+        .iter()
+        .rposition(|batch| batch.published_durable_freelist.is_some())
+    else {
+        return Ok(None);
+    };
+
+    // Fast path: single publisher whose Phase-A freelist and page-1 image already
+    // match current durable state and every non-publisher page-1 frame matches it.
+    if publisher_count == 1
+        && target_db_size == effective_db_size
+        && batches[last_pub_idx].published_durable_freelist.as_deref()
+            == Some(reconciled_u32.as_slice())
+    {
+        let pub_header = group_publication_page_one_freelist_header(batches);
+        let nonpub_stale = pub_header.is_some_and(|header| {
+            nonpublication_page_one_freelist_header_differs(batches, header)
+        });
+        let any_direct_page_one_in_group =
+            batches.iter().any(|batch| batch.conflict_pages.contains(&1));
+        let synthetic_page1_stale = batches.iter().any(|batch| {
+            !batch.conflict_pages.contains(&1)
+                && batch.frames.iter().any(|frame| {
+                    if frame.page_number != 1 || frame.page_data.len() < DATABASE_HEADER_SIZE {
+                        return false;
+                    }
+                    let frame_cc = u32::from_be_bytes(
+                        frame.page_data[24..28]
+                            .try_into()
+                            .expect("frame change-counter slice"),
+                    );
+                    let cc_stale = frame_cc == durable_change_counter
+                        || frame_cc.wrapping_sub(durable_change_counter) >= (u32::MAX / 2);
+                    any_direct_page_one_in_group
+                        || cc_stale
+                        || frame.page_data[..24] != durable_page_one[..24]
+                        || frame.page_data[40..92] != durable_page_one[40..92]
+                        || frame.page_data[96..] != durable_page_one[96..]
+                })
+        });
+        if !nonpub_stale && !synthetic_page1_stale {
+            return Ok(None);
+        }
+    }
+
+    let page_size_u32 = u32::try_from(page_size)
+        .map_err(|_| FrankenError::internal("WAL frame page_size exceeds u32"))?;
+    let page_size_typed = PageSize::new(page_size_u32)
+        .ok_or_else(|| FrankenError::internal("invalid WAL frame page_size"))?;
+    let reserved = batches
+        .iter()
+        .map(|batch| batch.reserved_per_page)
+        .max()
+        .unwrap_or(0);
+    let usable = page_size.saturating_sub(usize::from(reserved));
+    let max_leaf_entries = freelist_trunk_leaf_capacity(page_size_typed, reserved);
+    let total_free = u32::try_from(reconciled_u32.len())
+        .map_err(|_| FrankenError::internal("reconciled freelist exceeds u32"))?;
+
+    let (first_trunk, trunk_pages) = if reconciled_u32.is_empty() {
+        (0_u32, Vec::<u32>::new())
+    } else {
+        let trunk_count = reconciled_u32.len().div_ceil(max_leaf_entries + 1);
+        let trunks: Vec<u32> = reconciled_u32.iter().take(trunk_count).copied().collect();
+        (trunks[0], trunks)
+    };
+    let new_trunk_set: HashSet<u32> = trunk_pages.iter().copied().collect();
+
+    // Strip stale Phase-A synthetic trunk frames from every commit-planned batch
+    // (preserving secure_delete zeroing for demoted trunks).
+    for batch in batches.iter_mut() {
+        if !batch.commit_planned_freelist {
+            continue;
+        }
+        let batch_commit_db_size = batch
+            .frames
+            .iter()
+            .map(|frame| frame.db_size_if_commit)
+            .max()
+            .unwrap_or(0);
+        let synthetic_trunks: HashSet<u32> =
+            batch.synthetic_freelist_trunk_pages.iter().copied().collect();
+        let zeroed: HashSet<u32> = batch.zeroed_freelist_trunks.iter().copied().collect();
+        for frame in &mut batch.frames {
+            frame.db_size_if_commit = 0;
+        }
+        let mut kept = Vec::with_capacity(batch.frames.len());
+        for mut frame in std::mem::take(&mut batch.frames) {
+            if synthetic_trunks.contains(&frame.page_number) {
+                if zeroed.contains(&frame.page_number) && !new_trunk_set.contains(&frame.page_number)
+                {
+                    let end = usable.min(frame.page_data.len());
+                    frame.page_data[..end].fill(0);
+                    kept.push(frame);
+                }
+            } else {
+                kept.push(frame);
+            }
+        }
+        batch.frames = kept;
+        batch.synthetic_freelist_trunk_pages.clear();
+        if batch_commit_db_size != 0
+            && let Some(last) = batch.frames.last_mut()
+        {
+            last.db_size_if_commit = batch_commit_db_size.max(target_db_size);
+        }
+    }
+
+    // Build reconciled trunk frames and attach them to the final publishing batch.
+    let mut rebuilt_trunks = Vec::with_capacity(trunk_pages.len());
+    if !trunk_pages.is_empty() {
+        let mut leaf_index = trunk_pages.len();
+        for (idx, &trunk_pg) in trunk_pages.iter().enumerate() {
+            let next = trunk_pages.get(idx + 1).copied().unwrap_or(0);
+            let remaining = reconciled_u32.len().saturating_sub(leaf_index);
+            let take = remaining.min(max_leaf_entries);
+            let zeroed = union_zeroed_trunks.contains(&trunk_pg);
+
+            let mut buf = vec![0_u8; page_size];
+            if !(zeroed && reserved == 0) {
+                if let Some(existing_frame) = batches
+                    .iter()
+                    .rev()
+                    .flat_map(|batch| batch.frames.iter())
+                    .find(|frame| frame.page_number == trunk_pg)
+                {
+                    buf.copy_from_slice(&existing_frame.page_data);
+                } else if let Some(original) = read_durable_page_under_gate(
+                    cx,
+                    wal,
+                    db_file,
+                    page_cipher,
+                    page_size,
+                    trunk_pg,
+                )
+                .await?
+                {
+                    buf.copy_from_slice(&original);
+                }
+                if zeroed {
+                    buf[..usable].fill(0);
+                }
+            }
+            buf[0..4].copy_from_slice(&next.to_be_bytes());
+            let take_u32 = u32::try_from(take)
+                .map_err(|_| FrankenError::internal("freelist trunk leaf count exceeds u32"))?;
+            buf[4..8].copy_from_slice(&take_u32.to_be_bytes());
+            for i in 0..take {
+                let leaf = reconciled_u32[leaf_index + i];
+                let base = 8 + i * 4;
+                buf[base..base + 4].copy_from_slice(&leaf.to_be_bytes());
+            }
+            leaf_index += take;
+            rebuilt_trunks.push(fsqlite_wal::group_commit::FrameSubmission {
+                page_number: trunk_pg,
+                page_data: buf,
+                db_size_if_commit: 0,
+            });
+        }
+    }
+
+    {
+        let pub_batch = &mut batches[last_pub_idx];
+        for frame in &mut pub_batch.frames {
+            frame.db_size_if_commit = 0;
+        }
+        // Remove any existing frame in pub_batch for pages we are about to emit
+        // as reconciled trunks, then insert trunks right before page 1 (or at
+        // the end if page 1 is already present earlier).
+        pub_batch
+            .frames
+            .retain(|frame| !new_trunk_set.contains(&frame.page_number));
+        let insert_pos = pub_batch
+            .frames
+            .iter()
+            .position(|frame| frame.page_number == 1)
+            .unwrap_or(pub_batch.frames.len());
+        pub_batch
+            .frames
+            .splice(insert_pos..insert_pos, rebuilt_trunks);
+        if let Some(last) = pub_batch.frames.last_mut() {
+            last.db_size_if_commit = target_db_size;
+        }
+    }
+
+    // Determine authoritative base image for synthetic page-1 frames: if a batch
+    // in this group carries a direct (schema) page-1 write, preserve its body;
+    // otherwise use the fresh durable page 1 read under the gate.
+    let direct_page_one_body: Option<Vec<u8>> = batches
+        .iter()
+        .find(|batch| batch.conflict_pages.contains(&1))
+        .and_then(|batch| {
+            batch
+                .frames
+                .iter()
+                .find(|frame| frame.page_number == 1 && frame.page_data.len() == page_size)
+                .map(|frame| frame.page_data.clone())
+        });
+    let base_page_one: &[u8] = direct_page_one_body
+        .as_deref()
+        .unwrap_or(durable_page_one.as_slice());
+
+    let mut next_change_counter = durable_change_counter;
+    for batch in batches.iter() {
+        for frame in &batch.frames {
+            if frame.page_number == 1 && frame.page_data.len() >= DATABASE_HEADER_SIZE {
+                let cc = u32::from_be_bytes(
+                    frame.page_data[24..28]
+                        .try_into()
+                        .expect("frame change-counter slice"),
+                );
+                if cc.wrapping_sub(next_change_counter) < (u32::MAX / 2) {
+                    next_change_counter = cc;
+                }
+            }
+        }
+    }
+    if next_change_counter == durable_change_counter {
+        next_change_counter = durable_change_counter.wrapping_add(1);
+    }
+
+    for (idx, batch) in batches.iter_mut().enumerate() {
+        let is_direct_page_one = batch.conflict_pages.contains(&1);
+        for frame in &mut batch.frames {
+            if frame.page_number != 1 || frame.page_data.len() < DATABASE_HEADER_SIZE {
+                continue;
+            }
+            if !is_direct_page_one && frame.page_data.len() == base_page_one.len() {
+                frame.page_data.copy_from_slice(base_page_one);
+            }
+            let existing_page_count = u32::from_be_bytes(
+                frame.page_data[28..32]
+                    .try_into()
+                    .expect("frame page-count slice"),
+            );
+            frame.page_data[24..28].copy_from_slice(&next_change_counter.to_be_bytes());
+            frame.page_data[28..32]
+                .copy_from_slice(&existing_page_count.max(target_db_size).to_be_bytes());
+            frame.page_data[32..36].copy_from_slice(&first_trunk.to_be_bytes());
+            frame.page_data[36..40].copy_from_slice(&total_free.to_be_bytes());
+            frame.page_data[92..96].copy_from_slice(&next_change_counter.to_be_bytes());
+        }
+        if idx == last_pub_idx {
+            batch.published_durable_freelist = Some(reconciled_u32.clone());
+        } else if batch.published_durable_freelist.is_some() {
+            batch.published_durable_freelist = None;
+        }
+    }
+
+    Ok(Some(target_db_size))
 }
 
 fn group_commit_final_db_size(current_db_size: u32, batches: &[TransactionFrameBatch]) -> u32 {
@@ -25344,6 +25843,14 @@ where
 {
 }
 
+#[derive(Debug, Default)]
+struct CommitPlannedFreelistInput {
+    enabled: bool,
+    synthetic_freelist_trunk_pages: Vec<u32>,
+    zeroed_freelist_trunks: Vec<u32>,
+    reserved_per_page: u8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalPageOneWritePlan {
     max_written: u32,
@@ -26915,24 +27422,80 @@ where
         pages
     }
 
+    /// bd-yh9gm: whether this transaction's WAL freelist publication is
+    /// commit-planned (reconciled inside the serialized WAL append gate rather
+    /// than FCW-tracked on synthetic page 1 / trunk pages).
+    ///
+    /// Excluded for rollback journal mode, non-Concurrent transactions,
+    /// auto_vacuum pointer maps, VACUUM overrides, explicit shrink/truncation,
+    /// and GH#410 corrupt-freelist repair — all of which keep the conservative
+    /// FCW surface.
+    #[must_use]
+    fn uses_commit_planned_freelist(&self, freelist_repair_pending: bool) -> bool {
+        self.mode == TransactionMode::Concurrent
+            && self.journal_mode == JournalMode::Wal
+            && !self.pointer_map.uses_pointer_map()
+            && self.vacuum_override_freelist.is_none()
+            && self.truncated_db_size.is_none()
+            && !freelist_repair_pending
+    }
+
     fn predicted_conflict_pages_with_inner(&self, inner: &PagerInner<V::File>) -> Vec<PageNumber> {
         let committed_db_size = self.committed_db_size_with_inner(inner);
         let freelist_dirty = self.freelist_metadata_dirty_with_inner(inner, committed_db_size);
         let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
-        self.predicted_conflict_pages_for_wal_commit_with_inner(
+        let commit_planned_freelist =
+            self.uses_commit_planned_freelist(inner.freelist_repair_pending);
+        self.predicted_conflict_pages_for_wal_commit_with_synthetic_trunks(
             inner,
             wal_page1_plan,
             &self.freed_pages,
+            commit_planned_freelist,
+            &[],
         )
     }
 
+    #[cfg(test)]
     fn predicted_conflict_pages_for_wal_commit_with_inner(
         &self,
         inner: &PagerInner<V::File>,
         wal_page1_plan: WalPageOneWritePlan,
         freed_conflict_pages: &[PageNumber],
     ) -> Vec<PageNumber> {
-        let mut pages = self.predicted_commit_pages_with_inner(inner);
+        let commit_planned_freelist =
+            self.uses_commit_planned_freelist(inner.freelist_repair_pending);
+        self.predicted_conflict_pages_for_wal_commit_with_synthetic_trunks(
+            inner,
+            wal_page1_plan,
+            freed_conflict_pages,
+            commit_planned_freelist,
+            &[],
+        )
+    }
+
+    fn predicted_conflict_pages_for_wal_commit_with_synthetic_trunks(
+        &self,
+        inner: &PagerInner<V::File>,
+        wal_page1_plan: WalPageOneWritePlan,
+        freed_conflict_pages: &[PageNumber],
+        commit_planned_freelist: bool,
+        synthetic_freelist_trunk_pages: &[PageNumber],
+    ) -> Vec<PageNumber> {
+        let mut pages = if commit_planned_freelist {
+            // bd-yh9gm: in WAL Concurrent mode, freelist trunk pages are
+            // commit-planned (rebuilt from the current durable freelist under
+            // the serialized WAL append gate). Exclude synthetic trunk writes
+            // from the FCW surface so disjoint-table writers freeing pages do
+            // not collide on the shared trunk; newly freed B-tree pages still
+            // enter via `freed_conflict_pages` below.
+            let mut base = self.write_pages_sorted.clone();
+            if !synthetic_freelist_trunk_pages.is_empty() {
+                base.retain(|page| !synthetic_freelist_trunk_pages.contains(page));
+            }
+            base
+        } else {
+            self.predicted_commit_pages_with_inner(inner)
+        };
         pages.extend(freed_conflict_pages.iter().copied());
         pages.extend(self.vacuum_relocated_conflict_pages.iter().copied());
 
@@ -28148,6 +28711,7 @@ where
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            CommitPlannedFreelistInput::default(),
             queue,
             &mut publication_authorization,
             None,
@@ -28193,6 +28757,9 @@ where
         // DURABLE freelist — the only pops eligible for the append gate's
         // double-consumption refusal.
         freelist_publication_consumed_durable_pages: Vec<u32>,
+        // bd-yh9gm: commit-planned freelist reconciliation metadata for WAL
+        // Concurrent commits.
+        commit_planned_freelist: CommitPlannedFreelistInput,
         queue: &GroupCommitQueueRef,
         publication_authorization: &mut Option<ParallelWalPublicationAuthorization>,
         txn_attempt: Option<&Arc<PendingGroupCommitTxnAttempt<V::File>>>,
@@ -28333,12 +28900,19 @@ where
         )
         .with_route_watch(route_watch_pages, route_watch_complete);
         let carries_freelist_publication = published_durable_freelist.is_some();
-        let batch = batch.with_freelist_publication(
-            published_durable_freelist,
-            freelist_publication_freed_pages,
-            freelist_publication_consumed_pages,
-            freelist_publication_consumed_durable_pages,
-        );
+        let batch = batch
+            .with_freelist_publication(
+                published_durable_freelist,
+                freelist_publication_freed_pages,
+                freelist_publication_consumed_pages,
+                freelist_publication_consumed_durable_pages,
+            )
+            .with_commit_planned_freelist(
+                commit_planned_freelist.enabled,
+                commit_planned_freelist.synthetic_freelist_trunk_pages,
+                commit_planned_freelist.zeroed_freelist_trunks,
+                commit_planned_freelist.reserved_per_page,
+            );
         let conflict_snapshot_us = elapsed_profile_us(t_conflict_snapshot_start);
 
         let parallel_wal_control = queue.parallel_wal_control().clone();
@@ -28940,13 +29514,13 @@ where
                         }
                     }
                 }
-                let batches: Arc<[TransactionFrameBatch]> = Arc::from(batches);
-                // Mutable only for the bd-vnxjd floor certification under the
-                // append gate, which rebuilds all three from `batches`.
-                let (mut frame_refs, mut final_db_size) =
+                let mut batches: Arc<[TransactionFrameBatch]> = Arc::from(batches);
+                // Mutable for the bd-yh9gm commit-planned freelist reconciler
+                // and bd-vnxjd floor certification under the append gate.
+                let (frame_refs, mut final_db_size) =
                     flatten_group_commit_batches(flush_base_db_size, &batches);
                 debug_assert_eq!(final_db_size, consolidated_db_size);
-                let frame_count = frame_refs.len();
+                let mut frame_count = frame_refs.len();
                 let wal_encryption_active = inner_arc
                     .lock()
                     .is_ok_and(|inner| inner.page_cipher.is_enabled());
@@ -29082,13 +29656,14 @@ where
                     prepared_batch = prepared;
                     prepared_is_digested_frames = true;
                 }
+                drop(frame_refs);
                 // Whether the bytes about to be appended are the frames the
                 // certificate's payload digest was computed over: appended
                 // straight from `frame_refs`, prepared from them just above,
                 // or lane-staged and compared equal to them. Only then is this
                 // flush's certificate known to authorize its own WAL interval
                 // without reading the frames back (see `DurableDbSizeFloor`).
-                let appended_frames_are_digested =
+                let mut appended_frames_are_digested =
                     prepared_batch.is_none() || prepared_is_digested_frames;
                 let flush_frame_prep_us = elapsed_profile_us(t_flush_frame_prep_start);
                 GLOBAL_CONSOLIDATION_METRICS.transactions_batched.fetch_add(
@@ -29294,153 +29869,6 @@ where
                                             .join(","),
                                     });
                                 }
-                                // bd-gh302/bd-0shxy: committed-freelist
-                                // resurrection/erasure guard. A freelist
-                                // publication derived from a begin-time view
-                                // must still be exact against the CURRENT
-                                // durable freelist now that the append gate
-                                // is held; otherwise fail closed and let the
-                                // owner's retry re-derive it.
-                                if let Some(frame_page_size) = batches
-                                    .iter()
-                                    .flat_map(|batch| batch.frames.iter())
-                                    .map(|frame| frame.page_data.len())
-                                    .next()
-                                {
-                                    // bd-dw8oe: a synthetic page-1 rewrite whose
-                                    // freelist header bytes no longer match the
-                                    // CURRENT durable page-1 would republish a
-                                    // consumed freelist head (the promote ran
-                                    // before this gate; a peer publication can
-                                    // land in between). Fail closed; the retry
-                                    // re-promotes at the fresh header.
-                                    let carries_synthetic_page_one = batches.iter().any(|batch| {
-                                        batch.published_durable_freelist.is_none()
-                                            && batch
-                                                .frames
-                                                .iter()
-                                                .any(|frame| frame.page_number == 1)
-                                    });
-                                    if dw8oe_trace_enabled() {
-                                        for batch in batches.iter() {
-                                            for frame in &batch.frames {
-                                                if frame.page_number == 1
-                                                    && frame.page_data.len()
-                                                        >= DATABASE_HEADER_SIZE
-                                                {
-                                                    eprintln!(
-                                                        "DW8OE GATE-P1 reason={:?} pub={} bytes32_40={}",
-                                                        fallback_reason,
-                                                        batch.published_durable_freelist.is_some(),
-                                                        hex_bytes(&frame.page_data[32..40]),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if carries_synthetic_page_one {
-                                        // bd-ioq6x: non-publication page-1 frames
-                                        // must match THIS group's own publication
-                                        // header when present — the publication
-                                        // batch is separately validated against
-                                        // fresh durable by the resurrection/
-                                        // erasure guard below. Only when the group
-                                        // carries no publication of its own do the
-                                        // frames have to match the CURRENT durable
-                                        // header (bd-dw8oe promote→append window
-                                        // against a peer publication).
-                                        let stale = if let Some(header) =
-                                            group_publication_page_one_freelist_header(&batches)
-                                        {
-                                            if dw8oe_trace_enabled() {
-                                                eprintln!(
-                                                    "DW8OE GATE in_group32_40={}",
-                                                    hex_bytes(&header),
-                                                );
-                                            }
-                                            nonpublication_page_one_freelist_header_differs(
-                                                &batches, header,
-                                            )
-                                        } else {
-                                            let page_cipher = {
-                                                let inner = inner_arc.lock().map_err(|_| {
-                                                    FrankenError::internal(
-                                                        "SimpleTransaction lock poisoned",
-                                                    )
-                                                })?;
-                                                inner.page_cipher.clone()
-                                            };
-                                            let durable_page_one = read_durable_page_under_gate(
-                                                cx,
-                                                wal,
-                                                &db_file,
-                                                &page_cipher,
-                                                frame_page_size,
-                                                1,
-                                            )
-                                            .await?;
-                                            if dw8oe_trace_enabled() {
-                                                eprintln!(
-                                                    "DW8OE GATE durable32_40={}",
-                                                    durable_page_one.as_deref().map_or_else(
-                                                        || "none".to_owned(),
-                                                        |d| hex_bytes(&d[32..40])
-                                                    ),
-                                                );
-                                            }
-                                            stale_synthetic_page_one_freelist_header(
-                                                &batches,
-                                                durable_page_one.as_deref(),
-                                            )
-                                        };
-                                        if stale {
-                                            tracing::debug!(
-                                                target: "fsqlite.wal.conflict",
-                                                "synthetic page-1 freelist header is stale \
-                                                 against the current durable/in-group page 1; \
-                                                 failing closed with BusySnapshot \
-                                                 (bd-dw8oe/bd-ioq6x)"
-                                            );
-                                            return Err(FrankenError::BusySnapshot {
-                                                conflicting_pages: "1".to_owned(),
-                                            });
-                                        }
-                                    }
-                                    let page_cipher_for_guard = {
-                                        let inner = inner_arc.lock().map_err(|_| {
-                                            FrankenError::internal(
-                                                "SimpleTransaction lock poisoned",
-                                            )
-                                        })?;
-                                        inner.page_cipher.clone()
-                                    };
-                                    let freelist_guard_pages =
-                                        resurrected_or_erased_freelist_pages(
-                                            cx,
-                                            wal,
-                                            &db_file,
-                                            &page_cipher_for_guard,
-                                            frame_page_size,
-                                            &batches,
-                                        )
-                                        .await?;
-                                    if !freelist_guard_pages.is_empty() {
-                                        tracing::debug!(
-                                            target: "fsqlite.wal.conflict",
-                                            pages = ?freelist_guard_pages,
-                                            "freelist publication is stale against the \
-                                             current durable freelist; failing closed \
-                                             with BusySnapshot (bd-gh302/bd-0shxy)"
-                                        );
-                                        return Err(FrankenError::BusySnapshot {
-                                            conflicting_pages: freelist_guard_pages
-                                                .iter()
-                                                .map(u32::to_string)
-                                                .collect::<Vec<_>>()
-                                                .join(","),
-                                        });
-                                    }
-                                }
                                 // bd-9inpb allocator-race probe. Native append
                                 // attempts now retain WAL_WRITE and the main
                                 // RESERVED fence across these guards and the
@@ -29482,20 +29910,12 @@ where
                                             .await?
                                     }
                                 };
-                                // bd-9inpb: EOF-growth anti-alias gate. This runs
-                                // under the RESERVED append lock, so the floor
-                                // read above already reflects every peer commit
-                                // published before us. Our frames carry physical
-                                // page numbers allocated against
-                                // flush_snapshot_db_size; if any of them falls in
-                                // (flush_snapshot_db_size, durable_floor] it aliases
-                                // a page a peer now owns — one physical page handed
-                                // to two b-trees ("2nd reference to page N", lost
-                                // rows). Fail closed so the statement retry re-preps
-                                // against the fresh durable size and re-allocates a
-                                // non-conflicting EOF range. Disjoint-page and
-                                // non-growing commits never trip this: their pages
-                                // are all <= flush_snapshot_db_size.
+                                // bd-9inpb: EOF-growth anti-alias gate. Run
+                                // BEFORE commit-planned freelist reconciliation
+                                // so it checks this group's own Phase-A frames
+                                // against peer growth (never confusing a
+                                // reconciled durable-freelist trunk above
+                                // flush_snapshot_db_size with an EOF alias).
                                 if let Some(durable_db_size_floor) = durable_db_size_floor
                                     && durable_db_size_floor > flush_snapshot_db_size
                                 {
@@ -29525,6 +29945,218 @@ where
                                                 .collect::<Vec<_>>()
                                                 .join(","),
                                         });
+                                    }
+                                }
+                                // bd-yh9gm / bd-gh302 / bd-0shxy: freelist
+                                // reconciliation & resurrection/erasure guard.
+                                // When every publishing batch in this epoch is
+                                // commit-planned (WAL Concurrent mode without
+                                // auto_vacuum/VACUUM/shrink/repair), rebuild
+                                // the trunk chain and page-1 freelist header
+                                // from the CURRENT durable freelist right here
+                                // under `HeldAppendGate` while enforcing exact
+                                // durable-freelist reuse validation fail-closed.
+                                if let Some(frame_page_size) = batches
+                                    .iter()
+                                    .flat_map(|batch| batch.frames.iter())
+                                    .map(|frame| frame.page_data.len())
+                                    .next()
+                                {
+                                    let has_freelist_publication = batches
+                                        .iter()
+                                        .any(|batch| batch.published_durable_freelist.is_some());
+                                    let all_publishers_commit_planned = has_freelist_publication
+                                        && batches
+                                            .iter()
+                                            .filter(|batch| {
+                                                batch.published_durable_freelist.is_some()
+                                            })
+                                            .all(|batch| batch.commit_planned_freelist);
+                                    if all_publishers_commit_planned {
+                                        let page_cipher_for_reconcile = {
+                                            let inner = inner_arc.lock().map_err(|_| {
+                                                FrankenError::internal(
+                                                    "SimpleTransaction lock poisoned",
+                                                )
+                                            })?;
+                                            inner.page_cipher.clone()
+                                        };
+                                        let effective_db_size =
+                                            final_db_size.max(durable_db_size_floor.unwrap_or(0));
+                                        let mut mutable_batches = batches.to_vec();
+                                        if let Some(reconciled_db_size) =
+                                            reconcile_commit_planned_freelist_under_gate(
+                                                cx,
+                                                wal,
+                                                &db_file,
+                                                &page_cipher_for_reconcile,
+                                                frame_page_size,
+                                                &mut mutable_batches,
+                                                effective_db_size,
+                                            )
+                                            .await?
+                                        {
+                                            batches = Arc::from(mutable_batches);
+                                            let (rebuilt_frame_refs, rebuilt_db_size) =
+                                                flatten_group_commit_batches(
+                                                    reconciled_db_size,
+                                                    &batches,
+                                                );
+                                            frame_count = rebuilt_frame_refs.len();
+                                            final_db_size = rebuilt_db_size;
+                                            wal_frame_payload_digest =
+                                                group_commit_frame_payload_digest(
+                                                    &rebuilt_frame_refs,
+                                                )?;
+                                            if wal_encryption_active || prepared_batch.is_some() {
+                                                let mut prepared = wal
+                                                    .prepare_append_frames(&rebuilt_frame_refs)?;
+                                                if let Some(prepared) = prepared.as_mut() {
+                                                    wal.finalize_prepared_frames(cx, prepared)?;
+                                                    if wal_encryption_active {
+                                                        wal_frame_payload_digest =
+                                                            group_commit_prepared_batch_payload_digest(
+                                                                prepared,
+                                                            )?;
+                                                    }
+                                                }
+                                                prepared_batch = prepared;
+                                                if !wal_encryption_active {
+                                                    fallback_reason = Some(
+                                                        ParallelWalFallbackReason::FreelistPublication,
+                                                    );
+                                                }
+                                            }
+                                            appended_frames_are_digested = true;
+                                        }
+                                    } else {
+                                        // bd-dw8oe: a synthetic page-1 rewrite whose
+                                        // freelist header bytes no longer match the
+                                        // CURRENT durable page-1 would republish a
+                                        // consumed freelist head (the promote ran
+                                        // before this gate; a peer publication can
+                                        // land in between). Fail closed; the retry
+                                        // re-promotes at the fresh header.
+                                        let carries_synthetic_page_one =
+                                            batches.iter().any(|batch| {
+                                                batch.published_durable_freelist.is_none()
+                                                    && batch
+                                                        .frames
+                                                        .iter()
+                                                        .any(|frame| frame.page_number == 1)
+                                            });
+                                        if dw8oe_trace_enabled() {
+                                            for batch in batches.iter() {
+                                                for frame in &batch.frames {
+                                                    if frame.page_number == 1
+                                                        && frame.page_data.len()
+                                                            >= DATABASE_HEADER_SIZE
+                                                    {
+                                                        eprintln!(
+                                                            "DW8OE GATE-P1 reason={:?} pub={} bytes32_40={}",
+                                                            fallback_reason,
+                                                            batch
+                                                                .published_durable_freelist
+                                                                .is_some(),
+                                                            hex_bytes(&frame.page_data[32..40]),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if carries_synthetic_page_one {
+                                            let stale = if let Some(header) =
+                                                group_publication_page_one_freelist_header(&batches)
+                                            {
+                                                if dw8oe_trace_enabled() {
+                                                    eprintln!(
+                                                        "DW8OE GATE in_group32_40={}",
+                                                        hex_bytes(&header),
+                                                    );
+                                                }
+                                                nonpublication_page_one_freelist_header_differs(
+                                                    &batches, header,
+                                                )
+                                            } else {
+                                                let page_cipher = {
+                                                    let inner = inner_arc.lock().map_err(|_| {
+                                                        FrankenError::internal(
+                                                            "SimpleTransaction lock poisoned",
+                                                        )
+                                                    })?;
+                                                    inner.page_cipher.clone()
+                                                };
+                                                let durable_page_one =
+                                                    read_durable_page_under_gate(
+                                                        cx,
+                                                        wal,
+                                                        &db_file,
+                                                        &page_cipher,
+                                                        frame_page_size,
+                                                        1,
+                                                    )
+                                                    .await?;
+                                                if dw8oe_trace_enabled() {
+                                                    eprintln!(
+                                                        "DW8OE GATE durable32_40={}",
+                                                        durable_page_one.as_deref().map_or_else(
+                                                            || "none".to_owned(),
+                                                            |d| hex_bytes(&d[32..40])
+                                                        ),
+                                                    );
+                                                }
+                                                stale_synthetic_page_one_freelist_header(
+                                                    &batches,
+                                                    durable_page_one.as_deref(),
+                                                )
+                                            };
+                                            if stale {
+                                                tracing::debug!(
+                                                    target: "fsqlite.wal.conflict",
+                                                    "synthetic page-1 freelist header is stale \
+                                                     against the current durable/in-group page 1; \
+                                                     failing closed with BusySnapshot \
+                                                     (bd-dw8oe/bd-ioq6x)"
+                                                );
+                                                return Err(FrankenError::BusySnapshot {
+                                                    conflicting_pages: "1".to_owned(),
+                                                });
+                                            }
+                                        }
+                                        let page_cipher_for_guard = {
+                                            let inner = inner_arc.lock().map_err(|_| {
+                                                FrankenError::internal(
+                                                    "SimpleTransaction lock poisoned",
+                                                )
+                                            })?;
+                                            inner.page_cipher.clone()
+                                        };
+                                        let freelist_guard_pages =
+                                            resurrected_or_erased_freelist_pages(
+                                                cx,
+                                                wal,
+                                                &db_file,
+                                                &page_cipher_for_guard,
+                                                frame_page_size,
+                                                &batches,
+                                            )
+                                            .await?;
+                                        if !freelist_guard_pages.is_empty() {
+                                            tracing::debug!(
+                                                target: "fsqlite.wal.conflict",
+                                                pages = ?freelist_guard_pages,
+                                                "freelist publication is stale against the \
+                                                 current durable freelist; failing closed \
+                                                 with BusySnapshot (bd-gh302/bd-0shxy)"
+                                            );
+                                            return Err(FrankenError::BusySnapshot {
+                                                conflicting_pages: freelist_guard_pages
+                                                    .iter()
+                                                    .map(u32::to_string)
+                                                    .collect::<Vec<_>>()
+                                                    .join(","),
+                                            });
+                                        }
                                     }
                                 }
                                 // bd-vnxjd: db_size monotonicity gate. A peer
@@ -29635,7 +30267,7 @@ where
                                             rebuilt_frame_refs.len()
                                         );
                                     }
-                                    frame_refs = rebuilt_frame_refs;
+                                    frame_count = rebuilt_frame_refs.len();
                                     final_db_size = rebuilt_db_size;
                                 }
                                 frames_written_start = u64::try_from(wal.frame_count())
@@ -29794,9 +30426,11 @@ where
                                     .await?;
                                     prepared_batch = None;
                                 } else {
+                                    let (append_frame_refs, _) =
+                                        flatten_group_commit_batches(final_db_size, &batches);
                                     wal.append_frames_tracked(
                                         &durability_cx,
-                                        &frame_refs,
+                                        &append_frame_refs,
                                         frame_completion,
                                     )
                                     .await?;
@@ -32361,9 +32995,18 @@ where
             // bd-r82et: retained copy of the same publication for updating
             // PagerInner::durable_freelist_view once the commit is durable.
             let mut published_for_durable_view: Option<Vec<u32>> = None;
+            // bd-yh9gm: synthetic trunk pages staged by Phase A's freelist
+            // serializer, plus commit-planned eligibility & metadata.
+            let mut synthetic_freelist_trunk_pages: Vec<PageNumber> = Vec::new();
+            let commit_planned_freelist_enabled;
+            let commit_planned_reserved_per_page;
             {
                 // ShardedPageCache uses per-shard internal locking
                 //
+                commit_planned_freelist_enabled =
+                    self.uses_commit_planned_freelist(inner.freelist_repair_pending);
+                commit_planned_reserved_per_page =
+                    commit_reserved_per_page(&self.write_set, inner.reserved_per_page);
                 let freelist_dirty = self.freelist_metadata_dirty_with_pending_free_pages(
                     &inner,
                     committed_db_size,
@@ -32481,7 +33124,8 @@ where
                     )
                     .await
                     {
-                        Ok(published) => {
+                        Ok((published, synthetic_trunks)) => {
+                            synthetic_freelist_trunk_pages = synthetic_trunks;
                             published_durable_freelist =
                                 Some(published.iter().map(|page| page.get()).collect());
                             published_for_durable_view = published_durable_freelist.clone();
@@ -32606,10 +33250,12 @@ where
                     );
                 }
                 cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
-                    self.predicted_conflict_pages_for_wal_commit_with_inner(
+                    self.predicted_conflict_pages_for_wal_commit_with_synthetic_trunks(
                         &inner,
                         wal_page1_plan,
                         &pending_free_pages,
+                        commit_planned_freelist_enabled,
+                        &synthetic_freelist_trunk_pages,
                     )
                 } else {
                     Vec::new()
@@ -32672,6 +33318,19 @@ where
                         .map(|page| page.get())
                         .filter(|page| self.allocated_from_durable_freelist.contains(page))
                         .collect(),
+                    CommitPlannedFreelistInput {
+                        enabled: commit_planned_freelist_enabled,
+                        synthetic_freelist_trunk_pages: synthetic_freelist_trunk_pages
+                            .iter()
+                            .map(|page| page.get())
+                            .collect(),
+                        zeroed_freelist_trunks: self
+                            .zeroed_freelist_trunks
+                            .iter()
+                            .map(|page| page.get())
+                            .collect(),
+                        reserved_per_page: commit_planned_reserved_per_page,
+                    },
                     &self.group_commit_queue,
                     &mut wal_publication_authorization,
                     wal_attempt.as_ref(),
@@ -32798,12 +33457,12 @@ where
                         .await?;
                         self.finish_authorized_wal_attempt(&cleanup_cx, true)
                             .await?;
-                        // bd-r82et: the freelist publication is durable now.
-                        if let Some(view) = published_for_durable_view.take()
-                            && let Ok(mut inner) = self.inner.lock()
-                        {
-                            inner.durable_freelist_view = view.into_iter().collect();
-                        }
+                        // bd-r82et / bd-yh9gm: `complete_authorized_global`
+                        // already updated `inner.durable_freelist_view` from
+                        // the authoritative (possibly append-gate reconciled)
+                        // publication in `batches`. Avoid clobbering it with
+                        // the stale Phase-A snapshot.
+                        let _ = published_for_durable_view.take();
                         return Ok(());
                     }
                     PendingGroupCommitTxnResolution::NotCommitted => {
@@ -33349,6 +34008,13 @@ where
             // bd-r82et: retained copy of the same publication for updating
             // PagerInner::durable_freelist_view once the commit is durable.
             let mut published_for_durable_view: Option<Vec<u32>> = None;
+            // bd-yh9gm: synthetic trunk pages staged by Phase A's freelist
+            // serializer, plus commit-planned eligibility & metadata.
+            let mut synthetic_freelist_trunk_pages: Vec<PageNumber> = Vec::new();
+            let commit_planned_freelist_enabled =
+                self.uses_commit_planned_freelist(inner.freelist_repair_pending);
+            let commit_planned_reserved_per_page =
+                commit_reserved_per_page(&self.write_set, inner.reserved_per_page);
             let commit_result = {
                 let freelist_dirty = freelist_dirty_for_retain;
                 // Match the normal commit path: capture semantic Page 1 intent
@@ -33447,7 +34113,8 @@ where
                     )
                     .await
                     {
-                        Ok(published) => {
+                        Ok((published, synthetic_trunks)) => {
+                            synthetic_freelist_trunk_pages = synthetic_trunks;
                             published_durable_freelist =
                                 Some(published.iter().map(|page| page.get()).collect());
                             published_for_durable_view = published_durable_freelist.clone();
@@ -33573,10 +34240,12 @@ where
                     );
                 }
                 let cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
-                    self.predicted_conflict_pages_for_wal_commit_with_inner(
+                    self.predicted_conflict_pages_for_wal_commit_with_synthetic_trunks(
                         &inner,
                         wal_page1_plan,
                         &pending_free_pages,
+                        commit_planned_freelist_enabled,
+                        &synthetic_freelist_trunk_pages,
                     )
                 } else {
                     Vec::new()
@@ -33623,6 +34292,19 @@ where
                             .map(|page| page.get())
                             .filter(|page| self.allocated_from_durable_freelist.contains(page))
                             .collect(),
+                        CommitPlannedFreelistInput {
+                            enabled: commit_planned_freelist_enabled,
+                            synthetic_freelist_trunk_pages: synthetic_freelist_trunk_pages
+                                .iter()
+                                .map(|page| page.get())
+                                .collect(),
+                            zeroed_freelist_trunks: self
+                                .zeroed_freelist_trunks
+                                .iter()
+                                .map(|page| page.get())
+                                .collect(),
+                            reserved_per_page: commit_planned_reserved_per_page,
+                        },
                         &self.group_commit_queue,
                         &mut wal_publication_authorization,
                         wal_attempt.as_ref(),
@@ -33724,12 +34406,12 @@ where
                         .await?;
                         self.finish_authorized_wal_attempt(&cleanup_cx, false)
                             .await?;
-                        // bd-r82et: the freelist publication is durable now.
-                        if let Some(view) = published_for_durable_view.take()
-                            && let Ok(mut inner) = self.inner.lock()
-                        {
-                            inner.durable_freelist_view = view.into_iter().collect();
-                        }
+                        // bd-r82et / bd-yh9gm: `complete_authorized_global`
+                        // already updated `inner.durable_freelist_view` from
+                        // the authoritative (possibly append-gate reconciled)
+                        // publication in `batches`. Avoid clobbering it with
+                        // the stale Phase-A snapshot.
+                        let _ = published_for_durable_view.take();
                         return Ok(true);
                     }
                     PendingGroupCommitTxnResolution::NotCommitted => {
@@ -34042,22 +34724,27 @@ where
         pages.extend(self.freed_pages.iter().copied());
 
         // A free at or below the transaction's begin snapshot necessarily
-        // rewrites durable freelist metadata.  Locally allocated pages can
+        // rewrites durable freelist metadata. Locally allocated pages can
         // also become durable frees when another staged page advances this
         // transaction's eventual page-count high-water mark, so include that
-        // lock-free local bound as well.  Page 1 is the shared FCW token that
-        // makes disjoint free-only transactions conflict without consulting
-        // PagerInner to predict exact trunk-page synthesis.
-        let published_db_size = self.published_db_size.get();
-        let durable_bound = self
-            .max_live_written_page()
-            .map_or(published_db_size, |page| published_db_size.max(page.get()));
-        if self
-            .freed_pages
-            .iter()
-            .any(|page| page.get() <= durable_bound)
-        {
-            pages.push(PageNumber::ONE);
+        // lock-free local bound as well. For modes without commit-planned WAL
+        // freelist reconciliation, Page 1 is the shared FCW token that makes
+        // disjoint free-only transactions conflict without consulting
+        // PagerInner. In WAL Concurrent mode (bd-yh9gm), freelist publication
+        // is reconciled inside the serialized WAL append gate so disjoint
+        // table frees commute without colliding on Page 1.
+        if !self.uses_commit_planned_freelist(false) {
+            let published_db_size = self.published_db_size.get();
+            let durable_bound = self
+                .max_live_written_page()
+                .map_or(published_db_size, |page| published_db_size.max(page.get()));
+            if self
+                .freed_pages
+                .iter()
+                .any(|page| page.get() <= durable_bound)
+            {
+                pages.push(PageNumber::ONE);
+            }
         }
 
         pages.sort_unstable();
@@ -38500,6 +39187,7 @@ mod tests {
                     &HashMap::from([(committed_page, committed_bytes.as_slice())]),
                     &group_delta,
                     true,
+                    None,
                 )
                 .unwrap();
 
@@ -38568,6 +39256,7 @@ mod tests {
                     &HashMap::from([(PageNumber::ONE, certified_page_one.as_bytes())]),
                     &group_delta,
                     true,
+                    None,
                 )
                 .unwrap();
             txn.finish_authorized_wal_attempt(&cx, false).await.unwrap();
@@ -73350,10 +74039,20 @@ mod tests {
             assert!(precise.contains(&p2) && precise.contains(&p3));
             assert_eq!(
                 conservative,
-                vec![PageNumber::ONE, p2, p3],
-                "free-only FCW planning must include both freed pages and the shared page-1 freelist token; precise={precise:?}"
+                vec![p2, p3],
+                "bd-yh9gm: WAL Concurrent free-only FCW planning keeps both freed pages without synthetic Page 1; precise={precise:?}"
             );
             txn.rollback(&cx).await.unwrap();
+
+            // Non-Concurrent mode keeps the conservative Page 1 token.
+            let mut imm = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            imm.free_page(&cx, p2).await.unwrap();
+            assert_eq!(
+                imm.pending_conflict_pages_conservative(),
+                vec![PageNumber::ONE, p2],
+                "non-concurrent mode retains conservative Page 1 freelist token"
+            );
+            imm.rollback(&cx).await.unwrap();
         });
     }
 

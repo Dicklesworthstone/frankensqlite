@@ -217,6 +217,21 @@ pub struct TransactionFrameBatch {
     /// can have popped it and its absence from the current durable freelist
     /// is expected, not evidence of a conflict.
     pub consumed_durable_freelist_pages: Vec<u32>,
+    /// bd-yh9gm: true when this batch's freelist publication can be reconciled
+    /// (rebuilt from the current durable freelist minus consumed durable pages
+    /// plus newly freed pages) inside the serialized WAL append gate instead of
+    /// failing closed on a peer's concurrent freelist publication.
+    pub commit_planned_freelist: bool,
+    /// bd-yh9gm: trunk page numbers synthetically staged by Phase A's freelist
+    /// serializer so append-gate reconciliation can strip stale Phase-A trunks
+    /// before emitting the reconciled trunk chain.
+    pub synthetic_freelist_trunk_pages: Vec<u32>,
+    /// bd-yh9gm: pages requiring `secure_delete` zeroing when chosen as a
+    /// freelist trunk or demoted from a Phase-A synthetic trunk back to a leaf.
+    pub zeroed_freelist_trunks: Vec<u32>,
+    /// bd-yh9gm: database `reserved_per_page` bytes used when rebuilding trunk
+    /// pages during append-gate freelist reconciliation.
+    pub reserved_per_page: u8,
     /// bd-1epn5, bd-p9wzl: the interior b-tree pages of the submitting
     /// transaction's snapshot that it read and does not write, sorted. They
     /// include the ancestors of every b-tree page the batch writes.
@@ -304,6 +319,10 @@ impl TransactionFrameBatch {
             freed_pages: Vec::new(),
             consumed_freelist_pages: Vec::new(),
             consumed_durable_freelist_pages: Vec::new(),
+            commit_planned_freelist: false,
+            synthetic_freelist_trunk_pages: Vec::new(),
+            zeroed_freelist_trunks: Vec::new(),
+            reserved_per_page: 0,
             route_watch_pages: Vec::new(),
             route_watch_complete: false,
             explicit_db_size_shrink: None,
@@ -344,6 +363,23 @@ impl TransactionFrameBatch {
         self.freed_pages = freed_pages;
         self.consumed_freelist_pages = consumed_freelist_pages;
         self.consumed_durable_freelist_pages = consumed_durable_freelist_pages;
+        self
+    }
+
+    /// Configure commit-planned freelist reconciliation metadata for this batch
+    /// (bd-yh9gm).
+    #[must_use]
+    pub fn with_commit_planned_freelist(
+        mut self,
+        enabled: bool,
+        synthetic_freelist_trunk_pages: Vec<u32>,
+        zeroed_freelist_trunks: Vec<u32>,
+        reserved_per_page: u8,
+    ) -> Self {
+        self.commit_planned_freelist = enabled;
+        self.synthetic_freelist_trunk_pages = synthetic_freelist_trunk_pages;
+        self.zeroed_freelist_trunks = zeroed_freelist_trunks;
+        self.reserved_per_page = reserved_per_page;
         self
     }
 
