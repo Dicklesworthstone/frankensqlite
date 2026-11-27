@@ -496,6 +496,16 @@ pub trait VirtualTable: Send + Sync {
         Vec::new()
     }
 
+    /// Declared `HIDDEN` column names omitted from `*`, `tbl.*`, and `NATURAL`
+    /// joins while remaining directly bindable and usable in `USING(...)`.
+    /// `args` uses the same canonical argv shape as [`create`](Self::create).
+    fn hidden_column_names(_args: &[&str]) -> Vec<String>
+    where
+        Self: Sized,
+    {
+        Vec::new()
+    }
+
     /// Called for `CREATE VIRTUAL TABLE`.
     ///
     /// `args` follows SQLite's canonical module ABI: module name, database
@@ -674,6 +684,13 @@ pub trait VtabModuleFactory: Send + Sync {
     /// Column names and affinities for the virtual table schema. `args` uses
     /// the same canonical argv shape as [`create`](Self::create).
     fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
+        Vec::new()
+    }
+
+    /// Declared `HIDDEN` column names omitted from `*`, `tbl.*`, and `NATURAL`
+    /// joins. `args` uses the same canonical argv shape as
+    /// [`create`](Self::create).
+    fn hidden_column_names(&self, _args: &[&str]) -> Vec<String> {
         Vec::new()
     }
 
@@ -875,6 +892,10 @@ where
 
         fn column_info(&self, args: &[&str]) -> Vec<(String, char)> {
             T::column_info(args)
+        }
+
+        fn hidden_column_names(&self, args: &[&str]) -> Vec<String> {
+            T::hidden_column_names(args)
         }
 
         fn module_metadata(&self, args: &[&str]) -> VtabModuleMetadata {

@@ -9,11 +9,11 @@
 //! b56e7bc7c made `json` and `root` real hidden columns of `json_each` and
 //! `json_tree`. The names of a join's `*` skipped them but its row values did
 //! not, so a USING or NATURAL join gave rows wider than their header, even when
-//! the join column was an ordinary visible one. That commit is backed out, so
-//! those two are not columns here. What needs them is ignored and names
-//! bd-star-hidden-reland-nxl8a: [`HIDDEN_COLUMN_SHAPES`], and the four
-//! `generate_series` statements whose `*` still shows `start`, `stop` and
-//! `step`. They are the acceptance test for the re-land.
+//! the join column was an ordinary visible one. `bd-star-hidden-reland-nxl8a`
+//! re-landed hidden columns through one unified star-expansion authority so
+//! column names, values, affinities, collations, and views/CTAS/INSERT-SELECT
+//! all agree on [`HIDDEN_COLUMN_SHAPES`] and `generate_series`'s hidden
+//! `start`, `stop`, and `step` columns.
 //!
 //! `generate_series` has no bundled oracle, since it is an extension of the
 //! sqlite3 shell. Its expected values are what that shell prints (3.46.1).
@@ -373,9 +373,77 @@ fn bd_window_using_column_guy4l_matches_stock() {
 }
 
 #[test]
-#[ignore = "bd-star-hidden-reland-nxl8a: json and root are not columns without b56e7bc7c"]
 fn hidden_column_join_shapes_match_stock() {
     asupersync::test_utils::run_test(|| assert_shapes_match_stock(HIDDEN_COLUMN_SHAPES));
+}
+
+#[test]
+fn hidden_using_paren_join_natural_and_metadata_match_stock() {
+    const EXTRA_SETUP: &[&str] = &[
+        "CREATE TABLE tj(json TEXT, z INTEGER, note TEXT COLLATE NOCASE)",
+        "INSERT INTO tj VALUES ('[10,20]', 5, 'ZERO')",
+        "CREATE TABLE tj2(json TEXT, w INTEGER)",
+        "INSERT INTO tj2 VALUES ('[10,20]', 77)",
+    ];
+    const EXTRA_SHAPES: &[&str] = &[
+        "SELECT * FROM ({f} a JOIN tj USING(json))",
+        "SELECT * FROM tj t1 JOIN ({f} a JOIN tj t2 USING(json))",
+        "SELECT * FROM {f} a JOIN tj USING(json) NATURAL JOIN tj2",
+        "SELECT z FROM (SELECT * FROM {f} a JOIN tj USING(json)) WHERE z = '5'",
+        "SELECT note FROM (SELECT * FROM {f} a JOIN tj USING(json)) WHERE note = 'zero'",
+        "WITH q AS (SELECT * FROM {f} a JOIN tj USING(json)) SELECT z, note FROM q WHERE z = '5' AND note = 'zero'",
+    ];
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (frank, stock) = if file_backed {
+                (
+                    Connection::open(dir.path().join("f.db").to_str().unwrap())
+                        .await
+                        .unwrap(),
+                    rusqlite::Connection::open(dir.path().join("r.db")).unwrap(),
+                )
+            } else {
+                (
+                    Connection::open(":memory:").await.unwrap(),
+                    rusqlite::Connection::open_in_memory().unwrap(),
+                )
+            };
+            let db = if file_backed { "file" } else { "memory" };
+            for sql in EXTRA_SETUP {
+                frank.execute(sql).await.unwrap();
+                stock.execute_batch(sql).unwrap();
+            }
+            let mut failures = Vec::new();
+            let mut returned_rows = 0usize;
+            for source in SOURCES {
+                for shape in EXTRA_SHAPES {
+                    let sql = shape.replace("{f}", source);
+                    let expected = stock_table(&stock, &sql).unwrap();
+                    returned_rows += expected.1.len();
+                    for (form, table) in ["ad hoc", "prepared"]
+                        .iter()
+                        .zip(&frank_tables(&frank, &sql).await.unwrap())
+                    {
+                        if let Some(reason) = difference(&sql, &expected, table) {
+                            failures.push(format!("[{db}] {sql} [{form}]: {reason}"));
+                        }
+                    }
+                }
+            }
+            frank.close().await.unwrap();
+            assert!(
+                failures.is_empty(),
+                "[{db}] {} divergence(s):\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
+            assert!(
+                returned_rows > EXTRA_SHAPES.len(),
+                "[{db}] extra hidden-column shapes must return rows"
+            );
+        }
+    });
 }
 
 #[test]
@@ -442,7 +510,6 @@ fn generate_series_other_side_star_shows_only_value() {
 }
 
 #[test]
-#[ignore = "bd-star-hidden-reland-nxl8a: * shows start, stop and step without b56e7bc7c"]
 fn generate_series_join_star_shows_only_value() {
     asupersync::test_utils::run_test(|| {
         assert_series_shows_only_value(&[

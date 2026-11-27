@@ -528,7 +528,6 @@ impl Connection {
             && !statement_contains_rewritable_subquery(statement)
             && !statement_requires_in_table_name_rewrite(statement)
             && !statement_contains_deferred_values(statement)
-            && expand_statement_hidden_table_function_stars(statement).is_none()
             && matches!(
                 self.rewrite_statement_bare_pragma_table_functions(statement),
                 Cow::Borrowed(_)
@@ -1003,7 +1002,7 @@ impl Connection {
 
     /// bd-i3csr.2: the builtin generate_series module, unless the application
     /// registered its own under that name.
-    fn builtin_generate_series_module(&self) -> Option<Arc<dyn VtabModuleFactory>> {
+    pub(super) fn builtin_generate_series_module(&self) -> Option<Arc<dyn VtabModuleFactory>> {
         let modules = self.vtab_modules.borrow();
         let registered = modules.get("GENERATE_SERIES")?;
         let builtin = shared_default_vtab_module_registry().get("GENERATE_SERIES")?;

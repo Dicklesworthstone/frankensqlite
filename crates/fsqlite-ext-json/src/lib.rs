@@ -472,9 +472,10 @@ const JSON_VALID_JSON5_FLAG: u8 = 0x02;
 const JSON_VALID_JSONB_SUPERFICIAL_FLAG: u8 = 0x04;
 const JSON_VALID_JSONB_STRICT_FLAG: u8 = 0x08;
 const JSON_PRETTY_DEFAULT_INDENT_WIDTH: usize = 4;
-/// Output columns for the `json_each` / `json_tree` table-valued functions.
-pub const JSON_TABLE_COLUMN_NAMES: [&str; 8] = [
-    "key", "value", "type", "atom", "id", "parent", "fullkey", "path",
+/// Declared columns for `json_each` / `json_tree`. The trailing `json` and
+/// `root` input columns are HIDDEN and must not appear in a star projection.
+pub const JSON_TABLE_COLUMN_NAMES: [&str; 10] = [
+    "key", "value", "type", "atom", "id", "parent", "fullkey", "path", "json", "root",
 ];
 
 const JSONB_NULL_TYPE: u8 = 0x0;
@@ -2442,10 +2443,22 @@ pub struct JsonEachVtab;
 pub struct JsonEachCursor {
     rows: Vec<JsonTableRow>,
     pos: usize,
+    hidden_columns: Option<JsonTableHiddenColumns>,
 }
 
 impl VirtualTable for JsonEachVtab {
     type Cursor = JsonEachCursor;
+
+    fn hidden_column_names(_args: &[&str]) -> Vec<String> {
+        ["json", "root"].into_iter().map(str::to_owned).collect()
+    }
+
+    fn column_info(_args: &[&str]) -> Vec<(String, char)> {
+        JSON_TABLE_COLUMN_NAMES
+            .into_iter()
+            .map(|name| (name.to_owned(), 'A'))
+            .collect()
+    }
 
     fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
         Ok(Self)
@@ -2470,11 +2483,14 @@ impl VirtualTableCursor for JsonEachCursor {
         _idx_str: Option<&str>,
         args: &[SqliteValue],
     ) -> Result<()> {
-        self.rows = match parse_json_table_filter_args(args)? {
-            Some((blob, path)) => json_table_rows_from_jsonb(&blob, path, false)?,
-            None => Vec::new(),
-        };
+        // Re-filtering may fail; the previous scan must not remain visible.
+        self.rows.clear();
         self.pos = 0;
+        self.hidden_columns = None;
+        if let Some((blob, hidden)) = parse_json_table_filter_args("json_each", args)? {
+            self.rows = json_table_rows_from_jsonb(&blob, Some(hidden.root.as_str()), false)?;
+            self.hidden_columns = Some(hidden);
+        }
         Ok(())
     }
 
@@ -2494,7 +2510,7 @@ impl VirtualTableCursor for JsonEachCursor {
             ctx.set_value(SqliteValue::Null);
             return Ok(());
         };
-        write_json_table_column(row, ctx, col);
+        write_json_table_column(row, self.hidden_columns.as_ref(), ctx, col);
         Ok(())
     }
 
@@ -2511,10 +2527,22 @@ pub struct JsonTreeVtab;
 pub struct JsonTreeCursor {
     rows: Vec<JsonTableRow>,
     pos: usize,
+    hidden_columns: Option<JsonTableHiddenColumns>,
 }
 
 impl VirtualTable for JsonTreeVtab {
     type Cursor = JsonTreeCursor;
+
+    fn hidden_column_names(_args: &[&str]) -> Vec<String> {
+        ["json", "root"].into_iter().map(str::to_owned).collect()
+    }
+
+    fn column_info(_args: &[&str]) -> Vec<(String, char)> {
+        JSON_TABLE_COLUMN_NAMES
+            .into_iter()
+            .map(|name| (name.to_owned(), 'A'))
+            .collect()
+    }
 
     fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
         Ok(Self)
@@ -2539,11 +2567,13 @@ impl VirtualTableCursor for JsonTreeCursor {
         _idx_str: Option<&str>,
         args: &[SqliteValue],
     ) -> Result<()> {
-        self.rows = match parse_json_table_filter_args(args)? {
-            Some((blob, path)) => json_table_rows_from_jsonb(&blob, path, true)?,
-            None => Vec::new(),
-        };
+        self.rows.clear();
         self.pos = 0;
+        self.hidden_columns = None;
+        if let Some((blob, hidden)) = parse_json_table_filter_args("json_tree", args)? {
+            self.rows = json_table_rows_from_jsonb(&blob, Some(hidden.root.as_str()), true)?;
+            self.hidden_columns = Some(hidden);
+        }
         Ok(())
     }
 
@@ -2563,7 +2593,7 @@ impl VirtualTableCursor for JsonTreeCursor {
             ctx.set_value(SqliteValue::Null);
             return Ok(());
         };
-        write_json_table_column(row, ctx, col);
+        write_json_table_column(row, self.hidden_columns.as_ref(), ctx, col);
         Ok(())
     }
 
@@ -6693,23 +6723,55 @@ fn json_table_rows_from_jsonb(
     Ok(rows)
 }
 
+struct JsonTableHiddenColumns {
+    json: SqliteValue,
+    root: SmallText,
+}
+
 /// The JSONB input and PATH of a json_each/json_tree scan, or `None` when the
 /// scan has no rows. As in stock's `jsonEachFilter`, that is a missing or NULL
 /// input (checked before the PATH, so `json_each(NULL, 'x')` is empty) or a
 /// NULL PATH (checked after the input parses, so malformed input still
 /// errors). `FROM t, json_each(t.tags)` thus skips rows whose `tags` is NULL.
-fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<Option<(Vec<u8>, Option<&str>)>> {
+fn parse_json_table_filter_args(
+    name: &str,
+    args: &[SqliteValue],
+) -> Result<Option<(Vec<u8>, JsonTableHiddenColumns)>> {
+    if args.len() > 2 {
+        return Err(FrankenError::function_error(format!(
+            "too many arguments on {name}() - max 2"
+        )));
+    }
     let Some(input_arg) = args.first() else {
         return Ok(None);
     };
-    let input_blob = match input_arg {
+    let (input_blob, json) = match input_arg {
         SqliteValue::Null => return Ok(None),
-        SqliteValue::Text(input_text) => translate_json_text_to_jsonb(input_text)?,
-        SqliteValue::Blob(input_blob) => json_blob_to_jsonb(input_blob)?.into_owned(),
+        // JSON5 input accepted (bd-qear2); the hidden input retains the original text.
+        SqliteValue::Text(input_text) => {
+            (translate_json_text_to_jsonb(input_text)?, input_arg.clone())
+        }
+        SqliteValue::Blob(input_blob) => match decode_jsonb_root(input_blob) {
+            Ok(_) => (input_blob.to_vec(), input_arg.clone()),
+            Err(_) => {
+                // A text JSON blob is coerced to TEXT, while actual JSONB
+                // retains BLOB storage.
+                let text = std::str::from_utf8(input_blob).map_err(|_| malformed_json())?;
+                (
+                    translate_json_text_to_jsonb(text)?,
+                    SqliteValue::Text(SmallText::from_arc_bytes(Arc::clone(input_blob))),
+                )
+            }
+        },
+        // A bare SQL numeric is a JSON number (C SQLite convention), mirroring
+        // the scalar `json_arg_value` path: json_each(1.5) yields a single row
+        // with type='real', atom=1.5; json_tree(7) yields type='integer'. A
+        // non-finite REAL renders as the numeric literal 9.0e+999 / -9.0e+999
+        // (NaN -> null), so json_each(9e999) yields a single row (GH#212).
         SqliteValue::Integer(i) => {
             let mut out = Vec::new();
             append_jsonb_node(JSONB_INT_TYPE, i.to_string().as_bytes(), &mut out)?;
-            out
+            (out, SqliteValue::Text(input_arg.to_text().into()))
         }
         SqliteValue::Float(f) => {
             let mut out = Vec::new();
@@ -6726,19 +6788,24 @@ fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<Option<(Vec<u8>,
                 let formatted = fsqlite_types::value::format_sqlite_float(*f);
                 append_jsonb_node(JSONB_FLOAT_TYPE, formatted.as_bytes(), &mut out)?;
             }
-            out
+            (out, SqliteValue::Text(input_arg.to_text().into()))
         }
     };
 
-    let path = match args.get(1) {
-        None => None,
+    let root = match args.get(1) {
+        None => SmallText::from("$"),
         Some(SqliteValue::Null) => return Ok(None),
-        Some(_) => Some(path_arg("json_each", args, 1)?),
+        Some(_) => SmallText::from(path_arg(name, args, 1)?),
     };
 
-    Ok(Some((input_blob, path)))
+    Ok(Some((input_blob, JsonTableHiddenColumns { json, root })))
 }
-fn write_json_table_column(row: &JsonTableRow, ctx: &mut ColumnContext, col: i32) {
+fn write_json_table_column(
+    row: &JsonTableRow,
+    hidden: Option<&JsonTableHiddenColumns>,
+    ctx: &mut ColumnContext,
+    col: i32,
+) {
     let value = match col {
         0 => row.key.clone(),
         1 => row.value.clone(),
@@ -6748,6 +6815,10 @@ fn write_json_table_column(row: &JsonTableRow, ctx: &mut ColumnContext, col: i32
         5 => row.parent.clone(),
         6 => SqliteValue::Text(row.fullkey.as_str().into()),
         7 => SqliteValue::Text(row.path.as_str().into()),
+        8 => hidden.map_or(SqliteValue::Null, |columns| columns.json.clone()),
+        9 => hidden.map_or(SqliteValue::Null, |columns| {
+            SqliteValue::Text(columns.root.clone())
+        }),
         _ => SqliteValue::Null,
     };
     ctx.set_value(value);
@@ -12277,6 +12348,167 @@ mod tests {
         assert_eq!(ctx.take_value(), Some(SqliteValue::Null));
     }
 
+    fn json_cursor_column(cursor: &dyn VirtualTableCursor, column: i32) -> SqliteValue {
+        let mut context = ColumnContext::new();
+        cursor.column(&mut context, column).unwrap();
+        context.take_value().unwrap()
+    }
+
+    #[test]
+    fn json_table_hidden_inputs_preserve_sqlite_storage_classes() {
+        let cx = Cx::new();
+        // Applications can register either factory under another name. Its
+        // schema and hidden-column declaration must travel with the factory.
+        let factories: [Box<dyn fsqlite_func::vtab::VtabModuleFactory>; 2] = [
+            Box::new(fsqlite_func::vtab::module_factory_from::<JsonEachVtab>()),
+            Box::new(fsqlite_func::vtab::module_factory_from::<JsonTreeVtab>()),
+        ];
+        for factory in factories {
+            let args = ["custom_json", "main", "custom_json"];
+            let schema = factory.column_info(&args);
+            assert_eq!(schema.len(), 10);
+            assert!(schema.iter().all(|(_, affinity)| *affinity == 'A'));
+            assert_eq!(
+                &schema[8..],
+                &[("json".to_owned(), 'A'), ("root".to_owned(), 'A')]
+            );
+            assert_eq!(factory.hidden_column_names(&args), ["json", "root"]);
+        }
+        let jsonb = SqliteValue::Blob(jsonb("[1,2]").unwrap().into());
+        let cases = [
+            (
+                SqliteValue::Text(" [1,[2,3]] ".into()),
+                SqliteValue::Text(" [1,[2,3]] ".into()),
+            ),
+            (
+                SqliteValue::Text(" {items:[1,2],} ".into()),
+                SqliteValue::Text(" {items:[1,2],} ".into()),
+            ),
+            (SqliteValue::Integer(123), SqliteValue::Text("123".into())),
+            (SqliteValue::Float(1.5), SqliteValue::Text("1.5".into())),
+            (
+                SqliteValue::Float(f64::INFINITY),
+                SqliteValue::Text("Inf".into()),
+            ),
+            (
+                SqliteValue::Blob(Arc::from(b"[1,2]".as_slice())),
+                SqliteValue::Text("[1,2]".into()),
+            ),
+            (jsonb.clone(), jsonb),
+        ];
+        for mut cursor in [
+            Box::new(JsonEachCursor::default()) as Box<dyn VirtualTableCursor>,
+            Box::new(JsonTreeCursor::default()),
+        ] {
+            for (input, expected) in &cases {
+                cursor
+                    .filter(&cx, 0, None, std::slice::from_ref(input))
+                    .unwrap();
+                assert!(!cursor.eof(), "{input:?}");
+                while !cursor.eof() {
+                    assert_eq!(json_cursor_column(&*cursor, 8), *expected, "{input:?}");
+                    assert_eq!(
+                        json_cursor_column(&*cursor, 9),
+                        SqliteValue::Text("$".into())
+                    );
+                    cursor.next(&cx).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn json_table_rowids_are_zero_based_scan_ordinals_and_reset_on_refilter() {
+        let cx = Cx::new();
+        for mut cursor in [
+            Box::new(JsonEachCursor::default()) as Box<dyn VirtualTableCursor>,
+            Box::new(JsonTreeCursor::default()),
+        ] {
+            for root in ["$", "$.items"] {
+                let input = SqliteValue::Text(r#"{"items":[1,[2,3]],"other":4}"#.into());
+                cursor
+                    .filter(
+                        &cx,
+                        0,
+                        None,
+                        &[input.clone(), SqliteValue::Text(root.into())],
+                    )
+                    .unwrap();
+                let mut ordinal = 0;
+                while !cursor.eof() {
+                    assert_eq!(cursor.rowid().unwrap(), ordinal);
+                    assert_eq!(json_cursor_column(&*cursor, 8), input);
+                    assert_eq!(
+                        json_cursor_column(&*cursor, 9),
+                        SqliteValue::Text(root.into())
+                    );
+                    ordinal += 1;
+                    cursor.next(&cx).unwrap();
+                }
+                assert!(ordinal >= 2);
+                assert_eq!(cursor.rowid().unwrap(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn json_table_refilter_failures_and_empty_inputs_clear_previous_rows() {
+        let cx = Cx::new();
+        for mut cursor in [
+            Box::new(JsonEachCursor::default()) as Box<dyn VirtualTableCursor>,
+            Box::new(JsonTreeCursor::default()),
+        ] {
+            for (args, expected_error) in [
+                (
+                    vec![SqliteValue::Text("bad".into())],
+                    Some("malformed JSON"),
+                ),
+                (
+                    vec![
+                        SqliteValue::Text("[1]".into()),
+                        SqliteValue::Text("bad path".into()),
+                    ],
+                    Some("bad JSON path"),
+                ),
+                (
+                    vec![SqliteValue::Null, SqliteValue::Null, SqliteValue::Null],
+                    Some("too many arguments"),
+                ),
+                (Vec::new(), None),
+                (vec![SqliteValue::Null], None),
+                (
+                    vec![SqliteValue::Null, SqliteValue::Text("bad path".into())],
+                    None,
+                ),
+                (
+                    vec![SqliteValue::Text("[1]".into()), SqliteValue::Null],
+                    None,
+                ),
+                (
+                    vec![SqliteValue::Text("bad".into()), SqliteValue::Null],
+                    Some("malformed JSON"),
+                ),
+            ] {
+                cursor
+                    .filter(&cx, 0, None, &[SqliteValue::Text("[10]".into())])
+                    .unwrap();
+                assert!(!cursor.eof());
+                let result = cursor.filter(&cx, 0, None, &args);
+                if let Some(expected_error) = expected_error {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains(expected_error), "{error}");
+                } else {
+                    result.unwrap();
+                }
+                assert!(cursor.eof(), "{args:?}");
+                assert_eq!(cursor.rowid().unwrap(), 0);
+                for column in [1, 8, 9] {
+                    assert_eq!(json_cursor_column(&*cursor, column), SqliteValue::Null);
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_jsonb_chain_validity() {
         let first = jsonb_set(r#"{"a":1}"#, &[("$.a", SqliteValue::Integer(9))]).unwrap();
@@ -12466,9 +12698,10 @@ mod tests {
         // JSON number (yielding a single scalar row) instead of erroring
         // "must be TEXT or BLOB JSON". C SQLite: json_each(1.5) -> type='real'
         // atom=1.5; json_tree(7) -> type='integer'.
-        let (blob_float, path) = super::parse_json_table_filter_args(&[SqliteValue::Float(1.5)])
-            .unwrap()
-            .unwrap();
+        let (blob_float, hidden) =
+            super::parse_json_table_filter_args("json_each", &[SqliteValue::Float(1.5)])
+                .unwrap()
+                .unwrap();
         let v_float = super::decode_jsonb_root(&blob_float).unwrap();
         // A non-integral REAL is carried as its stock text (bd-1nxwh); it is
         // still a JSON real whose atom is 1.5.
@@ -12477,10 +12710,12 @@ mod tests {
             super::json_to_sqlite_scalar(&v_float).unwrap(),
             SqliteValue::Float(1.5)
         );
-        assert!(path.is_none());
-        let (blob_int, _) = super::parse_json_table_filter_args(&[SqliteValue::Integer(7)])
-            .unwrap()
-            .unwrap();
+        // An omitted path uses the root, also exposed by the hidden column.
+        assert_eq!(hidden.root, SmallText::from("$"));
+        let (blob_int, _) =
+            super::parse_json_table_filter_args("json_tree", &[SqliteValue::Integer(7)])
+                .unwrap()
+                .unwrap();
         let v_int = super::decode_jsonb_root(&blob_int).unwrap();
         assert_eq!(v_int, Value::Number(7_i64.into()));
         // GH#212 (verified against sqlite3 3.46.1): json_each(9e999) yields a
@@ -12488,7 +12723,7 @@ mod tests {
         // numeric literal 9.0e+999 rather than erroring. The non-finite REAL is
         // carried as a tagged string (bd-yalqc).
         let (blob_inf, _) =
-            super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)])
+            super::parse_json_table_filter_args("json_each", &[SqliteValue::Float(f64::INFINITY)])
                 .unwrap()
                 .unwrap();
         let v_inf = super::decode_jsonb_root(&blob_inf).unwrap();

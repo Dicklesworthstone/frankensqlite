@@ -203,15 +203,10 @@ impl QualifiedColumnCatalog for Connection {
 
     fn table_function_relation(&self, name: &str) -> QualifiedColumnRelation {
         let columns = self.table_function_result_column_names(name).map(|mut cols| {
-            for hidden in table_function_hidden_columns(name) {
-                if !cols.iter().any(|col| col.eq_ignore_ascii_case(hidden)) {
-                    cols.push((*hidden).to_owned());
-                }
-            }
-            if name.eq_ignore_ascii_case("generate_series") {
-                for hidden in ["start", "stop", "step"] {
+            if name.len() >= 7 && name[..7].eq_ignore_ascii_case("pragma_") {
+                for hidden in table_function_hidden_columns(name) {
                     if !cols.iter().any(|col| col.eq_ignore_ascii_case(hidden)) {
-                        cols.push(hidden.to_owned());
+                        cols.push((*hidden).to_owned());
                     }
                 }
             }

@@ -61,6 +61,13 @@ impl VirtualTable for GenerateSeriesTable {
             .collect()
     }
 
+    fn hidden_column_names(_args: &[&str]) -> Vec<String> {
+        ["start", "stop", "step"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
     fn create(_cx: &Cx, _args: &[&str]) -> Result<Self> {
         Ok(Self)
     }
