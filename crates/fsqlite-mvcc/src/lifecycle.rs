@@ -3405,34 +3405,97 @@ mod tests {
         checksum
     }
 
+    /// Deterministic range-scan tracking guard (bd-hvhfp): verifies in default
+    /// unit runs that `read_page_range` returns identical pages/checksums to an
+    /// untracked scan and records an exact, duplicate-free O(pages) tracking
+    /// footprint (including empty tail pages) without relying on host timing.
+    ///
+    /// Set `FSQLITE_MVCC_RANGE_SCAN_WALLCLOCK_BENCH=1` on a quiet host to also
+    /// run the optional wall-clock overhead check (`<= 25%`).
     #[test]
     #[allow(clippy::cast_precision_loss)]
     fn test_range_scan_tracking_overhead_under_five_percent() {
         const START_PAGE: u32 = 100;
-        const END_PAGE: u32 = 227;
+        const POPULATED_END_PAGE: u32 = 227;
+        const EMPTY_TAIL_END_PAGE: u32 = 235;
         const ITERATIONS: u32 = 24;
         const TRIALS: usize = 3;
 
         let m = mgr();
 
         let mut seed = m.begin(BeginKind::Immediate).unwrap();
-        for raw_page in START_PAGE..=END_PAGE {
+        for raw_page in START_PAGE..=POPULATED_END_PAGE {
             let page = PageNumber::new(raw_page).unwrap();
             m.write_page(&mut seed, page, test_data((raw_page % 251) as u8))
                 .unwrap();
         }
-        m.commit(&mut seed).unwrap();
+        let committed = m.commit(&mut seed).unwrap();
 
         let start_page = PageNumber::new(START_PAGE).unwrap();
-        let end_page = PageNumber::new(END_PAGE).unwrap();
+        let populated_end = PageNumber::new(POPULATED_END_PAGE).unwrap();
+        let tail_end = PageNumber::new(EMPTY_TAIL_END_PAGE).unwrap();
+        let expected_pages = usize::try_from(EMPTY_TAIL_END_PAGE - START_PAGE + 1).unwrap();
+
+        // Deterministic work-count and footprint check: always runs in default
+        // unit suites with zero wall-clock dependence.
+        let mut baseline_reader = m.begin(BeginKind::Concurrent).unwrap();
+        let baseline_rows =
+            read_page_range_without_tracking(&m, &mut baseline_reader, start_page, tail_end);
+        let baseline_checksum = consume_scan_rows(&baseline_rows);
+        m.abort(&mut baseline_reader);
+
+        let mut tracked_reader = m.begin(BeginKind::Concurrent).unwrap();
+        let tracked_rows = m
+            .read_page_range(&mut tracked_reader, start_page, tail_end)
+            .unwrap();
+        assert_eq!(tracked_rows.len(), expected_pages);
+        assert_eq!(consume_scan_rows(&tracked_rows), baseline_checksum);
+        assert_eq!(
+            tracked_reader.read_set_versions.len(),
+            expected_pages,
+            "range scan must record exactly one read-set version per scanned page"
+        );
+        assert_eq!(
+            tracked_reader.read_keys.len(),
+            expected_pages,
+            "range scan must record exactly one page witness per scanned page"
+        );
+        for raw_page in START_PAGE..=EMPTY_TAIL_END_PAGE {
+            let page = PageNumber::new(raw_page).unwrap();
+            let expected_seq = if raw_page <= POPULATED_END_PAGE {
+                committed
+            } else {
+                tracked_reader.snapshot.high
+            };
+            assert_eq!(
+                tracked_reader.read_version_for_page(page),
+                Some(expected_seq)
+            );
+        }
+        // Re-scanning the same range in the same transaction must not inflate
+        // the read-set version map or witness footprint.
+        let rescan_rows = m
+            .read_page_range(&mut tracked_reader, start_page, tail_end)
+            .unwrap();
+        assert_eq!(consume_scan_rows(&rescan_rows), baseline_checksum);
+        assert_eq!(tracked_reader.read_set_versions.len(), expected_pages);
+        m.abort(&mut tracked_reader);
+
+        if std::env::var_os("FSQLITE_MVCC_RANGE_SCAN_WALLCLOCK_BENCH").is_none() {
+            return;
+        }
 
         let baseline_elapsed = (0..TRIALS)
             .map(|_| {
                 let run_start = Instant::now();
                 for _ in 0..ITERATIONS {
                     let mut reader = m.begin(BeginKind::Concurrent).unwrap();
-                    let rows =
-                        read_page_range_without_tracking(&m, &mut reader, start_page, end_page);
+                    let rows = read_page_range_without_tracking(
+                        &m,
+                        &mut reader,
+                        start_page,
+                        populated_end,
+                    );
                     let checksum =
                         consume_scan_rows(&rows).rotate_left(7) ^ consume_scan_rows(&rows);
                     black_box(checksum);
@@ -3450,7 +3513,7 @@ mod tests {
                 for _ in 0..ITERATIONS {
                     let mut reader = m.begin(BeginKind::Concurrent).unwrap();
                     let rows = m
-                        .read_page_range(&mut reader, start_page, end_page)
+                        .read_page_range(&mut reader, start_page, populated_end)
                         .unwrap();
                     let checksum =
                         consume_scan_rows(&rows).rotate_left(7) ^ consume_scan_rows(&rows);

@@ -660,6 +660,9 @@ mod tests {
     #[test]
     fn metrics_increment() {
         // Delta-based: snapshot before, act, snapshot after.
+        // Use a lower bound so parallel tests in the same process incrementing
+        // the global read counter do not cause spurious exact-equality flakes
+        // (matching `swap_count_increments` and `seqlock::tests::metrics_increment`).
         let before = leftright_metrics();
         let lr = LeftRight::new(1);
         lr.read("m1");
@@ -668,7 +671,7 @@ mod tests {
 
         let after = leftright_metrics();
         let delta = after.fsqlite_leftright_reads_total - before.fsqlite_leftright_reads_total;
-        assert_eq!(delta, 3);
+        assert!(delta >= 3, "expected at least 3 reads, got {delta}");
     }
 
     #[test]
