@@ -112612,6 +112612,8 @@ impl Connection {
             return Ok(Some((rows, remaining_offset)));
         }
         let correlated_fallback = self.select_correlated_exists_where_requires_fallback(select)
+            || select_contains_prepared_dispatch_subquery(select, self)
+            || select_has_correlated_join_subquery(select)
             || select_has_unsupported_correlated_scalar_subquery(select, self)
             || select_has_unsupported_correlated_exists_subquery(select, self)
             || select_has_in_subquery_operand_requiring_semantic_fallback(select, self)
@@ -112659,6 +112661,96 @@ impl Connection {
             FrankenError::internal("interpreted compound arm did not retain OFFSET progress")
         })?;
         Ok(Some((rows, remaining_offset)))
+    }
+
+    /// Execute one unordered `UNION ALL` arm under a live remaining `OFFSET`
+    /// and optional remaining `LIMIT`, skipping projection on offset rows
+    /// whenever the arm supports native or fallback OFFSET progress (bd-ct8zm /
+    /// bd-msu6d).
+    async fn execute_union_all_arm_with_offset_limit(
+        &self,
+        core: &SelectCore,
+        arm_with: Option<fsqlite_ast::WithClause>,
+        params: Option<&[SqliteValue]>,
+        remaining_offset: &mut usize,
+        remaining_limit: &mut Option<usize>,
+        result: &mut Vec<Row>,
+    ) -> Result<()> {
+        if *remaining_offset > 0 {
+            let arm_select = SelectStatement {
+                with: arm_with.clone(),
+                body: SelectBody {
+                    select: core.clone(),
+                    compounds: Vec::new(),
+                },
+                order_by: Vec::new(),
+                limit: Some(fsqlite_ast::LimitClause {
+                    limit: Expr::Literal(
+                        Literal::Integer(
+                            remaining_limit
+                                .and_then(|count| i64::try_from(count).ok())
+                                .unwrap_or(-1),
+                        ),
+                        Span::ZERO,
+                    ),
+                    offset: Some(Expr::Literal(
+                        Literal::Integer(i64::try_from(*remaining_offset).unwrap_or(i64::MAX)),
+                        Span::ZERO,
+                    )),
+                }),
+            };
+            let arm_result = match self
+                .try_execute_compound_arm_with_offset(&arm_select, params)
+                .await?
+            {
+                Some(arm_res) => Some(arm_res),
+                None => {
+                    self.try_execute_compound_arm_with_fallback_offset(&arm_select, params)
+                        .await?
+                }
+            };
+            if let Some((arm_rows, offset_left)) = arm_result {
+                *remaining_offset = offset_left;
+                if let Some(rem) = remaining_limit.as_mut() {
+                    *rem = rem.saturating_sub(arm_rows.len());
+                }
+                result.extend(arm_rows);
+                return Ok(());
+            }
+        }
+        let arm_limit = remaining_limit
+            .map(|rem| rem.saturating_add(*remaining_offset))
+            .and_then(|count| i64::try_from(count).ok())
+            .map(|count_i64| fsqlite_ast::LimitClause {
+                limit: Expr::Literal(Literal::Integer(count_i64), Span::ZERO),
+                offset: None,
+            });
+        let arm_select = SelectStatement {
+            with: arm_with,
+            body: SelectBody {
+                select: core.clone(),
+                compounds: Vec::new(),
+            },
+            order_by: Vec::new(),
+            limit: arm_limit,
+        };
+        let mut arm_rows = self
+            .execute_statement(&Statement::Select(arm_select), params)
+            .await?;
+        if *remaining_offset > 0 {
+            if arm_rows.len() <= *remaining_offset {
+                *remaining_offset -= arm_rows.len();
+                return Ok(());
+            }
+            arm_rows.drain(..*remaining_offset);
+            *remaining_offset = 0;
+        }
+        if let Some(rem) = remaining_limit.as_mut() {
+            arm_rows.truncate(*rem);
+            *rem = rem.saturating_sub(arm_rows.len());
+        }
+        result.extend(arm_rows);
+        Ok(())
     }
 
     /// Execute a compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT).
@@ -112761,7 +112853,10 @@ impl Connection {
             .all(|(op, _)| matches!(op, CompoundOp::UnionAll));
 
         let mut streaming_suffix_start = select.body.compounds.len();
-        if streaming_needed.is_some() {
+        let can_stream_union_all_suffix = select.order_by.is_empty()
+            && (streaming_needed.is_some()
+                || resolved_limit.is_some_and(|limit| limit.offset > 0));
+        if can_stream_union_all_suffix {
             while streaming_suffix_start > 0 {
                 let (op, _) = &select.body.compounds[streaming_suffix_start - 1];
                 let can_stream = matches!(op, CompoundOp::UnionAll)
@@ -112792,9 +112887,9 @@ impl Connection {
             self.validate_select_before_limit_zero_short_circuit(select)?;
         }
 
-        // bd-ct8zm: for an unordered all-UNION-ALL compound with a positive
-        // OFFSET, skip rows before projection inside each simple FROM arm
-        // (matching SQLite's compound VDBE OFFSET register) instead of
+        // bd-ct8zm / bd-msu6d: for an unordered all-UNION-ALL compound with a
+        // positive OFFSET, skip rows before projection inside each simple FROM
+        // arm (matching SQLite's compound VDBE OFFSET register) instead of
         // materializing LIMIT+OFFSET projected rows from arm 0.
         if select.order_by.is_empty()
             && all_union_all
@@ -112812,78 +112907,15 @@ impl Connection {
                     break;
                 }
                 let arm_with = (arm_idx == 0).then(|| select.with.clone()).flatten();
-                if remaining_offset > 0 {
-                    let arm_select = SelectStatement {
-                        with: arm_with.clone(),
-                        body: SelectBody {
-                            select: core.clone(),
-                            compounds: Vec::new(),
-                        },
-                        order_by: Vec::new(),
-                        limit: Some(fsqlite_ast::LimitClause {
-                            limit: Expr::Literal(
-                                Literal::Integer(
-                                    remaining_limit
-                                        .and_then(|count| i64::try_from(count).ok())
-                                        .unwrap_or(-1),
-                                ),
-                                Span::ZERO,
-                            ),
-                            offset: Some(Expr::Literal(
-                                Literal::Integer(
-                                    i64::try_from(remaining_offset).unwrap_or(i64::MAX),
-                                ),
-                                Span::ZERO,
-                            )),
-                        }),
-                    };
-                    let arm_result = match self
-                        .try_execute_compound_arm_with_offset(&arm_select, params)
-                        .await?
-                    {
-                        Some(result) => Some(result),
-                        None => {
-                            self.try_execute_compound_arm_with_fallback_offset(&arm_select, params)
-                                .await?
-                        }
-                    };
-                    if let Some((arm_rows, offset_left)) = arm_result {
-                        remaining_offset = offset_left;
-                        if let Some(rem) = remaining_limit.as_mut() {
-                            *rem = rem.saturating_sub(arm_rows.len());
-                        }
-                        result.extend(arm_rows);
-                        continue;
-                    }
-                }
-                let arm_limit = remaining_limit
-                    .map(|rem| rem.saturating_add(remaining_offset))
-                    .and_then(make_arm_limit);
-                let arm_select = SelectStatement {
-                    with: arm_with,
-                    body: SelectBody {
-                        select: core.clone(),
-                        compounds: Vec::new(),
-                    },
-                    order_by: Vec::new(),
-                    limit: arm_limit,
-                };
-                let mut arm_rows = self
-                    .execute_statement(&Statement::Select(arm_select), params)
-                    .await?;
-                if remaining_offset > 0 {
-                    if arm_rows.len() <= remaining_offset {
-                        remaining_offset -= arm_rows.len();
-                        continue;
-                    }
-                    arm_rows.drain(..remaining_offset);
-                    remaining_offset = 0;
-                }
-                if let Some(rem) = remaining_limit.as_mut() {
-                    arm_rows.truncate(*rem);
-                    *rem = rem.saturating_sub(arm_rows.len());
-                }
-                result.extend(arm_rows);
+                self.execute_union_all_arm_with_offset_limit(
+                    core,
+                    arm_with,
+                    params,
+                    &mut remaining_offset,
+                    &mut remaining_limit,
+                    &mut result,
+                )
+                .await?;
             }
             return Ok(result);
         }
@@ -112964,8 +112996,46 @@ impl Connection {
         }
 
         // Process each compound arm.
+        let mut streaming_offset_state: Option<(usize, Option<usize>)> = None;
         for (arm_index, (op, core)) in select.body.compounds.iter().enumerate() {
             let is_streaming_arm = arm_index >= streaming_suffix_start;
+            if is_streaming_arm
+                && select.order_by.is_empty()
+                && let Some(limit) = resolved_limit
+                && limit.offset > 0
+            {
+                let (remaining_offset, remaining_limit) =
+                    streaming_offset_state.get_or_insert_with(|| {
+                        let initial_offset = usize::try_from(limit.offset).unwrap_or(usize::MAX);
+                        let rem_offset = if result.len() <= initial_offset {
+                            let rem = initial_offset - result.len();
+                            result.clear();
+                            rem
+                        } else {
+                            result.drain(..initial_offset);
+                            0
+                        };
+                        let rem_limit = (limit.limit >= 0).then(|| {
+                            let lim = usize::try_from(limit.limit).unwrap_or(usize::MAX);
+                            result.truncate(lim);
+                            lim.saturating_sub(result.len())
+                        });
+                        (rem_offset, rem_limit)
+                    });
+                if *remaining_limit == Some(0) {
+                    break;
+                }
+                self.execute_union_all_arm_with_offset_limit(
+                    core,
+                    None,
+                    params,
+                    remaining_offset,
+                    remaining_limit,
+                    &mut result,
+                )
+                .await?;
+                continue;
+            }
             let arm_limit = if is_streaming_arm && let Some(needed) = streaming_needed {
                 if result.len() >= needed {
                     break;
@@ -113108,7 +113178,9 @@ impl Connection {
             )?;
         }
 
-        apply_resolved_expression_limit(&mut result, resolved_limit);
+        if streaming_offset_state.is_none() {
+            apply_resolved_expression_limit(&mut result, resolved_limit);
+        }
 
         Ok(result)
     }

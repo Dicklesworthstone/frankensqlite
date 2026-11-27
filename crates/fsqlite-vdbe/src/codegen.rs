@@ -12058,15 +12058,17 @@ fn codegen_select_index_ordered_scan(
         emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_row);
     }
 
+    // OFFSET: if offset counter > 0, decrement by 1 and skip this row BEFORE
+    // projecting output columns (bd-msu6d: skipped rows must evaluate none of
+    // their result expressions, matching SQLite's selectInnerLoop codeOffset).
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_row, P4::None, 0);
+    }
+
     if let Some(covering_output) = &index_plan.covering_output {
         emit_covering_output_reads(b, index_cursor, rowid_reg, covering_output, out_regs);
     } else {
         emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
-    }
-
-    // OFFSET: if offset counter > 0, decrement by 1 and skip this row.
-    if let Some(off_r) = offset_reg {
-        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_row, P4::None, 0);
     }
 
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);

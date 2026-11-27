@@ -1281,3 +1281,233 @@ fn join_order_by_limit_runs_in_the_vdbe() {
         f.close().await.unwrap();
     });
 }
+
+/// bd-msu6d: rows skipped by OFFSET must evaluate none of their result
+/// expressions across simple SELECTs (including index-ordered ORDER BY),
+/// each arm of UNION ALL and UNION/INTERSECT/EXCEPT + UNION ALL, and joins.
+/// Negative controls with OFFSET 0 (and pure UNION before dedup) must still
+/// raise, matching live bundled rusqlite 3.54.1 across :memory:/file and
+/// ad hoc/prepared paths.
+#[test]
+fn bd_msu6d_offset_skips_result_expressions_and_matches_stock() {
+    let setup = "\
+CREATE TABLE ms_e(id INTEGER PRIMARY KEY, x INTEGER, k INTEGER);\
+INSERT INTO ms_e VALUES (1, -9223372036854775808, 10), (2, 1, 10), (3, 2, 10), (4, 3, 20);\
+CREATE INDEX idx_ms_e_k ON ms_e(k);\
+CREATE TABLE ms_u(id INTEGER PRIMARY KEY, a INTEGER);\
+INSERT INTO ms_u VALUES (1, 10), (2, 20);\
+CREATE INDEX idx_ms_u_a ON ms_u(a);";
+
+    let cases: &[(&str, &[i64])] = &[
+        // Simple SELECT (plain scan, index seek, index-ordered ASC/DESC, correlated EXISTS/scalar)
+        ("SELECT abs(x) FROM ms_e LIMIT 1 OFFSET 1", &[]),
+        ("SELECT abs(x) FROM ms_e WHERE k = 10 LIMIT 1 OFFSET 1", &[]),
+        ("SELECT abs(x) FROM ms_e ORDER BY k LIMIT 1 OFFSET 1", &[]),
+        ("SELECT abs(x) FROM ms_e ORDER BY k DESC LIMIT 1 OFFSET 3", &[]),
+        ("SELECT abs(x) FROM ms_e ORDER BY id LIMIT 1 OFFSET 1", &[]),
+        (
+            "SELECT EXISTS(SELECT 1 FROM ms_u WHERE abs(ms_e.x) > 0) FROM ms_e LIMIT 1 OFFSET 1",
+            &[],
+        ),
+        (
+            "SELECT (SELECT abs(ms_e.x) FROM ms_u WHERE ms_u.a = ms_e.k) FROM ms_e LIMIT 1 OFFSET 1",
+            &[],
+        ),
+        // Compound arms: UNION ALL arm 1 & arm 2, correlated EXISTS, mixed UNION/INTERSECT/EXCEPT + UNION ALL
+        (
+            "SELECT EXISTS(SELECT 1 FROM ms_u WHERE abs(ms_e.x) > 0) FROM ms_e \
+             UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+            &[],
+        ),
+        (
+            "SELECT EXISTS(SELECT 1 FROM ms_u WHERE abs(ms_e.x) > 0) FROM ms_e \
+             UNION ALL SELECT 99 LIMIT 1 OFFSET 2",
+            &[],
+        ),
+        (
+            "SELECT 10 UNION ALL SELECT abs(x) FROM ms_e LIMIT 1 OFFSET 2",
+            &[],
+        ),
+        (
+            "SELECT abs(x) FROM ms_e UNION ALL SELECT abs(x) FROM ms_e LIMIT 1 OFFSET 5",
+            &[],
+        ),
+        (
+            "SELECT 10 UNION SELECT 20 UNION ALL SELECT abs(x) FROM ms_e LIMIT 1 OFFSET 3",
+            &[],
+        ),
+        (
+            "SELECT 10 UNION SELECT 20 UNION ALL SELECT abs(x) FROM ms_e LIMIT -1 OFFSET 3",
+            &[],
+        ),
+        (
+            "SELECT 10 INTERSECT SELECT 10 UNION ALL SELECT abs(x) FROM ms_e LIMIT 1 OFFSET 2",
+            &[],
+        ),
+        (
+            "SELECT 10 EXCEPT SELECT 20 UNION ALL SELECT abs(x) FROM ms_e LIMIT 1 OFFSET 2",
+            &[],
+        ),
+        (
+            "SELECT 10 UNION SELECT 20 UNION ALL \
+             SELECT EXISTS(SELECT 1 FROM ms_u WHERE abs(ms_e.x) > 0) FROM ms_e LIMIT 1 OFFSET 3",
+            &[],
+        ),
+        // Pure UNION must still evaluate before dedup (negative control matching stock)
+        ("SELECT abs(x) FROM ms_e UNION SELECT 99 LIMIT 1 OFFSET 1", &[]),
+        // Joins (lookup, index, LEFT, nested-loop, and join inside UNION ALL)
+        (
+            "SELECT abs(ms_e.x) FROM ms_e JOIN ms_u ON ms_u.a = ms_e.k LIMIT 1 OFFSET 1",
+            &[],
+        ),
+        (
+            "SELECT abs(ms_e.x) FROM ms_e LEFT JOIN ms_u ON ms_u.a = ms_e.k LIMIT 1 OFFSET 1",
+            &[],
+        ),
+        (
+            "SELECT abs(ms_e.x) FROM ms_e JOIN ms_u ON ms_u.id = ms_e.id LIMIT 1 OFFSET 1",
+            &[],
+        ),
+        (
+            "SELECT abs(ms_e.x) FROM ms_e JOIN ms_u ON ms_u.a = 10 LIMIT 1 OFFSET 1",
+            &[],
+        ),
+        (
+            "SELECT abs(ms_e.x) FROM ms_e JOIN ms_u ON ms_u.a = ms_e.k \
+             UNION ALL SELECT 99 LIMIT 1 OFFSET 1",
+            &[],
+        ),
+        // Negative controls: the exact same shapes with OFFSET 0 MUST still raise
+        ("SELECT abs(x) FROM ms_e LIMIT 1 OFFSET 0", &[]),
+        ("SELECT abs(x) FROM ms_e ORDER BY k LIMIT 1 OFFSET 0", &[]),
+        (
+            "SELECT EXISTS(SELECT 1 FROM ms_u WHERE abs(ms_e.x) > 0) FROM ms_e LIMIT 1 OFFSET 0",
+            &[],
+        ),
+        (
+            "SELECT EXISTS(SELECT 1 FROM ms_u WHERE abs(ms_e.x) > 0) FROM ms_e \
+             UNION ALL SELECT 99 LIMIT 1 OFFSET 0",
+            &[],
+        ),
+        (
+            "SELECT abs(ms_e.x) FROM ms_e JOIN ms_u ON ms_u.a = ms_e.k LIMIT 1 OFFSET 0",
+            &[],
+        ),
+        (
+            "SELECT 10 UNION SELECT 20 UNION ALL SELECT abs(x) FROM ms_e LIMIT 1 OFFSET 2",
+            &[],
+        ),
+    ];
+
+    compare_fallback_limit_cases_with_setup(cases, setup);
+}
+
+/// bd-msu6d: a counting scalar UDF in the SELECT list must not be invoked for
+/// rows skipped by OFFSET across simple SELECT, index-ordered SELECT, joins,
+/// UNION ALL arms, and UNION + UNION ALL streaming suffixes (:memory:/file,
+/// ad hoc and prepared).
+#[test]
+fn bd_msu6d_offset_never_invokes_counting_udf_for_skipped_rows() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = open_pair(file_backed, &dir).await;
+            let setup = "\
+CREATE TABLE cu_e(id INTEGER PRIMARY KEY, x INTEGER, k INTEGER);\
+INSERT INTO cu_e VALUES (1, 100, 10), (2, 200, 10), (3, 300, 10), (4, 400, 20);\
+CREATE INDEX idx_cu_e_k ON cu_e(k);\
+CREATE TABLE cu_u(id INTEGER PRIMARY KEY, a INTEGER);\
+INSERT INTO cu_u VALUES (1, 10), (2, 20);\
+CREATE INDEX idx_cu_u_a ON cu_u(a);";
+            f.execute_batch(setup).await.unwrap();
+            r.execute_batch(setup).unwrap();
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            f.register_nondeterministic_scalar_function(OffsetPredicateCalls(Arc::clone(&calls)));
+
+            // (fsqlite SQL calling offset_predicate, stock-equivalent SQL, expected UDF calls)
+            let cases: &[(&str, &str, usize)] = &[
+                (
+                    "SELECT offset_predicate(x) FROM cu_e LIMIT 1 OFFSET 2",
+                    "SELECT x FROM cu_e LIMIT 1 OFFSET 2",
+                    1,
+                ),
+                (
+                    "SELECT offset_predicate(x) FROM cu_e ORDER BY k LIMIT 1 OFFSET 2",
+                    "SELECT x FROM cu_e ORDER BY k LIMIT 1 OFFSET 2",
+                    1,
+                ),
+                (
+                    "SELECT offset_predicate(x) FROM cu_e WHERE k = 10 LIMIT 1 OFFSET 2",
+                    "SELECT x FROM cu_e WHERE k = 10 LIMIT 1 OFFSET 2",
+                    1,
+                ),
+                (
+                    "SELECT offset_predicate(cu_e.x) FROM cu_e JOIN cu_u ON cu_u.a = cu_e.k LIMIT 1 OFFSET 2",
+                    "SELECT cu_e.x FROM cu_e JOIN cu_u ON cu_u.a = cu_e.k LIMIT 1 OFFSET 2",
+                    1,
+                ),
+                (
+                    "SELECT offset_predicate(x) FROM cu_e UNION ALL SELECT 99 LIMIT 1 OFFSET 4",
+                    "SELECT x FROM cu_e UNION ALL SELECT 99 LIMIT 1 OFFSET 4",
+                    0,
+                ),
+                (
+                    "SELECT 10 UNION ALL SELECT offset_predicate(x) FROM cu_e LIMIT 1 OFFSET 3",
+                    "SELECT 10 UNION ALL SELECT x FROM cu_e LIMIT 1 OFFSET 3",
+                    1,
+                ),
+                (
+                    "SELECT EXISTS(SELECT 1 FROM cu_u WHERE offset_predicate(cu_e.x) > 0) FROM cu_e \
+                     UNION ALL SELECT 99 LIMIT 1 OFFSET 4",
+                    "SELECT EXISTS(SELECT 1 FROM cu_u WHERE cu_e.x > 0) FROM cu_e \
+                     UNION ALL SELECT 99 LIMIT 1 OFFSET 4",
+                    0,
+                ),
+                (
+                    "SELECT 10 UNION SELECT 20 UNION ALL SELECT offset_predicate(x) FROM cu_e LIMIT 1 OFFSET 4",
+                    "SELECT 10 UNION SELECT 20 UNION ALL SELECT x FROM cu_e LIMIT 1 OFFSET 4",
+                    1,
+                ),
+                (
+                    "SELECT offset_predicate(x) FROM cu_e LIMIT 2 OFFSET 0",
+                    "SELECT x FROM cu_e LIMIT 2 OFFSET 0",
+                    2,
+                ),
+            ];
+
+            for &(sql, stock_sql, expected_calls) in cases {
+                let stock_rows = rq(&r, stock_sql, &[]).unwrap();
+
+                calls.store(0, Ordering::SeqCst);
+                let direct_rows = tag_rows(&f.query(sql).await.unwrap());
+                let direct_calls = calls.load(Ordering::SeqCst);
+                assert_eq!(
+                    direct_rows, stock_rows,
+                    "[file={file_backed} direct] `{sql}` diverged from stock"
+                );
+                assert_eq!(
+                    direct_calls, expected_calls,
+                    "[file={file_backed} direct] `{sql}` invoked UDF {direct_calls} times, expected {expected_calls}"
+                );
+
+                let stmt = f.prepare(sql).await.unwrap();
+                for run in 0..2 {
+                    calls.store(0, Ordering::SeqCst);
+                    let prep_rows = tag_rows(&stmt.query().await.unwrap());
+                    let prep_calls = calls.load(Ordering::SeqCst);
+                    assert_eq!(
+                        prep_rows, stock_rows,
+                        "[file={file_backed} prepared run={run}] `{sql}` diverged from stock"
+                    );
+                    assert_eq!(
+                        prep_calls, expected_calls,
+                        "[file={file_backed} prepared run={run}] `{sql}` invoked UDF {prep_calls} times, expected {expected_calls}"
+                    );
+                }
+            }
+            f.close().await.unwrap();
+        }
+    });
+}
