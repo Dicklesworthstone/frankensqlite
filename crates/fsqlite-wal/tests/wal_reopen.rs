@@ -524,6 +524,33 @@ fn capped_reads_resume_at_the_first_unconsumed_frame() {
 }
 
 #[test]
+fn reads_smaller_than_one_frame_recover_commits_and_payloads() {
+    run(async {
+        for mode in REPLAYS {
+            // A 64 KiB page also needs a 24-byte WAL header. A VFS can
+            // deliver every byte while capping each individual call at 64 KiB.
+            // The smaller case splits both the WAL header and a frame header.
+            for (page_size, cap) in [(65_536, READ_BUDGET), (512, 17)] {
+                let mut fixture = Fixture::new(mode, page_size, 6, 3).await;
+                fixture.audit.fault.lock().unwrap().max_read = Some(cap);
+                fixture.replay(mode).await.unwrap();
+                fixture.assert_prefix(6).await;
+                let reader = fixture.reader.as_ref().unwrap();
+                let headers = reader.read_frame_headers(&fixture.cx, 0, 6).await.unwrap();
+                for (index, header) in headers.iter().enumerate() {
+                    let expected = fixture.writer.read_frame(&fixture.cx, index).await.unwrap();
+                    assert_eq!(header, &expected.0);
+                    assert_eq!(
+                        reader.read_frame(&fixture.cx, index).await.unwrap(),
+                        expected
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
 fn read_errors_are_not_accepted_as_a_recoverable_tail() {
     run(async {
         for mode in REPLAYS {
