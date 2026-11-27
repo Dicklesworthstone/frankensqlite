@@ -29,11 +29,11 @@
 //! transactions and nested [`Savepoint`]s with [`TransactionBehavior`] and
 //! [`DropBehavior`], pragmas,
 //! `busy_timeout`, `changes`, `last_insert_rowid`, [`OptionalExtension`],
-//! user-defined scalar and aggregate functions ([`Connection::create_scalar_function`],
-//! [`Connection::create_aggregate_function`]),
+//! user-defined scalar, aggregate, and window functions ([`Connection::create_scalar_function`],
+//! [`Connection::create_aggregate_function`], [`Connection::create_window_function`]),
 //! custom collations ([`Connection::create_collation`]),
 //! and an [`Error`] whose variants and [`ErrorCode`]s match rusqlite's. Not
-//! yet: window functions, online backup, blob I/O, hooks, and
+//! yet: online backup, blob I/O, hooks, and
 //! the `chrono`/`uuid`/`serde_json` conversions.
 
 use std::cell::RefCell;
@@ -1069,7 +1069,8 @@ fn value_ref(value: &SqliteValue) -> ValueRef<'_> {
 
 /// User-defined SQL functions, as rusqlite's `functions` module: register a
 /// closure with [`Connection::create_scalar_function`] or an aggregate with
-/// [`Connection::create_aggregate_function`].
+/// [`Connection::create_aggregate_function`], or a window aggregate with
+/// [`Connection::create_window_function`].
 pub mod functions {
     use std::marker::PhantomData;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -1181,6 +1182,20 @@ pub mod functions {
         fn finalize(&self, ctx: &mut Context<'_>, acc: Option<A>) -> Result<T>;
     }
 
+    /// Callbacks for an aggregate that also supports sliding SQL window frames.
+    pub trait WindowAggregate<A, T>: Aggregate<A, T>
+    where
+        A: std::panic::RefUnwindSafe + std::panic::UnwindSafe,
+        T: ToSql,
+    {
+        /// Read or update the current accumulator without consuming it. A
+        /// frame that has received no rows supplies `None`.
+        fn value(&self, acc: Option<&mut A>) -> Result<T>;
+
+        /// Remove a previously stepped row from the frame.
+        fn inverse(&self, ctx: &mut Context<'_>, acc: &mut A) -> Result<()>;
+    }
+
     /// Adapts rusqlite's lazy, fallible initialization to the engine's state
     /// factory. A state keeps its callback alive even if registration changes.
     pub(super) struct AggregateAdapter<A, D, T> {
@@ -1223,6 +1238,32 @@ pub mod functions {
         D: Aggregate<A, T>,
         T: ToSql,
     {
+        fn callback<R>(
+            &mut self,
+            call: impl FnOnce(&D, &mut Option<A>) -> Result<R>,
+        ) -> fsqlite_error::Result<R> {
+            if let Some(message) = &self.failure {
+                return Err(FrankenError::FunctionError(message.clone()));
+            }
+            self.pending_finalization = true;
+            let result = {
+                let aggregate = self
+                    .aggregate
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                catch_unwind(AssertUnwindSafe(|| call(&aggregate, &mut self.accumulator)))
+                    .unwrap_or(Err(Error::UnwindingPanic))
+            };
+            result.map_err(|error| {
+                let message = error.to_string();
+                self.failure = Some(message.clone());
+                // A failed state may survive until the next statement reset.
+                // Release the callback lock before invoking user cleanup.
+                let _ = self.finish();
+                FrankenError::FunctionError(message)
+            })
+        }
+
         fn finish(&mut self) -> Result<SqliteValue> {
             // Disarm before calling user code: an error or panic must not
             // invoke finalize a second time when this state is dropped.
@@ -1276,36 +1317,16 @@ pub mod functions {
         }
 
         fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> fsqlite_error::Result<()> {
-            if let Some(error) = &state.failure {
-                return Err(FrankenError::FunctionError(error.clone()));
-            }
-            state.pending_finalization = true;
-            let result = {
-                let aggregate = state
-                    .aggregate
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
+            state.callback(|aggregate, accumulator| {
                 let mut context = Context { args };
-                catch_unwind(AssertUnwindSafe(|| {
-                    if state.accumulator.is_none() {
-                        state.accumulator = Some(aggregate.init(&mut context)?);
-                    }
-                    aggregate.step(
-                        &mut context,
-                        state.accumulator.as_mut().expect("initialized aggregate"),
-                    )
-                }))
-                .unwrap_or(Err(Error::UnwindingPanic))
-            };
-            if let Err(error) = result {
-                let message = error.to_string();
-                state.failure = Some(message.clone());
-                // The VM may retain failed states until its next reset. Run
-                // finalization now, after releasing the callback lock.
-                let _ = state.finish();
-                return Err(FrankenError::FunctionError(message));
-            }
-            Ok(())
+                if accumulator.is_none() {
+                    *accumulator = Some(aggregate.init(&mut context)?);
+                }
+                aggregate.step(
+                    &mut context,
+                    accumulator.as_mut().expect("initialized aggregate"),
+                )
+            })
         }
 
         fn finalize(&self, mut state: Self::State) -> fsqlite_error::Result<SqliteValue> {
@@ -1315,6 +1336,59 @@ pub mod functions {
             state
                 .finish()
                 .map_err(|error| FrankenError::FunctionError(error.to_string()))
+        }
+
+        fn num_args(&self) -> i32 {
+            self.n_arg
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    impl<A, D, T> fsqlite_func::WindowFunction for AggregateAdapter<A, D, T>
+    where
+        A: std::panic::RefUnwindSafe + std::panic::UnwindSafe + Send,
+        D: WindowAggregate<A, T> + Send,
+        T: ToSql,
+    {
+        // The engine borrows state immutably for xValue. rusqlite permits
+        // xValue to mutate the accumulator, including between peer groups.
+        type State = std::cell::RefCell<AggregateState<A, D, T>>;
+
+        fn initial_state(&self) -> Self::State {
+            std::cell::RefCell::new(fsqlite_func::AggregateFunction::initial_state(self))
+        }
+
+        fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> fsqlite_error::Result<()> {
+            fsqlite_func::AggregateFunction::step(self, state.get_mut(), args)
+        }
+
+        fn inverse(
+            &self,
+            state: &mut Self::State,
+            args: &[SqliteValue],
+        ) -> fsqlite_error::Result<()> {
+            state.get_mut().callback(|aggregate, accumulator| {
+                let acc = accumulator
+                    .as_mut()
+                    .expect("inverse requires a previously stepped row");
+                aggregate.inverse(&mut Context { args }, acc)
+            })
+        }
+
+        fn value(&self, state: &Self::State) -> fsqlite_error::Result<SqliteValue> {
+            state.borrow_mut().callback(|aggregate, accumulator| {
+                aggregate
+                    .value(accumulator.as_mut())?
+                    .to_sql()
+                    .map(engine_value)
+            })
+        }
+
+        fn finalize(&self, state: Self::State) -> fsqlite_error::Result<SqliteValue> {
+            fsqlite_func::AggregateFunction::finalize(self, state.into_inner())
         }
 
         fn num_args(&self) -> i32 {
@@ -2022,6 +2096,30 @@ impl Connection {
         validate_function_name_arity(fn_name, n_arg)?;
         self.as_async()
             .register_aggregate_function(functions::AggregateAdapter::<A, D, T>::new(
+                fn_name, n_arg, aggregate,
+            ));
+        Ok(())
+    }
+
+    /// Register an aggregate for both `OVER (...)` and ordinary aggregate calls.
+    /// Each partition has its own accumulator. The engine calls `step` for
+    /// incoming rows and `inverse` for rows leaving a sliding frame.
+    /// Name, arity, and flag handling follow [`Self::create_aggregate_function`].
+    pub fn create_window_function<A, W, T>(
+        &self,
+        fn_name: &str,
+        n_arg: i32,
+        _flags: functions::FunctionFlags,
+        aggregate: W,
+    ) -> Result<()>
+    where
+        A: std::panic::RefUnwindSafe + std::panic::UnwindSafe + Send + 'static,
+        W: functions::WindowAggregate<A, T> + Send + 'static,
+        T: ToSql + 'static,
+    {
+        validate_function_name_arity(fn_name, n_arg)?;
+        self.as_async()
+            .register_window_function(functions::AggregateAdapter::<A, W, T>::new(
                 fn_name, n_arg, aggregate,
             ));
         Ok(())
@@ -4198,6 +4296,98 @@ mod tests {
     fn user_aggregates_behave_like_rusqlite() {
         aggregate_scenario!(stock, indexed_minmax_scans_all: false);
         aggregate_scenario!(ours, indexed_minmax_scans_all: true);
+    }
+
+    // Exercise the same mutable xValue accumulator and xInverse callbacks
+    // through both public APIs. xFinal deliberately produces another value
+    // so an aggregate call routed through xValue is observable.
+    macro_rules! window_scenario {
+        ($m:ident) => {{
+            use $m::functions::{Aggregate, Context, FunctionFlags, WindowAggregate};
+
+            struct Rolling;
+
+            // (running sum, number of calls to xValue in this partition)
+            impl Aggregate<(i64, i64), i64> for Rolling {
+                fn init(&self, ctx: &mut Context<'_>) -> $m::Result<(i64, i64)> {
+                    assert_eq!(ctx.len(), 1);
+                    Ok((0, 0))
+                }
+
+                fn step(&self, ctx: &mut Context<'_>, acc: &mut (i64, i64)) -> $m::Result<()> {
+                    acc.0 += ctx.get::<i64>(0)?;
+                    Ok(())
+                }
+
+                fn finalize(
+                    &self,
+                    ctx: &mut Context<'_>,
+                    acc: Option<(i64, i64)>,
+                ) -> $m::Result<i64> {
+                    assert!(ctx.is_empty());
+                    Ok(acc.map_or(-1, |(sum, _)| sum))
+                }
+            }
+
+            impl WindowAggregate<(i64, i64), i64> for Rolling {
+                fn value(&self, acc: Option<&mut (i64, i64)>) -> $m::Result<i64> {
+                    Ok(match acc {
+                        Some(acc) => {
+                            acc.1 += 1;
+                            acc.0 + acc.1 * 100
+                        }
+                        None => -2,
+                    })
+                }
+
+                fn inverse(&self, ctx: &mut Context<'_>, acc: &mut (i64, i64)) -> $m::Result<()> {
+                    acc.0 -= ctx.get::<i64>(0)?;
+                    Ok(())
+                }
+            }
+
+            let conn = $m::Connection::open_in_memory().unwrap();
+            conn.create_window_function("rolling", 1, FunctionFlags::SQLITE_UTF8, Rolling)
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE points(g INTEGER, x INTEGER);
+                 INSERT INTO points VALUES (1,1), (1,2), (1,4), (2,8);",
+            )
+            .unwrap();
+            for (sql, expected) in [
+                (
+                    "SELECT rolling(x) OVER (PARTITION BY g ORDER BY x ROWS 1 PRECEDING)
+                  FROM points ORDER BY g,x",
+                    vec![101, 203, 306, 108],
+                ),
+                (
+                    "SELECT rolling(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING)
+                  FROM points ORDER BY x",
+                    vec![-2, 101, 202, 304],
+                ),
+                (
+                    "SELECT rolling(x) FROM points GROUP BY g ORDER BY g",
+                    vec![7, 8],
+                ),
+                ("SELECT rolling(x) FROM points WHERE x < 0", vec![-1]),
+                ("SELECT rolling(x) OVER () FROM points WHERE x < 0", vec![]),
+            ] {
+                let rows = conn
+                    .prepare(sql)
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<$m::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(rows, expected, "{sql}");
+            }
+        }};
+    }
+
+    #[test]
+    fn user_window_aggregate_behaves_like_rusqlite() {
+        window_scenario!(stock);
+        window_scenario!(ours);
     }
 
     macro_rules! aggregate_lifecycle_scenario {
