@@ -3632,8 +3632,29 @@ pub fn codegen_select(
         // `count_star_index_range_target` / `codegen_select_aggregate` so it seeks
         // or walks the forced index (covering when possible) instead of taking
         // `codegen_select_count_star`'s unindexed table scan.
+        // bd-6a2t9: except when `codegen_select_count_star`'s own `INDEXED BY`-aware
+        // `extract_count_indexed_in_target` handles the subquery/table semijoin
+        // (`CountIndexEqRun` streaming merge or materialized probe) on the forced
+        // index. Integer IN-lists still yield to `count_star_index_range_target`
+        // via the `index_integer_in_list_residual_target` check immediately below.
         && !(where_clause.is_some()
-            && matches!(from_index_hint, Some(fsqlite_ast::IndexHint::IndexedBy(_))))
+            && matches!(from_index_hint, Some(fsqlite_ast::IndexHint::IndexedBy(_)))
+            && extract_count_indexed_in_target(
+                where_clause.as_deref(),
+                table,
+                table_alias,
+                schema,
+                &ScanCtx {
+                    cursor,
+                    table,
+                    table_alias,
+                    schema: Some(schema),
+                    register_base: None,
+                    secondaries: &[],
+                },
+                from_index_hint,
+            )
+            .is_none())
         && {
             let seek_constraint = aggregate_index_seek_constraint(from_index_hint);
             !seek_constraint.allows_index_seek() || {
@@ -57918,53 +57939,90 @@ mod tests {
         }
     }
 
-    /// bd-2dgf5: the seek body and the scan-fallback body must emit the *same*
-    /// `AggStep` sequence — same DISTINCT flag, same function P4, same argument
-    /// count. Only the instruction that loads the argument may differ
+    /// bd-2dgf5 / bd-6a2t9: the seek body (`emit_aggregate_accumulate_body_covering`
+    /// or `emit_aggregate_accumulate_body`) and the full-table scan body must emit
+    /// the *same* `AggStep` sequence — same DISTINCT flag, same function P4, same
+    /// argument count. Only the instruction that loads the argument may differ
     /// (`IdxRowid`/`Column idx` vs `Rowid`/`Column table`).
     ///
-    /// Every seek program carries both bodies: the seek runs first, and the scan
-    /// fallback follows for the probe-matched-nothing case. They are emitted by two
-    /// different functions, so nothing but this test stops them from drifting — and
-    /// if they drift, the same query returns different answers depending on whether
-    /// the probe hit, which no value test on a populated table would catch.
+    /// Starting with 72128f6e9 (bd-aj9v4), `exact_seek` aggregate equality seeks
+    /// set `skip_scan = true` instead of emitting a dead unreachable scan fallback
+    /// after `Goto finalize_label` (verified strictly fewer Callgrind Ir on both
+    /// hit and miss: `SELECT COUNT(*) FROM t WHERE k = 2 ORDER BY 1` 4,023,908 ->
+    /// 4,000,513 Ir hit / 3,919,330 -> 3,902,404 Ir miss; `SELECT SUM(id) FROM t
+    /// WHERE k = 2` 4,023,974 -> 4,004,596 Ir hit / 3,895,684 -> 3,874,886 Ir miss).
+    /// This test therefore pins BOTH:
+    /// 1. Each exact-seek query takes the `SeekGE` path and omits the dead
+    ///    unreachable `OpenRead t; Rewind t` fallback.
+    /// 2. Its `AggStep` sequence matches the `NOT INDEXED` table-scan program's
+    ///    `AggStep` sequence verbatim so the covering and table-scan bodies cannot
+    ///    drift.
     #[test]
     fn bd_2dgf5_seek_and_fallback_bodies_emit_identical_agg_steps() {
-        // A lone COUNT(*) over an exact equality counts from the index without a
-        // fallback (bd-zgbhb); with an ORDER BY it keeps the seek and its fallback.
-        for sql in [
-            "SELECT COUNT(*) FROM t WHERE k = 2 ORDER BY 1",
-            "SELECT SUM(id) FROM t WHERE k = 2",
-            "SELECT SUM(k) FROM t WHERE k = 2",
-            "SELECT COUNT(DISTINCT k) FROM t WHERE k = 2",
-            "SELECT MIN(id), MAX(id) FROM t WHERE k = 2",
-            "SELECT SUM(v) FROM t WHERE k = 2",
+        let agg_steps = |slice: &[VdbeOp]| -> Vec<(i32, P4, u16)> {
+            slice
+                .iter()
+                .filter(|op| op.opcode == Opcode::AggStep)
+                .map(|op| (op.p1, op.p4.clone(), op.p5))
+                .collect()
+        };
+
+        // A lone COUNT(*) over an exact equality counts from the index without
+        // AggStep (bd-zgbhb); with an ORDER BY it keeps the covering seek + AggStep.
+        for (seek_sql, scan_sql) in [
+            (
+                "SELECT COUNT(*) FROM t WHERE k = 2 ORDER BY 1",
+                "SELECT COUNT(*) FROM t NOT INDEXED WHERE k = 2 ORDER BY 1",
+            ),
+            (
+                "SELECT SUM(id) FROM t WHERE k = 2",
+                "SELECT SUM(id) FROM t NOT INDEXED WHERE k = 2",
+            ),
+            (
+                "SELECT SUM(k) FROM t WHERE k = 2",
+                "SELECT SUM(k) FROM t NOT INDEXED WHERE k = 2",
+            ),
+            (
+                "SELECT COUNT(DISTINCT k) FROM t WHERE k = 2",
+                "SELECT COUNT(DISTINCT k) FROM t NOT INDEXED WHERE k = 2",
+            ),
+            (
+                "SELECT MIN(id), MAX(id) FROM t WHERE k = 2",
+                "SELECT MIN(id), MAX(id) FROM t NOT INDEXED WHERE k = 2",
+            ),
+            (
+                "SELECT SUM(v) FROM t WHERE k = 2",
+                "SELECT SUM(v) FROM t NOT INDEXED WHERE k = 2",
+            ),
         ] {
-            let ops = bd_2dgf5_program(sql);
-            let split = bd_2dgf5_fallback_start(&ops);
+            let seek_ops = bd_2dgf5_program(seek_sql);
             assert!(
-                split < ops.len(),
-                "`{sql}` should take the seek path and emit a scan fallback"
+                seek_ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+                "`{seek_sql}` must take the index seek path"
+            );
+            assert_eq!(
+                bd_2dgf5_fallback_start(&seek_ops),
+                seek_ops.len(),
+                "`{seek_sql}` is an exact seek and must not emit a dead scan fallback"
             );
 
-            let agg_steps = |slice: &[VdbeOp]| -> Vec<(i32, P4, u16)> {
-                slice
-                    .iter()
-                    .filter(|op| op.opcode == Opcode::AggStep)
-                    .map(|op| (op.p1, op.p4.clone(), op.p5))
-                    .collect()
-            };
-            let seek_body = agg_steps(&ops[..split]);
-            let fallback_body = agg_steps(&ops[split..]);
+            let scan_ops = bd_2dgf5_program(scan_sql);
+            assert!(
+                bd_2dgf5_fallback_start(&scan_ops) < scan_ops.len(),
+                "`{scan_sql}` must emit the table-scan body"
+            );
+
+            let seek_body = agg_steps(&seek_ops);
+            let scan_body = agg_steps(&scan_ops);
 
             assert!(
                 !seek_body.is_empty(),
-                "`{sql}` seek body must accumulate at least one aggregate"
+                "`{seek_sql}` seek body must accumulate at least one aggregate"
             );
             assert_eq!(
-                seek_body, fallback_body,
-                "AggStep drifted between the seek body and the scan-fallback body \
-                 for `{sql}`"
+                seek_body, scan_body,
+                "AggStep drifted between the seek body (`{seek_sql}`) and the table-scan \
+                 body (`{scan_sql}`)"
             );
         }
     }

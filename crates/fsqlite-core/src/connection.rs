@@ -309015,19 +309015,56 @@ mod pager_routing_tests {
                 "matching NOCASE semantics must remain on the direct merge: {nonunique_ops:?}"
             );
 
-            // The list/materialized-probe path deliberately remains single-key.
-            // Its `(key, min-rowid)` seek record is not a valid lower bound for a
-            // `(key, trailing-key, rowid)` composite index.
+            // bd-6a2t9 / bd-aj9v4: composite integer IN-lists under `INDEXED BY`
+            // deliberately avoid the old single-key 2-field `(key, i64::MIN)` probe
+            // (which would skip NULL trailing keys) and instead route to
+            // `CountIndexRange::Members` (`SeekGE` + `IdxCountBefore` using 1-field
+            // prefix `MakeRecord(key, 1)` records — verified 68.22x faster in
+            // Callgrind Ir on 50k rows: 276,966,619 -> 4,059,875 Ir; stock 1,366,859).
             let list_sql = "SELECT COUNT(*)
             FROM messages INDEXED BY sqlite_autoindex_messages_1
             WHERE conversation_id IN (1, 2, 4, 6, 7, 8, 9, 10)";
             assert_eq!(scalar_count(&conn, list_sql).await, 3);
-            let list_ops = explain_opcodes(&conn, list_sql).await;
+            let list_prepared = conn.prepare(list_sql).await.unwrap();
+            let list_ops = list_prepared.program.ops();
             assert!(
                 !list_ops
                     .iter()
-                    .any(|op| op == "CountIndexEqRun" || op == "SeekGE"),
-                "composite IN-list must not enter the single-key probe-record path: {list_ops:?}"
+                    .any(|op| op.opcode == Opcode::CountIndexEqRun),
+                "composite IN-list must not enter CountIndexEqRun: {list_ops:?}"
+            );
+            assert!(
+                list_ops
+                    .iter()
+                    .any(|op| op.opcode == Opcode::IdxCountBefore),
+                "composite IN-list should use CountIndexRange::Members IdxCountBefore: {list_ops:?}"
+            );
+            assert!(
+                list_ops
+                    .iter()
+                    .filter(|op| op.opcode == Opcode::MakeRecord)
+                    .all(|op| op.p2 == 1),
+                "composite IN-list must probe with 1-field prefix records, never 2-field (key, i64::MIN): {list_ops:?}"
+            );
+
+            // Prove 1-field prefix probes count NULL trailing keys accurately
+            // (where a 2-field `(key, i64::MIN)` record would skip NULL entries).
+            let nullable_trail = Connection::open(":memory:").await.unwrap();
+            for sql in [
+                "CREATE TABLE m_null (id INTEGER PRIMARY KEY, cid INTEGER NOT NULL, pos INTEGER);",
+                "CREATE INDEX idx_m_null_cid_pos ON m_null(cid, pos);",
+                "INSERT INTO m_null VALUES (1, 1, NULL), (2, 1, 0), (3, 2, NULL), (4, 3, 5);",
+            ] {
+                nullable_trail.execute(sql).await.unwrap();
+            }
+            assert_eq!(
+                scalar_count(
+                    &nullable_trail,
+                    "SELECT COUNT(*) FROM m_null INDEXED BY idx_m_null_cid_pos WHERE cid IN (1, 2, 4)"
+                )
+                .await,
+                3,
+                "1-field prefix IN-list probes must include NULL trailing key rows"
             );
         });
     }
