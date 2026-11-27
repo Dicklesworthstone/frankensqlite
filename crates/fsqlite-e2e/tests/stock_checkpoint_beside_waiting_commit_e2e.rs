@@ -400,11 +400,17 @@ const SHAPE_ATTEMPTS: usize = 3;
 /// again, from a fresh database: when the reset came first, the COMMIT can
 /// answer only after the checkpoint returned, so a COMMIT that answered
 /// first did not wait for the reset. Only that race is discarded: a COMMIT
-/// that answered before the checkpoint returned AND promptly (within the
-/// hold plus `PROMPT`) AND not with `Busy`. A COMMIT that stalled (slow, or
-/// `Busy` after its busy_timeout, the bd-reality-check-1022-llk6g.5.7
-/// failure) is never discarded: its assertions run and fail as before. The
-/// test fails if no attempt got the interleaving.
+/// that answered `Ok` before the checkpoint returned AND promptly (within
+/// the hold plus `PROMPT`). A COMMIT that stalled (slow, or `Busy` after its
+/// busy_timeout, the bd-reality-check-1022-llk6g.5.7 failure) is never
+/// discarded: its assertions run and fail as before. An `Err` answer is
+/// never discarded either, however early (coordinator ruling on bd-kcua5,
+/// 2026-11-27): it is judged on its merits, so a `BusySnapshot` passes a
+/// shape whose transaction read and anything else fails. The rule before
+/// that ruling also discarded an early `Err` other than `Busy`; in K1 (hz4,
+/// 2026-11-27) its one discard was a `BusySnapshot` answered 2411 us before
+/// the child's post-checkpoint timestamp, which this rule judges instead.
+/// The test fails if no attempt got the interleaving.
 fn shape_with(
     dir: &Path,
     script: Script,
@@ -428,11 +434,21 @@ fn shape_with(
             .expect("outcome slot")
             .take()
             .expect("the shape ran");
-        let won_the_race = script != Script::CommitAtGo
-            && outcome.commit_done_us <= outcome.checkpoint_done_us
-            && outcome.took < PROMPT + Duration::from_millis(HOLD_MS)
-            && !matches!(outcome.commit, Err(FrankenError::Busy));
+        let answered_first =
+            script != Script::CommitAtGo && outcome.commit_done_us <= outcome.checkpoint_done_us;
+        let won_the_race = answered_first
+            && outcome.commit.is_ok()
+            && outcome.took < PROMPT + Duration::from_millis(HOLD_MS);
         if !won_the_race {
+            if answered_first {
+                eprintln!(
+                    "event=shape_early_answer_judged attempt={attempt} \
+                     commit_answered_us_before_reset={} took={:?} commit={:?}",
+                    outcome.checkpoint_done_us - outcome.commit_done_us,
+                    outcome.took,
+                    outcome.commit
+                );
+            }
             return outcome;
         }
         let early = outcome.checkpoint_done_us - outcome.commit_done_us;
