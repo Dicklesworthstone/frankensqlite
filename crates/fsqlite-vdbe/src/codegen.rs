@@ -839,6 +839,8 @@ pub struct TableSchema {
     pub strict: bool,
     /// Whether this table is declared WITHOUT ROWID.
     pub without_rowid: bool,
+    /// Conflict policy for the PRIMARY KEY stored in a WITHOUT ROWID table's root.
+    pub without_rowid_pk_conflict: Option<ConflictAction>,
     /// PRIMARY KEY constraints expressed as ordered column-name groups.
     ///
     /// INTEGER PRIMARY KEY rowid aliases continue to use `ColumnInfo::is_ipk`;
@@ -30297,6 +30299,7 @@ fn emit_agg_wrapper(b: &mut ProgramBuilder, wrapper: &Expr, result_reg: i32) {
         indexes: vec![],
         strict: false,
         without_rowid: false,
+        without_rowid_pk_conflict: None,
         primary_key_constraints: Vec::new(),
         foreign_keys: Vec::new(),
         check_constraints: Vec::new(),
@@ -30348,6 +30351,7 @@ fn emit_simple_agg_wrapper(
         indexes: vec![],
         strict: false,
         without_rowid: false,
+        without_rowid_pk_conflict: None,
         primary_key_constraints: Vec::new(),
         foreign_keys: Vec::new(),
         check_constraints: Vec::new(),
@@ -30400,6 +30404,7 @@ fn emit_multi_agg_wrapper(
         indexes: vec![],
         strict: false,
         without_rowid: false,
+        without_rowid_pk_conflict: None,
         primary_key_constraints: Vec::new(),
         foreign_keys: Vec::new(),
         check_constraints: Vec::new(),
@@ -35280,6 +35285,7 @@ fn table_function_scan_schema(name: &str, columns: &[String]) -> TableSchema {
         indexes: Vec::new(),
         strict: false,
         without_rowid: false,
+        without_rowid_pk_conflict: None,
         primary_key_constraints: Vec::new(),
         foreign_keys: Vec::new(),
         check_constraints: Vec::new(),
@@ -38666,6 +38672,143 @@ fn without_rowid_pk_label(table: &TableSchema, pk_indices: &[usize]) -> String {
         .join(", ")
 }
 
+/// Return the declaration ordinal of an implicit SQLite index on this table.
+#[must_use]
+pub fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> {
+    let index_name_lower = index_name.to_ascii_lowercase();
+    let prefix = format!("sqlite_autoindex_{}_", table_name.to_ascii_lowercase());
+    let suffix = index_name_lower.strip_prefix(&prefix)?;
+    if suffix.is_empty() || suffix.starts_with('0') || !suffix.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
+    let ordinal = suffix.parse::<usize>().ok()?;
+    (ordinal.to_string() == suffix).then_some(ordinal)
+}
+
+/// The clustered primary key consumes an implicit index ordinal without a catalog row.
+#[must_use]
+pub fn without_rowid_pk_ordinal(table: &TableSchema) -> Option<usize> {
+    if !table.without_rowid {
+        return None;
+    }
+    let persisted: std::collections::BTreeSet<_> = table
+        .indexes
+        .iter()
+        .filter_map(|index| parse_autoindex_ordinal(&index.name, &table.name))
+        .collect();
+    (1..=persisted.len() + 1).find(|ordinal| !persisted.contains(ordinal))
+}
+
+/// Insert the clustered PK check at its place in SQLite's uniqueness order.
+/// Explicit indexes follow the table declaration; newer indexes are checked
+/// first, with schema REPLACE policies following all other policies.
+fn without_rowid_conflict_checks<'a>(
+    table: &TableSchema,
+    slots: &'a [(usize, i32, i32)],
+) -> impl Iterator<Item = Option<&'a (usize, i32, i32)>> {
+    let pk_replace = table.without_rowid_pk_conflict == Some(ConflictAction::Replace);
+    let pk_ordinal = without_rowid_pk_ordinal(table);
+    let split = slots.partition_point(|&(offset, _, _)| {
+        let index = &table.indexes[offset];
+        let replace = index.conflict_action == Some(ConflictAction::Replace);
+        if replace != pk_replace {
+            return !replace;
+        }
+        parse_autoindex_ordinal(&index.name, &table.name)
+            .is_none_or(|ordinal| Some(ordinal) > pk_ordinal)
+    });
+    let (before, after) = slots.split_at(split);
+    before
+        .iter()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .chain(after.iter().map(Some))
+}
+
+/// Probe the clustered PK without mutating either tree. A REPLACE victim is
+/// deleted only after all remaining constraints have admitted the candidate.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn emit_without_rowid_pk_check(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    table_cursor: i32,
+    values: i32,
+    pk_indices: &[usize],
+    new_pk_regs: i32,
+    old_pk_regs: Option<i32>,
+    victim_flag: i32,
+    stmt_level: Option<ConflictAction>,
+    pk_label: &str,
+    row_done: Label,
+) {
+    let clear = b.emit_label();
+    if let Some(old) = old_pk_regs {
+        // An UPDATE retaining its primary key cannot conflict with another row.
+        let changed = b.emit_label();
+        for (j, &column) in pk_indices.iter().enumerate() {
+            let collation = table.columns[column]
+                .collation
+                .as_deref()
+                .filter(|name| !name.eq_ignore_ascii_case("BINARY"))
+                .map_or(P4::None, |name| P4::Collation(name.to_owned()));
+            b.emit_jump_to_label(
+                Opcode::Ne,
+                values + column as i32,
+                old + j as i32,
+                changed,
+                collation,
+                0,
+            );
+        }
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, clear, P4::None, 0);
+        b.resolve_label(changed);
+    }
+    for (j, &column) in pk_indices.iter().enumerate() {
+        b.emit_op(
+            Opcode::Copy,
+            values + column as i32,
+            new_pk_regs + j as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
+    let key = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        new_pk_regs,
+        pk_indices.len() as i32,
+        key,
+        P4::None,
+        0,
+    );
+    b.emit_jump_to_label(Opcode::NoConflict, table_cursor, key, clear, P4::None, 0);
+    match effective_oe(stmt_level, table.without_rowid_pk_conflict) {
+        OE_IGNORE => {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done, P4::None, 0);
+        }
+        OE_REPLACE => {
+            b.emit_op(Opcode::Integer, 1, victim_flag, 0, P4::None, 0);
+        }
+        oe => {
+            b.emit_op(
+                Opcode::Halt,
+                ErrorCode::Constraint as i32,
+                halt_conflict_oe(oe),
+                0,
+                P4::Str(pk_label.to_owned()),
+                OPFLAG_HALT_PRIMARY_KEY,
+            );
+        }
+    }
+    b.resolve_label(clear);
+}
+
 /// Emit secondary-index inserts for a WITHOUT ROWID table row.
 ///
 /// Index entries are keyed by `(index key terms..., primary-key columns...)`
@@ -38851,7 +38994,6 @@ fn emit_without_rowid_update_rewrite(
     old_regs: i32,
     old_pk_regs: i32,
     pk_indices: &[usize],
-    oe_flag: u16,
     stmt_level: Option<ConflictAction>,
     row_done: Label,
 ) {
@@ -38862,8 +39004,8 @@ fn emit_without_rowid_update_rewrite(
     // PHASE A — decide every conflict before mutating anything.
     //
     // Ordering follows `emit_without_rowid_row_insert` (and SQLite's
-    // `sqlite3GenerateConstraintChecks`): the primary key is resolved first,
-    // then each index in stock's check order (`indexes_in_conflict_check_order`),
+    // `sqlite3GenerateConstraintChecks`): resolve the primary key and secondary
+    // indexes in stock's check order,
     // which decides which ABORT is reported and whether an IGNORE wins. Nothing
     // in phase A deletes: a REPLACE decision only *captures* the victim's
     // primary key, so a later IGNORE or ABORT on a different index still leaves
@@ -38881,90 +39023,9 @@ fn emit_without_rowid_update_rewrite(
         })
         .collect();
 
-    // A1: is the primary key unchanged? Compare collation-aware, per key
-    // column: a single differing column makes this an "other victim" probe.
-    let pk_changed = b.emit_label();
-    let pk_unchanged = b.emit_label();
-    for (j, &pk_col) in pk_indices.iter().enumerate() {
-        let pk_collation = table.columns[pk_col]
-            .collation
-            .as_deref()
-            .filter(|name| !name.eq_ignore_ascii_case("BINARY"))
-            .map_or(P4::None, |name| P4::Collation(name.to_owned()));
-        b.emit_jump_to_label(
-            Opcode::Ne,
-            new_regs + pk_col as i32,
-            old_pk_regs + j as i32,
-            pk_changed,
-            pk_collation,
-            0,
-        );
-    }
-    b.emit_jump_to_label(Opcode::Goto, 0, 0, pk_unchanged, P4::None, 0);
-
-    // A2: the primary key moved — decide against any *other* row holding NEW PK.
-    b.resolve_label(pk_changed);
     let new_pk_regs = b.alloc_regs(n_pk as i32);
-    for (j, &pk_col) in pk_indices.iter().enumerate() {
-        b.emit_op(
-            Opcode::Copy,
-            new_regs + pk_col as i32,
-            new_pk_regs + j as i32,
-            0,
-            P4::None,
-            0,
-        );
-    }
-    let new_pk_rec = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        new_pk_regs,
-        n_pk as i32,
-        new_pk_rec,
-        P4::None,
-        0,
-    );
-    let no_victim = b.emit_label();
-    b.emit_jump_to_label(
-        Opcode::NoConflict,
-        table_cursor,
-        new_pk_rec,
-        no_victim,
-        P4::None,
-        0,
-    );
-    if oe_flag == OE_REPLACE {
-        // Record the decision only. The victim's primary key *is* the NEW
-        // primary key, so no separate capture registers are needed; phase B
-        // re-seeks it. Deleting here would be visible to a later IGNORE.
-        b.emit_op(Opcode::Integer, 1, pk_victim_flag, 0, P4::None, 0);
-    } else if oe_flag == OE_IGNORE {
-        // Abandon the row with OLD still intact.
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done, P4::None, 0);
-    } else {
-        // ABORT / FAIL / ROLLBACK: raise the PRIMARY KEY violation now, while
-        // OLD is still present, so the statement cannot lose the OLD row on the
-        // way out. `NoConflict` fell through, so a conflicting row provably
-        // exists.
-        // Raise it with a constraint `Halt`, as the WITHOUT ROWID INSERT path
-        // does, not with a conflicting `IdxInsert`: the engine answers an
-        // `IdxInsert` conflict by deleting every index entry it inserted since
-        // the last table `Insert`, and a WITHOUT ROWID program has no `Insert`,
-        // so under FAIL that unwound the rows this statement had already
-        // rewritten (bd-nn29x review).
-        b.emit_op(
-            Opcode::Halt,
-            ErrorCode::Constraint as i32,
-            halt_conflict_oe(oe_flag),
-            0,
-            P4::Str(pk_label.clone()),
-            OPFLAG_HALT_PRIMARY_KEY,
-        );
-    }
-    b.resolve_label(no_victim);
-    b.resolve_label(pk_unchanged);
 
-    // A3: decide every UNIQUE secondary-index conflict, still without mutating.
+    // Decide every uniqueness conflict before deleting a victim.
     //
     // The engine's `IdxInsert` OE_REPLACE branch resolves its victim as a
     // *rowid* (`find_conflicting_rowid_in_index` -> `Option<i64>`, then
@@ -38974,7 +39035,23 @@ fn emit_without_rowid_update_rewrite(
     // database as malformed. Every unique conflict is therefore resolved here,
     // in clustered terms, and phase C hands the engine a non-REPLACE action so
     // the rowid-suffix path is never entered.
-    for &(idx_offset, victim_flag, victim_pk_regs) in &unique_index_slots {
+    for check in without_rowid_conflict_checks(table, &unique_index_slots) {
+        let Some(&(idx_offset, victim_flag, victim_pk_regs)) = check else {
+            emit_without_rowid_pk_check(
+                b,
+                table,
+                table_cursor,
+                new_regs,
+                pk_indices,
+                new_pk_regs,
+                Some(old_pk_regs),
+                pk_victim_flag,
+                stmt_level,
+                &pk_label,
+                row_done,
+            );
+            continue;
+        };
         let index = &table.indexes[idx_offset];
         let idx_oe = effective_oe(stmt_level, index.conflict_action);
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
@@ -39370,51 +39447,8 @@ fn emit_without_rowid_row_insert(
     // WITHOUT ROWID secondary entry ends in the composite PK, not a rowid, so
     // the engine's rowid-table REPLACE path cannot identify its victim.
     let pk_probe_regs = b.alloc_regs(n_pk as i32);
-    for (j, &pk_col) in pk_indices.iter().enumerate() {
-        b.emit_op(
-            Opcode::Copy,
-            val_regs + pk_col as i32,
-            pk_probe_regs + j as i32,
-            0,
-            P4::None,
-            0,
-        );
-    }
-    let pk_probe_rec = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        pk_probe_regs,
-        n_pk as i32,
-        pk_probe_rec,
-        P4::None,
-        0,
-    );
     let pk_victim_flag = b.alloc_reg();
     b.emit_op(Opcode::Integer, 0, pk_victim_flag, 0, P4::None, 0);
-    let pk_clear = b.emit_label();
-    b.emit_jump_to_label(
-        Opcode::NoConflict,
-        table_cursor,
-        pk_probe_rec,
-        pk_clear,
-        P4::None,
-        0,
-    );
-    if oe_flag == OE_IGNORE {
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done, P4::None, 0);
-    } else if oe_flag == OE_REPLACE {
-        b.emit_op(Opcode::Integer, 1, pk_victim_flag, 0, P4::None, 0);
-    } else {
-        b.emit_op(
-            Opcode::Halt,
-            ErrorCode::Constraint as i32,
-            halt_conflict_oe(oe_flag),
-            0,
-            P4::Str(pk_label.clone()),
-            OPFLAG_HALT_PRIMARY_KEY,
-        );
-    }
-    b.resolve_label(pk_clear);
 
     // Secondary UNIQUE decisions in stock's check order (see
     // `indexes_in_conflict_check_order`).
@@ -39428,7 +39462,23 @@ fn emit_without_rowid_row_insert(
         })
         .collect();
 
-    for &(idx_offset, victim_flag, victim_pk_regs) in &unique_index_slots {
+    for check in without_rowid_conflict_checks(table, &unique_index_slots) {
+        let Some(&(idx_offset, victim_flag, victim_pk_regs)) = check else {
+            emit_without_rowid_pk_check(
+                b,
+                table,
+                table_cursor,
+                val_regs,
+                pk_indices,
+                pk_probe_regs,
+                None,
+                pk_victim_flag,
+                stmt_level,
+                &pk_label,
+                row_done,
+            );
+            continue;
+        };
         let index = &table.indexes[idx_offset];
         let idx_oe = effective_oe(stmt_level, index.conflict_action);
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
@@ -40878,7 +40928,6 @@ fn codegen_update_without_rowid(
         old_regs,
         pk_probe_regs,
         &pk_indices,
-        oe_flag,
         stmt.or_conflict,
         row_done,
     );
@@ -41338,7 +41387,6 @@ fn codegen_update_from_without_rowid(
         old_img,
         pk_probe_regs,
         &pk_indices,
-        oe_flag,
         stmt.or_conflict,
         row_done,
     );
@@ -43679,6 +43727,7 @@ fn emit_having_filter(
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -43718,6 +43767,7 @@ fn emit_having_filter(
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -56218,6 +56268,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -56299,6 +56350,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -56599,6 +56651,7 @@ mod tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -56634,6 +56687,7 @@ mod tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -56661,6 +56715,7 @@ mod tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -56679,6 +56734,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -56767,6 +56823,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -56804,6 +56861,7 @@ mod tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -56841,6 +56899,7 @@ mod tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -56885,6 +56944,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -56896,6 +56956,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -56946,6 +57007,7 @@ mod tests {
                 }],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -56957,6 +57019,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -56977,6 +57040,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -57003,6 +57067,7 @@ mod tests {
                 }],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -57744,6 +57809,7 @@ mod tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
@@ -58882,6 +58948,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -58925,6 +58992,7 @@ mod tests {
             indexes: vec![],
             strict: true,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -58968,6 +59036,7 @@ mod tests {
             indexes: vec![],
             strict: true,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -58985,6 +59054,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -59002,6 +59072,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: true,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -59042,6 +59113,7 @@ mod tests {
             ],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -59806,6 +59878,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -59849,6 +59922,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -59887,6 +59961,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -60093,6 +60168,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -60133,6 +60209,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -60242,6 +60319,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -60308,6 +60386,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -60368,6 +60447,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -60382,6 +60462,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -60463,6 +60544,7 @@ mod tests {
                 }],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -60477,6 +60559,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -60579,6 +60662,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -60620,6 +60704,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -62747,6 +62832,7 @@ mod tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -62784,6 +62870,7 @@ mod tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -62814,6 +62901,7 @@ mod tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -64218,6 +64306,7 @@ mod tests {
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -64406,6 +64495,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -64489,6 +64579,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -64534,6 +64625,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -64568,6 +64660,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -69475,6 +69568,7 @@ mod tests {
                 }],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -69489,6 +69583,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -69920,6 +70015,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -69937,6 +70033,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -69951,6 +70048,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -69965,6 +70063,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -70683,6 +70782,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -70698,6 +70798,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -70724,6 +70825,7 @@ mod tests {
                 }],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -70863,6 +70965,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -70877,6 +70980,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -70915,6 +71019,7 @@ mod tests {
                 ],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -70934,6 +71039,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -70948,6 +71054,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -70986,6 +71093,7 @@ mod tests {
                 ],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -71144,6 +71252,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -71158,6 +71267,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -71199,6 +71309,7 @@ mod tests {
                 ],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -71219,6 +71330,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -71260,6 +71372,7 @@ mod tests {
                 ],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -71280,6 +71393,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -71305,6 +71419,7 @@ mod tests {
                 }],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -71325,6 +71440,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -71363,6 +71479,7 @@ mod tests {
                 ],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -71663,6 +71780,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -71677,6 +71795,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -71718,6 +71837,7 @@ mod tests {
                 ],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -72528,6 +72648,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -74087,6 +74208,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
@@ -74104,6 +74226,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
@@ -74322,6 +74445,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
@@ -74333,6 +74457,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
@@ -74358,6 +74483,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
@@ -74369,6 +74495,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
@@ -74427,6 +74554,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
@@ -74438,6 +74566,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: vec![],
                 foreign_keys: vec![],
                 check_constraints: vec![],
@@ -75857,6 +75986,7 @@ mod tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -76579,6 +76709,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -76626,6 +76757,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -76674,6 +76806,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -76713,6 +76846,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -76745,6 +76879,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -77316,6 +77451,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: primary_key.is_some(),
+            without_rowid_pk_conflict: None,
             primary_key_constraints: primary_key
                 .map(|name| vec![vec![name.to_owned()]])
                 .unwrap_or_default(),
@@ -77834,6 +77970,7 @@ mod tests {
             ],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
@@ -77938,6 +78075,7 @@ mod tests {
                 .collect(),
             indexes: Vec::new(),
             strict: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: vec![],
             check_constraints: vec![],
             without_rowid: false,
@@ -78037,6 +78175,7 @@ mod tests {
                 mk_idx("t_c", 5, &["c"]),
             ],
             strict: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: vec![],
             check_constraints: vec![],
             without_rowid: false,
@@ -78218,6 +78357,7 @@ mod tests {
             indexes: vec![mk_idx("ib", 3, &["b"])],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),

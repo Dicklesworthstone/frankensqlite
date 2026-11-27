@@ -837,9 +837,6 @@ fn review_column_and_table_level_conflict_clauses() {
     let mut cases = Vec::new();
     for algorithm in ALGORITHMS {
         for mode in MODES {
-            // The constraint's own clause decides only when the statement
-            // has none; ABORT is the default either way.
-            let own_clause_decides = mode.is_empty() && algorithm != "ABORT";
             for txn in TXNS {
                 let tag = format!("{algorithm}, `{mode}`, {txn:?}");
                 cases.push(Case {
@@ -906,27 +903,42 @@ fn review_column_and_table_level_conflict_clauses() {
                     ),
                     queries: strs(&["SELECT id, v FROM w ORDER BY id"]),
                 });
-                // Pre-existing: a WITHOUT ROWID PRIMARY KEY's own clause is
-                // not applied; only the statement clause is.
-                if !own_clause_decides {
-                    cases.push(Case {
-                        name: format!("WITHOUT ROWID TEXT PRIMARY KEY ON CONFLICT {tag}, UPDATE"),
-                        setup: vec![
-                            format!(
-                                "CREATE TABLE w(k TEXT PRIMARY KEY ON CONFLICT {algorithm}, v) \
-                                 WITHOUT ROWID"
-                            ),
-                            "INSERT INTO w VALUES ('b', 1), ('c', 2), ('d', 3), ('cc', 9)"
-                                .to_owned(),
-                        ],
-                        steps: in_txn(
-                            txn,
-                            "INSERT INTO w VALUES ('z', 0)",
-                            format!("UPDATE {mode} w SET k = k || k WHERE k IN ('b', 'c', 'd')"),
+                cases.push(Case {
+                    name: format!("WITHOUT ROWID TEXT PRIMARY KEY ON CONFLICT {tag}, UPDATE"),
+                    setup: vec![
+                        format!(
+                            "CREATE TABLE w(k TEXT PRIMARY KEY ON CONFLICT {algorithm}, v) \
+                             WITHOUT ROWID"
                         ),
-                        queries: strs(&["SELECT k, v FROM w ORDER BY k"]),
-                    });
-                }
+                        "INSERT INTO w VALUES ('b', 1), ('c', 2), ('d', 3), ('cc', 9)"
+                            .to_owned(),
+                    ],
+                    steps: in_txn(
+                        txn,
+                        "INSERT INTO w VALUES ('z', 0)",
+                        format!("UPDATE {mode} w SET k = k || k WHERE k IN ('b', 'c', 'd')"),
+                    ),
+                    queries: strs(&["SELECT k, v FROM w ORDER BY k"]),
+                });
+                cases.push(Case {
+                    name: format!("WITHOUT ROWID composite PRIMARY KEY ON CONFLICT {tag}, INSERT"),
+                    setup: vec![
+                        format!(
+                            "CREATE TABLE w(k, v, data, PRIMARY KEY(v, k) ON CONFLICT {algorithm}) \
+                             WITHOUT ROWID"
+                        ),
+                        "INSERT INTO w VALUES ('a', 1, 'old')".to_owned(),
+                    ],
+                    steps: in_txn(
+                        txn,
+                        "INSERT INTO w VALUES ('z', 0, 'prior')",
+                        format!(
+                            "INSERT {mode} INTO w VALUES ('b', 1, 'first'), ('a', 1, 'dup'), \
+                             ('a', 2, 'last')"
+                        ),
+                    ),
+                    queries: strs(&["SELECT k, v, data FROM w ORDER BY v, k"]),
+                });
                 cases.push(Case {
                     name: format!("rowid TEXT PRIMARY KEY ON CONFLICT {tag}, INSERT"),
                     setup: vec![
@@ -1012,6 +1024,38 @@ fn review_column_and_table_level_conflict_clauses() {
         &BASIC_LANES,
         no_normalize,
     );
+}
+
+/// A row can hit the clustered PK and a secondary UNIQUE constraint at once.
+/// Their declaration order (and SQLite's REPLACE-last rule) selects the
+/// winning action before any previous row can be deleted.
+#[test]
+fn without_rowid_primary_key_and_secondary_conflict_order() {
+    let mut cases = Vec::new();
+    for constraints in [
+        "k PRIMARY KEY ON CONFLICT IGNORE, u UNIQUE",
+        "k PRIMARY KEY, u UNIQUE ON CONFLICT IGNORE",
+        "u UNIQUE, k PRIMARY KEY ON CONFLICT IGNORE",
+        "u UNIQUE ON CONFLICT IGNORE, k PRIMARY KEY",
+        "k PRIMARY KEY ON CONFLICT REPLACE, u UNIQUE ON CONFLICT IGNORE",
+        "u UNIQUE ON CONFLICT REPLACE, k PRIMARY KEY ON CONFLICT FAIL",
+    ] {
+        for conflict in [
+            "INSERT INTO w(k,u) VALUES (1,4)",
+            "UPDATE w SET k = 1, u = 4 WHERE k = 5",
+        ] {
+            cases.push(Case {
+                name: format!("{constraints} / {conflict}"),
+                setup: vec![
+                    format!("CREATE TABLE w({constraints}) WITHOUT ROWID"),
+                    "INSERT INTO w(k,u) VALUES (1,2),(3,4),(5,6)".to_owned(),
+                ],
+                steps: vec![conflict.to_owned()],
+                queries: strs(&["SELECT k,u FROM w ORDER BY k", "PRAGMA integrity_check"]),
+            });
+        }
+    }
+    assert_matches_stock("clustered primary-key conflict order", &cases, &BASIC_LANES, no_normalize);
 }
 
 /// bd-q51j8: RETURNING exposes only writes that survive the chosen schema or

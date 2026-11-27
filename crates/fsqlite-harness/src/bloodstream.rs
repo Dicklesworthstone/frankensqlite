@@ -1379,6 +1379,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),

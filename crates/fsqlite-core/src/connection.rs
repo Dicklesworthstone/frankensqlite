@@ -259,7 +259,8 @@ use fsqlite_vdbe::codegen::{
     codegen_insert,
     codegen_select, codegen_update, emit_backfill_column_read, emit_backfill_key_expr,
     emit_scan_filter, join_select_seeks_outer_table, join_select_uses_lookup,
-    without_rowid_index_appended_pk, without_rowid_pk_indices,
+    parse_autoindex_ordinal, without_rowid_index_appended_pk, without_rowid_pk_indices,
+    without_rowid_pk_ordinal,
 };
 #[cfg(not(test))]
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
@@ -29111,12 +29112,9 @@ impl Connection {
                 .filter_map(|&idx| table.columns.get(idx).map(|c| c.name.clone()))
                 .collect();
             let upsert_override = Self::upsert_matches_index_or_pk(&insert.upsert, &table, &pk_names);
-            let pk_col_conflict = (wr_pk_cols.len() == 1)
-                .then(|| table.columns[wr_pk_cols[0]].conflict_action)
-                .flatten();
             let oe = upsert_override
                 .or(stmt_or)
-                .or(pk_col_conflict)
+                .or(table.without_rowid_pk_conflict)
                 .unwrap_or(fsqlite_ast::ConflictAction::Abort);
             if oe == fsqlite_ast::ConflictAction::Abort {
                 return StmtJournalAbortProfile::ALWAYS;
@@ -29386,11 +29384,8 @@ impl Connection {
         // Indexes and WITHOUT ROWID PK affected by the UPDATE.
         let mut may_replace = false;
         if table.without_rowid && wr_pk_cols.iter().any(|idx| effective_updated_cols.contains(idx)) {
-            let pk_col_conflict = (wr_pk_cols.len() == 1)
-                .then(|| table.columns[wr_pk_cols[0]].conflict_action)
-                .flatten();
             let oe = stmt_or
-                .or(pk_col_conflict)
+                .or(table.without_rowid_pk_conflict)
                 .unwrap_or(fsqlite_ast::ConflictAction::Abort);
             if oe == fsqlite_ast::ConflictAction::Abort {
                 return StmtJournalAbortProfile::ALWAYS;
@@ -51167,6 +51162,7 @@ impl Connection {
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -56768,8 +56764,8 @@ impl Connection {
             // requires the full codegen INSERT path, which honors per-constraint
             // conflict resolution; the direct-simple lane does not (bd-587fx,
             // bd-24hno). Decline so such tables fall back to codegen.
-            let no_per_constraint_conflict =
-                table.columns.iter().all(|c| c.conflict_action.is_none())
+            let no_per_constraint_conflict = table.without_rowid_pk_conflict.is_none()
+                    && table.columns.iter().all(|c| c.conflict_action.is_none())
                     && table.indexes.iter().all(|i| i.conflict_action.is_none());
             fk_ok && no_per_constraint_conflict
         })
@@ -68610,6 +68606,7 @@ impl Connection {
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -68742,6 +68739,7 @@ impl Connection {
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -76752,6 +76750,7 @@ impl Connection {
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -76783,6 +76782,7 @@ impl Connection {
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -78700,6 +78700,9 @@ impl Connection {
                     indexes: implicit_indexes,
                     strict: create.strict,
                     without_rowid: create.without_rowid,
+                    without_rowid_pk_conflict: implicit_autoindex_slots
+                        .iter()
+                        .find_map(ImplicitAutoindexSlot::without_rowid_pk_conflict),
                     primary_key_constraints,
                     foreign_keys: fk_defs,
                     check_constraints: check_defs,
@@ -78917,6 +78920,7 @@ impl Connection {
                 indexes: Vec::new(),
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -78984,6 +78988,7 @@ impl Connection {
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -84674,7 +84679,9 @@ impl Connection {
         if insert.or_conflict.is_none()
             && let Some(table) = self.local_dml_target_table(table_name, Some(target_schema))
         {
-            let has_schema_pk_or_unique_replace = table.columns.iter().any(|column| {
+            let has_schema_pk_or_unique_replace =
+                table.without_rowid_pk_conflict == Some(fsqlite_ast::ConflictAction::Replace)
+                    || table.columns.iter().any(|column| {
                 column.is_ipk
                     && column.conflict_action == Some(fsqlite_ast::ConflictAction::Replace)
             }) || table.indexes.iter().any(|index| {
@@ -84928,7 +84935,8 @@ impl Connection {
     fn table_declares_replace_conflict(&self, table_name: &str, schema: Option<&str>) -> bool {
         self.local_dml_target_table(table_name, schema)
             .is_none_or(|table| {
-                table.columns.iter().any(|column| {
+                table.without_rowid_pk_conflict == Some(fsqlite_ast::ConflictAction::Replace)
+                    || table.columns.iter().any(|column| {
                     column.conflict_action == Some(fsqlite_ast::ConflictAction::Replace)
                 }) || table.indexes.iter().any(|index| {
                     index.conflict_action == Some(fsqlite_ast::ConflictAction::Replace)
@@ -85000,7 +85008,10 @@ impl Connection {
         }
         // Any column/index with a non-ABORT per-constraint conflict action
         // (IGNORE/REPLACE/FAIL/ROLLBACK) can skip or partially commit rows.
-        if !table.columns.iter().all(|c| {
+        if !matches!(
+            table.without_rowid_pk_conflict,
+            None | Some(fsqlite_ast::ConflictAction::Abort)
+        ) || !table.columns.iter().all(|c| {
             matches!(
                 c.conflict_action,
                 None | Some(fsqlite_ast::ConflictAction::Abort)
@@ -90474,6 +90485,7 @@ impl Connection {
                         indexes: Vec::new(),
                         strict: false,
                         without_rowid: false,
+                        without_rowid_pk_conflict: None,
                         primary_key_constraints: Vec::new(),
                         foreign_keys: Vec::new(),
                         check_constraints: Vec::new(),
@@ -90629,6 +90641,7 @@ impl Connection {
                     indexes: Vec::new(),
                     strict: false,
                     without_rowid: false,
+                    without_rowid_pk_conflict: None,
                     primary_key_constraints: Vec::new(),
                     foreign_keys: Vec::new(),
                     check_constraints: Vec::new(),
@@ -97484,7 +97497,7 @@ impl Connection {
                     table.indexes.iter().any(|index| index.name.eq_ignore_ascii_case(name))
                         || (table.without_rowid
                             && parse_autoindex_ordinal(name, &table.name).is_some_and(|ordinal| {
-                                pragma_without_rowid_pk_ordinal(table) == Some(ordinal)
+                                without_rowid_pk_ordinal(table) == Some(ordinal)
                             }))
                 })
             }).await?;
@@ -99964,7 +99977,7 @@ impl Connection {
                         // auto-index number missing from the persisted set, spliced
                         // into creation order so the reversal matches stock's
                         // ordering. (GH #344 / bd-sn184)
-                        if let Some(pk_ordinal) = pragma_without_rowid_pk_ordinal(t) {
+                        if let Some(pk_ordinal) = without_rowid_pk_ordinal(t) {
                             let name = format!("sqlite_autoindex_{}_{pk_ordinal}", t.name);
                             let pos = entries
                                 .iter()
@@ -99973,7 +99986,8 @@ impl Connection {
                                         .is_some_and(|o| o > pk_ordinal)
                                 })
                                 .unwrap_or(entries.len());
-                            entries.insert(pos, (name, 1, "pk", 0, false));
+                            let replace = t.without_rowid_pk_conflict == Some(fsqlite_ast::ConflictAction::Replace);
+                            entries.insert(pos, (name, 1, "pk", 0, replace));
                         }
 
                         // Stock lists `Table.pIndex`: newest first, except that
@@ -100137,7 +100151,7 @@ impl Connection {
                     }
                     // The PK auto-index ordinal is the one number missing from the
                     // persisted auto-index set — the same choice index_list makes.
-                    let Some(pk_ordinal) = pragma_without_rowid_pk_ordinal(table) else {
+                    let Some(pk_ordinal) = without_rowid_pk_ordinal(table) else {
                         continue;
                     };
                     let pk_name = format!("sqlite_autoindex_{}_{pk_ordinal}", table.name);
@@ -117344,6 +117358,7 @@ impl Connection {
                         indexes: Vec::new(),
                         strict: false,
                         without_rowid: false,
+                        without_rowid_pk_conflict: None,
                         primary_key_constraints: Vec::new(),
                         foreign_keys: Vec::new(),
                         check_constraints: Vec::new(),
@@ -117436,6 +117451,7 @@ impl Connection {
                     indexes: Vec::new(),
                     strict: false,
                     without_rowid: false,
+                    without_rowid_pk_conflict: None,
                     primary_key_constraints: Vec::new(),
                     foreign_keys: Vec::new(),
                     check_constraints: Vec::new(),
@@ -117688,6 +117704,7 @@ impl Connection {
                 indexes: Vec::new(),
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -127338,6 +127355,9 @@ impl Connection {
                         |create| create.strict,
                     ),
                     without_rowid,
+                    without_rowid_pk_conflict: bound_table_autoindexes.and_then(|bound| {
+                        bound.implicit_slots().find_map(ImplicitAutoindexSlot::without_rowid_pk_conflict)
+                    }),
                     primary_key_constraints,
                     foreign_keys: fk_defs,
                     check_constraints: check_defs,
@@ -127542,6 +127562,7 @@ impl Connection {
                     indexes: Vec::new(),
                     strict: false,
                     without_rowid: false,
+                    without_rowid_pk_conflict: None,
                     primary_key_constraints: Vec::new(),
                     foreign_keys: Vec::new(),
                     check_constraints: Vec::new(),
@@ -149606,6 +149627,7 @@ fn rewrite_probe_is_correlated(conn: &Connection, sub: &SelectStatement) -> bool
         indexes: Vec::new(),
         strict: false,
         without_rowid: false,
+        without_rowid_pk_conflict: None,
         primary_key_constraints: Vec::new(),
         foreign_keys: Vec::new(),
         check_constraints: Vec::new(),
@@ -156186,6 +156208,13 @@ impl ImplicitAutoindexSlot {
     }
 
     #[must_use]
+    pub(crate) fn without_rowid_pk_conflict(&self) -> Option<fsqlite_ast::ConflictAction> {
+        self.hidden_without_rowid_primary_key
+            .then_some(self.definition.conflict_action)
+            .flatten()
+    }
+
+    #[must_use]
     pub(crate) fn key_collations(&self) -> &[Option<String>] {
         &self.definition.key_collations
     }
@@ -156209,28 +156238,6 @@ impl ImplicitAutoindexSlot {
             conflict_action: self.definition.conflict_action,
         }
     }
-}
-
-fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> {
-    let index_name_lower = index_name.to_ascii_lowercase();
-    let prefix = format!("sqlite_autoindex_{}_", table_name.to_ascii_lowercase());
-    let suffix = index_name_lower.strip_prefix(&prefix)?;
-    if suffix.is_empty() || suffix.starts_with('0') || !suffix.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return None;
-    }
-    let ordinal = suffix.parse::<usize>().ok()?;
-    (ordinal.to_string() == suffix).then_some(ordinal)
-}
-
-fn pragma_without_rowid_pk_ordinal(table: &TableSchema) -> Option<usize> {
-    if !table.without_rowid {
-        return None;
-    }
-    let persisted: std::collections::BTreeSet<_> = table.indexes.iter()
-        .filter_map(|index| parse_autoindex_ordinal(&index.name, &table.name))
-        .collect();
-    (1..=persisted.len() + 1).find(|ordinal| !persisted.contains(ordinal))
 }
 
 fn column_def_declared_collation(column: &fsqlite_ast::ColumnDef) -> Option<String> {
@@ -266300,6 +266307,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -266343,6 +266351,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -266409,6 +266418,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -266459,6 +266469,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -266505,6 +266516,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -266536,6 +266548,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             indexes: Vec::new(),
             strict: false,
             without_rowid: primary_key.is_some(),
+            without_rowid_pk_conflict: None,
             primary_key_constraints: primary_key
                 .map(|name| vec![vec![name.to_owned()]])
                 .unwrap_or_default(),
@@ -286011,6 +286024,7 @@ mod pager_routing_tests {
             indexes: Vec::new(),
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -294169,6 +294183,7 @@ mod pager_routing_tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -294217,6 +294232,7 @@ mod pager_routing_tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -294267,6 +294283,7 @@ mod pager_routing_tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -294314,6 +294331,7 @@ mod pager_routing_tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -294370,6 +294388,7 @@ mod pager_routing_tests {
             }],
             strict: false,
             without_rowid: false,
+            without_rowid_pk_conflict: None,
             primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -308924,6 +308943,7 @@ mod pager_routing_tests {
                 indexes: Vec::new(),
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -308935,6 +308955,7 @@ mod pager_routing_tests {
                 indexes: Vec::new(),
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -308964,6 +308985,7 @@ mod pager_routing_tests {
                 indexes: Vec::new(),
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
@@ -308975,6 +308997,7 @@ mod pager_routing_tests {
                 indexes: Vec::new(),
                 strict: false,
                 without_rowid: false,
+                without_rowid_pk_conflict: None,
                 primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
