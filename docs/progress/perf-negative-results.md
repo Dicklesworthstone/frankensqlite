@@ -94,6 +94,34 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-27 - REJECTED on its time kill line (gb_a_sum_c a replicated judge v2b LOSE, cpu 1.0240 / 1.0197 and cycles 1.0226 / 1.0311, at Ir 1.0000; re-judge under bd-j0jc0/bd-gvews), with its gain line cleared: -1,504 Ir per FULL autocommit INSERT (x8.18 -> x8.11 stock 3.54.1): the vfs unix -shm maps hash their region numbers and owner ids with foldhash instead of SipHash (bd-fuwx0, commit-path lane round 2, lever L3 = option O-C1, hashing part 2)
+
+- Target: the autocommit commit's -shm bookkeeping. After L1 (56e28f1df) the SipHash left under the vfs on a FULL
+  INSERT was shm_map 592, release_shm_shared_slot 294 and the slot's shared-holder insert 147: 1,033 Ir per INSERT
+  (callgrind --tree=caller, arm A below).
+- Ledger preflight: no entry rejects it; L1 (this round) and bd-i3csr.4 F2 are the foldhash precedent.
+- Change (not landed; patch kept as scripts/cm1/lever3_v2.patch in /data/projects/frankensqlite-perf-ds, untracked):
+  crates/fsqlite-vfs/src/unix.rs ShmInfo.{regions, owner_refs, mapping_owners} and ShmSlotState.shared_holders as
+  HashMap / HashSet with foldhash::fast::FixedState (ShmKeyedMap / ShmKeyedSet); crates/fsqlite-vfs/Cargo.toml adds
+  foldhash 0.2.0 (already in the lock); Cargo.lock gains that edge. Every iteration of these maps is order-free
+  (any / all / sum / max / len / is_empty; one test takes the single mapping owner).
+- Evidence: arms A (origin/main ff82c2f0c, L1 landed) and B3 in ONE rch job on hz2 (CLI 0a8af8945b2a1d12 /
+  b2258aec4267369a, mt-mvcc-bench 30e4abf421f117a4 / 691bc421c79f336c; B3 recompiled fsqlite-vfs and its
+  dependents); thinkstation1, governor powersave; stock 3.54.1 (84a5d033) live. Callgrind per unit
+  (N800 - N400)/400: FULL 7 pairs median -1,504 (-0.87%; pairs -453 to -2,073), prediction -0.7k to -1.0k, gain
+  kill -0.5k: past the line, above the band (the mechanism is 1,033 Ir of SipHash gone, checked in B3's profile;
+  the rest is within the +-0.5k malloc-state spread per pair); NORMAL -746 (3 pairs); txn10 -2.2k per commit
+  (-0.39%); point SELECT -402 (-0.47%, inside its -0.2k to -0.6k band). Judge v2b: run 1 valid (max |z| 2.80),
+  run 2 VOID (null max |z| 4.89), run 3 valid (max |z| 1.98); the valid pair 1+3 has gb_a_sum_c cpu LOSE
+  1.0240 (T 1.52%) / 1.0197 (T 1.72%) and cycles LOSE 1.0226 / 1.0311 at Ir 1.0000 -> KILL. Unreplicated in 1+3:
+  group_by_1000_groups cpu, order_by_text_limit10 cycles, update_10pct_300k cpu LOSE in run 1 only.
+  mt-mvcc FULL separate, rows-per-transaction 5, A/B/Q, three passes: 4w VOID (null 1.097) / 0.978 TIE / 0.997 TIE,
+  8w 1.024 TIE / 0.918 TIE / VOID (null 0.939); no LOSE, no failed write.
+- Retry condition: re-judge under bd-j0jc0 / bd-gvews once the host governor is fixed, rebuilding both arms from the
+  same patch: gb_a_sum_c is a read-only GROUP BY whose one read transaction maps the -shm a handful of times (Ir
+  1.0000), so a 2-3% cycles LOSE there is the layout class those beads describe, as for L2. Not as a stack with
+  another lever: each has to clear its own time line.
+
 ## 2026-11-26 - WIN (landed as 56e28f1df; exact instruction counts, inside its prediction, past its gain kill line: -2,969 Ir per FULL autocommit INSERT, x8.46 -> x8.32 stock 3.54.1; time cells VOID under the powersave governor, no replicated judge v2b LOSE): the pager's group-commit queue hashes its process-minted keys (epochs, batch ids, handle addresses) with foldhash instead of SipHash (bd-fuwx0, commit-path lane rounds 1-2, lever L1 = option O-C1, hashing)
 
 - Target: the autocommit one-row INSERT's commit path. On origin/main bc49ec280 about 21 SipHash-1-3 lookups (146 Ir
