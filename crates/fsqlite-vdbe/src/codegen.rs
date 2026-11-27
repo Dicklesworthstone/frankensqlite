@@ -1594,6 +1594,30 @@ fn emit_strict_type_check(b: &mut ProgramBuilder, table: &TableSchema, first_reg
     }
 }
 
+/// COLLATE may be retained on the parsed expression or the indexed term.
+fn upsert_target_term(indexed: &IndexedColumn) -> (&Expr, Option<&str>) {
+    match (&indexed.expr, &indexed.collation) {
+        (Expr::Collate { expr, collation, .. }, None) => (expr.as_ref(), Some(collation.as_str())),
+        (expr, collation) => (expr, collation.as_deref()),
+    }
+}
+
+/// Resolve target expressions before matching them against unique keys.
+/// A target WHERE is allowed on a non-partial key, but its names must resolve.
+pub fn validate_upsert_target_columns(
+    target: &UpsertTarget,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Result<(), CodegenError> {
+    for term in &target.columns {
+        validate_single_table_expr_columns(&term.expr, table, table_alias)?;
+    }
+    if let Some(predicate) = target.where_clause.as_ref() {
+        validate_single_table_expr_columns(predicate, table, table_alias)?;
+    }
+    Ok(())
+}
+
 /// Find the UNIQUE index matching the UPSERT target columns, if any.
 ///
 /// Returns `(index_offset, &IndexSchema)` when the target columns match a
@@ -1607,21 +1631,7 @@ pub fn find_upsert_target_index<'a>(
     // Each target term is an expression and an optional collation; the
     // parser reads `x COLLATE c` as one expression, so a top-level COLLATE is
     // the term's collation.
-    let target_terms: Vec<(&Expr, Option<&str>)> = target
-        .columns
-        .iter()
-        .map(
-            |indexed_column| match (&indexed_column.expr, &indexed_column.collation) {
-                (
-                    Expr::Collate {
-                        expr, collation, ..
-                    },
-                    None,
-                ) => (expr.as_ref(), Some(collation.as_str())),
-                (expr, collation) => (expr, collation.as_deref()),
-            },
-        )
-        .collect();
+    let target_terms: Vec<_> = target.columns.iter().map(upsert_target_term).collect();
     if target_terms.is_empty() {
         return None;
     }
@@ -1629,7 +1639,22 @@ pub fn find_upsert_target_index<'a>(
     // sqlite3UpsertAnalyzeTarget, every term matches one key term, in any
     // order: a column by its name, an expression key (bd-d8s37) by its
     // structure. An explicit collation must be the key term's.
-    for (idx_offset, index) in table.indexes.iter().enumerate() {
+    // A bare target can match several UNIQUE keys with different collations.
+    // WITHOUT ROWID considers its clustered key at the same position in the
+    // index list as SQLite. Preserve the existing rowid table dispatch.
+    let candidates = if table.without_rowid {
+        without_rowid_upsert_probe_order(table)
+    } else {
+        (0..table.indexes.len()).map(Some).collect()
+    };
+    for candidate in candidates {
+        let Some(idx_offset) = candidate else {
+            if upsert_target_matches_without_rowid_primary_key(table, target) {
+                return None;
+            }
+            continue;
+        };
+        let index = &table.indexes[idx_offset];
         let key_terms = index.key_term_count();
         if !index.is_unique || key_terms == 0 || key_terms != target_terms.len() {
             continue;
@@ -1664,16 +1689,25 @@ pub fn find_upsert_target_index<'a>(
                     .is_some_and(|key| expressions_match_table_locally(term, key, table, None)),
             }
         };
-        let mut matched_key_terms = vec![false; key_terms];
-        let terms_match = target_terms.iter().all(|&(term, collation)| {
-            let Some(key_pos) = (0..key_terms).find(|&key_pos| {
-                !matched_key_terms[key_pos] && term_matches_key(term, collation, key_pos)
-            }) else {
-                return false;
-            };
-            matched_key_terms[key_pos] = true;
-            true
-        });
+        let terms_match = if table.without_rowid {
+            // sqlite3UpsertAnalyzeTarget asks whether each physical key term
+            // has a target expression. An uncollated occurrence can match
+            // multiple copies of the same column under different collations.
+            (0..key_terms).all(|key_pos| target_terms.iter().any(|&(term, collation)| {
+                term_matches_key(term, collation, key_pos)
+            }))
+        } else {
+            let mut matched_key_terms = vec![false; key_terms];
+            target_terms.iter().all(|&(term, collation)| {
+                let Some(key_pos) = (0..key_terms).find(|&key_pos| {
+                    !matched_key_terms[key_pos] && term_matches_key(term, collation, key_pos)
+                }) else {
+                    return false;
+                };
+                matched_key_terms[key_pos] = true;
+                true
+            })
+        };
         if terms_match && upsert_target_matches_index_predicate(table, target, index) {
             return Some((idx_offset, index));
         }
@@ -1720,48 +1754,29 @@ pub fn upsert_target_matches_rowid_primary_key(table: &TableSchema, target: &Ups
 
 /// Match a WITHOUT ROWID table's PRIMARY KEY as an `ON CONFLICT` arbiter.
 ///
-/// The PK is a valid arbiter but is stored as the clustering key in
-/// `primary_key_constraints` — not as an entry in `table.indexes` (so
-/// `find_upsert_target_index` misses it) and not as an `is_ipk` rowid alias (so
-/// `upsert_target_matches_rowid_primary_key` misses it). Match a plain,
-/// non-collated, non-partial target whose column set equals the PRIMARY KEY
-/// column set (order-independent, like a UNIQUE-index arbiter).
+/// A declared target collation must match the key term. A bare target column
+/// can match any collation, including several occurrences of the same column.
+/// The primary key is non-partial and accepts a resolved target WHERE.
 #[must_use]
 pub fn upsert_target_matches_without_rowid_primary_key(
     table: &TableSchema,
     target: &UpsertTarget,
 ) -> bool {
-    if !table.without_rowid || target.where_clause.is_some() {
-        return false;
-    }
-    let mut target_cols: Vec<&str> = Vec::with_capacity(target.columns.len());
-    for indexed in &target.columns {
-        // Only plain, non-collated column targets can name the PRIMARY KEY here.
-        if indexed.collation.is_some() {
-            return false;
-        }
-        let Expr::Column(column, _) = &indexed.expr else {
-            return false;
-        };
-        target_cols.push(column.column.as_ref());
-    }
-    let Some(pk_group) = table.primary_key_constraints.first() else {
+    let Some(pk) = table.primary_key_constraints.first() else {
         return false;
     };
-    if target_cols.is_empty() || pk_group.len() != target_cols.len() {
-        return false;
-    }
-    // Order-independent set match against the PRIMARY KEY columns.
-    let mut matched = vec![false; pk_group.len()];
-    target_cols.iter().all(|target_column| {
-        let Some(position) = pk_group.iter().enumerate().position(|(index, pk_column)| {
-            matched.get(index).is_some_and(|m| !m) && pk_column.eq_ignore_ascii_case(target_column)
-        }) else {
-            return false;
-        };
-        matched[position] = true;
-        true
-    })
+    table.without_rowid && !pk.is_empty() && pk.len() == target.columns.len()
+        && pk.iter().enumerate().all(|(slot, name)| {
+            let Some(index) = table.column_index(name) else { return false };
+            target.columns.iter().any(|term| {
+                let (expr, collation) = upsert_target_term(term);
+                matches!(expr, Expr::Column(column, _) if column.column.eq_ignore_ascii_case(name))
+                    && collation.is_none_or(|collation| {
+                        table.without_rowid_pk_collation(slot, index).unwrap_or("BINARY")
+                            .eq_ignore_ascii_case(collation)
+                    })
+            })
+        })
 }
 
 /// Emit UPSERT DO UPDATE assignments into `target_regs`.
@@ -38733,14 +38748,15 @@ pub fn without_rowid_pk_ordinal(table: &TableSchema) -> Option<usize> {
 /// Insert the clustered PK check at its place in SQLite's uniqueness order.
 /// Explicit indexes follow the table declaration; newer indexes are checked
 /// first, with schema REPLACE policies following all other policies.
-fn without_rowid_conflict_checks<'a>(
+fn without_rowid_conflict_checks<'a, T>(
     table: &TableSchema,
-    slots: &'a [(usize, i32, i32)],
-) -> impl Iterator<Item = Option<&'a (usize, i32, i32)>> {
+    slots: &'a [T],
+    index_offset: impl Fn(&T) -> usize,
+) -> impl Iterator<Item = Option<&'a T>> {
     let pk_replace = table.without_rowid_pk_conflict == Some(ConflictAction::Replace);
     let pk_ordinal = without_rowid_pk_ordinal(table);
-    let split = slots.partition_point(|&(offset, _, _)| {
-        let index = &table.indexes[offset];
+    let split = slots.partition_point(|slot| {
+        let index = &table.indexes[index_offset(slot)];
         let replace = index.conflict_action == Some(ConflictAction::Replace);
         if replace != pk_replace {
             return !replace;
@@ -38754,6 +38770,20 @@ fn without_rowid_conflict_checks<'a>(
         .map(Some)
         .chain(std::iter::once(None))
         .chain(after.iter().map(Some))
+}
+
+/// SQLite's uniqueness list for a WITHOUT ROWID UPSERT: None denotes the
+/// clustered primary key, Some(offset) a UNIQUE secondary index. The first
+/// conflicting constraint determines which existing row a targetless clause
+/// updates. Both bytecode and trigger dispatch probe in this order.
+#[must_use]
+pub fn without_rowid_upsert_probe_order(table: &TableSchema) -> Vec<Option<usize>> {
+    let secondary: Vec<_> = indexes_in_conflict_check_order(table)
+        .filter_map(|(offset, index)| index.is_unique.then_some(offset))
+        .collect();
+    without_rowid_conflict_checks(table, &secondary, |offset| *offset)
+        .map(|offset| offset.copied())
+        .collect()
 }
 
 /// Probe the clustered PK without mutating either tree. A REPLACE victim is
@@ -39063,7 +39093,7 @@ fn emit_without_rowid_update_rewrite(
     // database as malformed. Every unique conflict is therefore resolved here,
     // in clustered terms, and phase C hands the engine a non-REPLACE action so
     // the rowid-suffix path is never entered.
-    for check in without_rowid_conflict_checks(table, &unique_index_slots) {
+    for check in without_rowid_conflict_checks(table, &unique_index_slots, |slot| slot.0) {
         let Some(&(idx_offset, victim_flag, victim_pk_regs)) = check else {
             emit_without_rowid_pk_check(
                 b,
@@ -39488,7 +39518,7 @@ fn emit_without_rowid_row_insert(
         })
         .collect();
 
-    for check in without_rowid_conflict_checks(table, &unique_index_slots) {
+    for check in without_rowid_conflict_checks(table, &unique_index_slots, |slot| slot.0) {
         let Some(&(idx_offset, victim_flag, victim_pk_regs)) = check else {
             emit_without_rowid_pk_check(
                 b,
@@ -39666,9 +39696,9 @@ fn emit_without_rowid_row_insert(
 ///  - `explicit_target_index = Some(i)` (an explicit secondary-UNIQUE target,
 ///    bd-yqjjx): probe ONLY that index. A PRIMARY KEY or other-index collision
 ///    is not the named arbiter, so it routes to `no_conflict_label`.
-///  - omitted target (`probe_unique_secondaries = true`): probe the PRIMARY KEY,
-///    then each UNIQUE secondary index in stock's check order
-///    (`indexes_in_conflict_check_order`); the first hit wins.
+///  - omitted target (`probe_unique_secondaries = true`): probe the clustered
+///    key and UNIQUE indexes in SQLite's constraint-check order. The first
+///    hit chooses the victim.
 ///  - explicit PRIMARY KEY target (`explicit_target_index = None`,
 ///    `probe_unique_secondaries = false`): probe the PRIMARY KEY only.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -39686,174 +39716,49 @@ fn emit_without_rowid_upsert_probe(
 ) {
     let n_pk = pk_indices.len();
 
-    if let Some(target_idx) = explicit_target_index {
-        // Explicit secondary-UNIQUE conflict target (bd-yqjjx): DO UPDATE fires
-        // ONLY on a conflict against THIS index. A PRIMARY KEY collision, or a
-        // collision on any OTHER unique index, is not this target — it routes to
-        // `no_conflict_label`. So there is deliberately no PK-for-update probe
-        // here; probe only the target index, exactly like a single iteration of
-        // the omitted-target secondary loop below.
-        let index = &table.indexes[target_idx];
-        let idx_cursor = table_cursor + 1 + target_idx as i32;
-        let n_idx_cols = index.key_term_count();
-        let scan_ctx = ScanCtx {
-            cursor: table_cursor,
-            table,
-            table_alias: None,
-            schema: None,
-            register_base: Some(RegisterRow::columns(val_regs)),
-            secondaries: &[],
-        };
-        // A row outside a partial index cannot violate its UNIQUE constraint.
-        // Test membership before looking up a key that an indexed row may share.
-        emit_index_predicate_guard(b, index, &scan_ctx, no_conflict_label);
-        let idx_key_regs = b.alloc_regs(n_idx_cols as i32);
-        for key_pos in 0..n_idx_cols {
-            emit_index_key_term(b, index, key_pos, idx_key_regs + key_pos as i32, &scan_ctx);
-        }
-        let idx_probe_rec = b.alloc_reg();
-        b.emit_op(
-            Opcode::MakeRecord,
-            idx_key_regs,
-            n_idx_cols as i32,
-            idx_probe_rec,
-            P4::None,
-            0,
-        );
-        // No existing entry shares these key terms (a NULL key term never
-        // conflicts — SQLite UNIQUE semantics) -> no conflict for this clause.
-        b.emit_jump_to_label(
-            Opcode::NoConflict,
-            idx_cursor,
-            idx_probe_rec,
-            no_conflict_label,
-            P4::None,
-            0,
-        );
-        // Conflict: position the table cursor on the conflicting row via the
-        // index entry's PK suffix. If the index and table are inconsistent (row
-        // missing), route to `no_conflict_label`.
-        emit_without_rowid_index_to_table_seek(
-            b,
-            table,
-            table_cursor,
-            idx_cursor,
-            index,
-            pk_indices,
-            no_conflict_label,
-        );
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, conflict_label, P4::None, 0);
+    let probes = if explicit_target_index.is_some() || !probe_unique_secondaries {
+        vec![explicit_target_index]
     } else {
-        // Probe the PRIMARY KEY: build a PK-prefix key and test for an existing row.
-        let pk_probe_regs = b.alloc_regs(n_pk as i32);
-        for (j, &pk_col) in pk_indices.iter().enumerate() {
-            b.emit_op(
-                Opcode::Copy,
-                val_regs + pk_col as i32,
-                pk_probe_regs + j as i32,
-                0,
-                P4::None,
-                0,
-            );
-        }
-        let pk_probe_rec = b.alloc_reg();
-        b.emit_op(
-            Opcode::MakeRecord,
-            pk_probe_regs,
-            n_pk as i32,
-            pk_probe_rec,
-            P4::None,
-            0,
-        );
-        // NoConflict jumps when there is NO existing PK match; a match falls through
-        // with the table cursor positioned on the conflicting row.
-        let pk_no_conflict = b.emit_label();
-        b.emit_jump_to_label(
-            Opcode::NoConflict,
-            table_cursor,
-            pk_probe_rec,
-            pk_no_conflict,
-            P4::None,
-            0,
-        );
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, conflict_label, P4::None, 0);
-        b.resolve_label(pk_no_conflict);
-
-        // Omitted conflict target: SQLite fires DO UPDATE on whichever uniqueness
-        // constraint is violated, checked in constraint order — the PRIMARY KEY
-        // (above), then each UNIQUE secondary index in stock's check order
-        // (`indexes_in_conflict_check_order`). Probe each UNIQUE index against
-        // the attempted-insert values; on the first hit, position the table
-        // cursor on that row via its PK suffix and route to `conflict_label`.
-        // An explicit PRIMARY KEY target skips this (PK-only).
-        if probe_unique_secondaries {
-            for (idx_offset, index) in indexes_in_conflict_check_order(table) {
-                if !index.is_unique {
-                    continue;
-                }
-                let idx_cursor = table_cursor + 1 + idx_offset as i32;
-                let n_idx_cols = index.key_term_count();
-                let next_index = b.emit_label();
-                let scan_ctx = ScanCtx {
-                    cursor: table_cursor,
-                    table,
-                    table_alias: None,
-                    schema: None,
-                    register_base: Some(RegisterRow::columns(val_regs)),
-                    secondaries: &[],
-                };
-                emit_index_predicate_guard(b, index, &scan_ctx, next_index);
-                let idx_key_regs = b.alloc_regs(n_idx_cols as i32);
-                for key_pos in 0..n_idx_cols {
-                    emit_index_key_term(
-                        b,
-                        index,
-                        key_pos,
-                        idx_key_regs + key_pos as i32,
-                        &scan_ctx,
-                    );
-                }
-                let idx_probe_rec = b.alloc_reg();
-                b.emit_op(
-                    Opcode::MakeRecord,
-                    idx_key_regs,
-                    n_idx_cols as i32,
-                    idx_probe_rec,
-                    P4::None,
-                    0,
-                );
-                // NoConflict jumps to `next_index` when no existing entry shares
-                // these key terms (a NULL key term never conflicts — SQLite UNIQUE
-                // semantics). On a conflict the index cursor is positioned on the
-                // conflicting entry.
-                b.emit_jump_to_label(
-                    Opcode::NoConflict,
-                    idx_cursor,
-                    idx_probe_rec,
-                    next_index,
-                    P4::None,
-                    0,
-                );
-                // Position the table cursor on the conflicting row via the index
-                // entry's PK suffix, then route to `conflict_label`. If the index
-                // and table are inconsistent (row missing), route to
-                // `no_conflict_label`.
-                emit_without_rowid_index_to_table_seek(
-                    b,
-                    table,
-                    table_cursor,
-                    idx_cursor,
-                    index,
-                    pk_indices,
-                    no_conflict_label,
-                );
-                b.emit_jump_to_label(Opcode::Goto, 0, 0, conflict_label, P4::None, 0);
-                b.resolve_label(next_index);
+        without_rowid_upsert_probe_order(table)
+    };
+    let scan_ctx = ScanCtx {
+        cursor: table_cursor,
+        table,
+        table_alias: None,
+        schema: None,
+        register_base: Some(RegisterRow::columns(val_regs)),
+        secondaries: &[],
+    };
+    for target in probes {
+        let next = b.emit_label();
+        if let Some(offset) = target {
+            let index = &table.indexes[offset];
+            let idx_cursor = table_cursor + 1 + offset as i32;
+            emit_index_predicate_guard(b, index, &scan_ctx, next);
+            let n_terms = index.key_term_count();
+            let regs = b.alloc_regs(n_terms as i32);
+            for slot in 0..n_terms {
+                emit_index_key_term(b, index, slot, regs + slot as i32, &scan_ctx);
             }
+            let record = b.alloc_reg();
+            b.emit_op(Opcode::MakeRecord, regs, n_terms as i32, record, P4::None, 0);
+            b.emit_jump_to_label(Opcode::NoConflict, idx_cursor, record, next, P4::None, 0);
+            emit_without_rowid_index_to_table_seek(
+                b, table, table_cursor, idx_cursor, index, pk_indices, next,
+            );
+        } else {
+            let regs = b.alloc_regs(n_pk as i32);
+            for (slot, &column) in pk_indices.iter().enumerate() {
+                b.emit_op(Opcode::Copy, val_regs + column as i32, regs + slot as i32, 0, P4::None, 0);
+            }
+            let record = b.alloc_reg();
+            b.emit_op(Opcode::MakeRecord, regs, n_pk as i32, record, P4::None, 0);
+            b.emit_jump_to_label(Opcode::NoConflict, table_cursor, record, next, P4::None, 0);
         }
-        // No uniqueness conflict against this clause's target(s).
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, no_conflict_label, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, conflict_label, P4::None, 0);
+        b.resolve_label(next);
     }
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, no_conflict_label, P4::None, 0);
 }
 
 /// Emit the DO UPDATE apply body for one UPSERT clause on a WITHOUT ROWID table.
@@ -40122,6 +40027,9 @@ fn codegen_insert_without_rowid(
     // (`find_upsert_target_index`, bd-yqjjx); a target that matches none raises
     // the same error stock does.
     for clause in &stmt.upsert {
+        if let Some(target) = clause.target.as_ref() {
+            validate_upsert_target_columns(target, table, target_alias)?;
+        }
         if let Some(target) = clause.target.as_ref()
             && find_upsert_target_index(table, Some(target)).is_none()
             && !upsert_target_matches_without_rowid_primary_key(table, target)

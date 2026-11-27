@@ -35732,14 +35732,23 @@ impl Connection {
             let Some(target) = clause.target.as_ref() else {
                 continue;
             };
-            for indexed in &target.columns {
-                if let Expr::Column(column, _) = &indexed.expr
-                    && table.column_index(&column.column).is_none()
-                {
-                    return Err(FrankenError::function_error(format!(
-                        "no such column: {}",
-                        column.column
-                    )));
+            if table.without_rowid {
+                fsqlite_vdbe::codegen::validate_upsert_target_columns(
+                    target,
+                    table,
+                    insert.alias.as_deref(),
+                )
+                .map_err(codegen_error_to_franken)?;
+            } else {
+                for indexed in &target.columns {
+                    if let Expr::Column(column, _) = &indexed.expr
+                        && table.column_index(&column.column).is_none()
+                    {
+                        return Err(FrankenError::function_error(format!(
+                            "no such column: {}",
+                            column.column
+                        )));
+                    }
                 }
             }
             if fsqlite_vdbe::codegen::find_upsert_target_index(table, Some(target)).is_none()
@@ -64575,21 +64584,32 @@ impl Connection {
         slot: usize,
     ) -> Result<Expr> {
         let expr = Self::build_limit_scope_projection_expr(table_ref, name);
-        self.with_dml_target_table(table_ref, |table| {
-            if table.without_rowid
-                && let Some(column) = table.column_index(name)
-                && !table.without_rowid_pk_matches_column(slot, column)
-            {
-                Expr::Collate {
-                    expr: Box::new(expr),
-                    collation: table.without_rowid_pk_collation(slot, column)
-                        .unwrap_or("BINARY").to_owned(),
-                    span: Span::ZERO,
-                }
-            } else {
-                expr
-            }
+        self.with_dml_target_table(table_ref, |table| match table.column_index(name) {
+            Some(column) => Self::primary_key_comparison_expr(table, slot, column, expr),
+            None => expr,
         })
+    }
+
+    /// A primary-key term can compare text differently from the declared column.
+    /// Replay and UPSERT probes must use the comparison that identified the row.
+    fn primary_key_comparison_expr(
+        table: &TableSchema,
+        slot: usize,
+        column: usize,
+        expr: Expr,
+    ) -> Expr {
+        if table.without_rowid && !table.without_rowid_pk_matches_column(slot, column) {
+            Expr::Collate {
+                expr: Box::new(expr),
+                collation: table
+                    .without_rowid_pk_collation(slot, column)
+                    .unwrap_or("BINARY")
+                    .to_owned(),
+                span: Span::ZERO,
+            }
+        } else {
+            expr
+        }
     }
 
     fn build_update_replay_locator_filter(
@@ -69723,51 +69743,26 @@ impl Connection {
         let mut candidate_predicates = Vec::new();
         let mut saw_indeterminate = false;
 
-        match target {
+        // Both the write and the trigger/RETURNING probe must pick the same
+        // unique constraint when the incoming row conflicts with several rows.
+        // None in this order denotes the table's own primary key.
+        let arbiters = match target {
+            Some(target)
+                if fsqlite_vdbe::codegen::upsert_target_matches_rowid_primary_key(
+                    &table, target,
+                ) =>
+            {
+                vec![None]
+            }
             Some(target) => {
-                if fsqlite_vdbe::codegen::upsert_target_matches_rowid_primary_key(&table, target) {
-                    if let Some(ipk) = ipk_idx {
-                        if let Some(expr) =
-                            Self::build_upsert_column_group_match_expr(&table, &[ipk], attempted)
-                        {
-                            candidate_predicates.push(expr);
-                        }
-                    } else {
-                        saw_indeterminate = true;
-                    }
+                if let Some((index, _)) =
+                    fsqlite_vdbe::codegen::find_upsert_target_index(&table, Some(target))
+                {
+                    vec![Some(index)]
                 } else if fsqlite_vdbe::codegen::upsert_target_matches_without_rowid_primary_key(
                     &table, target,
                 ) {
-                    if let Some(pk_indices) = table.primary_key_constraints.first().and_then(|g| {
-                        g.iter()
-                            .map(|name| table.column_index(name))
-                            .collect::<Option<Vec<_>>>()
-                    }) {
-                        if let Some(expr) = Self::build_upsert_column_group_match_expr(
-                            &table,
-                            &pk_indices,
-                            attempted,
-                        ) {
-                            candidate_predicates.push(expr);
-                        }
-                    } else {
-                        saw_indeterminate = true;
-                    }
-                } else if let Some((_, index)) =
-                    fsqlite_vdbe::codegen::find_upsert_target_index(&table, Some(target))
-                {
-                    match self.build_upsert_index_conflict_match_expr(
-                        &table,
-                        &table_label,
-                        index,
-                        attempted,
-                    ) {
-                        UpsertIndexConflictMatch::Matched(expr) => {
-                            candidate_predicates.push(*expr);
-                        }
-                        UpsertIndexConflictMatch::CannotConflict => {}
-                        UpsertIndexConflictMatch::Indeterminate => saw_indeterminate = true,
-                    }
+                    vec![None]
                 } else {
                     let column_names: Vec<String> =
                         table.columns.iter().map(|c| c.name.clone()).collect();
@@ -69781,42 +69776,49 @@ impl Connection {
                     } else {
                         saw_indeterminate = true;
                     }
+                    Vec::new()
                 }
             }
-            None => {
-                // Targetless `ON CONFLICT DO UPDATE` catches a conflict on the
-                // table's PRIMARY KEY or any UNIQUE index.
-                if !table.without_rowid {
-                    if let Some(ipk) = ipk_idx
-                        && let Some(expr) =
-                            Self::build_upsert_column_group_match_expr(&table, &[ipk], attempted)
+            None if table.without_rowid => {
+                fsqlite_vdbe::codegen::without_rowid_upsert_probe_order(&table)
+            }
+            None => std::iter::once(None)
+                .chain(
+                    table
+                        .indexes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, index)| index.is_unique)
+                        .map(|(offset, _)| Some(offset)),
+                )
+                .collect(),
+        };
+        for arbiter in arbiters {
+            if let Some(offset) = arbiter {
+                match self.build_upsert_index_conflict_match_expr(
+                    &table,
+                    &table_label,
+                    &table.indexes[offset],
+                    attempted,
+                ) {
+                    UpsertIndexConflictMatch::Matched(expr) => candidate_predicates.push(*expr),
+                    UpsertIndexConflictMatch::CannotConflict => {}
+                    UpsertIndexConflictMatch::Indeterminate => saw_indeterminate = true,
+                }
+            } else {
+                let columns = if table.without_rowid {
+                    without_rowid_pk_indices(&table).ok()
+                } else {
+                    ipk_idx.map(|ipk| vec![ipk])
+                };
+                if let Some(columns) = columns {
+                    if let Some(expr) =
+                        Self::build_upsert_primary_key_match_expr(&table, &columns, attempted)
                     {
                         candidate_predicates.push(expr);
                     }
-                } else if let Some(pk_indices) =
-                    table.primary_key_constraints.first().and_then(|g| {
-                        g.iter()
-                            .map(|name| table.column_index(name))
-                            .collect::<Option<Vec<_>>>()
-                    })
-                    && let Some(expr) =
-                        Self::build_upsert_column_group_match_expr(&table, &pk_indices, attempted)
-                {
-                    candidate_predicates.push(expr);
-                }
-                for index in table.indexes.iter().filter(|idx| idx.is_unique) {
-                    match self.build_upsert_index_conflict_match_expr(
-                        &table,
-                        &table_label,
-                        index,
-                        attempted,
-                    ) {
-                        UpsertIndexConflictMatch::Matched(expr) => {
-                            candidate_predicates.push(*expr);
-                        }
-                        UpsertIndexConflictMatch::CannotConflict => {}
-                        UpsertIndexConflictMatch::Indeterminate => saw_indeterminate = true,
-                    }
+                } else if target.is_some() || table.without_rowid {
+                    saw_indeterminate = true;
                 }
             }
         }
@@ -69889,10 +69891,10 @@ impl Connection {
         }
     }
 
-    /// Build a `col_0 = lit_0 AND ...` predicate for a non-null column group.
+    /// Build a primary-key equality predicate in physical key order.
     /// Returns `None` if any column value in `attempted` is NULL (NULL never
     /// conflicts on a PK/UNIQUE constraint in SQLite).
-    fn build_upsert_column_group_match_expr(
+    fn build_upsert_primary_key_match_expr(
         table: &TableSchema,
         col_indices: &[usize],
         attempted: &[SqliteValue],
@@ -69901,17 +69903,15 @@ impl Connection {
             return None;
         }
         let mut predicate: Option<Expr> = None;
-        for &idx in col_indices {
+        for (slot, &idx) in col_indices.iter().enumerate() {
             let col = table.columns.get(idx)?;
             let val = attempted.get(idx)?;
             if val.is_null() {
                 return None;
             }
+            let expr = Expr::Column(fsqlite_ast::ColumnRef::bare(col.name.clone()), Span::ZERO);
             let eq = Expr::BinaryOp {
-                left: Box::new(Expr::Column(
-                    fsqlite_ast::ColumnRef::bare(col.name.clone()),
-                    fsqlite_ast::Span::new(0, 0),
-                )),
+                left: Box::new(Self::primary_key_comparison_expr(table, slot, idx, expr)),
                 op: fsqlite_ast::BinaryOp::Eq,
                 right: Box::new(value_to_literal_expr(val.clone())),
                 span: fsqlite_ast::Span::new(0, 0),

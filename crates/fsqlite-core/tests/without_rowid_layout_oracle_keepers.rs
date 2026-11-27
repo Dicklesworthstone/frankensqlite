@@ -770,3 +770,73 @@ fn clustered_primary_key_collations_govern_writes_and_secondary_locators_after_r
         }
     });
 }
+
+#[test]
+fn clustered_upserts_choose_the_same_victim_as_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let db = Connection::open(":memory:").await.unwrap();
+        // The candidate 'x' collides with 'X' under NOCASE and with 'x '
+        // under RTRIM. Updating the wrong victim still succeeds.
+        for (definition, explicit_index) in [
+            ("PRIMARY KEY(k COLLATE NOCASE), UNIQUE(k COLLATE RTRIM)", false),
+            ("UNIQUE(k COLLATE RTRIM), PRIMARY KEY(k COLLATE NOCASE)", false),
+            ("PRIMARY KEY(k COLLATE NOCASE), UNIQUE(k COLLATE RTRIM) ON CONFLICT REPLACE", false),
+            ("PRIMARY KEY(k COLLATE NOCASE)", true),
+        ] {
+            let create = format!("CREATE TABLE t(k TEXT,v INT,{definition}) WITHOUT ROWID");
+            for sql in [
+                create.as_str(),
+                "CREATE TABLE audit(k TEXT)",
+                "CREATE TRIGGER witness AFTER UPDATE ON t BEGIN INSERT INTO audit VALUES(OLD.k); END",
+            ] {
+                db.execute(sql).await.unwrap();
+                stock.execute_batch(sql).unwrap();
+            }
+            if explicit_index {
+                let sql = "CREATE UNIQUE INDEX u ON t(k COLLATE RTRIM)";
+                db.execute(sql).await.unwrap();
+                stock.execute_batch(sql).unwrap();
+            }
+            for target in ["", "(k)", "(k COLLATE NOCASE)", "(k COLLATE RTRIM) WHERE 0"] {
+                for action in ["DO NOTHING", "DO UPDATE SET v=v+1"] {
+                    let insert = format!("INSERT INTO t VALUES('x',9) ON CONFLICT{target} {action}");
+                    for sql in [
+                        "DELETE FROM audit",
+                        "DELETE FROM t",
+                        "INSERT INTO t VALUES('X',0),('x ',0)",
+                        insert.as_str(),
+                    ] {
+                        stock.execute_batch(sql).unwrap();
+                        db.execute(sql).await.unwrap_or_else(|e| panic!("{definition} / {sql}: {e}"));
+                    }
+                    for probe in ["SELECT k,v FROM t ORDER BY k COLLATE BINARY", "SELECT k FROM audit"] {
+                        let rows = db.query(probe).await.unwrap();
+                        assert_eq!(rows.iter().map(row_values).collect::<Vec<_>>(),
+                            stock_pragma_rows(&stock, probe), "{definition}: {insert}: {probe}");
+                    }
+                }
+            }
+            db.execute("DROP TABLE t").await.unwrap();
+            db.execute("DROP TABLE audit").await.unwrap();
+            stock.execute_batch("DROP TABLE t; DROP TABLE audit").unwrap();
+        }
+
+        let create = "CREATE TABLE r(k TEXT,j INT,PRIMARY KEY(k COLLATE NOCASE,k COLLATE RTRIM)) WITHOUT ROWID";
+        for sql in [create, "INSERT INTO r VALUES('X',1)"] {
+            stock.execute_batch(sql).unwrap();
+            db.execute(sql).await.unwrap();
+        }
+        for target in [
+            "k", "k,k", "k,j", "j,k", "k COLLATE RTRIM,k COLLATE NOCASE",
+            "k COLLATE NOCASE,k COLLATE NOCASE", "k COLLATE BINARY,k COLLATE RTRIM",
+            "k COLLATE BINARY,k", "k,unknown_col", "k,unknown_col COLLATE NOCASE",
+        ] {
+            let sql = format!("INSERT INTO r VALUES('X',2) ON CONFLICT({target}) DO UPDATE SET j=excluded.j");
+            let expected = stock.execute_batch(&sql);
+            let actual = db.execute(&sql).await;
+            assert_eq!(actual.is_ok(), expected.is_ok(), "{sql}: {actual:?} vs {expected:?}");
+        }
+        db.close().await.unwrap();
+    });
+}
