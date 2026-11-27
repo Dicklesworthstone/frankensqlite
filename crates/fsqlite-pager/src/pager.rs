@@ -22413,9 +22413,10 @@ where
             .await?
                 == 0
         {
-            // Existing-only open never lets a sidecar bootstrap an empty main
-            // file, even if that sidecar looks like a valid hot journal.
-            return Err(FrankenError::CannotOpen { path: db_path });
+            // GH#543: an existing, zero-length main file represents an empty
+            // database. Do not let any recovery sidecar establish its state:
+            // the existing-only bootstrap below must remain sidecar-free.
+            Self::ensure_reserved_recovery_artifacts_absent(cx, &*vfs, &db_path)?;
         }
 
         // bd-qgh42 (GH#366): a ReservedEmpty open whose file is ALREADY a coherent
@@ -22529,7 +22530,10 @@ where
                         }
                     }
                     let file_size = db_file.file_size(cx)?;
-                    if *disposition == ReadWriteOpenDisposition::ExistingOnly && file_size == 0 {
+                    if *disposition == ReadWriteOpenDisposition::ExistingOnly
+                        && file_size == 0
+                        && vfs.access(cx, journal_path, AccessFlags::EXISTS)?
+                    {
                         return Err(FrankenError::CannotOpen {
                             path: db_path.clone(),
                         });
@@ -22571,7 +22575,7 @@ where
                 }
                 Err(_) => requested_page_size,
             }
-        } else if disposition == ReadWriteOpenDisposition::ExistingOnly {
+        } else if disposition == ReadWriteOpenDisposition::ExistingOnly && file_size != 0 {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "database file too small for header: {file_size} bytes (< {DATABASE_HEADER_SIZE})"
@@ -22591,9 +22595,9 @@ where
                 true,
             )
         } else if file_size == 0 {
-            if disposition == ReadWriteOpenDisposition::ExistingOnly {
-                return Err(FrankenError::CannotOpen { path: db_path });
-            }
+            // A first writer on an existing empty main file must initialize
+            // page 1 under EXCLUSIVE, never over a peer's completed bootstrap.
+            let existing_bootstrap = disposition == ReadWriteOpenDisposition::ExistingOnly;
             let reserved_bootstrap = disposition == ReadWriteOpenDisposition::ReservedEmpty;
             // bd-dd24l (GH#376): `pre_open_lock_sidecars` is snapshotted ABOVE,
             // before the VFS open that creates our own advisory-lock sidecars.
@@ -22601,7 +22605,7 @@ where
             // and made the AllowExpected reserved validation reject the target,
             // breaking Windows `VACUUM INTO`. The reserved bootstrap still runs
             // the cooperative lock below; only the witness capture moved earlier.
-            let mut bootstrap_lock = reserved_bootstrap.then(|| {
+            let mut bootstrap_lock = (reserved_bootstrap || existing_bootstrap).then(|| {
                 BeginExternalLockState::new(&group_commit_queue, Arc::clone(&db_file), cx)
             });
             if let Some(lock) = bootstrap_lock.as_mut() {
@@ -22626,6 +22630,23 @@ where
                             WindowsLockSidecarPolicy::AllowExpected,
                             pre_open_lock_sidecars.as_ref(),
                         )?;
+                    }
+                    Self::ensure_reserved_recovery_artifacts_absent(cx, &*vfs, &db_path)?;
+                }
+                if existing_bootstrap {
+                    if file.file_size(cx)? != 0 {
+                        // The peer initialized this database after our probe.
+                        // Retry normal open instead of replacing its page 1.
+                        return Err(FrankenError::Busy);
+                    }
+                    if expected_identity.is_some() && file.file_identity()? != expected_identity {
+                        return Err(FrankenError::CannotOpen {
+                            path: db_path.clone(),
+                        });
+                    }
+                    #[cfg(all(feature = "native", any(unix, windows)))]
+                    if let Some(binding) = &namespace_binding {
+                        binding.validate_path_identity()?;
                     }
                     Self::ensure_reserved_recovery_artifacts_absent(cx, &*vfs, &db_path)?;
                 }
