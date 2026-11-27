@@ -94,6 +94,46 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-27 - WIN (landed as 2408be7c5; inside its prediction band, past its gain kill line: trig_cte_20000 -68.66M Ir, x8.88 -> x8.59 stock 3.54.1): a trigger WHEN guard of literals and operators evaluates on the synchronous truthiness twin (bd-fpr5g, trig lane round 10, lever W1)
+
+- Target:
+  - `trigger_when_matches` evaluated every WHEN guard through the async `eval_expr_truthiness`, with two boxed futures
+    per leaf.
+  - On trig_cte_20000 (guard `NEW.n % 7 <> 3`, 20,000 firings) the guard cost 152.7M inclusive. 99.0M of it was the
+    async evaluation, 4.95k Ir a firing (callgrind, origin/main 630329d7c; bead comment of round 9).
+- Change (`crates/fsqlite-core/src/connection.rs`):
+  - When the bound guard has no parameters and `trigger_when_is_sync_evaluable` holds, `trigger_when_matches` first
+    calls `try_eval_expr_truthiness_sync` (bd-k5isc).
+  - The guard must be built only from literals, unary and binary operators, CAST, COLLATE, IS [NOT] NULL and searched
+    CASE.
+  - On `None` the async evaluator runs as before.
+  - Keeper: `bd_fpr5g_trigger_body_cache_under_cte::trigger_when_guards_fire_on_stocks_rows_on_both_evaluators`.
+- Prediction (bead, round 9, before any code): trig_cte / trig_src / trig_values -50M to -75M each, trig_src_9999 half
+  of that, every other row within +-0.1%.
+- Kill lines:
+  - trig_cte gaining under 30M;
+  - any other row above +0.2% Ir;
+  - a replicated judge v2b time LOSE above 1%;
+  - any answer that differs from stock.
+- Result:
+  - Arms in one rch job (a10e, vmi1227854, at 593cd5008): P f180dd300b486de2, W cfc3302a75d44835. Job j10d rebuilt
+    the same two ELFs byte for byte.
+  - Callgrind, stock 3.54.1 live, answers equal.
+  - trig_cte -68.66M (x8.88 -> x8.59), trig_src -68.08M (x7.84 -> x7.58), trig_srcw -68.42M (x8.60 -> x8.36),
+    trig_values -57.99M (x1.83 -> x1.78), trig_src_9999 -34.47M (x7.64 -> x7.37).
+  - The eight non-trigger rows are within +0.005%.
+  - Judge v2b (rj14/judge_run_v2b.sh; K=6 layouts of both ELFs from job j10d; stock 3.54.1 live; governor
+    performance): two valid runs (null max |z| 2.12 and 1.55). Every row and metric is a replicated TIE, so there is
+    no replicated LOSE above 1%.
+- Remaining on the guard: about 84M a 20,000-firing row.
+  - The twin is 30.1M.
+  - The per-firing clone + bind + drop of the WHEN tree is about 47M: `bind_trigger_when_skeleton` 28.9M, clone 7.2M,
+    drop 6.2M, row-value lowering 4.7M.
+  - The structural check is 2.4M.
+- Next lever on the guard: evaluate it without binding a cloned tree per firing.
+- Not caught by the keeper: mutant b (the checks bypassed). The twin declines those shapes itself today, so the check
+  is defensive.
+
 ## 2026-11-27 - CORRECTION to the bd-crzqa entry below (deab606c7): a SMALL WIN in real instructions. perf stat user instructions per autocommit point SELECT went 77,380 -> 76,139 (-1,241, -1.6%; x4.04 -> x3.97 against stock 3.54.1's 19,166). That is the real-instruction delta. Callgrind's -12,141 Ir (x4.52 -> x3.89) counts the removed ~11.7 KB rep movsb copy at about one Ir per byte, so it overstates the real change about 10x and is not a real change in the stock ratio. The time effect is pending bd-j0jc0 / bd-gvews.
 
 ## 2026-11-27 - WIN (landed as deab606c7; a regression fix measured like a lever, inside its prediction, past its gain kill line): one async executor layer instead of three gives back -12,141 Ir per autocommit point SELECT, x4.52 -> x3.89 stock 3.54.1 (bd-crzqa)
