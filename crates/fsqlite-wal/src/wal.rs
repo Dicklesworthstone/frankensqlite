@@ -4067,7 +4067,7 @@ mod tests {
                 .unwrap();
         wal.file()
             .write(cx, &bytes, wal.frame_offset(index))
-            .unwrap();
+            .expect("write the fixture frame");
         checksum
     }
 
@@ -4109,8 +4109,10 @@ mod tests {
         let vfs = MemoryVfs::new();
         let mut writer = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
             .expect("create WAL");
-        writer.append_frame(&cx, 1, &sample_page(1), 1).unwrap();
-        let mut reader = WalFile::open(&cx, open_wal_file(&vfs, &cx)).unwrap();
+        writer
+            .append_frame(&cx, 1, &sample_page(1), 1)
+            .expect("committed prefix");
+        let mut reader = WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("open the reader");
         let generation = reader.generation_identity();
         let checksum = reader.running_checksum();
         let marker = reader.last_commit_frame_header();
@@ -4127,7 +4129,7 @@ mod tests {
             damaged_prefix_checksum,
         );
 
-        let reopened = WalFile::open(&cx, open_wal_file(&vfs, &cx)).unwrap();
+        let reopened = WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("reopen the WAL");
         assert_eq!(reopened.frame_count(), 1);
         reader.refresh(&cx).expect("incremental replay");
         assert_eq!(reader.frame_count(), reopened.frame_count());
@@ -4179,7 +4181,8 @@ mod tests {
             assert_eq!(wal.frame_count(), 0);
             assert_eq!(wal.file().file_size(&cx).unwrap(), initial_size);
         }
-        wal.append_frame(&cx, 1, &page, 1).unwrap();
+        wal.append_frame(&cx, 1, &page, 1)
+            .expect("a valid frame still appends");
         assert_eq!(wal.frame_count(), 1);
     }
 
@@ -5968,7 +5971,7 @@ mod tests {
             .expect("create");
         let page = sample_page(1);
         wal.set_recorded_frame_header_cap(2);
-        wal.append_frame(&cx, 1, &page, 1).unwrap();
+        wal.append_frame(&cx, 1, &page, 1).expect("first commit");
         let frames = [
             frame_ref(2, &page, 0),
             frame_ref(3, &page, 0),
@@ -5979,10 +5982,15 @@ mod tests {
         assert_eq!(headers.len(), 1, "only one more header fits before I/O");
         assert_eq!(headers[0].page_number, 2);
         wal.append_prepared_frame_bytes(&cx, &mut bytes, &transforms)
-            .unwrap();
+            .expect("append the prepared batch");
         assert_eq!(wal.frame_count(), 4);
         assert_eq!(wal.frame_headers.len(), 2);
-        assert_eq!(wal.read_frame_header(&cx, 3).unwrap().db_size, 4);
+        assert_eq!(
+            wal.read_frame_header(&cx, 3)
+                .expect("read frame header 3")
+                .db_size,
+            4
+        );
 
         // Raising the cap after a gap cannot turn later headers into a prefix.
         wal.set_recorded_frame_header_cap(8);
