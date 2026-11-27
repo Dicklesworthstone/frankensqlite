@@ -160,6 +160,16 @@ fn inner_where_keeps_its_result_alias_scope() {
                     "SELECT y FROM (SELECT p + 5 AS x, q AS y FROM s WHERE abs(x) > 9)",
                     // The real source column p wins over the equally named inner alias.
                     "SELECT y FROM (SELECT q AS p, q AS y FROM s WHERE p > 5)",
+                    // The derived table exposes a, not the base column q.
+                    // These references to the outer alias q must evaluate p.
+                    "SELECT a AS q FROM (SELECT p AS a FROM s) WHERE q > 5",
+                    "SELECT a + 1 AS q FROM (SELECT p AS a FROM s) WHERE q BETWEEN 3 AND 7",
+                    "SELECT a AS q FROM (SELECT p AS a FROM s) ORDER BY q + 0",
+                    // If the derived table also exposes q it wins in WHERE.
+                    "SELECT a AS q FROM (SELECT p AS a, q FROM s) WHERE q = 1",
+                    "SELECT q FROM (SELECT *, p AS q FROM s) ORDER BY q",
+                    "SELECT a AS q FROM (SELECT p AS a, q FROM s) ORDER BY q COLLATE NOCASE",
+                    "SELECT a, q AS a FROM (SELECT p AS a, q FROM s) ORDER BY a",
                 ] {
                     let expected = stock(&rconn, sql).unwrap();
                     assert_eq!(
@@ -167,6 +177,16 @@ fn inner_where_keeps_its_result_alias_scope() {
                         Ok(expected),
                         "file={file_backed} strict={strict}: {sql}"
                     );
+                }
+                for sql in [
+                    "SELECT q FROM (SELECT p FROM s)",
+                    "SELECT s.p FROM (SELECT p FROM s) AS d",
+                    "SELECT main.d.p FROM (SELECT p FROM s) AS d",
+                    "SELECT a AS q, q FROM (SELECT p AS a FROM s)",
+                    "SELECT y AS x FROM (SELECT q AS y FROM s WHERE x > 5)",
+                ] {
+                    assert!(stock(&rconn, sql).is_err(), "{sql}");
+                    assert!(frank(&fconn, sql).await.is_err(), "file={file_backed} strict={strict}: {sql}");
                 }
             }
         }

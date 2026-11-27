@@ -143234,26 +143234,13 @@ fn flatten_from_subquery_select(
     let mut projection_map = build_flatten_projection_map(inner_columns)?;
     // A star may expose a column with the same name as an explicit projection.
     // Without expanding the source schema, the map cannot prove which name is
-    // the first exposed column. Keep these new shapes on the materializing path.
-    if strict && projection_map.passthrough_columns && !projection_map.columns.is_empty() {
+    // the first exposed column.
+    if projection_map.passthrough_columns && !projection_map.columns.is_empty() {
         return None;
     }
     // A table function's hidden argument columns are not exposed by `*`.
     if inner_is_table_function && projection_map.passthrough_columns {
         return None;
-    }
-    if strict {
-        projection_map.strict_outer_aliases = Some(
-            outer_columns
-                .iter()
-                .filter_map(|column| match column {
-                    ResultColumn::Expr {
-                        alias: Some(alias), ..
-                    } => Some(alias.to_ascii_lowercase()),
-                    _ => None,
-                })
-                .collect(),
-        );
     }
     let flattened_columns = flatten_outer_result_columns(
         outer_columns,
@@ -143261,18 +143248,44 @@ fn flatten_from_subquery_select(
         outer_alias.as_deref(),
         &projection_map,
     )?;
+    // Output aliases are visible in WHERE and ORDER BY, after FROM columns.
+    // They are invisible to sibling result expressions. Bind the projection
+    // first, then retain each alias's first definition in the base-table scope.
+    if outer_where.is_some() || !select.order_by.is_empty() {
+        for column in &flattened_columns {
+            if let ResultColumn::Expr { expr, alias: Some(name) } = column {
+                let name = name.to_ascii_lowercase();
+                if !projection_map.columns.contains_key(&name) {
+                    projection_map.clause_aliases.entry(name).or_insert_with(|| expr.clone());
+                }
+            }
+        }
+    }
     // A bare name in the inner WHERE can resolve to an inner result alias.
     // Hoisting that WHERE would resolve it against the outer projection,
     // which may omit or redefine the alias (bd-rzsg2).
     let mut inner_where = inner_where.clone();
     if let Some(predicate) = inner_where.as_deref_mut() {
         let mut uses_inner_alias = false;
+        let mut outer_only_names = Vec::new();
         for_each_column_ref_in_expr(predicate, &mut |column| {
-            uses_inner_alias = uses_inner_alias
-                || (column.table.is_none() && result_alias_expr(inner_columns, &column.column).is_some());
+            if column.table.is_some() {
+                return;
+            }
+            if result_alias_expr(inner_columns, &column.column).is_some() {
+                uses_inner_alias = true;
+            } else if let Some(expr) = result_alias_expr(&flattened_columns, &column.column)
+                && !matches!(expr, Expr::Column(base, _) if base.column.eq_ignore_ascii_case(&column.column))
+            {
+                outer_only_names.push(column.column.to_ascii_lowercase());
+            }
         });
-        if uses_inner_alias {
+        if uses_inner_alias || !outer_only_names.is_empty() {
             let source_columns = conn.select_from_column_names(inner_query)?;
+            // An outer alias cannot make an unresolved inner WHERE name valid.
+            if outer_only_names.iter().any(|name| !source_columns.contains(name)) {
+                return None;
+            }
             substitute_result_aliases_in_expr(predicate, inner_columns, &source_columns);
         }
     }
@@ -143285,7 +143298,6 @@ fn flatten_from_subquery_select(
         &select.order_by,
         outer_columns,
         inner_columns,
-        &flattened_columns,
         outer_alias.as_deref(),
         &projection_map,
     )?;
@@ -143323,10 +143335,7 @@ fn flatten_from_subquery_select(
 struct FlattenProjectionMap {
     passthrough_columns: bool,
     columns: HashMap<String, Expr>,
-    /// bd-5ap77: `Some(outer result aliases)` turns on strict resolution, where
-    /// a column reference that is neither exposed by the subquery nor an outer
-    /// alias blocks flattening.
-    strict_outer_aliases: Option<HashSet<String>>,
+    clause_aliases: HashMap<String, Expr>,
 }
 
 /// bd-5ap77: an inner projection expression that may be substituted for every
@@ -143469,10 +143478,7 @@ fn flatten_outer_result_columns(
             // expression carries no subquery or window whose own name scope the
             // rewrite cannot see into.
             ResultColumn::Expr { expr, alias } => {
-                if projection_map.strict_outer_aliases.is_none()
-                    || expr_has_any_subquery(expr)
-                    || expr_has_window_function(expr)
-                {
+                if expr_has_any_subquery(expr) || expr_has_window_function(expr) {
                     return None;
                 }
                 flattened.push(ResultColumn::Expr {
@@ -143508,7 +143514,6 @@ fn flatten_select_order_by_terms(
     order_by: &[OrderingTerm],
     outer_columns: &[ResultColumn],
     inner_columns: &[ResultColumn],
-    flattened_columns: &[ResultColumn],
     outer_alias: Option<&str>,
     projection_map: &FlattenProjectionMap,
 ) -> Option<Vec<OrderingTerm>> {
@@ -143559,7 +143564,7 @@ fn flatten_select_order_by_terms(
         // (`SELECT x+0 AS y FROM (SELECT a AS x, b AS y ...) ORDER BY y`
         // orders by a, not b). An unknowable name ahead of the match keeps
         // the subquery.
-        if let Expr::Column(column_ref, _) = &term.expr
+        if let Expr::Column(column_ref, _) = strip_collate_wrappers(&term.expr)
             && column_ref.table.is_none()
         {
             let mut target = None;
@@ -143574,14 +143579,16 @@ fn flatten_select_order_by_terms(
                 }
             }
             if let Some(index) = target {
-                let ResultColumn::Expr { expr, .. } = flattened_columns.get(index)? else {
-                    return None;
-                };
-                flattened_order_by.push(OrderingTerm {
-                    expr: expr.clone(),
-                    direction: term.direction,
-                    nulls: term.nulls,
-                });
+                // A named ORDER BY term addresses the result slot, even
+                // under COLLATE. Keep the collation wrappers and the slot
+                // identity so a volatile result needn't be evaluated twice.
+                let mut resolved = term.clone();
+                let mut leaf = &mut resolved.expr;
+                while let Expr::Collate { expr, .. } = leaf {
+                    leaf = expr;
+                }
+                *leaf = Expr::Literal(Literal::Integer(i64::try_from(index + 1).ok()?), leaf.span());
+                flattened_order_by.push(resolved);
                 continue;
             }
         }
@@ -143850,6 +143857,11 @@ fn flatten_column_ref(
     outer_alias: Option<&str>,
     projection_map: &FlattenProjectionMap,
 ) -> Option<Expr> {
+    // A derived table is a query-local source. A database-qualified name
+    // cannot refer to it, even when the table part spells the derived alias.
+    if column_ref.schema.is_some() {
+        return None;
+    }
     let exposed_name = column_ref.column.to_ascii_lowercase();
     let explicitly_qualified = column_ref
         .table
@@ -143862,9 +143874,7 @@ fn flatten_column_ref(
         }
         if projection_map.passthrough_columns {
             // A `*` subquery does not expose its source's rowid.
-            if projection_map.strict_outer_aliases.is_some()
-                && ["rowid", "oid", "_rowid_"].contains(&exposed_name.as_str())
-            {
+            if ["rowid", "oid", "_rowid_"].contains(&exposed_name.as_str()) {
                 return None;
             }
             return Some(Expr::Column(
@@ -143872,21 +143882,14 @@ fn flatten_column_ref(
                 span,
             ));
         }
-        if explicitly_qualified {
-            return None;
-        }
     }
 
-    if let Some(outer_aliases) = &projection_map.strict_outer_aliases {
-        // bd-5ap77: strict resolution keeps only unqualified references to an
-        // outer result alias; anything else (an unexposed inner column, an
-        // enclosing-query correlation) stays on the materializing path.
-        if column_ref.table.is_some() || !outer_aliases.contains(&exposed_name) {
-            return None;
-        }
+    // A derived table exposes only its result columns. Leaving an unknown
+    // name bare here would allow the base table to capture it after flattening.
+    if column_ref.table.is_none() {
+        return projection_map.clause_aliases.get(&exposed_name).cloned();
     }
-
-    Some(Expr::Column(column_ref.clone(), span))
+    None
 }
 
 fn combine_where_clauses(
