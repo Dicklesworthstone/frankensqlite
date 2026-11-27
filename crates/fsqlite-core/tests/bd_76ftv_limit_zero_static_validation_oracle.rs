@@ -19,12 +19,10 @@
 //!
 //! Every statement runs on bundled SQLite 3.54.1 (its outcome is pinned, so
 //! the comparison cannot pass vacuously) and on fsqlite, on `:memory:` and on
-//! a file, executed directly and prepared then stepped. A statement stock
-//! refuses must be refused; where fsqlite's message is stock's (`exact`), the
-//! text must match. The others keep fsqlite's pre-existing FROM-less wording
-//! (for example "no such column in WHERE" for stock's "no such column:
-//! missing_column"), which is a separate message-parity residual, not this
-//! regression, and is not pinned here.
+//! a file, executed directly and prepared then stepped. Since bd-22yt1, every
+//! statement — including the FROM-less column/alias/aggregate/window errors
+//! with `LIMIT 0`, `LIMIT 1`, bound `LIMIT ?`, and no `LIMIT` — must match
+//! stock SQLite 3.54.1's exact outcome text.
 //!
 //! Negative cases a naive "validate everything eagerly" fix fails: LIMIT 0
 //! still evaluates no row expression (an `abs(-9223372036854775808)` in the
@@ -141,117 +139,319 @@ fn untimed(outcome: &str) -> String {
 
 const SETUP: &str = "CREATE TABLE t(a, b); INSERT INTO t VALUES (1, 2), (3, 4);";
 
-/// (sql, bound parameters, stock 3.54.1's outcome, fsqlite's text must equal stock's)
-const STATEMENTS: &[(&str, &[i64], &str, bool)] = &[
-    // Refused by stock at prepare; fsqlite answered [] under LIMIT 0.
+/// (sql, bound parameters, stock 3.54.1's exact outcome)
+const STATEMENTS: &[(&str, &[i64], &str)] = &[
+    // Refused by stock at prepare; fsqlite answered [] under LIMIT 0 (bd-76ftv)
+    // and previously used nameless FROM-less wording (bd-22yt1).
     (
         "SELECT missing_column, count(*) LIMIT 0",
         &[],
         "prepare error: no such column: missing_column",
-        false,
     ),
     (
         "SELECT count(*) WHERE missing_column LIMIT 0",
         &[],
         "prepare error: no such column: missing_column",
-        false,
     ),
     (
         "SELECT count(*) LIMIT 0 OFFSET missing_column",
         &[],
         "prepare error: no such column: missing_column",
-        false,
     ),
     (
         "SELECT count(*) GROUP BY 1 LIMIT 0",
         &[],
         "prepare error: aggregate functions are not allowed in the GROUP BY clause",
-        true,
     ),
     (
         "SELECT count(*) AS c WHERE c = 1 LIMIT 0",
         &[],
         "prepare error: misuse of aggregate: count()",
-        false,
     ),
     (
         "SELECT count(*) AS c, c + 1 AS d WHERE d = 2 LIMIT 0",
         &[],
         "prepare error: no such column: c",
-        false,
     ),
     (
         "SELECT missing_column LIMIT 0",
         &[],
         "prepare error: no such column: missing_column",
-        false,
     ),
     (
         "SELECT 1 WHERE missing_column LIMIT 0",
         &[],
         "prepare error: no such column: missing_column",
-        false,
     ),
     (
         "SELECT 1 LIMIT 0 OFFSET missing_column",
         &[],
         "prepare error: no such column: missing_column",
-        false,
     ),
     // LIMIT given by an expression whose value is 0, or a bound 0.
     (
         "SELECT missing_column, count(*) LIMIT 1 - 1",
         &[],
         "prepare error: no such column: missing_column",
-        false,
     ),
     (
         "SELECT count(*) AS c WHERE c = 1 LIMIT -0",
         &[],
         "prepare error: misuse of aggregate: count()",
-        false,
     ),
     (
         "SELECT count(*) GROUP BY 1 LIMIT abs(0)",
         &[],
         "prepare error: aggregate functions are not allowed in the GROUP BY clause",
-        true,
     ),
     (
         "SELECT count(*) WHERE missing_column LIMIT (SELECT 0)",
         &[],
         "prepare error: no such column: missing_column",
-        true,
     ),
     (
         "SELECT missing_column, count(*) LIMIT ?",
         &[0],
         "prepare error: no such column: missing_column",
-        false,
     ),
     (
         "SELECT count(*) WHERE missing_column LIMIT ?",
         &[0],
         "prepare error: no such column: missing_column",
-        false,
     ),
     (
         "SELECT count(*) GROUP BY 1 LIMIT ?",
         &[0],
         "prepare error: aggregate functions are not allowed in the GROUP BY clause",
-        true,
     ),
     (
         "SELECT count(*) AS c WHERE c = 1 LIMIT ?",
         &[0],
         "prepare error: misuse of aggregate: count()",
-        false,
     ),
     (
         "SELECT 1 WHERE missing_column LIMIT ?",
         &[0],
         "prepare error: no such column: missing_column",
-        false,
+    ),
+    // bd-22yt1: the same FROM-less statements with LIMIT 1, bound LIMIT 1,
+    // and no LIMIT must produce the exact same stock error text.
+    (
+        "SELECT missing_column, count(*) LIMIT 1",
+        &[],
+        "prepare error: no such column: missing_column",
+    ),
+    (
+        "SELECT missing_column, count(*)",
+        &[],
+        "prepare error: no such column: missing_column",
+    ),
+    (
+        "SELECT count(*) WHERE missing_column LIMIT 1",
+        &[],
+        "prepare error: no such column: missing_column",
+    ),
+    (
+        "SELECT count(*) WHERE missing_column",
+        &[],
+        "prepare error: no such column: missing_column",
+    ),
+    (
+        "SELECT count(*) LIMIT 1 OFFSET missing_column",
+        &[],
+        "prepare error: no such column: missing_column",
+    ),
+    (
+        "SELECT count(*) AS c WHERE c = 1 LIMIT 1",
+        &[],
+        "prepare error: misuse of aggregate: count()",
+    ),
+    (
+        "SELECT count(*) AS c WHERE c = 1",
+        &[],
+        "prepare error: misuse of aggregate: count()",
+    ),
+    (
+        "SELECT count(*) AS c, c + 1 AS d WHERE d = 2 LIMIT 1",
+        &[],
+        "prepare error: no such column: c",
+    ),
+    (
+        "SELECT count(*) AS c, c + 1 AS d WHERE d = 2",
+        &[],
+        "prepare error: no such column: c",
+    ),
+    (
+        "SELECT missing_column LIMIT 1",
+        &[],
+        "prepare error: no such column: missing_column",
+    ),
+    (
+        "SELECT missing_column",
+        &[],
+        "prepare error: no such column: missing_column",
+    ),
+    (
+        "SELECT 1 WHERE missing_column LIMIT 1",
+        &[],
+        "prepare error: no such column: missing_column",
+    ),
+    (
+        "SELECT 1 WHERE missing_column",
+        &[],
+        "prepare error: no such column: missing_column",
+    ),
+    (
+        "SELECT 1 LIMIT 1 OFFSET missing_column",
+        &[],
+        "prepare error: no such column: missing_column",
+    ),
+    (
+        "SELECT missing_column, count(*) LIMIT ?",
+        &[1],
+        "prepare error: no such column: missing_column",
+    ),
+    (
+        "SELECT count(*) WHERE missing_column LIMIT ?",
+        &[1],
+        "prepare error: no such column: missing_column",
+    ),
+    (
+        "SELECT count(*) AS c WHERE c = 1 LIMIT ?",
+        &[1],
+        "prepare error: misuse of aggregate: count()",
+    ),
+    (
+        "SELECT 1 WHERE missing_column LIMIT ?",
+        &[1],
+        "prepare error: no such column: missing_column",
+    ),
+    // bd-22yt1: adjacent FROM-less clauses, qualified names, duplicate-alias
+    // precedence, multi-aggregate alias misuse, and aliased window misuse.
+    (
+        "SELECT t.missing LIMIT 0",
+        &[],
+        "prepare error: no such column: t.missing",
+    ),
+    (
+        "SELECT t.missing",
+        &[],
+        "prepare error: no such column: t.missing",
+    ),
+    (
+        "SELECT 1 WHERE t.missing LIMIT 0",
+        &[],
+        "prepare error: no such column: t.missing",
+    ),
+    (
+        "SELECT 1 LIMIT 0 OFFSET t.missing",
+        &[],
+        "prepare error: no such column: t.missing",
+    ),
+    (
+        "SELECT count(*) AS c, sum(1) AS d WHERE c = 1 AND d = 1 LIMIT 0",
+        &[],
+        "prepare error: misuse of aggregate: sum()",
+    ),
+    (
+        "SELECT count(*) AS c, sum(1) AS d WHERE c = 1 AND d = 1",
+        &[],
+        "prepare error: misuse of aggregate: sum()",
+    ),
+    (
+        "SELECT count(*) AS c WHERE missing_col AND c = 1 LIMIT 0",
+        &[],
+        "prepare error: no such column: missing_col",
+    ),
+    (
+        "SELECT count(*) AS c WHERE c = 1 AND missing_col",
+        &[],
+        "prepare error: no such column: missing_col",
+    ),
+    (
+        "SELECT count(*) AS c WHERE (SELECT c) LIMIT 0",
+        &[],
+        "prepare error: misuse of aggregate: count()",
+    ),
+    (
+        "SELECT count(*) AS c WHERE (SELECT c)",
+        &[],
+        "prepare error: misuse of aggregate: count()",
+    ),
+    (
+        "SELECT 1 AS c WHERE (SELECT c)",
+        &[],
+        "rows=[[\"1\"]]",
+    ),
+    (
+        "SELECT 1 AS c, (SELECT c)",
+        &[],
+        "prepare error: no such column: c",
+    ),
+    (
+        "SELECT row_number() OVER () AS r WHERE (SELECT r)",
+        &[],
+        "prepare error: misuse of aliased window function r",
+    ),
+    (
+        "SELECT count(*) AS x, 1 AS x WHERE x = 1 LIMIT 0",
+        &[],
+        "prepare error: misuse of aggregate: count()",
+    ),
+    (
+        "SELECT count(*) AS x, 1 AS x WHERE x = 1",
+        &[],
+        "prepare error: misuse of aggregate: count()",
+    ),
+    (
+        "SELECT 1 AS x, count(*) AS x WHERE x = 1",
+        &[],
+        "rows=[[\"1\", \"1\"]]",
+    ),
+    (
+        "SELECT row_number() OVER () AS r WHERE r = 1 LIMIT 0",
+        &[],
+        "prepare error: misuse of aliased window function r",
+    ),
+    (
+        "SELECT row_number() OVER () AS r WHERE r = 1",
+        &[],
+        "prepare error: misuse of aliased window function r",
+    ),
+    (
+        "SELECT row_number() OVER () AS r GROUP BY r",
+        &[],
+        "prepare error: misuse of aliased window function r",
+    ),
+    (
+        "SELECT row_number() OVER () AS r GROUP BY 1",
+        &[],
+        "prepare error: misuse of window function row_number()",
+    ),
+    (
+        "SELECT count(*) GROUP BY missing_g",
+        &[],
+        "prepare error: no such column: missing_g",
+    ),
+    (
+        "SELECT count(*) HAVING missing_h",
+        &[],
+        "prepare error: no such column: missing_h",
+    ),
+    (
+        "SELECT 1 ORDER BY missing_o",
+        &[],
+        "prepare error: no such column: missing_o",
+    ),
+    (
+        "VALUES (missing_v)",
+        &[],
+        "prepare error: no such column: missing_v",
+    ),
+    (
+        "SELECT row_number() OVER (ORDER BY missing_w)",
+        &[],
+        "prepare error: no such column: missing_w",
     ),
     // A window SELECT without FROM: its windows' keys, reached through a
     // SELECT-list alias, resolve their collation at prepare.
@@ -259,63 +459,53 @@ const STATEMENTS: &[(&str, &[i64], &str, bool)] = &[
         "SELECT 1 COLLATE nope AS x WINDOW w AS (ORDER BY x) ORDER BY row_number() OVER w LIMIT 0",
         &[],
         "prepare error: no such collation sequence: nope",
-        true,
     ),
     (
         "SELECT 1 COLLATE nope AS x WINDOW w AS (ORDER BY x) \
          ORDER BY row_number() OVER w LIMIT 1 - 1",
         &[],
         "prepare error: no such collation sequence: nope",
-        true,
     ),
     (
         "SELECT 1 COLLATE nope AS x ORDER BY row_number() OVER (ORDER BY x) LIMIT ?",
         &[0],
         "prepare error: no such collation sequence: nope",
-        true,
     ),
     // Refused under LIMIT 0 before this change too; must stay refused.
     (
         "SELECT count(*) AS c GROUP BY c LIMIT 0",
         &[],
         "prepare error: aggregate functions are not allowed in the GROUP BY clause",
-        true,
     ),
     (
         "SELECT count(*) HAVING missing_column LIMIT 0",
         &[],
         "prepare error: no such column: missing_column",
-        true,
     ),
     (
         "SELECT count(*) ORDER BY missing_column LIMIT 0",
         &[],
         "prepare error: no such column: missing_column",
-        true,
     ),
     (
         "SELECT count(*), no_such_fn(1) LIMIT 0",
         &[],
         "prepare error: no such function: no_such_fn",
-        true,
     ),
     (
         "SELECT count(*), abs(1, 2) LIMIT 0",
         &[],
         "prepare error: wrong number of arguments to function abs()",
-        true,
     ),
     (
         "SELECT a, (SELECT nosuch, count(*) LIMIT 0) FROM t ORDER BY a",
         &[],
         "prepare error: no such column: nosuch",
-        true,
     ),
     (
         "SELECT a, (SELECT t.nosuch LIMIT 0) FROM t ORDER BY a",
         &[],
         "prepare error: no such column: t.nosuch",
-        true,
     ),
     // Valid: LIMIT 0 evaluates no row expression (the overflow is never
     // raised) and a SELECT-list alias stays visible.
@@ -323,132 +513,111 @@ const STATEMENTS: &[(&str, &[i64], &str, bool)] = &[
         "SELECT count(*), abs(-9223372036854775808) LIMIT 0",
         &[],
         "rows=[]",
-        true,
     ),
     (
         "SELECT abs(-9223372036854775808) LIMIT 0",
         &[],
         "rows=[]",
-        true,
     ),
     (
         "SELECT count(*), abs(-9223372036854775808) LIMIT 1 - 1",
         &[],
         "rows=[]",
-        true,
     ),
     (
         "SELECT count(*), abs(-9223372036854775808) LIMIT ?",
         &[0],
         "rows=[]",
-        true,
     ),
     (
         "SELECT max(1) WHERE abs(-9223372036854775808) LIMIT 0",
         &[],
         "rows=[]",
-        true,
     ),
     (
         "SELECT count(*) GROUP BY abs(-9223372036854775808) LIMIT 0",
         &[],
         "rows=[]",
-        true,
     ),
     (
         "SELECT count(*) HAVING abs(-9223372036854775808) LIMIT 0",
         &[],
         "rows=[]",
-        true,
     ),
     (
         "SELECT count(*), abs(-9223372036854775808) ORDER BY 1 LIMIT 0",
         &[],
         "rows=[]",
-        true,
     ),
     (
         "SELECT count(*) LIMIT 0 OFFSET abs(-9223372036854775808)",
         &[],
         "rows=[]",
-        true,
     ),
     (
         "SELECT row_number() OVER (), abs(-9223372036854775808) LIMIT 0",
         &[],
         "rows=[]",
-        true,
     ),
     (
         "SELECT sum(abs(-9223372036854775808)) OVER () LIMIT 0",
         &[],
         "rows=[]",
-        true,
     ),
     (
         "SELECT 1 AS x ORDER BY row_number() OVER (ORDER BY x) LIMIT 0",
         &[],
         "rows=[]",
-        true,
     ),
-    ("SELECT 1 AS c WHERE c = 1 LIMIT 0", &[], "rows=[]", true),
-    ("SELECT count(*) AS c HAVING c > 0 LIMIT 0", &[], "rows=[]", true),
-    ("SELECT 1 AS c, count(*) WHERE c = 1 LIMIT 0", &[], "rows=[]", true),
+    ("SELECT 1 AS c WHERE c = 1 LIMIT 0", &[], "rows=[]"),
+    ("SELECT count(*) AS c HAVING c > 0 LIMIT 0", &[], "rows=[]"),
+    ("SELECT 1 AS c, count(*) WHERE c = 1 LIMIT 0", &[], "rows=[]"),
     // Valid: a subquery without FROM reads its outer row under LIMIT 0.
     (
         "SELECT a, (SELECT t.a LIMIT 0) FROM t ORDER BY a",
         &[],
         "rows=[[\"1\", \"NULL\"], [\"3\", \"NULL\"]]",
-        true,
     ),
     (
         "SELECT a, (SELECT count(*) + t.a LIMIT 0) FROM t ORDER BY a",
         &[],
         "rows=[[\"1\", \"NULL\"], [\"3\", \"NULL\"]]",
-        true,
     ),
     (
         "SELECT a, (SELECT b WHERE a > 1 LIMIT 0) FROM t ORDER BY a",
         &[],
         "rows=[[\"1\", \"NULL\"], [\"3\", \"NULL\"]]",
-        true,
     ),
     (
         "SELECT a FROM t WHERE NOT EXISTS (SELECT 1 WHERE t.b > 0 LIMIT 0) ORDER BY a",
         &[],
         "rows=[[\"1\"], [\"3\"]]",
-        true,
     ),
     (
         "SELECT a, (SELECT count(*) HAVING t.a > 0 LIMIT 0) FROM t ORDER BY a",
         &[],
         "rows=[[\"1\", \"NULL\"], [\"3\", \"NULL\"]]",
-        true,
     ),
     // Controls: with LIMIT 1 the same expressions do run.
     (
         "SELECT count(*), abs(-9223372036854775808) LIMIT 1",
         &[],
         "step error: integer overflow",
-        true,
     ),
     (
         "SELECT row_number() OVER (), abs(-9223372036854775808) LIMIT 1",
         &[],
         "step error: integer overflow",
-        true,
     ),
     (
         "SELECT 1 AS x ORDER BY row_number() OVER (ORDER BY x) LIMIT 1",
         &[],
         "rows=[[\"1\"]]",
-        true,
     ),
     (
         "SELECT a, (SELECT count(*) + t.a LIMIT 1) FROM t ORDER BY a",
         &[],
         "rows=[[\"1\", \"2\"], [\"3\", \"4\"]]",
-        true,
     ),
 ];
 
@@ -456,7 +625,7 @@ const STATEMENTS: &[(&str, &[i64], &str, bool)] = &[
 fn limit_zero_keeps_stock_prepare_errors_and_evaluates_no_row() {
     let stock = rusqlite::Connection::open_in_memory().unwrap();
     stock.execute_batch(SETUP).unwrap();
-    for (sql, params, pinned, _) in STATEMENTS {
+    for (sql, params, pinned) in STATEMENTS {
         assert_eq!(
             stock_outcome(&stock, sql, params),
             *pinned,
@@ -475,19 +644,13 @@ fn limit_zero_keeps_stock_prepare_errors_and_evaluates_no_row() {
             let conn = Connection::open(&path).await.unwrap();
             conn.execute_batch(SETUP).await.unwrap();
             for prepared in [false, true] {
-                for (sql, params, pinned, exact) in STATEMENTS {
+                for (sql, params, pinned) in STATEMENTS {
                     let got = fsqlite_outcome(&conn, sql, params, prepared).await;
-                    let stock_refuses = pinned.contains("error: ");
-                    let ok = if *exact {
-                        untimed(&got) == untimed(pinned)
-                    } else {
-                        stock_refuses && got.contains("error: ")
-                    };
+                    let ok = untimed(&got) == untimed(pinned);
                     if !ok {
                         mismatches.push(format!(
                             "file_backed={file_backed} prepared={prepared} `{sql}` {params:?}:\n    \
-                             got   {got}\n    stock {pinned}{}",
-                            if *exact { "" } else { " (refusal only)" }
+                             got   {got}\n    stock {pinned}"
                         ));
                     }
                 }

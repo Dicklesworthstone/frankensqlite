@@ -103408,6 +103408,58 @@ impl Connection {
         }
     }
 
+    fn fromless_aggregate_misuse_error(&self, expr: &Expr) -> FrankenError {
+        let message = self.with_fallback_function_registry(|| {
+            if let Some((name, span)) = rightmost_bare_aggregate_name_span(expr) {
+                set_error_byte_offset(span.start);
+                format!("misuse of aggregate: {name}()")
+            } else {
+                "misuse of aggregate: ".to_owned()
+            }
+        });
+        FrankenError::FunctionError(message)
+    }
+
+    fn first_fromless_window_alias_ref(
+        &self,
+        expr: &Expr,
+        columns: &[ResultColumn],
+    ) -> Option<String> {
+        let mut seen_aliases = HashSet::new();
+        let mut non_window_aliases = HashSet::new();
+        let mut window_aliases = Vec::new();
+        for column in columns {
+            let ResultColumn::Expr {
+                expr: col_expr,
+                alias: Some(alias),
+            } = column
+            else {
+                continue;
+            };
+            let alias_key = alias.to_ascii_lowercase();
+            if !seen_aliases.insert(alias_key.clone()) {
+                continue;
+            }
+            if expr_has_window_function(col_expr) {
+                window_aliases.push((alias_key, alias.clone()));
+            } else {
+                non_window_aliases.insert(alias_key);
+            }
+        }
+        if window_aliases.is_empty() {
+            return None;
+        }
+        let col_ref = first_external_column_ref_with_locals(expr, &[], &non_window_aliases)?;
+        if col_ref.table.is_some() {
+            return None;
+        }
+        let key = col_ref.column.to_ascii_lowercase();
+        window_aliases
+            .into_iter()
+            .find(|(alias_key, _)| *alias_key == key)
+            .map(|(_, alias)| alias)
+    }
+
     fn validate_fromless_aggregate_group_shape(&self, select: &SelectStatement) -> Result<()> {
         let SelectCore::Select {
             columns,
@@ -103421,27 +103473,15 @@ impl Connection {
             return Ok(());
         };
         if let Some(where_clause) = where_clause {
-            let scalar_output_aliases: HashSet<String> = columns
-                .iter()
-                .filter_map(|column| match column {
-                    ResultColumn::Expr {
-                        expr,
-                        alias: Some(alias),
-                    } if !self.expr_contains_aggregate_with_registry(expr)
-                        && !expr_has_window_function(expr) =>
-                    {
-                        Some(alias.to_ascii_lowercase())
-                    }
-                    ResultColumn::Expr { .. } | ResultColumn::Star | ResultColumn::TableStar(_) => {
-                        None
-                    }
-                })
-                .collect();
-            if expr_has_external_column_ref_with_locals(where_clause, &[], &scalar_output_aliases) {
-                return Err(FrankenError::FunctionError(
-                    "no such column or aggregate alias in WHERE".to_owned(),
-                ));
+            let output_aliases = collect_select_core_result_aliases(&select.body.select);
+            if let Some(col_ref) =
+                first_external_column_ref_with_locals(where_clause, &[], &output_aliases)
+            {
+                return Err(FrankenError::NoSuchColumn {
+                    name: format_external_column_ref_name(col_ref),
+                });
             }
+            let _ = self.resolve_fromless_aliases(where_clause, columns, true, "WHERE")?;
         }
         for group_expr in group_by {
             let effective = self.resolve_fromless_group_expr_with_aliases(group_expr, columns)?;
@@ -103451,22 +103491,27 @@ impl Connection {
                 ));
             }
             if expr_has_window_function(&effective) {
-                return Err(FrankenError::FunctionError(
-                    "misuse of window function".to_owned(),
-                ));
+                if let Some(alias) = self.first_fromless_window_alias_ref(group_expr, columns) {
+                    return Err(FrankenError::FunctionError(format!(
+                        "misuse of aliased window function {alias}"
+                    )));
+                }
+                return Err(window_misuse_error(&effective));
             }
-            if expr_has_external_column_ref(&effective, &[]) {
-                return Err(FrankenError::FunctionError(
-                    "no such column in GROUP BY".to_owned(),
-                ));
+            if let Some(col_ref) = first_external_column_ref(&effective, &[]) {
+                return Err(FrankenError::NoSuchColumn {
+                    name: format_external_column_ref_name(col_ref),
+                });
             }
         }
         if let Some(having) = having {
             let output_aliases = collect_select_core_result_aliases(&select.body.select);
-            if expr_has_external_column_ref_with_locals(having, &[], &output_aliases) {
-                return Err(FrankenError::FunctionError(
-                    "no such column in HAVING".to_owned(),
-                ));
+            if let Some(col_ref) =
+                first_external_column_ref_with_locals(having, &[], &output_aliases)
+            {
+                return Err(FrankenError::NoSuchColumn {
+                    name: format_external_column_ref_name(col_ref),
+                });
             }
         }
         Ok(())
@@ -103486,11 +103531,13 @@ impl Connection {
         expr: &Expr,
         columns: &[ResultColumn],
         scalar_aliases_only: bool,
-        clause: &str,
+        _clause: &str,
     ) -> Result<Expr> {
         let mut seen_aliases = HashSet::new();
+        let mut scalar_aliases = HashSet::new();
         let mut col_map = Vec::new();
         let mut replacements = Vec::new();
+        let mut non_scalar_defs: Vec<(String, String, &Expr)> = Vec::new();
         for column in columns {
             let ResultColumn::Expr {
                 expr,
@@ -103507,10 +103554,16 @@ impl Connection {
             // result expressions. Keep that invariant local to this helper as
             // well so alias cycles/dependencies cannot survive if a caller is
             // added without the normal prevalidation step.
-            if expr_has_external_column_ref(expr, &[]) {
-                return Err(FrankenError::FunctionError(format!(
-                    "cyclic or unresolved output alias in {clause}: {alias}"
-                )));
+            if let Some(col_ref) = first_external_column_ref(expr, &[]) {
+                return Err(FrankenError::NoSuchColumn {
+                    name: format_external_column_ref_name(col_ref),
+                });
+            }
+            if !self.expr_contains_aggregate_with_registry(expr) && !expr_has_window_function(expr)
+            {
+                scalar_aliases.insert(alias_key.clone());
+            } else {
+                non_scalar_defs.push((alias_key.clone(), alias.clone(), expr));
             }
             col_map.push(("$result".to_owned(), alias_key, false));
             replacements.push(expr.clone());
@@ -103542,14 +103595,31 @@ impl Connection {
         );
         if scalar_aliases_only {
             if self.expr_contains_aggregate_with_registry(&resolved) {
-                return Err(FrankenError::FunctionError(format!(
-                    "misuse of aggregate alias in {clause}"
-                )));
+                return Err(self.fromless_aggregate_misuse_error(&resolved));
             }
             if expr_has_window_function(&resolved) {
-                return Err(FrankenError::FunctionError(format!(
-                    "misuse of window-function alias in {clause}"
-                )));
+                if let Some(alias) = self.first_fromless_window_alias_ref(expr, columns) {
+                    return Err(FrankenError::FunctionError(format!(
+                        "misuse of aliased window function {alias}"
+                    )));
+                }
+                return Err(window_misuse_error(&resolved));
+            }
+            if let Some(col_ref) = first_external_column_ref_with_locals(expr, &[], &scalar_aliases)
+                && col_ref.table.is_none()
+            {
+                let key = col_ref.column.to_ascii_lowercase();
+                if let Some((_, alias, def_expr)) = non_scalar_defs
+                    .iter()
+                    .find(|(alias_key, _, _)| *alias_key == key)
+                {
+                    if expr_has_window_function(def_expr) {
+                        return Err(FrankenError::FunctionError(format!(
+                            "misuse of aliased window function {alias}"
+                        )));
+                    }
+                    return Err(self.fromless_aggregate_misuse_error(def_expr));
+                }
             }
         }
         Ok(resolved)
@@ -103754,9 +103824,12 @@ impl Connection {
                 let resolved =
                     self.resolve_fromless_aliases(predicate, columns, false, "HAVING")?;
                 if expr_has_window_function(&resolved) {
-                    return Err(FrankenError::FunctionError(
-                        "misuse of window function".to_owned(),
-                    ));
+                    if let Some(alias) = self.first_fromless_window_alias_ref(predicate, columns) {
+                        return Err(FrankenError::FunctionError(format!(
+                            "misuse of aliased window function {alias}"
+                        )));
+                    }
+                    return Err(window_misuse_error(&resolved));
                 }
                 Some(resolved)
             }
@@ -104615,10 +104688,10 @@ impl Connection {
                         false,
                         "ORDER BY",
                     )?;
-                    if expr_has_external_column_ref(&effective, &[]) {
-                        return Err(FrankenError::FunctionError(
-                            "no such column in ORDER BY".to_owned(),
-                        ));
+                    if let Some(col_ref) = first_external_column_ref(&effective, &[]) {
+                        return Err(FrankenError::NoSuchColumn {
+                            name: format_external_column_ref_name(col_ref),
+                        });
                     }
                     if evaluate_independent {
                         self.evaluate_expression_only_order_expr(&effective).await?;
@@ -147532,63 +147605,98 @@ fn expr_has_external_column_ref_with_schema_in_core_and_locals(
     ) != *expr
 }
 
+fn format_external_column_ref_name(col_ref: &ColumnRef) -> String {
+    col_ref.table.as_ref().map_or_else(
+        || col_ref.column.to_string(),
+        |table| format!("{table}.{}", col_ref.column),
+    )
+}
+
 fn select_statement_has_external_column_ref(
     select: &SelectStatement,
     ancestor_tables: &[String],
 ) -> bool {
-    select.with.as_ref().is_some_and(|with| {
-        with.ctes
-            .iter()
-            .any(|cte| select_statement_has_external_column_ref(&cte.query, ancestor_tables))
-    }) || select_core_has_external_column_ref(&select.body.select, ancestor_tables)
-        || select
-            .body
-            .compounds
-            .iter()
-            .any(|(_, core)| select_core_has_external_column_ref(core, ancestor_tables))
-        // bd-2fong red 4: statement-level ORDER BY and LIMIT resolve in the
-        // primary core's scope and can carry correlated outer references
-        // (`... ORDER BY abs(y - outer.x) LIMIT 1`). Skipping them made the
-        // correlation detector misjudge such subqueries as non-correlated, so
-        // the compiled IN-probe lane admitted a shape whose codegen cannot
-        // resolve the outer name (NoSuchColumn at prepare). Mirror the
-        // substitution walker's statement-level extension.
-        || {
-            let inner_tables =
-                protected_tables_for_core(&select.body.select, ancestor_tables);
-            // ORDER BY resolves output aliases before any outer scope
-            // (`SELECT 1 AS x ORDER BY x` is fully local), so aliases join
-            // the local set unconditionally here.
-            let output_aliases = collect_select_core_result_aliases(&select.body.select);
-            select.order_by.iter().any(|term| {
-                expr_has_external_column_ref_with_locals(
-                    &term.expr,
-                    &inner_tables,
-                    &output_aliases,
-                )
-            }) || select.limit.as_ref().is_some_and(|limit| {
-                expr_has_external_column_ref_with_locals(
-                    &limit.limit,
-                    &inner_tables,
-                    &output_aliases,
-                ) || limit.offset.as_ref().is_some_and(|offset| {
-                    expr_has_external_column_ref_with_locals(
-                        offset,
-                        &inner_tables,
-                        &output_aliases,
-                    )
-                })
-            })
-        }
+    select_statement_first_external_column_ref_with_outer_locals(
+        select,
+        ancestor_tables,
+        &HashSet::new(),
+    )
+    .is_some()
 }
 
-fn select_core_has_external_column_ref(core: &SelectCore, ancestor_tables: &[String]) -> bool {
+fn select_statement_first_external_column_ref_with_outer_locals<'a>(
+    select: &'a SelectStatement,
+    ancestor_tables: &[String],
+    outer_locals: &HashSet<String>,
+) -> Option<&'a ColumnRef> {
+    if let Some(with) = &select.with
+        && let Some(col_ref) = with.ctes.iter().find_map(|cte| {
+            select_statement_first_external_column_ref_with_outer_locals(
+                &cte.query,
+                ancestor_tables,
+                outer_locals,
+            )
+        })
+    {
+        return Some(col_ref);
+    }
+    if let Some(col_ref) = select_core_first_external_column_ref_with_outer_locals(
+        &select.body.select,
+        ancestor_tables,
+        outer_locals,
+    ) {
+        return Some(col_ref);
+    }
+    if let Some(col_ref) = select.body.compounds.iter().find_map(|(_, core)| {
+        select_core_first_external_column_ref_with_outer_locals(core, ancestor_tables, outer_locals)
+    }) {
+        return Some(col_ref);
+    }
+    // bd-2fong red 4: statement-level ORDER BY and LIMIT resolve in the
+    // primary core's scope and can carry correlated outer references
+    // (`... ORDER BY abs(y - outer.x) LIMIT 1`). Skipping them made the
+    // correlation detector misjudge such subqueries as non-correlated, so
+    // the compiled IN-probe lane admitted a shape whose codegen cannot
+    // resolve the outer name (NoSuchColumn at prepare). Mirror the
+    // substitution walker's statement-level extension.
+    let inner_tables = protected_tables_for_core(&select.body.select, ancestor_tables);
+    // ORDER BY resolves output aliases before any outer scope
+    // (`SELECT 1 AS x ORDER BY x` is fully local), so aliases join
+    // the local set unconditionally here.
+    let mut output_aliases = collect_select_core_result_aliases(&select.body.select);
+    output_aliases.extend(outer_locals.iter().cloned());
+    select
+        .order_by
+        .iter()
+        .find_map(|term| {
+            first_external_column_ref_with_locals(&term.expr, &inner_tables, &output_aliases)
+        })
+        .or_else(|| {
+            select.limit.as_ref().and_then(|limit| {
+                first_external_column_ref_with_locals(&limit.limit, &inner_tables, &output_aliases)
+                    .or_else(|| {
+                        limit.offset.as_ref().and_then(|offset| {
+                            first_external_column_ref_with_locals(
+                                offset,
+                                &inner_tables,
+                                &output_aliases,
+                            )
+                        })
+                    })
+            })
+        })
+}
+
+fn select_core_first_external_column_ref_with_outer_locals<'a>(
+    core: &'a SelectCore,
+    ancestor_tables: &[String],
+    outer_locals: &HashSet<String>,
+) -> Option<&'a ColumnRef> {
     let inner_tables = protected_tables_for_core(core, ancestor_tables);
     match core {
-        SelectCore::Values(rows) => rows
-            .iter()
-            .flatten()
-            .any(|expr| expr_has_external_column_ref(expr, &inner_tables)),
+        SelectCore::Values(rows) => rows.iter().flatten().find_map(|expr| {
+            first_external_column_ref_with_locals(expr, &inner_tables, outer_locals)
+        }),
         SelectCore::Select {
             columns,
             from,
@@ -147598,32 +147706,54 @@ fn select_core_has_external_column_ref(core: &SelectCore, ancestor_tables: &[Str
             windows,
             ..
         } => {
-            let output_aliases = if from.is_none() {
+            let mut output_aliases = if from.is_none() {
                 collect_select_core_result_aliases(core)
             } else {
                 HashSet::new()
             };
+            output_aliases.extend(outer_locals.iter().cloned());
             // bd-r9dhv: GROUP BY resolves output aliases before any outer
             // scope, and may then reach an outer column (SQLite 3.53).
-            let group_by_locals = collect_select_core_result_aliases(core);
+            let mut group_by_locals = collect_select_core_result_aliases(core);
+            group_by_locals.extend(outer_locals.iter().cloned());
             columns
                 .iter()
-                .any(|column| result_column_has_external_column_ref(column, &inner_tables))
-                || group_by.iter().any(|expr| {
-                    expr_has_external_column_ref_with_locals(expr, &inner_tables, &group_by_locals)
+                .find_map(|column| {
+                    result_column_first_external_column_ref_with_outer_locals(
+                        column,
+                        &inner_tables,
+                        outer_locals,
+                    )
                 })
-                || from
-                    .as_ref()
-                    .is_some_and(|from| from_clause_has_external_column_ref(from, &inner_tables))
-                || where_clause.as_deref().is_some_and(|wh| {
-                    expr_has_external_column_ref_with_locals(wh, &inner_tables, &output_aliases)
+                .or_else(|| {
+                    group_by.iter().find_map(|expr| {
+                        first_external_column_ref_with_locals(expr, &inner_tables, &group_by_locals)
+                    })
                 })
-                || having.as_deref().is_some_and(|expr| {
-                    expr_has_external_column_ref_with_locals(expr, &inner_tables, &output_aliases)
+                .or_else(|| {
+                    from.as_ref().and_then(|from| {
+                        from_clause_first_external_column_ref_with_outer_locals(
+                            from,
+                            &inner_tables,
+                            outer_locals,
+                        )
+                    })
                 })
-                || windows
-                    .iter()
-                    .any(|window| window_spec_has_external_column_ref(&window.spec, &inner_tables))
+                .or_else(|| {
+                    where_clause.as_deref().and_then(|wh| {
+                        first_external_column_ref_with_locals(wh, &inner_tables, &output_aliases)
+                    })
+                })
+                .or_else(|| {
+                    having.as_deref().and_then(|expr| {
+                        first_external_column_ref_with_locals(expr, &inner_tables, &output_aliases)
+                    })
+                })
+                .or_else(|| {
+                    windows.iter().find_map(|window| {
+                        window_spec_first_external_column_ref(&window.spec, &inner_tables)
+                    })
+                })
         }
     }
 }
@@ -147647,44 +147777,64 @@ fn collect_select_core_inner_aliases(core: &SelectCore, out: &mut Vec<String>) {
     }
 }
 
-fn result_column_has_external_column_ref(column: &ResultColumn, inner_tables: &[String]) -> bool {
+fn result_column_first_external_column_ref_with_outer_locals<'a>(
+    column: &'a ResultColumn,
+    inner_tables: &[String],
+    outer_locals: &HashSet<String>,
+) -> Option<&'a ColumnRef> {
     match column {
-        ResultColumn::Expr { expr, .. } => expr_has_external_column_ref(expr, inner_tables),
-        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+        ResultColumn::Expr { expr, .. } => {
+            first_external_column_ref_with_locals(expr, inner_tables, outer_locals)
+        }
+        ResultColumn::Star | ResultColumn::TableStar(_) => None,
     }
 }
 
-fn window_spec_has_external_column_ref(window: &WindowSpec, inner_tables: &[String]) -> bool {
+fn window_spec_first_external_column_ref<'a>(
+    window: &'a WindowSpec,
+    inner_tables: &[String],
+) -> Option<&'a ColumnRef> {
     window
         .partition_by
         .iter()
-        .any(|expr| expr_has_external_column_ref(expr, inner_tables))
-        || window
-            .order_by
-            .iter()
-            .any(|term| expr_has_external_column_ref(&term.expr, inner_tables))
-        || window
-            .frame
-            .as_ref()
-            .is_some_and(|frame| frame_spec_has_external_column_ref(frame, inner_tables))
+        .find_map(|expr| first_external_column_ref(expr, inner_tables))
+        .or_else(|| {
+            window
+                .order_by
+                .iter()
+                .find_map(|term| first_external_column_ref(&term.expr, inner_tables))
+        })
+        .or_else(|| {
+            window
+                .frame
+                .as_ref()
+                .and_then(|frame| frame_spec_first_external_column_ref(frame, inner_tables))
+        })
 }
 
-fn frame_spec_has_external_column_ref(frame: &FrameSpec, inner_tables: &[String]) -> bool {
-    frame_bound_has_external_column_ref(&frame.start, inner_tables)
-        || frame
+fn frame_spec_first_external_column_ref<'a>(
+    frame: &'a FrameSpec,
+    inner_tables: &[String],
+) -> Option<&'a ColumnRef> {
+    frame_bound_first_external_column_ref(&frame.start, inner_tables).or_else(|| {
+        frame
             .end
             .as_ref()
-            .is_some_and(|bound| frame_bound_has_external_column_ref(bound, inner_tables))
+            .and_then(|bound| frame_bound_first_external_column_ref(bound, inner_tables))
+    })
 }
 
-fn frame_bound_has_external_column_ref(bound: &FrameBound, inner_tables: &[String]) -> bool {
+fn frame_bound_first_external_column_ref<'a>(
+    bound: &'a FrameBound,
+    inner_tables: &[String],
+) -> Option<&'a ColumnRef> {
     match bound {
         FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
-            expr_has_external_column_ref(expr, inner_tables)
+            first_external_column_ref(expr, inner_tables)
         }
         FrameBound::UnboundedPreceding
         | FrameBound::CurrentRow
-        | FrameBound::UnboundedFollowing => false,
+        | FrameBound::UnboundedFollowing => None,
     }
 }
 
@@ -147943,31 +148093,57 @@ fn collect_main_qualified_name(name: &QualifiedName, out: &mut HashSet<String>) 
     }
 }
 
-fn from_clause_has_external_column_ref(from: &FromClause, inner_tables: &[String]) -> bool {
-    table_or_subquery_has_external_column_ref(&from.source, inner_tables)
-        || from.joins.iter().any(|join| {
-            table_or_subquery_has_external_column_ref(&join.table, inner_tables)
-                || matches!(
-                    &join.constraint,
-                    Some(JoinConstraint::On(expr))
-                        if expr_has_external_column_ref(expr, inner_tables)
-                )
+fn from_clause_first_external_column_ref_with_outer_locals<'a>(
+    from: &'a FromClause,
+    inner_tables: &[String],
+    outer_locals: &HashSet<String>,
+) -> Option<&'a ColumnRef> {
+    table_or_subquery_first_external_column_ref_with_outer_locals(
+        &from.source,
+        inner_tables,
+        outer_locals,
+    )
+    .or_else(|| {
+        from.joins.iter().find_map(|join| {
+            table_or_subquery_first_external_column_ref_with_outer_locals(
+                &join.table,
+                inner_tables,
+                outer_locals,
+            )
+            .or_else(|| match &join.constraint {
+                Some(JoinConstraint::On(expr)) => {
+                    first_external_column_ref_with_locals(expr, inner_tables, outer_locals)
+                }
+                _ => None,
+            })
         })
+    })
 }
 
-fn table_or_subquery_has_external_column_ref(
-    source: &TableOrSubquery,
+fn table_or_subquery_first_external_column_ref_with_outer_locals<'a>(
+    source: &'a TableOrSubquery,
     inner_tables: &[String],
-) -> bool {
+    outer_locals: &HashSet<String>,
+) -> Option<&'a ColumnRef> {
     match source {
-        TableOrSubquery::Table { .. } => false,
+        TableOrSubquery::Table { .. } => None,
         TableOrSubquery::Subquery { query, .. } => {
-            select_statement_has_external_column_ref(query, inner_tables)
+            select_statement_first_external_column_ref_with_outer_locals(
+                query,
+                inner_tables,
+                outer_locals,
+            )
         }
         TableOrSubquery::TableFunction { args, .. } => args
             .iter()
-            .any(|expr| expr_has_external_column_ref(expr, inner_tables)),
-        TableOrSubquery::ParenJoin(from) => from_clause_has_external_column_ref(from, inner_tables),
+            .find_map(|expr| first_external_column_ref_with_locals(expr, inner_tables, outer_locals)),
+        TableOrSubquery::ParenJoin(from) => {
+            from_clause_first_external_column_ref_with_outer_locals(
+                from,
+                inner_tables,
+                outer_locals,
+            )
+        }
     }
 }
 
@@ -147981,67 +148157,85 @@ fn table_or_subquery_has_external_column_ref(
 /// does not match an inner table can be proven external without schema-aware
 /// name resolution.
 fn expr_has_external_column_ref(expr: &Expr, inner_tables: &[String]) -> bool {
-    expr_has_external_column_ref_with_locals(expr, inner_tables, &HashSet::new())
+    first_external_column_ref(expr, inner_tables).is_some()
 }
 
-fn expr_has_external_column_ref_with_locals(
-    expr: &Expr,
+fn first_external_column_ref<'a>(
+    expr: &'a Expr,
+    inner_tables: &[String],
+) -> Option<&'a ColumnRef> {
+    first_external_column_ref_with_locals(expr, inner_tables, &HashSet::new())
+}
+
+fn first_external_column_ref_with_locals<'a>(
+    expr: &'a Expr,
     inner_tables: &[String],
     local_output_names: &HashSet<String>,
-) -> bool {
+) -> Option<&'a ColumnRef> {
     match expr {
         Expr::Column(col_ref, _) => {
             if let Some(qualifier) = &col_ref.table {
-                if inner_tables.is_empty() {
-                    return true;
+                if inner_tables.is_empty()
+                    || !inner_tables
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(qualifier))
+                {
+                    return Some(col_ref);
                 }
-                return !inner_tables
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(qualifier));
+                return None;
             }
-            inner_tables.is_empty()
-                && !local_output_names.contains(&col_ref.column.to_ascii_lowercase())
+            (inner_tables.is_empty()
+                && !local_output_names.contains(&col_ref.column.to_ascii_lowercase()))
+            .then_some(col_ref)
         }
         Expr::BinaryOp { left, right, .. } => {
-            expr_has_external_column_ref_with_locals(left, inner_tables, local_output_names)
-                || expr_has_external_column_ref_with_locals(right, inner_tables, local_output_names)
+            first_external_column_ref_with_locals(left, inner_tables, local_output_names).or_else(
+                || first_external_column_ref_with_locals(right, inner_tables, local_output_names),
+            )
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
         | Expr::Cast { expr: inner, .. }
         | Expr::Collate { expr: inner, .. } => {
-            expr_has_external_column_ref_with_locals(inner, inner_tables, local_output_names)
+            first_external_column_ref_with_locals(inner, inner_tables, local_output_names)
         }
         Expr::Between {
             expr: inner,
             low,
             high,
             ..
-        } => {
-            expr_has_external_column_ref_with_locals(inner, inner_tables, local_output_names)
-                || expr_has_external_column_ref_with_locals(low, inner_tables, local_output_names)
-                || expr_has_external_column_ref_with_locals(high, inner_tables, local_output_names)
-        }
+        } => first_external_column_ref_with_locals(inner, inner_tables, local_output_names)
+            .or_else(|| {
+                first_external_column_ref_with_locals(low, inner_tables, local_output_names)
+            })
+            .or_else(|| {
+                first_external_column_ref_with_locals(high, inner_tables, local_output_names)
+            }),
         Expr::In {
             expr: inner, set, ..
         } => {
             if matches!(set, InSet::List(values) if values.is_empty()) {
-                return false;
+                return None;
             }
-            expr_has_external_column_ref_with_locals(inner, inner_tables, local_output_names)
+            first_external_column_ref_with_locals(inner, inner_tables, local_output_names).or_else(
                 || match set {
-                    InSet::List(items) => items.iter().any(|item| {
-                        expr_has_external_column_ref_with_locals(
+                    InSet::List(items) => items.iter().find_map(|item| {
+                        first_external_column_ref_with_locals(
                             item,
                             inner_tables,
                             local_output_names,
                         )
                     }),
                     InSet::Subquery(subquery) => {
-                        select_statement_has_external_column_ref(subquery, inner_tables)
+                        select_statement_first_external_column_ref_with_outer_locals(
+                            subquery,
+                            inner_tables,
+                            local_output_names,
+                        )
                     }
-                    InSet::Table(_) => false,
-                }
+                    InSet::Table(_) => None,
+                },
+            )
         }
         Expr::FunctionCall {
             args,
@@ -148050,84 +148244,98 @@ fn expr_has_external_column_ref_with_locals(
             over,
             ..
         } => {
-            let args_have_external_ref = matches!(
-                args,
-                FunctionArgs::List(items)
-                    if items
-                        .iter()
-                        .any(|item| expr_has_external_column_ref_with_locals(
-                            item,
+            let args_ref = match args {
+                FunctionArgs::List(items) => items.iter().find_map(|item| {
+                    first_external_column_ref_with_locals(item, inner_tables, local_output_names)
+                }),
+                FunctionArgs::Star => None,
+            };
+            args_ref
+                .or_else(|| {
+                    order_by.iter().find_map(|term| {
+                        first_external_column_ref_with_locals(
+                            &term.expr,
                             inner_tables,
                             local_output_names,
-                        ))
-            );
-            args_have_external_ref
-                || order_by.iter().any(|term| {
-                    expr_has_external_column_ref_with_locals(
-                        &term.expr,
-                        inner_tables,
-                        local_output_names,
-                    )
+                        )
+                    })
                 })
-                || filter.as_ref().is_some_and(|expr| {
-                    expr_has_external_column_ref_with_locals(expr, inner_tables, local_output_names)
+                .or_else(|| {
+                    filter.as_ref().and_then(|expr| {
+                        first_external_column_ref_with_locals(
+                            expr,
+                            inner_tables,
+                            local_output_names,
+                        )
+                    })
                 })
-                || over
-                    .as_ref()
-                    .is_some_and(|window| window_spec_has_external_column_ref(window, inner_tables))
+                .or_else(|| {
+                    over.as_ref()
+                        .and_then(|window| window_spec_first_external_column_ref(window, inner_tables))
+                })
         }
         Expr::Case {
             operand,
             whens,
             else_expr,
             ..
-        } => {
-            operand.as_ref().is_some_and(|operand| {
-                expr_has_external_column_ref_with_locals(operand, inner_tables, local_output_names)
-            }) || whens.iter().any(|(c, t)| {
-                expr_has_external_column_ref_with_locals(c, inner_tables, local_output_names)
-                    || expr_has_external_column_ref_with_locals(t, inner_tables, local_output_names)
-            }) || else_expr.as_ref().is_some_and(|else_expr| {
-                expr_has_external_column_ref_with_locals(
-                    else_expr,
-                    inner_tables,
-                    local_output_names,
-                )
+        } => operand
+            .as_ref()
+            .and_then(|operand| {
+                first_external_column_ref_with_locals(operand, inner_tables, local_output_names)
             })
-        }
+            .or_else(|| {
+                whens.iter().find_map(|(c, t)| {
+                    first_external_column_ref_with_locals(c, inner_tables, local_output_names)
+                        .or_else(|| {
+                            first_external_column_ref_with_locals(
+                                t,
+                                inner_tables,
+                                local_output_names,
+                            )
+                        })
+                })
+            })
+            .or_else(|| {
+                else_expr.as_ref().and_then(|else_expr| {
+                    first_external_column_ref_with_locals(
+                        else_expr,
+                        inner_tables,
+                        local_output_names,
+                    )
+                })
+            }),
         Expr::Like {
             expr: inner,
             pattern,
             escape,
             ..
-        } => {
-            expr_has_external_column_ref_with_locals(inner, inner_tables, local_output_names)
-                || expr_has_external_column_ref_with_locals(
-                    pattern,
-                    inner_tables,
-                    local_output_names,
-                )
-                || escape.as_ref().is_some_and(|escape| {
-                    expr_has_external_column_ref_with_locals(
-                        escape,
-                        inner_tables,
-                        local_output_names,
-                    )
+        } => first_external_column_ref_with_locals(inner, inner_tables, local_output_names)
+            .or_else(|| {
+                first_external_column_ref_with_locals(pattern, inner_tables, local_output_names)
+            })
+            .or_else(|| {
+                escape.as_ref().and_then(|escape| {
+                    first_external_column_ref_with_locals(escape, inner_tables, local_output_names)
                 })
-        }
+            }),
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
-            select_statement_has_external_column_ref(subquery, inner_tables)
+            select_statement_first_external_column_ref_with_outer_locals(
+                subquery,
+                inner_tables,
+                local_output_names,
+            )
         }
         Expr::JsonAccess {
             expr: inner, path, ..
-        } => {
-            expr_has_external_column_ref_with_locals(inner, inner_tables, local_output_names)
-                || expr_has_external_column_ref_with_locals(path, inner_tables, local_output_names)
-        }
-        Expr::RowValue(values, _) => values.iter().any(|value| {
-            expr_has_external_column_ref_with_locals(value, inner_tables, local_output_names)
+        } => first_external_column_ref_with_locals(inner, inner_tables, local_output_names)
+            .or_else(|| {
+                first_external_column_ref_with_locals(path, inner_tables, local_output_names)
+            }),
+        Expr::RowValue(values, _) => values.iter().find_map(|value| {
+            first_external_column_ref_with_locals(value, inner_tables, local_output_names)
         }),
-        _ => false,
+        _ => None,
     }
 }
 
@@ -168819,31 +169027,32 @@ fn validate_fromless_projection_shape(select: &SelectStatement) -> Result<()> {
     }
     for column in columns {
         if let ResultColumn::Expr { expr, .. } = column
-            && expr_has_external_column_ref(expr, &[])
+            && let Some(col_ref) = first_external_column_ref(expr, &[])
         {
-            return Err(FrankenError::FunctionError(
-                "no such column in result expression".to_owned(),
-            ));
+            return Err(FrankenError::NoSuchColumn {
+                name: format_external_column_ref_name(col_ref),
+            });
         }
     }
     let output_aliases = collect_select_core_result_aliases(&select.body.select);
-    if where_clause.as_deref().is_some_and(|where_clause| {
-        expr_has_external_column_ref_with_locals(where_clause, &[], &output_aliases)
+    if let Some(col_ref) = where_clause.as_deref().and_then(|where_clause| {
+        first_external_column_ref_with_locals(where_clause, &[], &output_aliases)
     }) {
-        return Err(FrankenError::FunctionError(
-            "no such column in WHERE".to_owned(),
-        ));
+        return Err(FrankenError::NoSuchColumn {
+            name: format_external_column_ref_name(col_ref),
+        });
     }
-    if select.limit.as_ref().is_some_and(|limit| {
-        expr_has_external_column_ref(&limit.limit, &[])
-            || limit
+    if let Some(col_ref) = select.limit.as_ref().and_then(|limit| {
+        first_external_column_ref(&limit.limit, &[]).or_else(|| {
+            limit
                 .offset
                 .as_ref()
-                .is_some_and(|offset| expr_has_external_column_ref(offset, &[]))
+                .and_then(|offset| first_external_column_ref(offset, &[]))
+        })
     }) {
-        return Err(FrankenError::FunctionError(
-            "no such column in LIMIT or OFFSET".to_owned(),
-        ));
+        return Err(FrankenError::NoSuchColumn {
+            name: format_external_column_ref_name(col_ref),
+        });
     }
     Ok(())
 }
@@ -168872,13 +169081,13 @@ fn validate_fromless_window_value_shapes(select: &SelectStatement) -> Result<()>
                 detail: "VALUES rows must have matching column counts".to_owned(),
             });
         }
-        if row
+        if let Some(col_ref) = row
             .iter()
-            .any(|expr| expr_has_external_column_ref(expr, &[]))
+            .find_map(|expr| first_external_column_ref(expr, &[]))
         {
-            return Err(FrankenError::FunctionError(
-                "no such column in VALUES expression".to_owned(),
-            ));
+            return Err(FrankenError::NoSuchColumn {
+                name: format_external_column_ref_name(col_ref),
+            });
         }
     }
     Ok(())
@@ -168911,10 +169120,10 @@ fn validate_fromless_used_window_scopes(
                 )
             })?;
             let resolved = resolve_used_window_spec(&window, visible_windows)?;
-            if window_spec_has_external_column_ref(&resolved, &[]) {
-                return Err(FrankenError::FunctionError(
-                    "no such column in window specification".to_owned(),
-                ));
+            if let Some(col_ref) = window_spec_first_external_column_ref(&resolved, &[]) {
+                return Err(FrankenError::NoSuchColumn {
+                    name: format_external_column_ref_name(col_ref),
+                });
             }
             if let Some(filter) = &filter {
                 validate_window_key_expr_collations_cached(
@@ -173530,8 +173739,9 @@ struct SelectApproximateColumn {
     generated_suffix_upper_bound: Option<usize>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SelectOutputAliasUse {
+    #[default]
     None,
     Where,
     GroupBy,
@@ -173546,6 +173756,7 @@ struct SelectColumnReferenceScope {
     col_map: Vec<(String, String, bool)>,
     using_skip: HashSet<usize>,
     output_aliases: Vec<SelectOutputAlias>,
+    nested_alias_use: SelectOutputAliasUse,
     valid_qualifiers: Vec<String>,
     match_table_names: Vec<String>,
     fts5_rank_table_names: Vec<String>,
@@ -173826,6 +174037,7 @@ impl SelectColumnReferenceScope {
             col_map,
             using_skip,
             output_aliases,
+            nested_alias_use: SelectOutputAliasUse::None,
             valid_qualifiers: Vec::new(),
             match_table_names,
             fts5_rank_table_names,
@@ -173846,6 +174058,7 @@ impl SelectColumnReferenceScope {
             col_map: Vec::new(),
             using_skip: HashSet::new(),
             output_aliases: Vec::new(),
+            nested_alias_use: SelectOutputAliasUse::None,
             valid_qualifiers: Vec::new(),
             match_table_names: Vec::new(),
             fts5_rank_table_names: Vec::new(),
@@ -175462,8 +175675,11 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
         &mut self,
         select: &'select SelectStatement,
         scope: &SelectColumnReferenceScope,
+        alias_use: SelectOutputAliasUse,
     ) -> Result<()> {
-        self.outer_scopes.push(scope.clone());
+        let mut outer_scope = scope.clone();
+        outer_scope.nested_alias_use = alias_use;
+        self.outer_scopes.push(outer_scope);
         let result = self.validate_select(select);
         self.outer_scopes.pop();
         result
@@ -175688,7 +175904,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                 if let Some(select) = singleton_subquery {
                     // SQLite resolves an IN-subquery's SELECT before the LHS;
                     // an ordinary expression list retains LHS-first order.
-                    self.validate_nested_select(select, scope)?;
+                    self.validate_nested_select(select, scope, alias_use)?;
                     return self.validate_expr(expr, scope, alias_use);
                 }
                 if let (Expr::RowValue(lhs_values, _), InSet::List(values)) = (expr.as_ref(), set)
@@ -175754,7 +175970,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             Expr::Subquery(select, _)
             | Expr::Exists {
                 subquery: select, ..
-            } => self.validate_nested_select(select, scope),
+            } => self.validate_nested_select(select, scope, alias_use),
             Expr::FunctionCall {
                 name,
                 args,
@@ -175859,6 +176075,41 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
         Ok(())
     }
 
+    fn check_output_alias_use(
+        alias: &SelectOutputAlias,
+        alias_use: SelectOutputAliasUse,
+        nested_in_subquery: bool,
+    ) -> Result<()> {
+        if alias.is_window && !matches!(alias_use, SelectOutputAliasUse::OrderBy) {
+            return Err(FrankenError::FunctionError(format!(
+                "misuse of aliased window function {}",
+                alias.name
+            )));
+        }
+        if alias.is_aggregate {
+            match alias_use {
+                SelectOutputAliasUse::GroupBy if !nested_in_subquery => {
+                    return Err(FrankenError::FunctionError(
+                        "aggregate functions are not allowed in the GROUP BY clause".to_owned(),
+                    ));
+                }
+                SelectOutputAliasUse::Where
+                | SelectOutputAliasUse::JoinOn
+                | SelectOutputAliasUse::GroupBy => {
+                    let detail = alias.aggregate_name.as_ref().map_or_else(
+                        || "misuse of aggregate function".to_owned(),
+                        |name| format!("misuse of aggregate: {name}()"),
+                    );
+                    return Err(FrankenError::FunctionError(detail));
+                }
+                SelectOutputAliasUse::None
+                | SelectOutputAliasUse::Having
+                | SelectOutputAliasUse::OrderBy => {}
+            }
+        }
+        Ok(())
+    }
+
     fn validate_column(
         &self,
         column: &ColumnRef,
@@ -175872,36 +176123,17 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             && column.table.is_none()
             && let Some(alias) = scope.output_alias(&column.column)
         {
-            if alias.is_window && !matches!(alias_use, SelectOutputAliasUse::OrderBy) {
-                return Err(FrankenError::FunctionError(format!(
-                    "misuse of aliased window function {}",
-                    alias.name
-                )));
-            }
-            if alias.is_aggregate {
-                match alias_use {
-                    SelectOutputAliasUse::GroupBy => {
-                        return Err(FrankenError::FunctionError(
-                            "aggregate functions are not allowed in the GROUP BY clause".to_owned(),
-                        ));
-                    }
-                    SelectOutputAliasUse::Where | SelectOutputAliasUse::JoinOn => {
-                        let detail = alias.aggregate_name.as_ref().map_or_else(
-                            || "misuse of aggregate function".to_owned(),
-                            |name| format!("misuse of aggregate: {name}()"),
-                        );
-                        return Err(FrankenError::FunctionError(detail));
-                    }
-                    SelectOutputAliasUse::None
-                    | SelectOutputAliasUse::Having
-                    | SelectOutputAliasUse::OrderBy => {}
-                }
-            }
-            return Ok(());
+            return Self::check_output_alias_use(alias, alias_use, false);
         }
         for outer_scope in self.outer_scopes.iter().rev() {
             if self.scope_resolves_column(outer_scope, column)? {
                 return Ok(());
+            }
+            if outer_scope.nested_alias_use != SelectOutputAliasUse::None
+                && column.table.is_none()
+                && let Some(alias) = outer_scope.output_alias(&column.column)
+            {
+                return Self::check_output_alias_use(alias, outer_scope.nested_alias_use, true);
             }
         }
         let name = column.table.as_ref().map_or_else(
@@ -181652,6 +181884,10 @@ fn emit_expr(
             let args = FunctionArgs::List(vec![inner.as_ref().clone(), path.as_ref().clone()]);
             emit_function_call(builder, func, &args, false, false, target_reg, bind_state)
         }
+
+        Expr::Column(col_ref, _) => Err(FrankenError::NoSuchColumn {
+            name: format_external_column_ref_name(col_ref),
+        }),
 
         _ => Err(FrankenError::NotImplemented(format!(
             "expression form is not supported in this connection path: {expr:?}",
