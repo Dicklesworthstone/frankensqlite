@@ -94,6 +94,51 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-27 - WIN (landed as db2b0343a; inside its prediction band; count_star x10.21 -> x0.710 stock 3.54.1 in instructions): a one-worker autocommit count(*) of a large tree walks the snapshot on its own thread (bd-read-miss-path-cost-w8msq, serial read lane rounds 15-17, lever SW)
+
+- Target: count_star, the read row furthest behind stock after PH v2. The cursor count takes each page through the
+  transaction, the shared page cache, the in-flight read table and the VFS: about 5,700 Ir a page over 7,605 pages,
+  against stock's 560.
+- Ledger preflight: 2026-11-13 bd-w4pr1.13.11 (the reader, the split and the parallel count; its "workers=1 records no
+  walk" stays true, and its retry condition "rollback-journal and :memory: decline" still holds: they get no reader);
+  2026-11-14 "parallel scans sized by leaf pages" (the same 32 leaves a thread); 2026-11-21 AFC (deadline and budget
+  observation intervals: 256 pages here). No entry rejects a one-thread snapshot walk.
+- Touched: `crates/fsqlite-btree/src/snapshot_walk.rs` (`count_entries_on_this_thread`, `SNAPSHOT_COUNT_MIN_LEAF_PAGES`,
+  `SnapshotCountRecord`), `crates/fsqlite-vdbe/src/engine.rs` (the Count opcode's one-worker branch,
+  `snapshot_scan_reader`, `snapshot_count_should_stop`, `parallel_workers` 0 as the default),
+  `crates/fsqlite-core/src/connection.rs` (`statement_parallel_workers` 1 -> 0 inside an explicit transaction),
+  `crates/fsqlite-core/tests/bd_w4pr1_13_11_parallel_scan_oracle.rs` (keepers).
+- Prediction (on the bead before the build, 2026-11-23): count_star 1.6M-3.5M Ir; every other row within +-0.05%.
+- Result: one rch job on hz4 (parent 34eb18ae6 fsqlite-cargo 8dd15fd34da21ec7, lever 9baa66b7d64c38d8), stock sqlite3
+  3.54.1 live, callgrind on single ELFs, answers equal stock's:
+  - count_star 43,526,501 -> 3,025,532 Ir (-93.0%), x10.21 -> x0.710 stock;
+  - rowid_lookups_200k -504, scan_filter_agg +1,439 (+0.00012%), join_no_index_5k_x_5k -6,197, window_row_number -298.
+  - Judge v2b, 4 runs: r1 valid; r2, r3, r4 VOID on their A/A nulls (count_star cycles z -3.60, bulk cpu z +4.63,
+    window_sum_over cpu z -5.74), the bd-j0jc0/bd-gvews class under the powersave governor. Instruction counters at or
+    under 1.0002 on every row in every run (update_10pct_300k 0.9890). No replicated LOSE. count_star time (r1 cycles
+    0.111, cpu 0.476) only pending bd-j0jc0/bd-gvews. count_star records 0 extra threads in every arm.
+- Keeper defect found by the gate and fixed in the landed commit: `snapshot_walk_counts_a_stock_written_file_and_
+  stops_when_asked` asserted `leaves_walked < 50` after a stop that answers true on its 51st ask. `walk_subtree` asks
+  before each page and this file's split subtrees are its 250 leaves, so 50 leaves are read (red at line 433 on hz2).
+  It now asserts exactly 51 asks and at most 50 leaves: tighter, and mutant m2's red now comes from its own assertion.
+- Gate (one worker pinned per attempt):
+  - 34eb18ae6 + SW (hz2): clippy -D warnings (btree, vdbe, core, all targets) clean; btree lib 591/0; vdbe lib
+    1,285/2. The 2 are `bd_2dgf5_rowid_equality_aggregate_seeks_single_row` and
+    `bd_2dgf5_seek_and_fallback_bodies_emit_identical_agg_steps`, identical on the parent (SW reversed) in one job on
+    vmi1153651. Goldens: 9 differing, byte-identical to main's (bd-wb3oi, since fixed by 630329d7c). Keepers: the
+    line-433 red above.
+  - Mutants on the fixed keeper (hz2): m1 red (line 212), m2 red (lines 449 and 229: the small-tree assertions),
+    m3 red (line 244); m4 red (vmi1153651). Keepers with the fix: 4 + 1 + 14 pass.
+  - Rebased tree fc0b378a3 (origin/main 6d8fa72cd + SW; ovh-a): clippy clean; btree lib 591/0; vdbe lib 1,286/2
+    (`bd_2dgf5_rowid_in_list_point_lookups`, `bd_2dgf5_rowid_equality_aggregate_seeks_single_row`, identical on the
+    parent in the same job); goldens 10/10; keepers 4 + 1 + 14 pass; core lib 4,242/0 (parent 4,242/0).
+  - Landed as db2b0343a after two more conflict-free rebases (range-diff "="); the 4 intervening commits touch none
+    of SW's functions. rustfmt: snapshot_walk.rs clean, the rest in ignored crates. ubs: 0 critical.
+- Not this lever's target: the per-miss cost of a page read (the bead's acceptance). On 34eb18ae6 + SW, join_100k
+  pays 5,985 Ir per extra read at cache_size -2000 against -128000, and stock 3.54.1 pays 349. Measured on the landed
+  tip for the bead.
+- Retry condition: none for the count.
+
 ## 2026-11-27 - REJECTED on its time kill line (gb_a_sum_c a replicated judge v2b LOSE, cpu 1.0240 / 1.0197 and cycles 1.0226 / 1.0311, at Ir 1.0000; re-judge under bd-j0jc0/bd-gvews), with its gain line cleared: -1,504 Ir per FULL autocommit INSERT (x8.18 -> x8.11 stock 3.54.1): the vfs unix -shm maps hash their region numbers and owner ids with foldhash instead of SipHash (bd-fuwx0, commit-path lane round 2, lever L3 = option O-C1, hashing part 2)
 
 - Target: the autocommit commit's -shm bookkeeping. After L1 (56e28f1df) the SipHash left under the vfs on a FULL
