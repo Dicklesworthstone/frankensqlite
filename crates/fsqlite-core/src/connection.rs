@@ -4591,6 +4591,19 @@ impl PagerBackend {
         }
     }
 
+    /// bd-126l1: see [`SimplePager::sweep_disowned_ledger_on_open`].
+    async fn sweep_disowned_ledger_on_open(&self, cx: &Cx) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.sweep_disowned_ledger_on_open(cx).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.sweep_disowned_ledger_on_open(cx).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.sweep_disowned_ledger_on_open(cx).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.sweep_disowned_ledger_on_open(cx).await,
+        }
+    }
+
     /// bd-ioq6x: see [`SimplePager::discard_in_range_parked_holes`] and
     /// [`SimplePager::forget_hole_marker_publication`], after a reclaim.
     #[cfg(feature = "native")]
@@ -19530,6 +19543,15 @@ impl Connection {
             #[cfg(feature = "native")]
             if hole_reclaim_requested {
                 conn.reclaim_eof_holes_as_first_attacher(&op_cx).await;
+            }
+            // bd-126l1: once WAL mode, the WAL backend, namespace bootstrap,
+            // and any marker-driven first-attacher reclaim have finished,
+            // sweep any in-range disowned holes still parked in the shared
+            // per-file ledger (re-seeded across a drop-all from
+            // `PENDING_DISOWNED_BY_PATH`). Fast O(1) no-op when the ledger is
+            // empty, on `:memory:`, read-only, or non-WAL opens.
+            if !pager_is_memory && !storage_was_empty && !conn.pager.is_readonly() {
+                let _ = conn.pager.sweep_disowned_ledger_on_open(&op_cx).await;
             }
             op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             Ok(())
@@ -341970,6 +341992,336 @@ mod join_projection_prune_tests {
                     );
                 }
             }
+        });
+    }
+}
+
+#[cfg(all(test, unix))]
+mod ledger_sweep_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    const PAGE: usize = 4096;
+    const ROWS: i64 = 60;
+
+    #[derive(Debug)]
+    struct StockView {
+        page_count: i64,
+        freelist_count: i64,
+        never_used: BTreeSet<u32>,
+        other: Vec<String>,
+        rows: i64,
+    }
+
+    fn stock_view(db: &Path) -> StockView {
+        let stock = rusqlite::Connection::open_with_flags(
+            db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("stock open");
+        let report: Vec<String> = {
+            let mut stmt = stock
+                .prepare("PRAGMA integrity_check(100000)")
+                .expect("prepare integrity_check");
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .expect("integrity_check")
+                .collect::<std::result::Result<_, _>>()
+                .expect("integrity rows")
+        };
+        let mut never_used = BTreeSet::new();
+        let mut other = Vec::new();
+        for line in report.iter().flat_map(|row| row.lines()) {
+            if line.starts_with("*** in database") {
+                continue;
+            }
+            if line.contains("never used") {
+                let digits: String = line
+                    .trim_start_matches(|c: char| !c.is_ascii_digit())
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                if let Ok(page) = digits.parse() {
+                    never_used.insert(page);
+                    continue;
+                }
+            }
+            if line != "ok" {
+                other.push(line.to_owned());
+            }
+        }
+        let page_count = stock
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .expect("page_count");
+        let freelist_count = stock
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .expect("freelist_count");
+        let rows = stock
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .expect("row count");
+        StockView {
+            page_count,
+            freelist_count,
+            never_used,
+            other,
+            rows,
+        }
+    }
+
+    async fn drive_q1_rollback_and_drop(
+        db: &Path,
+        truncate_before_q1: bool,
+    ) -> (u32, BTreeSet<u32>, u32) {
+        let db_str = db.to_string_lossy().into_owned();
+        let conn = Connection::open(db_str.clone()).await.expect("open db");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .await
+            .expect("create table");
+        conn.execute("BEGIN").await.expect("begin");
+        for id in 0..ROWS {
+            conn.execute(&format!(
+                "INSERT INTO t VALUES({id}, '{}')",
+                format!("row{id:04}-").repeat(20)
+            ))
+            .await
+            .expect("insert");
+        }
+        conn.execute("COMMIT").await.expect("commit");
+        let conn = if truncate_before_q1 {
+            conn.close().await.expect("close before truncate");
+            let stock = rusqlite::Connection::open(db).expect("stock vacuum");
+            stock.execute("VACUUM", []).expect("vacuum");
+            stock
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .expect("truncate checkpoint");
+            drop(stock);
+            Connection::open(db_str).await.expect("reopen after truncate")
+        } else {
+            conn
+        };
+
+        let base_page_count = conn.pager.published_snapshot().db_size;
+        let cx = conn.op_cx().expect("op cx");
+        let mut holder = conn
+            .pager
+            .begin(&cx, TransactionMode::Concurrent)
+            .await
+            .expect("holder begin");
+        let mut written = Vec::new();
+        let mut lease = BTreeSet::new();
+        for _ in 0..64 {
+            let page = holder.allocate_page(&cx).await.expect("holder allocate");
+            holder
+                .write_page(&cx, page, &[0x52; PAGE])
+                .await
+                .expect("holder write");
+            written.push(page.get());
+            lease = holder
+                .live_reserved_pages()
+                .iter()
+                .map(|page| page.get())
+                .collect();
+            if !lease.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !lease.is_empty(),
+            "precondition: holder must acquire an unused EOF lease (written={written:?})"
+        );
+
+        let mut grow = conn
+            .pager
+            .begin(&cx, TransactionMode::Concurrent)
+            .await
+            .expect("grow begin");
+        let grown_page = grow.allocate_page(&cx).await.expect("grow allocate");
+        grow.write_page(&cx, grown_page, &[0x54; PAGE])
+            .await
+            .expect("grow write");
+        assert!(
+            written
+                .iter()
+                .chain(&lease)
+                .all(|page| *page < grown_page.get()),
+            "precondition: grower allocates past holder (written={written:?} lease={lease:?} grown={grown_page:?})"
+        );
+        grow.commit(&cx).await.expect("grow commit");
+        drop(grow);
+
+        holder.rollback(&cx).await.expect("holder rollback");
+        drop(holder);
+        // Drop WITHOUT calling close(): the rolled-back pool must flow through
+        // PagerInner::drop -> disowned ledger -> GroupCommitQueue::drop -> pen.
+        drop(conn);
+
+        // Remove any `.fsqlite-holes` marker so bd-ioq6x's first-attacher walk
+        // cannot mask the on-open disowned-ledger sweep.
+        let marker = crate::migration::hole_marker_path(db);
+        if marker.exists() {
+            std::fs::remove_file(&marker).expect("remove hole marker");
+        }
+        let held: BTreeSet<u32> = written.into_iter().chain(lease).collect();
+        (base_page_count, held, grown_page.get())
+    }
+
+    /// bd-126l1 close-probe keeper: on the real file WAL with the `.fsqlite-holes`
+    /// marker absent, reopening after dropping a connection that held rolled-back
+    /// in-range EOF holes must reclaim every disowned hole into the durable
+    /// freelist while leaving the grower's committed frame untouched.
+    #[test]
+    fn reopen_sweep_reclaims_the_holes_a_dropped_connection_disowned_on_the_file_wal() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let db = dir.path().join("bd_126l1_sweep.db");
+            let (base_page_count, held, grown_page) = drive_q1_rollback_and_drop(&db, false).await;
+
+            // Control: stock 3.54.1 read-only sees every held page as never used.
+            let before = stock_view(&db);
+            assert!(
+                held.iter().all(|page| before.never_used.contains(page)) && before.rows == ROWS,
+                "bd-126l1 precondition: held={held:?} base={base_page_count} before={before:?}"
+            );
+
+            // Reopen and cleanly close: the on-open sweep must reclaim `held`.
+            let conn = Connection::open(db.to_string_lossy().into_owned())
+                .await
+                .expect("reopen");
+            let count_rows = conn
+                .query("SELECT count(*) FROM t")
+                .await
+                .expect("count rows");
+            assert_eq!(count_rows[0].values()[0], SqliteValue::Integer(ROWS));
+            conn.close().await.expect("clean close");
+
+            let after = stock_view(&db);
+            let leaked: Vec<u32> = held
+                .iter()
+                .copied()
+                .filter(|page| after.never_used.contains(page))
+                .collect();
+            assert!(
+                leaked.is_empty()
+                    && after.other.is_empty()
+                    && after.rows == ROWS
+                    && after.page_count > after.freelist_count
+                    && after.freelist_count
+                        >= before.freelist_count + i64::try_from(held.len()).expect("small"),
+                "bd-126l1: on-open sweep must reclaim every disowned hole on the file WAL: \
+                 base={base_page_count} held={held:?} leaked={leaked:?} before={before:?} after={after:?}"
+            );
+            assert!(
+                after.never_used.contains(&grown_page),
+                "bd-126l1 double-grant guard: grower's committed frame page {grown_page} must not be freed: after={after:?}"
+            );
+        });
+    }
+
+    /// bd-126l1: the same drop -> marker-absent reopen shape when the grower's
+    /// commit also bound the first real WAL header on a headerless/truncated WAL.
+    #[test]
+    fn reopen_sweep_reclaims_disowned_holes_after_headerless_first_wal_commit() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let db = dir.path().join("bd_126l1_headerless.db");
+            let (base_page_count, held, grown_page) = drive_q1_rollback_and_drop(&db, true).await;
+
+            let before = stock_view(&db);
+            assert!(
+                held.iter().all(|page| before.never_used.contains(page)) && before.rows == ROWS,
+                "bd-126l1 headerless precondition: held={held:?} base={base_page_count} before={before:?}"
+            );
+
+            let conn = Connection::open(db.to_string_lossy().into_owned())
+                .await
+                .expect("reopen");
+            conn.close().await.expect("clean close");
+
+            let after = stock_view(&db);
+            let leaked: Vec<u32> = held
+                .iter()
+                .copied()
+                .filter(|page| after.never_used.contains(page))
+                .collect();
+            assert!(
+                leaked.is_empty()
+                    && after.other.is_empty()
+                    && after.rows == ROWS
+                    && after.freelist_count
+                        >= before.freelist_count + i64::try_from(held.len()).expect("small"),
+                "bd-126l1 headerless: on-open sweep must reclaim every disowned hole: \
+                 held={held:?} leaked={leaked:?} before={before:?} after={after:?}"
+            );
+            assert!(
+                after.never_used.contains(&grown_page),
+                "bd-126l1 headerless double-grant guard: committed page {grown_page} must not be freed: after={after:?}"
+            );
+        });
+    }
+
+    /// bd-126l1 / bd-9inpb cross-generation safety: if an external writer
+    /// (stock SQLite) compacts and truncates the WAL between drop and reopen,
+    /// reusing the same page numbers for live B-tree pages in a new WAL
+    /// generation, the reopened connection must discard the stale-generation
+    /// pen entries rather than double-freeing live pages.
+    #[test]
+    fn reopen_sweep_discards_stale_disowned_pages_after_external_checkpoint() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let db = dir.path().join("bd_126l1_cross_gen.db");
+            let (_base, held, _grown_page) = drive_q1_rollback_and_drop(&db, false).await;
+            let max_held = *held.iter().max().expect("non-empty held");
+
+            // External stock SQLite rewrites the database and truncates the WAL,
+            // moving the file into a brand-new generation where pages up through
+            // `max_held` are live B-tree pages with zero frames in the new WAL.
+            let extra_rows: i64 = 200;
+            {
+                let stock = rusqlite::Connection::open(&db).expect("stock rw open");
+                stock.execute("VACUUM", []).expect("stock vacuum");
+                stock.execute("BEGIN", []).expect("stock begin");
+                for id in ROWS..(ROWS + extra_rows) {
+                    stock
+                        .execute(
+                            "INSERT INTO t VALUES(?1, ?2)",
+                            rusqlite::params![id, format!("live{id:04}-").repeat(20)],
+                        )
+                        .expect("stock insert");
+                }
+                stock.execute("COMMIT", []).expect("stock commit");
+                stock
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                    .expect("stock truncate");
+                let pc: u32 = stock
+                    .query_row("PRAGMA page_count", [], |r| r.get(0))
+                    .expect("stock page_count");
+                assert!(
+                    pc >= max_held,
+                    "precondition: stock rewrite must allocate live pages covering held range (pc={pc}, max_held={max_held})"
+                );
+            }
+
+            let conn = Connection::open(db.to_string_lossy().into_owned())
+                .await
+                .expect("reopen after external checkpoint");
+            let count_rows = conn
+                .query("SELECT count(*) FROM t")
+                .await
+                .expect("count rows");
+            assert_eq!(
+                count_rows[0].values()[0],
+                SqliteValue::Integer(ROWS + extra_rows)
+            );
+            conn.close().await.expect("clean close");
+
+            let after = stock_view(&db);
+            assert!(
+                after.never_used.is_empty()
+                    && after.other.is_empty()
+                    && after.freelist_count == 0
+                    && after.rows == ROWS + extra_rows,
+                "bd-126l1 / bd-9inpb: stale-generation pen entries must NEVER double-free live pages after external checkpoint: held={held:?} after={after:?}"
+            );
         });
     }
 }
