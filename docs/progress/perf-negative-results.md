@@ -94,6 +94,53 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-27 - WIN (landed as deab606c7; a regression fix measured like a lever, inside its prediction, past its gain kill line): one async executor layer instead of three gives back -12,141 Ir per autocommit point SELECT, x4.52 -> x3.89 stock 3.54.1 (bd-crzqa)
+
+- Target: every table program, through `Connection::execute_table_program_with_cx` in
+  `crates/fsqlite-core/src/connection.rs`. f4e97cf40 (bd-ct8zm) had made it a chain of three nested async fns
+  (`_with_cx` -> `_and_replace_staging` -> `_and_result_offset`) so one caller could get the unconsumed OFFSET back.
+  On the point SELECT path the outer layer then copied the inner future (about 11.7 KB) by value on every statement.
+  The callgrind caller tree showed it: memcpy under `execute_table_program_with_cx::{closure#0}` went from 544 to
+  11,676 Ir per SELECT. Found by the commit-path lane r2 on the cm1 point shape.
+- Ledger preflight: no entry rejects folding executor layers. The 2026-11-14 WIN for the boxed cached engine said a
+  later by-value move "should show up as memcpy in the two executor layers on the same callgrind shape", and it did.
+- Change (deab606c7): `execute_table_program_with_cx` is the one executor body and takes
+  `stage_write_on_replace_victims` itself. The three `_and_replace_staging` callers call it directly; the six old
+  `_with_cx` callers and `execute_table_program` pass `false`. The compound-arm OFFSET caller
+  (`try_execute_compound_arm_with_offset`) reads the unconsumed OFFSET after the call through
+  `parked_engine_remaining_result_offset`: the same engine and register the removed 4-tuple read, from
+  `cached_vdbe_engine`, where the executor parks the engine on return. No boxed future was added, so the debug stack
+  gets two async layers fewer.
+- Attribution: f4e97cf40 against its parent's connection.rs (ec18e5501), both arms built in ONE rch job on hz4
+  (CLI P0 dd80101f63fb394b / P1 6868f1c173e31a93): point SELECT +11,091 Ir (3 pairs, +14.92%, x3.86 -> x4.43), FULL
+  INSERT +34 (5 pairs). P1's caller tree has an 11,140-Ir memcpy under the executor's closure; in P0 no executor
+  closure copies more than its 548-Ir argument block.
+- Evidence (A = origin/main 6051e6e8f, B = A + the fold, ONE rch job on hz4; CLI A 6381b6089fd1380d / B
+  c3e14ea8f49b759f; thinkstation1, governor powersave; stock 3.54.1 (84a5d033) live). Callgrind, whole process,
+  io_uring refused, per unit (N800 - N400)/400:
+  - point SELECT: 3 pairs, median -12,141 (-13.94%; pairs -12,346 / -11,752 / -12,209), x4.52 -> x3.89. Prediction
+    -11.0k..-12.4k, gain kill line -5.8k.
+  - FULL INSERT: 5 pairs, -351 (-0.20%), x8.47 -> x8.45. NORMAL: -270. txn10: -1,600 per COMMIT (-0.28%).
+  - rowid_lookups_200k: -14.0k / -12.2k, net of open + SELECT 1, out of 2,240M (x4.88 stock). count_star: -10.0k /
+    -11.5k (x10.47 -> x10.46). The open + SELECT 1 control itself was +3.8k in B in both runs: a /proc/self/maps
+    sscanf and RandomState-seeded inserts, which vary by process.
+  - perf stat, user instructions per point SELECT: 77,380 -> 76,139 (-1,241; x4.04 -> x3.97). Natively the copy
+    is an AVX loop, not one rep movsb, so it is about a tenth of callgrind's count. User cycles dropped 120.9k ->
+    108.3k per statement; that is indicative only under powersave.
+  - Mechanism: in B's caller tree the 11,596-Ir memcpy under the executor's closure is gone. The 548-Ir argument
+    copy is left, inside the one body.
+- Gate: on hz4, this tree: clippy -D warnings fsqlite-core --all-targets clean; fsqlite-core lib 4,242 passed / 0
+  failed / 4 ignored; 12 keeper targets (bd_9gl3w_join_limit, bd_ct8zm, bd_76ftv, bd_7zeum, bd_92pxs, the compound
+  ORDER/LIMIT and collate oracles, bd_pn6az, bd_wiffk, trigger_fk_upsert_oracle_keepers, update_family_review_oracle,
+  bd_nn29x) 97 passed / 0 failed; fsqlite compat_tests blocking_api_fits_default_thread_stack passed. ubs
+  insert_batch.rs 0 critical (connection.rs is in .ubsignore); rustfmt: ignored crate. No intervening commit
+  touched the executor or its callers before the landing.
+- Lesson: on a hot path, never wrap an async fn in a forwarding async fn just to adapt its signature or its return
+  value. When a rarely used output needs an extra return value, read it from state the callee already leaves
+  behind, or give that one caller its own call. Callgrind shows the cost as memcpy under the outer layer's closure.
+- Retry condition: none for this shape. If a later executor change makes the point SELECT memcpy under
+  `execute_table_program_with_cx` grow again, look for a new wrapper layer.
+
 ## 2026-11-27 - REJECTED on its regression kill line (trig_values_20000 +5.83M Ir, +0.271%, over its +0.2% line; the extra cost is glibc allocator work on a row the lever barely executes), with its gain line cleared by far: upd_50k_grow -542.7M Ir (-29.9%), x4.88 -> x3.42 stock 3.54.1. A size-changing UPDATE rewrites its cell in place on a compact descending table leaf instead of delete + insert (bd-yb70u, trig lane rounds 5-9, lever Y1, and variant Y1b)
 
 - Target: a same-rowid UPDATE whose record changes size. The engine's `overwrite_in_place` arm falls back to
