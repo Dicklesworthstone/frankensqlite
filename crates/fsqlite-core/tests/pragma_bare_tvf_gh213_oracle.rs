@@ -308,16 +308,24 @@ fn controls_call_form_unknown_name_and_arg_pragma() {
             "arg call form must be unaffected"
         );
 
-        // ... and its bare, argument-less form still behaves as before (errors);
-        // this bead deliberately does NOT route arg-requiring pragma TVFs.
-        match conn.query("SELECT * FROM pragma_table_info").await {
-            Ok(rows) => {
-                panic!("bare arg-requiring pragma_table_info unexpectedly succeeded: {rows:?}")
-            }
-            Err(e) => assert!(
-                e.to_string().to_ascii_lowercase().contains("no such table"),
-                "bare pragma_table_info must still error, got: {e}"
-            ),
-        }
+        // Bare eponymous pragma_table_info (bd-c1q6u): without a constraint on
+        // hidden `arg`, stock SQLite returns 0 rows; with `WHERE arg = 't'`, it
+        // returns the columns of `t` with hidden `arg='t'` and `schema=NULL`.
+        let bare_empty = frank_rows(&conn, "SELECT * FROM pragma_table_info").await;
+        assert!(
+            bare_empty.is_empty(),
+            "bare pragma_table_info without arg constraint must return 0 rows, got: {bare_empty:?}"
+        );
+        let bare_filtered: Vec<String> =
+            frank_rows(&conn, "SELECT name FROM pragma_table_info WHERE arg = 't'")
+                .await
+                .iter()
+                .map(|row| text(&row.values()[0]))
+                .collect();
+        assert_eq!(
+            bare_filtered,
+            vec!["a".to_owned(), "b".to_owned()],
+            "bare pragma_table_info WHERE arg = 't' must match stock SQLite"
+        );
     });
 }

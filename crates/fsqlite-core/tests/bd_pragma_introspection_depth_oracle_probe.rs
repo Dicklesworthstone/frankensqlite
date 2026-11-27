@@ -749,3 +749,190 @@ fn gh512_pragma_table_info_quoted_and_parenthesized_pk_ordinals() {
     });
 }
 
+#[test]
+fn bd_c1q6u_json_each_tree_and_pragma_hidden_columns_match_rusqlite_oracle() {
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let f_path = dir.path().join("frank_c1q6u.db");
+            let r_path = dir.path().join("stock_c1q6u.db");
+            let f = Connection::open(if file_backed {
+                f_path.to_str().unwrap()
+            } else {
+                ":memory:"
+            })
+            .await
+            .unwrap();
+            let r = if file_backed {
+                rusqlite::Connection::open(&r_path).unwrap()
+            } else {
+                rusqlite::Connection::open_in_memory().unwrap()
+            };
+            let db = if file_backed { "file" } else { "memory" };
+
+            for sql in [
+                "PRAGMA foreign_keys = OFF",
+                "CREATE TABLE t(a INTEGER, b TEXT)",
+                "CREATE INDEX idx_t_a ON t(a)",
+                "CREATE TABLE t2(c REAL)",
+                "CREATE TEMP TABLE t(p TEXT)",
+                "CREATE INDEX temp.idx_temp_t ON t(p)",
+                "ATTACH ':memory:' AS aux",
+                "CREATE TABLE aux.t(k INTEGER, z TEXT GENERATED ALWAYS AS (k || '!') VIRTUAL)",
+                "CREATE INDEX aux.idx_aux_t ON t(k)",
+                "CREATE TABLE aux.at(v INTEGER)",
+                "CREATE TABLE fk_parent(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE fk_child(pid INTEGER REFERENCES fk_parent(id))",
+                "INSERT INTO fk_child VALUES (99)",
+                "CREATE TABLE tbl_names(tname TEXT)",
+                "INSERT INTO tbl_names VALUES ('t'), ('t2')",
+                "CREATE TABLE jdocs(id INTEGER PRIMARY KEY, raw TEXT, bin BLOB)",
+                "INSERT INTO jdocs VALUES (1, '{\"a\":[10,{\"b\":20}],\"u\":\"\\u0041\"}', jsonb('{\"a\":[10,{\"b\":20}],\"u\":\"\\u0041\"}'))",
+            ] {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+
+            let queries = [
+                // json_each / json_tree: all 9 visible+rowid columns + hidden json & root
+                "SELECT rowid, key, value, type, atom, id, parent, fullkey, path, json, typeof(json), root, typeof(root) FROM json_each('[10,20,30]')",
+                "SELECT rowid, key, value, type, atom, id, parent, fullkey, path, json, root FROM json_each('{\"a\":[10,{\"b\":20}]}', '$.a')",
+                "SELECT rowid, key, value, type, atom, id, parent, fullkey, path, json, root FROM json_tree('{\"a\":[10,{\"b\":20}]}', '$.a')",
+                "SELECT d.id, j.rowid, j.key, j.value, j.id, j.parent, j.fullkey, j.path, typeof(j.json), j.root FROM jdocs d, json_tree(d.raw, '$.a') j",
+                "SELECT d.id, j.rowid, j.key, j.value, j.id, j.parent, j.fullkey, j.path, typeof(j.json), j.root FROM jdocs d, json_tree(d.bin, '$.a') j",
+                "SELECT key, value, root FROM json_each('{\"a\":[1,2]}', '$.a') WHERE root = '$.a'",
+                "SELECT key, value FROM json_each('[10,20]') WHERE json = '[10,20]'",
+                "SELECT key, value FROM json_each('[10,20]') WHERE json = '[99]'",
+                "SELECT * FROM json_each('[10,20]')",
+                // pragma_table_info / pragma_table_xinfo / pragma_index_list / pragma_index_info / pragma_index_xinfo / pragma_foreign_key_list / pragma_foreign_key_check / pragma_table_list hidden arg & schema
+                "SELECT * FROM pragma_table_info('t') ORDER BY cid",
+                "SELECT cid, name, arg, typeof(arg), schema, typeof(schema) FROM pragma_table_info('t') ORDER BY cid",
+                "SELECT cid, name, arg, typeof(arg), schema, typeof(schema) FROM pragma_table_info('t', 'main') ORDER BY cid",
+                "SELECT cid, name, arg, typeof(arg), schema, typeof(schema) FROM pragma_table_info('t', 'TEMP') ORDER BY cid",
+                "SELECT cid, name, arg, typeof(arg), schema, typeof(schema) FROM pragma_table_info('t', 'aux') ORDER BY cid",
+                "SELECT cid, name, arg, typeof(arg), schema, typeof(schema) FROM pragma_table_info('t', NULL) ORDER BY cid",
+                "SELECT cid, name, arg, typeof(arg), schema, typeof(schema) FROM pragma_table_info(x'74', x'617578') ORDER BY cid",
+                "SELECT cid, name, arg, length(arg), schema, length(schema) FROM pragma_table_info('t' || char(0) || 'x', 'main' || char(0) || 'y') ORDER BY cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info('t') WHERE arg = 't' ORDER BY cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info('t') WHERE arg = 'other' ORDER BY cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info('t') WHERE schema IS NULL ORDER BY cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info('t') WHERE schema = 'main' ORDER BY cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info('t') WHERE schema = 'aux' ORDER BY cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info('t', 'main') WHERE schema = 'main' ORDER BY cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info('t', 'main') WHERE schema = 'temp' ORDER BY cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info('T') WHERE arg = 't' ORDER BY cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info('T') WHERE arg = 't' COLLATE NOCASE ORDER BY cid",
+                // Bare parenless pragma_* forms with WHERE / aliased / reversed / IS constraints
+                "SELECT count(*) FROM pragma_table_info",
+                "SELECT count(*) FROM pragma_table_info()",
+                "SELECT cid, name, arg, schema FROM pragma_table_info WHERE arg = 't' ORDER BY cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info WHERE 't' = arg AND 'aux' = schema ORDER BY cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info WHERE arg = 't' AND schema = 'main' ORDER BY cid",
+                "SELECT p.cid, p.name, p.arg, p.schema FROM pragma_table_info p WHERE p.arg = 't' AND p.schema = 'aux' ORDER BY p.cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info WHERE arg IS 't' ORDER BY cid",
+                "SELECT cid, name, arg, schema FROM pragma_table_info WHERE arg = 't' AND arg = 't2' ORDER BY cid",
+                "SELECT cid, name, hidden, arg, schema FROM pragma_table_xinfo WHERE arg = 't' AND schema = 'aux' ORDER BY cid",
+                // pragma_index_list / pragma_index_info / pragma_index_xinfo / pragma_foreign_key_list / pragma_foreign_key_check / pragma_table_list
+                "SELECT * FROM pragma_index_list('t', 'main') ORDER BY name",
+                "SELECT name, arg, typeof(arg), schema, typeof(schema) FROM pragma_index_list('t') ORDER BY name",
+                "SELECT name, arg, schema FROM pragma_index_list('t', 'aux') ORDER BY name",
+                "SELECT name, arg, schema FROM pragma_index_list WHERE arg = 't' AND schema = 'main' ORDER BY name",
+                "SELECT name, arg, schema FROM pragma_index_list WHERE arg = 't' AND schema = 'aux' ORDER BY name",
+                "SELECT name, arg, schema FROM pragma_index_info WHERE arg = 'idx_aux_t' AND schema = 'aux' ORDER BY seqno",
+                "SELECT name, key, arg, schema FROM pragma_index_xinfo WHERE arg = 'idx_aux_t' AND schema = 'aux' AND key = 1 ORDER BY seqno",
+                "SELECT \"from\", arg, schema FROM pragma_foreign_key_list WHERE arg = 'fk_child' AND schema = 'main' ORDER BY id, seq",
+                "SELECT \"table\", rowid, parent, fkid, arg, typeof(arg), schema, typeof(schema) FROM pragma_foreign_key_check",
+                "SELECT \"table\", rowid, parent, fkid, arg, schema FROM pragma_foreign_key_check('fk_child', 'main')",
+                "SELECT \"table\", rowid, parent, fkid, arg, schema FROM pragma_foreign_key_check WHERE arg = 'fk_child' AND schema = 'main'",
+                "SELECT name, arg, typeof(arg), schema FROM pragma_table_list WHERE name = 'at'",
+                "SELECT name, arg, typeof(arg), schema FROM pragma_table_list('at')",
+                "SELECT name, arg, schema FROM pragma_table_list WHERE arg = 't' AND schema = 'aux'",
+                // JOIN ON / USING over pragma_* hidden columns + star width control
+                "SELECT n.tname, p.name, p.arg, p.schema FROM tbl_names n JOIN pragma_table_info p ON p.arg = n.tname ORDER BY n.tname, p.cid",
+                "SELECT * FROM pragma_table_info('t2') a JOIN (SELECT 't2' AS arg, 'ok' AS tag) b USING(arg) ORDER BY cid",
+                "SELECT * FROM (SELECT 't2' AS arg, 'ok' AS tag) b JOIN pragma_table_info a USING(arg) ORDER BY cid",
+                // Error parity: invalid schema via WHERE, missing hidden columns on no-arg pragmas
+                "SELECT name FROM pragma_table_info('t') WHERE schema = 'nosuchdb'",
+                "SELECT name FROM pragma_table_info WHERE arg = 't' AND schema = 'nosuchdb'",
+                "SELECT arg FROM pragma_database_list",
+                "SELECT schema FROM pragma_database_list",
+                "SELECT arg FROM pragma_collation_list",
+                "SELECT schema FROM pragma_collation_list",
+            ];
+
+            for sql in queries {
+                let stock = rq(&r, sql);
+                let direct = fq(&f, sql).await;
+                let prepared = match f.prepare(sql).await {
+                    Ok(stmt) => match stmt.query().await {
+                        Ok(rows) => rows
+                            .iter()
+                            .map(|row| row.values().iter().map(tag_f).collect())
+                            .collect(),
+                        Err(_) => vec![vec!["ERR".to_owned()]],
+                    },
+                    Err(_) => vec![vec!["ERR".to_owned()]],
+                };
+                if direct != stock || prepared != stock {
+                    diffs.push(format!(
+                        "[{db}] `{sql}`\n   direct=   {direct:?}\n   prepared= {prepared:?}\n   stock=    {stock:?}"
+                    ));
+                }
+            }
+
+            // Parameterized bare pragma_table_info with anonymous `?` AND numbered `?1`/`?2`
+            for sql in [
+                "SELECT name, arg, schema FROM pragma_table_info WHERE arg = ? AND schema = ? ORDER BY cid",
+                "SELECT name, arg, schema FROM pragma_table_info WHERE arg = ?1 AND schema = ?2 ORDER BY cid",
+                "SELECT name, arg, schema FROM pragma_table_info(?) WHERE schema = ? ORDER BY cid",
+            ] {
+                let prepared_f = f.prepare(sql).await.unwrap();
+                let mut prepared_r = r.prepare(sql).unwrap();
+                for (arg_val, schema_val) in [("t", "main"), ("t", "aux"), ("t", "temp")] {
+                    let stock_rows: Vec<Vec<String>> = prepared_r
+                        .query_map([arg_val, schema_val], |row| {
+                            Ok(vec![
+                                tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(0)),
+                                tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(1)),
+                                tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(2)),
+                            ])
+                        })
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect();
+                    let params = [SqliteValue::from(arg_val), SqliteValue::from(schema_val)];
+                    let direct_rows: Vec<Vec<String>> = f
+                        .query_with_params(sql, &params)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.values().iter().map(tag_f).collect())
+                        .collect();
+                    let prep_rows: Vec<Vec<String>> = prepared_f
+                        .query_with_params(&params)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.values().iter().map(tag_f).collect())
+                        .collect();
+                    if direct_rows != stock_rows || prep_rows != stock_rows {
+                        diffs.push(format!(
+                            "[{db}] param `{sql}` ({arg_val}, {schema_val})\n   direct=   {direct_rows:?}\n   prepared= {prep_rows:?}\n   stock=    {stock_rows:?}"
+                        ));
+                    }
+                }
+            }
+
+            f.execute("DETACH aux").await.unwrap();
+            f.close().await.unwrap();
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} bd-c1q6u hidden-column divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}
+

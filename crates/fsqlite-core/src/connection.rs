@@ -8046,15 +8046,45 @@ fn pragma_table_function_columns(name: &str) -> Option<&'static [&'static str]> 
     }
 }
 
+/// Hidden input columns exposed by a built-in `pragma_<name>` table-valued
+/// function, matching SQLite 3.54.1 `pragma_table_xinfo('pragma_<name>')`:
+/// - `table_info`, `table_xinfo`, `index_list`, `index_info`, `index_xinfo`,
+///   `foreign_key_list`, `foreign_key_check` declare hidden `arg` and `schema`.
+/// - `table_list` already exposes visible `schema`, so its sole hidden column
+///   is `arg`.
+/// - No-arg pragmas (`database_list`, `compile_options`, `function_list`,
+///   `collation_list`) declare no hidden columns.
+fn pragma_table_function_hidden_columns(name: &str) -> &'static [&'static str] {
+    let Some(pragma) = name
+        .get(..7)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("pragma_"))
+        .and_then(|_| name.get(7..))
+    else {
+        return &[];
+    };
+    if pragma.eq_ignore_ascii_case("table_list") {
+        return &["arg"];
+    }
+    let has_arg_and_schema = [
+        "table_info",
+        "table_xinfo",
+        "index_list",
+        "index_info",
+        "index_xinfo",
+        "foreign_key_list",
+        "foreign_key_check",
+    ]
+    .iter()
+    .any(|known| pragma.eq_ignore_ascii_case(known));
+    if has_arg_and_schema {
+        &["arg", "schema"]
+    } else {
+        &[]
+    }
+}
+
 /// Whether a `pragma_<name>` table-valued function is one of the NO-ARGUMENT
-/// introspection pragmas that produce a meaningful result with zero arguments
-/// (e.g. `SELECT * FROM pragma_database_list`). This is the allow-list used to
-/// route the *parenless* eponymous bare-table form through the pragma-TVF
-/// execution path (GH #207/#213, bd-xl98m).
-///
-/// Arg-requiring pragma TVFs (e.g. `pragma_table_info(t)`) are intentionally
-/// excluded: their bare, argument-less form keeps its prior behaviour
-/// (`NoSuchTable`) — only the no-arg pragmas are in scope for this fix.
+/// introspection pragmas that accept zero positional arguments.
 fn pragma_table_function_is_no_arg(name: &str) -> bool {
     let Some(prefix) = name.get(..7) else {
         return false;
@@ -8070,15 +8100,19 @@ fn pragma_table_function_is_no_arg(name: &str) -> bool {
         || pragma.eq_ignore_ascii_case("table_list")
 }
 
-// Call only after the source has resolved to a built-in PRAGMA table function.
-fn validate_pragma_table_function_arity(name: &str, count: usize) -> Result<()> {
-    let max = if name.eq_ignore_ascii_case("pragma_table_list") {
+fn pragma_table_function_max_args(name: &str) -> usize {
+    if name.eq_ignore_ascii_case("pragma_table_list") {
         1
     } else if pragma_table_function_is_no_arg(name) {
         0
     } else {
         2
-    };
+    }
+}
+
+// Call only after the source has resolved to a built-in PRAGMA table function.
+fn validate_pragma_table_function_arity(name: &str, count: usize) -> Result<()> {
+    let max = pragma_table_function_max_args(name);
     if count > max {
         return Err(FrankenError::function_error(format!(
             "too many arguments on {name}() - max {max}"
@@ -61961,7 +61995,7 @@ impl Connection {
     /// Persistent views resolve their own relations in their owning catalog.
     /// An attachment's persistent views run on its child connection.
     fn view_metadata_query(&self, view: &ViewDef) -> SelectStatement {
-        let mut query = view.query.clone();
+        let mut query = self.rewrite_bare_pragma_table_functions(&view.query).into_owned();
         if !view.temporary {
             qualify_persistent_view_relations(&mut query);
         }
@@ -63412,10 +63446,15 @@ impl Connection {
         name: &str,
     ) -> Option<(Vec<String>, HashSet<String>)> {
         if let Some(columns) = pragma_table_function_columns(name) {
-            return Some((
-                columns.iter().map(|column| (*column).to_owned()).collect(),
-                HashSet::new(),
-            ));
+            let hidden_names = pragma_table_function_hidden_columns(name);
+            let mut all_columns: Vec<String> =
+                columns.iter().map(|column| (*column).to_owned()).collect();
+            let mut hidden = HashSet::with_capacity(hidden_names.len());
+            for &hidden_col in hidden_names {
+                all_columns.push(hidden_col.to_owned());
+                hidden.insert(hidden_col.to_ascii_lowercase());
+            }
+            return Some((all_columns, hidden));
         }
         let module_key = name.to_ascii_uppercase();
         let factory_args = [name.to_owned(), "main".to_owned(), name.to_owned()];
@@ -87667,6 +87706,7 @@ impl Connection {
                 view.name.to_ascii_lowercase()
             ));
             let column_view_state = Rc::new(RefCell::new(SelectViewValidationState::default()));
+            let rewritten = self.rewrite_bare_pragma_table_functions(&view.query);
             let mut resolver = match owner_label {
                 Some(owner) => SelectRelationResolver::for_persistent_owner(
                     self,
@@ -87681,20 +87721,19 @@ impl Connection {
                 ),
             };
             let validation = with_view_expansion_stack(|| {
-                self.with_fallback_function_registry(|| resolver.validate_select(&view.query))
-                    .and_then(|()| {
-                        let mut query = view.query.clone();
-                        if !view.temporary {
-                            qualify_persistent_view_relations(&mut query);
-                        }
-                        self.with_fallback_function_registry(|| {
-                            SelectColumnReferenceResolver::with_view_state(
-                                self,
-                                column_view_state,
-                            )
+                self.with_fallback_function_registry(|| {
+                    resolver.validate_select(rewritten.as_ref())
+                })
+                .and_then(|()| {
+                    let mut query = rewritten.as_ref().clone();
+                    if !view.temporary {
+                        qualify_persistent_view_relations(&mut query);
+                    }
+                    self.with_fallback_function_registry(|| {
+                        SelectColumnReferenceResolver::with_view_state(self, column_view_state)
                             .validate_select(&query)
-                        })
                     })
+                })
             });
             if let Err(err) = validation {
                 return Err(FrankenError::FunctionError(format!(
@@ -89807,24 +89846,67 @@ impl Connection {
     /// table-valued function used as a bare FROM source
     /// (`SELECT * FROM pragma_compile_options`) into the equivalent call form
     /// (`pragma_compile_options()`), so the existing table-function execution
-    /// path serves it instead of the bare-table resolver raising `NoSuchTable`.
-    ///
-    /// Only the NO-ARG synthesize-path pragmas (`pragma_table_function_is_no_arg`)
-    /// are routed, and only when no real table, view, or in-scope CTE shadows the
-    /// name — so unknown bare names still raise `NoSuchTable`, a real relation
-    /// still wins, and arg-requiring pragma TVFs (`pragma_table_info`) are
-    /// untouched. Returns a borrowed statement when nothing is rewritten, so the
-    /// common (non-pragma) path pays only a cheap scan and never clones.
+    /// Rewrite bare eponymous `pragma_<name>` references (when not shadowed by a
+    /// real table, view, or in-scope CTE) into `TableOrSubquery::TableFunction`,
+    /// and bind missing hidden `arg`/`schema` arguments from top-level `WHERE`,
+    /// `JOIN ON`, and `JOIN USING` equalities (matching SQLite's
+    /// `pragmaVtabBestIndex`). Returns a borrowed statement when no pragma TVF
+    /// appears, so the common path pays only a cheap scan with zero clones.
     fn rewrite_statement_bare_pragma_table_functions<'a>(
         &self,
         statement: &'a Statement,
     ) -> Cow<'a, Statement> {
-        let Statement::Select(select) = statement else {
-            return Cow::Borrowed(statement);
-        };
-        match self.rewrite_bare_pragma_table_functions(select) {
-            Cow::Borrowed(_) => Cow::Borrowed(statement),
-            Cow::Owned(rewritten) => Cow::Owned(Statement::Select(rewritten)),
+        match statement {
+            Statement::Select(select) => match self.rewrite_bare_pragma_table_functions(select) {
+                Cow::Borrowed(_) => Cow::Borrowed(statement),
+                Cow::Owned(rewritten) => Cow::Owned(Statement::Select(rewritten)),
+            },
+            Statement::Insert(insert) => {
+                let needs_rewrite = matches!(
+                    &insert.source,
+                    fsqlite_ast::InsertSource::Select(select)
+                        if select_may_need_pragma_tvf_rewrite(select)
+                ) || insert.with.as_ref().is_some_and(|with| {
+                    with.ctes
+                        .iter()
+                        .any(|cte| select_may_need_pragma_tvf_rewrite(&cte.query))
+                });
+                if !needs_rewrite {
+                    return Cow::Borrowed(statement);
+                }
+                let mut owned =
+                    canonicalize_insert_placeholders(insert).unwrap_or_else(|_| insert.clone());
+                let outer_scope: Vec<String> = owned.with.as_ref().map_or_else(Vec::new, |with| {
+                    with.ctes.iter().map(|cte| cte.name.clone()).collect()
+                });
+                if let Some(with) = &mut owned.with {
+                    for cte in &mut with.ctes {
+                        self.rewrite_bare_pragma_in_statement(&mut cte.query, &outer_scope);
+                    }
+                }
+                if let fsqlite_ast::InsertSource::Select(select) = &mut owned.source {
+                    self.rewrite_bare_pragma_in_statement(select, &outer_scope);
+                }
+                Cow::Owned(Statement::Insert(owned))
+            }
+            Statement::CreateTable(create) => {
+                let fsqlite_ast::CreateTableBody::AsSelect(select) = &create.body else {
+                    return Cow::Borrowed(statement);
+                };
+                if !select_may_need_pragma_tvf_rewrite(select) {
+                    return Cow::Borrowed(statement);
+                }
+                let mut owned = create.clone();
+                if let fsqlite_ast::CreateTableBody::AsSelect(select) = &mut owned.body {
+                    let _ = canonicalize_select_placeholders_in_statement(
+                        select,
+                        &mut BindParamState::default(),
+                    );
+                    self.rewrite_bare_pragma_in_statement(select, &[]);
+                }
+                Cow::Owned(Statement::CreateTable(owned))
+            }
+            _ => Cow::Borrowed(statement),
         }
     }
 
@@ -89832,14 +89914,15 @@ impl Connection {
         &self,
         select: &'a SelectStatement,
     ) -> Cow<'a, SelectStatement> {
-        // This allocation-free preflight includes expression-position
-        // subqueries. Scope/shadowing is checked by the rewrite itself.
-        if !select_contains_relation_reference(select, &mut |name: &QualifiedName| {
-            pragma_table_function_is_no_arg(&name.name)
-        }) {
+        if !select_may_need_pragma_tvf_rewrite(select) {
             return Cow::Borrowed(select);
         }
         let mut owned = select.clone();
+        // Number anonymous `?` before copying any WHERE/ON equality RHS into a
+        // pragma TVF argument so binding the constraint never duplicates a `?`
+        // slot.
+        let _ =
+            canonicalize_select_placeholders_in_statement(&mut owned, &mut BindParamState::default());
         self.rewrite_bare_pragma_in_statement(&mut owned, &[]);
         Cow::Owned(owned)
     }
@@ -89953,6 +90036,13 @@ impl Connection {
                 if let Some(expr) = where_clause {
                     self.rewrite_bare_pragma_in_expr(expr, cte_names);
                 }
+                if let Some(from) = from {
+                    self.bind_pragma_hidden_args_in_from_clause(
+                        from,
+                        where_clause.as_deref(),
+                        cte_names,
+                    );
+                }
                 for expr in group_by {
                     self.rewrite_bare_pragma_in_expr(expr, cte_names);
                 }
@@ -89995,7 +90085,7 @@ impl Connection {
                 };
                 if index_hint.is_none()
                     && time_travel.is_none()
-                    && pragma_table_function_is_no_arg(&name.name)
+                    && pragma_table_function_columns(&name.name).is_some()
                     && !shadowed
                 {
                     let tvf_schema = name.schema.take();
@@ -90114,6 +90204,339 @@ impl Connection {
                 if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = bound {
                     self.rewrite_bare_pragma_in_expr(expr, cte_names);
                 }
+            }
+        }
+    }
+
+    fn pragma_source_known_columns(
+        &self,
+        source: &TableOrSubquery,
+        cte_names: &[String],
+    ) -> Option<Vec<String>> {
+        match unwrap_single_item_source(source) {
+            TableOrSubquery::TableFunction { name, .. } => {
+                self.table_function_result_column_names(name)
+            }
+            TableOrSubquery::Table { name, .. } => {
+                if name.schema.is_none()
+                    && cte_names
+                        .iter()
+                        .any(|cte| cte.eq_ignore_ascii_case(&name.name))
+                {
+                    return None;
+                }
+                let scope = match name.schema.as_deref() {
+                    None => PragmaSchemaScope::Unqualified,
+                    Some(s) if s.eq_ignore_ascii_case("main") => PragmaSchemaScope::Main,
+                    Some(s) if s.eq_ignore_ascii_case("temp") => PragmaSchemaScope::Temp,
+                    Some(_) => return None,
+                };
+                if let Some(table) = self
+                    .pragma_table_schemas_for_scope(scope)
+                    .into_iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(&name.name))
+                {
+                    return Some(table.columns.into_iter().map(|c| c.name).collect());
+                }
+                None
+            }
+            TableOrSubquery::Subquery { query, .. } => {
+                let cols = self.select_result_column_names(query, &[], &mut Vec::new());
+                (!cols.is_empty()).then_some(cols)
+            }
+            TableOrSubquery::ParenJoin(_) => None,
+        }
+    }
+
+    /// Bind missing hidden `arg` and `schema` arguments of `pragma_*` TVFs in
+    /// `from` from top-level `AND` equalities in `where_clause`, `JOIN ON`, and
+    /// `JOIN USING` (matching SQLite's `pragmaVtabBestIndex`). Original
+    /// predicates remain in place so conflicting or residual filters still run.
+    #[allow(clippy::too_many_lines)]
+    fn bind_pragma_hidden_args_in_from_clause(
+        &self,
+        from: &mut FromClause,
+        where_clause: Option<&Expr>,
+        cte_names: &[String],
+    ) {
+        if let TableOrSubquery::ParenJoin(nested) = unwrap_single_item_source_mut(&mut from.source)
+        {
+            self.bind_pragma_hidden_args_in_from_clause(nested, None, cte_names);
+        }
+        for join in &mut from.joins {
+            if let TableOrSubquery::ParenJoin(nested) =
+                unwrap_single_item_source_mut(&mut join.table)
+            {
+                self.bind_pragma_hidden_args_in_from_clause(nested, None, cte_names);
+            }
+        }
+
+        struct PragmaSourceSlot {
+            label: String,
+            pragma_name: Option<String>,
+            arg_count: usize,
+            max_args: usize,
+            has_arg_hidden: bool,
+            has_schema_hidden: bool,
+            known_columns: Option<Vec<String>>,
+        }
+
+        let source_count = 1 + from.joins.len();
+        let mut slots = Vec::with_capacity(source_count);
+        for idx in 0..source_count {
+            let source = if idx == 0 {
+                &from.source
+            } else {
+                &from.joins[idx - 1].table
+            };
+            let eff = unwrap_single_item_source(source);
+            let label = match eff {
+                TableOrSubquery::Table { name, alias, .. } => {
+                    alias.as_deref().unwrap_or(&name.name).to_owned()
+                }
+                TableOrSubquery::TableFunction { name, alias, .. } => {
+                    alias.as_deref().unwrap_or(name).to_owned()
+                }
+                TableOrSubquery::Subquery { alias, .. } => alias.clone().unwrap_or_default(),
+                TableOrSubquery::ParenJoin(_) => String::new(),
+            };
+            let (pragma_name, arg_count, max_args, has_arg_hidden, has_schema_hidden) = match eff {
+                TableOrSubquery::TableFunction { name, args, .. }
+                    if pragma_table_function_columns(name).is_some() =>
+                {
+                    let hidden = pragma_table_function_hidden_columns(name);
+                    let max_args = pragma_table_function_max_args(name);
+                    (
+                        (!hidden.is_empty()).then(|| name.clone()),
+                        args.len(),
+                        max_args,
+                        hidden.iter().any(|h| h.eq_ignore_ascii_case("arg")),
+                        hidden.iter().any(|h| h.eq_ignore_ascii_case("schema")),
+                    )
+                }
+                _ => (None, 0, 0, false, false),
+            };
+            let known_columns = self.pragma_source_known_columns(eff, cte_names);
+            slots.push(PragmaSourceSlot {
+                label,
+                pragma_name,
+                arg_count,
+                max_args,
+                has_arg_hidden,
+                has_schema_hidden,
+                known_columns,
+            });
+        }
+
+        if !slots
+            .iter()
+            .any(|slot| slot.pragma_name.is_some() && slot.arg_count < slot.max_args)
+        {
+            return;
+        }
+
+        let any_right_or_full_join = from
+            .joins
+            .iter()
+            .any(|join| matches!(join.join_type.kind, JoinKind::Right | JoinKind::Full));
+
+        let mut bound_args: Vec<(Option<Expr>, Option<Expr>)> = vec![(None, None); source_count];
+
+        let try_bind_equality = |col_ref: &ColumnRef,
+                                 rhs: &Expr,
+                                 allowed_range: std::ops::RangeInclusive<usize>,
+                                 bound_args: &mut [(Option<Expr>, Option<Expr>)]| {
+            if col_ref.schema.is_some() || expr_contains_anonymous_placeholder(rhs) {
+                return;
+            }
+            let is_schema = if col_ref.column.eq_ignore_ascii_case("arg") {
+                false
+            } else if col_ref.column.eq_ignore_ascii_case("schema") {
+                true
+            } else {
+                return;
+            };
+            let target_col = if is_schema { "schema" } else { "arg" };
+            let target_idx = if let Some(tbl) = col_ref.table.as_deref() {
+                let mut matched = None;
+                for (i, slot) in slots.iter().enumerate() {
+                    if !slot.label.is_empty() && slot.label.eq_ignore_ascii_case(tbl) {
+                        if matched.is_some() {
+                            return;
+                        }
+                        matched = Some(i);
+                    }
+                }
+                matched
+            } else {
+                let mut candidate = None;
+                for (i, slot) in slots.iter().enumerate() {
+                    let has_col = slot.known_columns.as_ref().is_none_or(|cols| {
+                        cols.iter().any(|c| c.eq_ignore_ascii_case(target_col))
+                    });
+                    if has_col {
+                        if candidate.is_some() {
+                            return;
+                        }
+                        candidate = Some(i);
+                    }
+                }
+                candidate
+            };
+            let Some(i) = target_idx else {
+                return;
+            };
+            if !allowed_range.contains(&i) {
+                return;
+            }
+            let slot = &slots[i];
+            if slot.pragma_name.is_none() || slot.arg_count >= slot.max_args {
+                return;
+            }
+            if is_schema && !slot.has_schema_hidden {
+                return;
+            }
+            if !is_schema && (!slot.has_arg_hidden || slot.arg_count >= 1) {
+                return;
+            }
+            if is_schema && slot.arg_count >= 2 {
+                return;
+            }
+            // Reject self-references to columns of the same pragma source.
+            let mut refs_self = false;
+            for_each_column_ref_in_expr(rhs, &mut |rhs_col| {
+                if let Some(tbl) = rhs_col.table.as_deref() {
+                    if !slot.label.is_empty() && tbl.eq_ignore_ascii_case(&slot.label) {
+                        refs_self = true;
+                    }
+                } else if slot.known_columns.as_ref().is_none_or(|cols| {
+                    cols.iter().any(|c| c.eq_ignore_ascii_case(&rhs_col.column))
+                }) || rhs_col.column.eq_ignore_ascii_case("rowid")
+                    || rhs_col.column.eq_ignore_ascii_case("_rowid_")
+                    || rhs_col.column.eq_ignore_ascii_case("oid")
+                {
+                    refs_self = true;
+                }
+            });
+            if refs_self {
+                return;
+            }
+            let entry = &mut bound_args[i];
+            if is_schema {
+                if entry.1.is_none() {
+                    entry.1 = Some(rhs.clone());
+                }
+            } else if entry.0.is_none() {
+                entry.0 = Some(rhs.clone());
+            }
+        };
+
+        if let Some(predicate) = where_clause
+            && !any_right_or_full_join
+        {
+            let mut equalities = Vec::new();
+            collect_top_level_and_equalities(predicate, &mut equalities);
+            for (col_ref, rhs) in equalities {
+                try_bind_equality(col_ref, rhs, 0..=(source_count - 1), &mut bound_args);
+            }
+        }
+
+        for (j, join) in from.joins.iter().enumerate() {
+            let right_idx = j + 1;
+            match (&join.join_type.kind, &join.constraint) {
+                (JoinKind::Inner | JoinKind::Cross, Some(JoinConstraint::On(on_expr))) => {
+                    let mut equalities = Vec::new();
+                    collect_top_level_and_equalities(on_expr, &mut equalities);
+                    for (col_ref, rhs) in equalities {
+                        try_bind_equality(col_ref, rhs, 0..=right_idx, &mut bound_args);
+                    }
+                }
+                (JoinKind::Left, Some(JoinConstraint::On(on_expr))) => {
+                    let mut equalities = Vec::new();
+                    collect_top_level_and_equalities(on_expr, &mut equalities);
+                    for (col_ref, rhs) in equalities {
+                        try_bind_equality(col_ref, rhs, right_idx..=right_idx, &mut bound_args);
+                    }
+                }
+                (
+                    JoinKind::Inner | JoinKind::Cross | JoinKind::Left,
+                    Some(JoinConstraint::Using(using_cols)),
+                ) => {
+                    let slot = &slots[right_idx];
+                    if slot.pragma_name.is_some() && slot.arg_count < slot.max_args {
+                        for col in using_cols {
+                            let is_schema = if col.eq_ignore_ascii_case("arg")
+                                && slot.has_arg_hidden
+                                && slot.arg_count == 0
+                            {
+                                false
+                            } else if col.eq_ignore_ascii_case("schema")
+                                && slot.has_schema_hidden
+                                && slot.arg_count < 2
+                            {
+                                true
+                            } else {
+                                continue;
+                            };
+                            if let Some(donor) = slots[..right_idx].iter().find(|left_slot| {
+                                left_slot.known_columns.as_ref().is_some_and(|cols| {
+                                    cols.iter().any(|c| c.eq_ignore_ascii_case(col))
+                                })
+                            }) {
+                                let rhs = Expr::Column(
+                                    ColumnRef {
+                                        schema: None,
+                                        table: (!donor.label.is_empty())
+                                            .then(|| Arc::from(donor.label.as_str())),
+                                        column: Arc::from(col.as_str()),
+                                    },
+                                    Span::ZERO,
+                                );
+                                let entry = &mut bound_args[right_idx];
+                                if is_schema {
+                                    if entry.1.is_none() {
+                                        entry.1 = Some(rhs);
+                                    }
+                                } else if entry.0.is_none() {
+                                    entry.0 = Some(rhs);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (i, (arg_expr, schema_expr)) in bound_args.into_iter().enumerate() {
+            if arg_expr.is_none() && schema_expr.is_none() {
+                continue;
+            }
+            let source = if i == 0 {
+                &mut from.source
+            } else {
+                &mut from.joins[i - 1].table
+            };
+            let TableOrSubquery::TableFunction { args, .. } =
+                unwrap_single_item_source_mut(source)
+            else {
+                continue;
+            };
+            let slot = &slots[i];
+            if args.is_empty() {
+                if slot.has_schema_hidden
+                    && let Some(schema) = schema_expr
+                {
+                    args.push(arg_expr.unwrap_or_else(|| Expr::Literal(Literal::Null, Span::ZERO)));
+                    args.push(schema);
+                } else if let Some(arg) = arg_expr {
+                    args.push(arg);
+                }
+            } else if args.len() == 1
+                && slot.has_schema_hidden
+                && let Some(schema) = schema_expr
+            {
+                args.push(schema);
             }
         }
     }
@@ -90499,7 +90922,7 @@ impl Connection {
     /// body is not one SELECT core or its columns cannot carry those names.
     fn inlinable_view_body(&self, view_index: usize) -> Option<SelectStatement> {
         let view = self.views.borrow().get(view_index)?.clone();
-        let mut body = view.query;
+        let mut body = self.rewrite_bare_pragma_table_functions(&view.query).into_owned();
         if body.with.is_some() || !body.body.compounds.is_empty() {
             return None;
         }
@@ -110269,7 +110692,9 @@ impl Connection {
 
     /// Run a PRAGMA table-valued function through the ordinary PRAGMA row
     /// generators. For schema-aware functions, the second argument is the
-    /// database qualifier in `PRAGMA schema.name(arg)`.
+    /// database qualifier in `PRAGMA schema.name(arg)`. Hidden `arg` and
+    /// `schema` columns (when declared by the pragma) are appended after the
+    /// visible columns as TEXT (NUL-truncated) or NULL, matching SQLite.
     async fn execute_pragma_table_function_rows(
         &self,
         name: &str,
@@ -110282,20 +110707,21 @@ impl Connection {
         let pragma_name = name[7..].to_ascii_lowercase();
         let empty_row = [];
         let empty_col_map = [];
-        let value = if let Some(arg) = args.first() {
+        let arg_text = if let Some(arg) = args.first() {
             let arg_value = self
                 .eval_expr_with_subqueries(arg, &empty_row, &empty_col_map, params)
                 .await?;
-            pragma_table_function_text(&arg_value).map(|text| {
-                fsqlite_ast::PragmaValue::Call(Expr::Literal(
-                    Literal::String(text),
-                    fsqlite_ast::Span::ZERO,
-                ))
-            })
+            pragma_table_function_text(&arg_value)
         } else {
             None
         };
-        let schema = if let Some(arg) = args.get(1) {
+        let value = arg_text.as_ref().map(|text| {
+            fsqlite_ast::PragmaValue::Call(Expr::Literal(
+                Literal::String(text.clone()),
+                fsqlite_ast::Span::ZERO,
+            ))
+        });
+        let schema_text = if let Some(arg) = args.get(1) {
             let value = self
                 .eval_expr_with_subqueries(arg, &empty_row, &empty_col_map, params)
                 .await?;
@@ -110305,25 +110731,45 @@ impl Connection {
         };
         let stmt = fsqlite_ast::PragmaStatement {
             name: fsqlite_ast::QualifiedName {
-                schema,
+                schema: schema_text.clone(),
                 name: pragma_name,
             },
             value,
         };
         let attached = self.attached_target_schema(&stmt.name).map_err(|error| {
             stmt.name.schema.as_ref().map_or(error, |schema| {
-                FrankenError::function_error(format!("unknown database '{}'", schema.replace('\'', "''")))
+                FrankenError::function_error(format!(
+                    "unknown database '{}'",
+                    schema.replace('\'', "''")
+                ))
             })
         })?;
         let rows = if let Some(attached) = attached {
-            self.execute_pragma_in_attached_catalog(&attached, stmt).await?
+            self.execute_pragma_in_attached_catalog(&attached, stmt)
+                .await?
         } else {
             self.execute_pragma(&stmt).await?
         };
+        let hidden_names = pragma_table_function_hidden_columns(name);
+        let hidden_arg_val = arg_text
+            .as_deref()
+            .map_or(SqliteValue::Null, |text| SqliteValue::Text(text.into()));
+        let hidden_schema_val = schema_text
+            .as_deref()
+            .map_or(SqliteValue::Null, |text| SqliteValue::Text(text.into()));
         let mut out = Vec::with_capacity(rows.len());
         for (i, row) in rows.into_iter().enumerate() {
             let mut values = row.values;
             values.resize(column_count, SqliteValue::Null);
+            for &hidden_col in hidden_names {
+                if hidden_col.eq_ignore_ascii_case("arg") {
+                    values.push(hidden_arg_val.clone());
+                } else if hidden_col.eq_ignore_ascii_case("schema") {
+                    values.push(hidden_schema_val.clone());
+                } else {
+                    values.push(SqliteValue::Null);
+                }
+            }
             if include_hidden_rowid {
                 values.push(SqliteValue::Integer(i64::try_from(i + 1).unwrap_or(0)));
             }
@@ -137783,26 +138229,338 @@ fn table_function_hidden_columns(name: &str) -> &'static [&'static str] {
     if name.eq_ignore_ascii_case("generate_series") {
         return &["start", "stop", "step"];
     }
-    let Some(pragma) = name
-        .get(..7)
-        .filter(|prefix| prefix.eq_ignore_ascii_case("pragma_"))
-        .and_then(|_| name.get(7..))
-    else {
-        return &[];
-    };
-    let takes_argument = [
-        "table_info",
-        "table_xinfo",
-        "index_list",
-        "index_info",
-        "index_xinfo",
-        "foreign_key_list",
-        "foreign_key_check",
-        "table_list",
-    ]
-    .iter()
-    .any(|known| pragma.eq_ignore_ascii_case(known));
-    if takes_argument { &["arg", "schema"] } else { &[] }
+    pragma_table_function_hidden_columns(name)
+}
+
+fn select_may_need_pragma_tvf_rewrite(select: &SelectStatement) -> bool {
+    if select
+        .with
+        .as_ref()
+        .is_some_and(|with| with.ctes.iter().any(|cte| select_may_need_pragma_tvf_rewrite(&cte.query)))
+    {
+        return true;
+    }
+    if select_core_may_need_pragma_tvf_rewrite(&select.body.select)
+        || select
+            .body
+            .compounds
+            .iter()
+            .any(|(_, core)| select_core_may_need_pragma_tvf_rewrite(core))
+        || select
+            .order_by
+            .iter()
+            .any(|term| expr_may_need_pragma_tvf_rewrite(&term.expr))
+    {
+        return true;
+    }
+    select.limit.as_ref().is_some_and(|limit| {
+        expr_may_need_pragma_tvf_rewrite(&limit.limit)
+            || limit
+                .offset
+                .as_ref()
+                .is_some_and(expr_may_need_pragma_tvf_rewrite)
+    })
+}
+
+fn select_core_may_need_pragma_tvf_rewrite(core: &SelectCore) -> bool {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            from.as_ref().is_some_and(from_may_need_pragma_tvf_rewrite)
+                || columns.iter().any(|col| match col {
+                    ResultColumn::Expr { expr, .. } => expr_may_need_pragma_tvf_rewrite(expr),
+                    ResultColumn::Star | ResultColumn::TableStar(_) => false,
+                })
+                || where_clause
+                    .as_deref()
+                    .is_some_and(expr_may_need_pragma_tvf_rewrite)
+                || group_by.iter().any(expr_may_need_pragma_tvf_rewrite)
+                || having
+                    .as_deref()
+                    .is_some_and(expr_may_need_pragma_tvf_rewrite)
+                || windows.iter().any(|w| window_may_need_pragma_tvf_rewrite(&w.spec))
+        }
+        SelectCore::Values(rows) => rows
+            .iter()
+            .flatten()
+            .any(expr_may_need_pragma_tvf_rewrite),
+    }
+}
+
+fn from_may_need_pragma_tvf_rewrite(from: &FromClause) -> bool {
+    source_may_need_pragma_tvf_rewrite(&from.source)
+        || from.joins.iter().any(|join| {
+            source_may_need_pragma_tvf_rewrite(&join.table)
+                || matches!(
+                    &join.constraint,
+                    Some(JoinConstraint::On(expr)) if expr_may_need_pragma_tvf_rewrite(expr)
+                )
+        })
+}
+
+fn source_may_need_pragma_tvf_rewrite(source: &TableOrSubquery) -> bool {
+    match source {
+        TableOrSubquery::Table { name, .. } => pragma_table_function_columns(&name.name).is_some(),
+        TableOrSubquery::TableFunction { name, args, .. } => {
+            !pragma_table_function_hidden_columns(name).is_empty()
+                || args.iter().any(expr_may_need_pragma_tvf_rewrite)
+        }
+        TableOrSubquery::Subquery { query, .. } => select_may_need_pragma_tvf_rewrite(query),
+        TableOrSubquery::ParenJoin(from) => from_may_need_pragma_tvf_rewrite(from),
+    }
+}
+
+fn window_may_need_pragma_tvf_rewrite(window: &WindowSpec) -> bool {
+    window
+        .partition_by
+        .iter()
+        .any(expr_may_need_pragma_tvf_rewrite)
+        || window
+            .order_by
+            .iter()
+            .any(|term| expr_may_need_pragma_tvf_rewrite(&term.expr))
+        || window.frame.as_ref().is_some_and(|frame| {
+            std::iter::once(&frame.start)
+                .chain(frame.end.iter())
+                .any(|bound| {
+                    matches!(
+                        bound,
+                        FrameBound::Preceding(expr) | FrameBound::Following(expr)
+                            if expr_may_need_pragma_tvf_rewrite(expr)
+                    )
+                })
+        })
+}
+
+fn expr_may_need_pragma_tvf_rewrite(expr: &Expr) -> bool {
+    match expr {
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::Placeholder(_, _)
+        | Expr::Raise { .. } => false,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_may_need_pragma_tvf_rewrite(left) || expr_may_need_pragma_tvf_rewrite(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => expr_may_need_pragma_tvf_rewrite(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_may_need_pragma_tvf_rewrite(expr)
+                || expr_may_need_pragma_tvf_rewrite(low)
+                || expr_may_need_pragma_tvf_rewrite(high)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_may_need_pragma_tvf_rewrite(expr)
+                || match set {
+                    InSet::List(values) => values.iter().any(expr_may_need_pragma_tvf_rewrite),
+                    InSet::Subquery(query) => select_may_need_pragma_tvf_rewrite(query),
+                    InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_may_need_pragma_tvf_rewrite(expr)
+                || expr_may_need_pragma_tvf_rewrite(pattern)
+                || escape
+                    .as_deref()
+                    .is_some_and(expr_may_need_pragma_tvf_rewrite)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(expr_may_need_pragma_tvf_rewrite)
+                || whens.iter().any(|(w, t)| {
+                    expr_may_need_pragma_tvf_rewrite(w) || expr_may_need_pragma_tvf_rewrite(t)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_may_need_pragma_tvf_rewrite)
+        }
+        Expr::Subquery(query, _) | Expr::Exists { subquery: query, .. } => {
+            select_may_need_pragma_tvf_rewrite(query)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            matches!(args, FunctionArgs::List(list) if list.iter().any(expr_may_need_pragma_tvf_rewrite))
+                || order_by
+                    .iter()
+                    .any(|term| expr_may_need_pragma_tvf_rewrite(&term.expr))
+                || filter
+                    .as_deref()
+                    .is_some_and(expr_may_need_pragma_tvf_rewrite)
+                || over.as_ref().is_some_and(window_may_need_pragma_tvf_rewrite)
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            expr_may_need_pragma_tvf_rewrite(expr) || expr_may_need_pragma_tvf_rewrite(path)
+        }
+        Expr::RowValue(values, _) => values.iter().any(expr_may_need_pragma_tvf_rewrite),
+    }
+}
+
+fn expr_contains_anonymous_placeholder(expr: &Expr) -> bool {
+    match expr {
+        Expr::Placeholder(PlaceholderType::Anonymous, _) => true,
+        Expr::Placeholder(_, _)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::Raise { .. } => false,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_anonymous_placeholder(left) || expr_contains_anonymous_placeholder(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => expr_contains_anonymous_placeholder(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_anonymous_placeholder(expr)
+                || expr_contains_anonymous_placeholder(low)
+                || expr_contains_anonymous_placeholder(high)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_contains_anonymous_placeholder(expr)
+                || match set {
+                    InSet::List(values) => values.iter().any(expr_contains_anonymous_placeholder),
+                    InSet::Subquery(_) | InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_anonymous_placeholder(expr)
+                || expr_contains_anonymous_placeholder(pattern)
+                || escape
+                    .as_deref()
+                    .is_some_and(expr_contains_anonymous_placeholder)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(expr_contains_anonymous_placeholder)
+                || whens.iter().any(|(w, t)| {
+                    expr_contains_anonymous_placeholder(w) || expr_contains_anonymous_placeholder(t)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_contains_anonymous_placeholder)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            matches!(args, FunctionArgs::List(list) if list.iter().any(expr_contains_anonymous_placeholder))
+                || order_by
+                    .iter()
+                    .any(|term| expr_contains_anonymous_placeholder(&term.expr))
+                || filter
+                    .as_deref()
+                    .is_some_and(expr_contains_anonymous_placeholder)
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            expr_contains_anonymous_placeholder(expr) || expr_contains_anonymous_placeholder(path)
+        }
+        Expr::RowValue(values, _) => values.iter().any(expr_contains_anonymous_placeholder),
+        Expr::Subquery(_, _) | Expr::Exists { .. } => false,
+    }
+}
+
+fn strip_collate_expr(mut expr: &Expr) -> &Expr {
+    while let Expr::Collate { expr: inner, .. } = expr {
+        expr = inner;
+    }
+    expr
+}
+
+fn collect_top_level_and_equalities<'a>(
+    expr: &'a Expr,
+    out: &mut Vec<(&'a ColumnRef, &'a Expr)>,
+) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+            ..
+        } => {
+            collect_top_level_and_equalities(left, out);
+            collect_top_level_and_equalities(right, out);
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+            ..
+        } => {
+            if let Expr::Column(col_ref, _) = strip_collate_expr(left) {
+                out.push((col_ref, right.as_ref()));
+            }
+            if let Expr::Column(col_ref, _) = strip_collate_expr(right) {
+                out.push((col_ref, left.as_ref()));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn unwrap_single_item_source(mut source: &TableOrSubquery) -> &TableOrSubquery {
+    while let TableOrSubquery::ParenJoin(inner) = source {
+        if inner.joins.is_empty() {
+            source = &inner.source;
+        } else {
+            break;
+        }
+    }
+    source
+}
+
+fn unwrap_single_item_source_mut(mut source: &mut TableOrSubquery) -> &mut TableOrSubquery {
+    while matches!(
+        source,
+        TableOrSubquery::ParenJoin(inner) if inner.joins.is_empty()
+    ) {
+        let TableOrSubquery::ParenJoin(inner) = source else {
+            unreachable!("checked above");
+        };
+        source = &mut inner.source;
+    }
+    source
 }
 
 /// Detect whether a SELECT contains at least one MATCH operator.
@@ -176326,6 +177084,9 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         }
         let active_views = self.active_views.clone();
         let column_view_state = Rc::clone(&self.column_view_state);
+        let rewritten = self
+            .connection
+            .rewrite_bare_pragma_table_functions(&view.query);
         let mut resolver = if view.temporary {
             SelectRelationResolver::with_active_views(
                 self.connection,
@@ -176343,14 +177104,14 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
             )
         };
         let result = with_view_expansion_stack(|| {
-            resolver.validate_select(&view.query).and_then(|()| {
+            resolver.validate_select(rewritten.as_ref()).and_then(|()| {
                 // View expansion is part of SQLite's relation/name-resolution
                 // phase, so a broken referenced view must outrank an enclosing
                 // SELECT's LIMIT/OFFSET diagnostic even when the reference is
                 // nested in a scalar subquery or derived table. Relation-only
                 // traversal is insufficient here: validate the expanded view's
                 // lexical columns before returning to the outer SELECT.
-                let mut query = view.query.clone();
+                let mut query = rewritten.as_ref().clone();
                 if !view.temporary {
                     qualify_persistent_view_relations(&mut query);
                 }
