@@ -12770,6 +12770,46 @@ enum CreateTableRun {
 /// true when omitted); a false value means the update is a no-op.
 type UpsertUpdatePlan = (Option<i64>, Vec<SqliteValue>, Vec<SqliteValue>, bool);
 
+/// A foreign key bound to the referenced parent's declared columns. Its
+/// comparison must be identical when looking for children and when acting
+/// on them, even after the parent row has already been changed.
+struct InboundForeignKey {
+    child_table: String,
+    fk: FkDef,
+    child_columns: Vec<String>,
+    parent_columns: Vec<usize>,
+    parent_collations: Vec<Option<String>>,
+    predicate: String,
+}
+
+impl InboundForeignKey {
+    fn parent_values(&self, row: &[SqliteValue]) -> Result<Vec<SqliteValue>> {
+        self.parent_columns
+            .iter()
+            .map(|&i| row.get(i).cloned())
+            .collect::<Option<_>>()
+            .ok_or(FrankenError::ForeignKeyViolation)
+    }
+
+    fn matches(
+        &self,
+        row: &[SqliteValue],
+        indices: &[usize],
+        key: &[SqliteValue],
+        registry: &Mutex<CollationRegistry>,
+    ) -> bool {
+        indices
+            .iter()
+            .zip(key)
+            .zip(&self.parent_collations)
+            .all(|((&i, value), coll)| {
+                row.get(i).is_some_and(|other| {
+                    cmp_sqlite_values_collated(other, value, coll.as_deref(), registry).is_eq()
+                })
+            })
+    }
+}
+
 /// Describes the action to take when a FK-referenced parent row is deleted.
 #[allow(dead_code)]
 enum FkDeleteAction {
@@ -12779,18 +12819,21 @@ enum FkDeleteAction {
     Cascade {
         child_table: String,
         child_columns: Vec<String>,
+        predicate: String,
         parent_values: Vec<SqliteValue>,
     },
     /// Child rows exist and ON DELETE SET NULL is specified.
     SetNull {
         child_table: String,
         child_columns: Vec<String>,
+        predicate: String,
         parent_values: Vec<SqliteValue>,
     },
     /// Child rows exist and ON DELETE SET DEFAULT is specified.
     SetDefault {
         child_table: String,
         child_columns: Vec<String>,
+        predicate: String,
         /// SQL DEFAULT expression text per child column (`NULL` if none).
         child_defaults: Vec<String>,
         parent_values: Vec<SqliteValue>,
@@ -12804,17 +12847,20 @@ enum FkUpdateAction {
     Cascade {
         child_table: String,
         child_columns: Vec<String>,
+        predicate: String,
         old_parent_values: Vec<SqliteValue>,
         new_parent_values: Vec<SqliteValue>,
     },
     SetNull {
         child_table: String,
         child_columns: Vec<String>,
+        predicate: String,
         old_parent_values: Vec<SqliteValue>,
     },
     SetDefault {
         child_table: String,
         child_columns: Vec<String>,
+        predicate: String,
         /// SQL DEFAULT expression text per child column (`NULL` if none).
         child_defaults: Vec<String>,
         old_parent_values: Vec<SqliteValue>,
@@ -86432,6 +86478,71 @@ impl Connection {
             .unwrap_or_default()
     }
 
+    fn inbound_foreign_keys(&self, table_name: &str) -> Result<Vec<InboundForeignKey>> {
+        let schema = self.schema.borrow();
+        let parent = schema
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(table_name));
+        let mut references = Vec::new();
+        for child in schema.iter() {
+            for fk in child
+                .foreign_keys
+                .iter()
+                .filter(|fk| fk.parent_table.eq_ignore_ascii_case(table_name))
+            {
+                let parent = parent.ok_or(FrankenError::ForeignKeyViolation)?;
+                let implicit;
+                let names = if fk.parent_columns.is_empty() {
+                    implicit = Self::fk_implicit_parent_key_columns(Some(parent));
+                    &implicit
+                } else {
+                    &fk.parent_columns
+                };
+                if names.is_empty() || names.len() != fk.child_columns.len() {
+                    return Err(FrankenError::ForeignKeyViolation);
+                }
+                let mut parent_columns = Vec::with_capacity(names.len());
+                let mut parent_collations = Vec::with_capacity(names.len());
+                let mut child_columns = Vec::with_capacity(names.len());
+                let mut terms = Vec::with_capacity(names.len());
+                for (slot, (name, &cid)) in names.iter().zip(&fk.child_columns).enumerate() {
+                    let pid = parent
+                        .column_index(name)
+                        .ok_or(FrankenError::ForeignKeyViolation)?;
+                    let column = child
+                        .columns
+                        .get(cid)
+                        .ok_or(FrankenError::ForeignKeyViolation)?;
+                    let collation = &parent.columns[pid].collation;
+                    let parent_collation = collation.as_deref().unwrap_or("BINARY");
+                    let mut term = quote_identifier(&column.name);
+                    if !column
+                        .collation
+                        .as_deref()
+                        .unwrap_or("BINARY")
+                        .eq_ignore_ascii_case(parent_collation)
+                    {
+                        term.push_str(" COLLATE ");
+                        term.push_str(&quote_identifier(parent_collation));
+                    }
+                    terms.push(format!("{term} = ?{}", slot + 1));
+                    parent_columns.push(pid);
+                    parent_collations.push(collation.clone());
+                    child_columns.push(column.name.clone());
+                }
+                references.push(InboundForeignKey {
+                    child_table: child.name.clone(),
+                    fk: fk.clone(),
+                    child_columns,
+                    parent_columns,
+                    parent_collations,
+                    predicate: terms.join(" AND "),
+                });
+            }
+        }
+        Ok(references)
+    }
+
     /// Verify that no child table references a row being deleted from `table_name`.
     ///
     /// `row_values` are the column values of the row about to be deleted.
@@ -86460,68 +86571,16 @@ impl Connection {
         row_values: &[SqliteValue],
         defer_no_action_to_statement_end: bool,
     ) -> Result<Vec<FkDeleteAction>> {
-        let schema = self.schema.borrow();
-        // Find all child tables that have FK references to this parent table.
-        let mut actions: Vec<(String, FkDef, Vec<String>)> = Vec::new();
-        for table in schema.iter() {
-            for fk in &table.foreign_keys {
-                if fk.parent_table.eq_ignore_ascii_case(table_name) {
-                    let child_col_names = fk
-                        .child_columns
-                        .iter()
-                        .map(|&idx| table.columns.get(idx).map(|c| c.name.clone()))
-                        .collect::<Option<Vec<_>>>()
-                        .ok_or(FrankenError::ForeignKeyViolation)?;
-                    actions.push((table.name.clone(), fk.clone(), child_col_names));
-                }
-            }
-        }
-        let parent = schema
-            .iter()
-            .find(|t| t.name.eq_ignore_ascii_case(table_name));
-        let implicit_parent_key_cols = Self::fk_implicit_parent_key_columns(parent);
-        drop(schema);
-
-        if actions.is_empty() {
-            return Ok(vec![]);
-        }
-
         let mut result_actions = Vec::new();
-
-        for (child_table, fk, child_col_names) in &actions {
-            // Determine which parent column values to match.
-            // When fk.parent_columns is empty, the FK implicitly references
-            // the parent's declared primary key — NOT all columns.
-            let parent_key_cols: &[String] = if fk.parent_columns.is_empty() {
-                &implicit_parent_key_cols
-            } else {
-                &fk.parent_columns
-            };
-            if parent_key_cols.is_empty()
-                || child_col_names.is_empty()
-                || parent_key_cols.len() != child_col_names.len()
-            {
-                return Err(FrankenError::ForeignKeyViolation);
-            }
-
-            // Get parent values for the FK columns.
-            let parent_schema = self.schema.borrow();
-            let parent_table = parent_schema
-                .iter()
-                .find(|t| t.name.eq_ignore_ascii_case(table_name));
-            let parent_values = parent_key_cols
-                .iter()
-                .map(|col_name| {
-                    parent_table.and_then(|p| {
-                        p.columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                            .and_then(|idx| row_values.get(idx).cloned())
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-                .ok_or(FrankenError::ForeignKeyViolation)?;
-            drop(parent_schema);
+        for reference in self.inbound_foreign_keys(table_name)? {
+            let InboundForeignKey {
+                child_table,
+                fk,
+                child_columns: child_col_names,
+                predicate,
+                ..
+            } = &reference;
+            let parent_values = reference.parent_values(row_values)?;
 
             if parent_values.iter().any(|v| matches!(v, SqliteValue::Null)) {
                 continue;
@@ -86542,21 +86601,17 @@ impl Connection {
             // `min_matching_rows` must be 1.
             let self_references_deleted_row = !defer_no_action_to_statement_end
                 && child_table.eq_ignore_ascii_case(table_name)
-                && fk
-                    .child_columns
-                    .iter()
-                    .zip(&parent_values)
-                    .all(|(&idx, pv)| row_values.get(idx) == Some(pv));
+                && reference.matches(
+                    row_values,
+                    &fk.child_columns,
+                    &parent_values,
+                    &self.collation_registry,
+                );
             let min_matching_rows = if self_references_deleted_row { 2 } else { 1 };
-            let where_parts: Vec<String> = child_col_names
-                .iter()
-                .enumerate()
-                .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
-                .collect();
             let sql = format!(
                 "SELECT 1 FROM {} WHERE {} LIMIT {min_matching_rows}",
                 quote_identifier(child_table),
-                where_parts.join(" AND ")
+                predicate
             );
             // bd-issue59: Use fk_validation_query for consistent FK checking.
             let rows = self.fk_validation_query(&sql, &parent_values).await?;
@@ -86567,6 +86622,7 @@ impl Connection {
                         result_actions.push(FkDeleteAction::Cascade {
                             child_table: child_table.clone(),
                             child_columns: child_col_names.clone(),
+                            predicate: predicate.clone(),
                             parent_values: parent_values.clone(),
                         });
                     }
@@ -86574,6 +86630,7 @@ impl Connection {
                         result_actions.push(FkDeleteAction::SetNull {
                             child_table: child_table.clone(),
                             child_columns: child_col_names.clone(),
+                            predicate: predicate.clone(),
                             parent_values: parent_values.clone(),
                         });
                     }
@@ -86583,6 +86640,7 @@ impl Connection {
                         result_actions.push(FkDeleteAction::SetDefault {
                             child_table: child_table.clone(),
                             child_columns: child_col_names.clone(),
+                            predicate: predicate.clone(),
                             child_defaults,
                             parent_values: parent_values.clone(),
                         });
@@ -86611,7 +86669,7 @@ impl Connection {
                             let fetch_sql = format!(
                                 "SELECT * FROM {} WHERE {}",
                                 quote_identifier(child_table),
-                                where_parts.join(" AND ")
+                                predicate
                             );
                             let affected =
                                 self.fk_validation_query(&fetch_sql, &parent_values).await?;
@@ -86906,17 +86964,13 @@ impl Connection {
             FkDeleteAction::Cascade {
                 child_table,
                 child_columns,
+                predicate,
                 parent_values,
             } => {
-                let where_parts: Vec<String> = child_columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
-                    .collect();
                 let sql = format!(
                     "DELETE FROM {} WHERE {}",
                     quote_identifier(child_table),
-                    where_parts.join(" AND ")
+                    predicate
                 );
                 let result = {
                     let _cascade = self.enter_fk_cascade()?;
@@ -86926,6 +86980,7 @@ impl Connection {
                 self.queue_fk_action_survivors(
                     child_table,
                     child_columns,
+                    predicate,
                     parent_values,
                     &fsqlite_ast::TriggerEvent::Delete,
                 )
@@ -86934,22 +86989,18 @@ impl Connection {
             FkDeleteAction::SetNull {
                 child_table,
                 child_columns,
+                predicate,
                 parent_values,
             } => {
                 let set_parts: Vec<String> = child_columns
                     .iter()
                     .map(|col| format!("{} = NULL", quote_identifier(col)))
                     .collect();
-                let where_parts: Vec<String> = child_columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
-                    .collect();
                 let sql = format!(
                     "UPDATE OR ABORT {} SET {} WHERE {}",
                     quote_identifier(child_table),
                     set_parts.join(", "),
-                    where_parts.join(" AND ")
+                    predicate
                 );
                 let result = {
                     let _cascade = self.enter_fk_cascade()?;
@@ -86959,6 +87010,7 @@ impl Connection {
                 self.queue_fk_action_survivors(
                     child_table,
                     child_columns,
+                    predicate,
                     parent_values,
                     &fsqlite_ast::TriggerEvent::Update(child_columns.clone()),
                 )
@@ -86967,6 +87019,7 @@ impl Connection {
             FkDeleteAction::SetDefault {
                 child_table,
                 child_columns,
+                predicate,
                 child_defaults,
                 parent_values,
             } => {
@@ -86975,16 +87028,11 @@ impl Connection {
                     .zip(child_defaults)
                     .map(|(col, def)| format!("{} = {}", quote_identifier(col), def))
                     .collect();
-                let where_parts: Vec<String> = child_columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
-                    .collect();
                 let sql = format!(
                     "UPDATE OR ABORT {} SET {} WHERE {}",
                     quote_identifier(child_table),
                     set_parts.join(", "),
-                    where_parts.join(" AND ")
+                    predicate
                 );
                 let result = {
                     let _cascade = self.enter_fk_cascade()?;
@@ -87006,6 +87054,7 @@ impl Connection {
         &self,
         child_table: &str,
         child_columns: &[String],
+        predicate: &str,
         parent_values: &[SqliteValue],
         event: &fsqlite_ast::TriggerEvent,
     ) -> Result<()> {
@@ -87027,12 +87076,16 @@ impl Connection {
                 .enumerate()
                 .filter(|(_, fk)| {
                     fk.child_columns.len() == child_columns.len()
-                        && fk.child_columns.iter().zip(child_columns).all(|(&index, name)| {
-                            table
-                                .columns
-                                .get(index)
-                                .is_some_and(|column| column.name.eq_ignore_ascii_case(name))
-                        })
+                        && fk
+                            .child_columns
+                            .iter()
+                            .zip(child_columns)
+                            .all(|(&index, name)| {
+                                table
+                                    .columns
+                                    .get(index)
+                                    .is_some_and(|column| column.name.eq_ignore_ascii_case(name))
+                            })
                 })
                 .map(|(index, _)| index)
                 .collect()
@@ -87040,15 +87093,10 @@ impl Connection {
         if keys.is_empty() {
             return Ok(());
         }
-        let where_parts: Vec<String> = child_columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
-            .collect();
         let sql = format!(
             "SELECT * FROM {} WHERE {}",
             quote_identifier(child_table),
-            where_parts.join(" AND ")
+            predicate
         );
         for row in self.fk_validation_query(&sql, parent_values).await? {
             self.check_fk_parent_exists_for_keys(child_table, row.values(), Some(&keys))
@@ -87067,79 +87115,17 @@ impl Connection {
         old_values: &[SqliteValue],
         new_values: &[SqliteValue],
     ) -> Result<Vec<FkUpdateAction>> {
-        let schema = self.schema.borrow();
-        let mut actions: Vec<(String, fsqlite_vdbe::codegen::FkDef, Vec<String>)> = Vec::new();
-        for table in schema.iter() {
-            for fk in &table.foreign_keys {
-                if fk.parent_table.eq_ignore_ascii_case(table_name) {
-                    let child_col_names = fk
-                        .child_columns
-                        .iter()
-                        .map(|&idx| table.columns.get(idx).map(|c| c.name.clone()))
-                        .collect::<Option<Vec<_>>>()
-                        .ok_or(FrankenError::ForeignKeyViolation)?;
-                    actions.push((table.name.clone(), fk.clone(), child_col_names));
-                }
-            }
-        }
-        let parent = schema
-            .iter()
-            .find(|t| t.name.eq_ignore_ascii_case(table_name));
-        let implicit_parent_key_cols = Self::fk_implicit_parent_key_columns(parent);
-        drop(schema);
-
-        if actions.is_empty() {
-            return Ok(vec![]);
-        }
-
         let mut result_actions = Vec::new();
-
-        for (child_table, fk, child_col_names) in &actions {
-            // When fk.parent_columns is empty, the FK implicitly references
-            // the parent's declared primary key — NOT all columns.
-            let parent_key_cols: &[String] = if fk.parent_columns.is_empty() {
-                &implicit_parent_key_cols
-            } else {
-                &fk.parent_columns
-            };
-            if parent_key_cols.is_empty()
-                || child_col_names.is_empty()
-                || parent_key_cols.len() != child_col_names.len()
-            {
-                return Err(FrankenError::ForeignKeyViolation);
-            }
-
-            let parent_schema = self.schema.borrow();
-            let parent_table = parent_schema
-                .iter()
-                .find(|t| t.name.eq_ignore_ascii_case(table_name));
-
-            let old_parent_vals = parent_key_cols
-                .iter()
-                .map(|col_name| {
-                    parent_table.and_then(|t| {
-                        t.columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                            .and_then(|idx| old_values.get(idx).cloned())
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-                .ok_or(FrankenError::ForeignKeyViolation)?;
-
-            let new_parent_vals = parent_key_cols
-                .iter()
-                .map(|col_name| {
-                    parent_table.and_then(|t| {
-                        t.columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                            .and_then(|idx| new_values.get(idx).cloned())
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-                .ok_or(FrankenError::ForeignKeyViolation)?;
-            drop(parent_schema);
+        for reference in self.inbound_foreign_keys(table_name)? {
+            let InboundForeignKey {
+                child_table,
+                fk,
+                child_columns: child_col_names,
+                predicate,
+                ..
+            } = &reference;
+            let old_parent_vals = reference.parent_values(old_values)?;
+            let new_parent_vals = reference.parent_values(new_values)?;
 
             if old_parent_vals
                 .iter()
@@ -87148,7 +87134,12 @@ impl Connection {
                 continue;
             }
 
-            if old_parent_vals == new_parent_vals {
+            if reference.matches(
+                new_values,
+                &reference.parent_columns,
+                &old_parent_vals,
+                &self.collation_registry,
+            ) {
                 continue;
             }
 
@@ -87160,32 +87151,28 @@ impl Connection {
             // child — require at least 2 matching rows before triggering
             // RESTRICT / NO ACTION / CASCADE / SET NULL / SET DEFAULT.
             let old_row_matched_self = child_table.eq_ignore_ascii_case(table_name)
-                && fk
-                    .child_columns
-                    .iter()
-                    .zip(&old_parent_vals)
-                    .all(|(&idx, pv)| old_values.get(idx) == Some(pv));
+                && reference.matches(
+                    old_values,
+                    &fk.child_columns,
+                    &old_parent_vals,
+                    &self.collation_registry,
+                );
             let new_row_still_matches_old_parent = child_table.eq_ignore_ascii_case(table_name)
-                && fk
-                    .child_columns
-                    .iter()
-                    .zip(&old_parent_vals)
-                    .all(|(&idx, pv)| new_values.get(idx) == Some(pv));
-            let min_matching_rows =
-                if old_row_matched_self && !new_row_still_matches_old_parent {
-                    2
-                } else {
-                    1
-                };
-            let where_parts: Vec<String> = child_col_names
-                .iter()
-                .enumerate()
-                .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
-                .collect();
+                && reference.matches(
+                    new_values,
+                    &fk.child_columns,
+                    &old_parent_vals,
+                    &self.collation_registry,
+                );
+            let min_matching_rows = if old_row_matched_self && !new_row_still_matches_old_parent {
+                2
+            } else {
+                1
+            };
             let sql = format!(
                 "SELECT 1 FROM {} WHERE {} LIMIT {min_matching_rows}",
                 quote_identifier(child_table),
-                where_parts.join(" AND ")
+                predicate
             );
             // bd-issue59: Use fk_validation_query for consistent FK checking.
             let rows = self.fk_validation_query(&sql, &old_parent_vals).await?;
@@ -87195,6 +87182,7 @@ impl Connection {
                         result_actions.push(FkUpdateAction::Cascade {
                             child_table: child_table.clone(),
                             child_columns: child_col_names.clone(),
+                            predicate: predicate.clone(),
                             old_parent_values: old_parent_vals,
                             new_parent_values: new_parent_vals,
                         });
@@ -87203,6 +87191,7 @@ impl Connection {
                         result_actions.push(FkUpdateAction::SetNull {
                             child_table: child_table.clone(),
                             child_columns: child_col_names.clone(),
+                            predicate: predicate.clone(),
                             old_parent_values: old_parent_vals,
                         });
                     }
@@ -87212,6 +87201,7 @@ impl Connection {
                         result_actions.push(FkUpdateAction::SetDefault {
                             child_table: child_table.clone(),
                             child_columns: child_col_names.clone(),
+                            predicate: predicate.clone(),
                             child_defaults,
                             old_parent_values: old_parent_vals,
                         });
@@ -87234,7 +87224,7 @@ impl Connection {
                             let fetch_sql = format!(
                                 "SELECT * FROM {} WHERE {}",
                                 quote_identifier(child_table),
-                                where_parts.join(" AND ")
+                                predicate
                             );
                             let affected = self
                                 .fk_validation_query(&fetch_sql, &old_parent_vals)
@@ -87264,22 +87254,18 @@ impl Connection {
             FkUpdateAction::Cascade {
                 child_table,
                 child_columns,
+                predicate,
                 old_parent_values,
                 new_parent_values,
             } => {
                 let set_parts: Vec<String> = child_columns
                     .iter()
                     .enumerate()
-                    .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
-                    .collect();
-                let where_parts: Vec<String> = child_columns
-                    .iter()
-                    .enumerate()
                     .map(|(i, col)| {
                         format!(
                             "{} = ?{}",
                             quote_identifier(col),
-                            i + 1 + child_columns.len()
+                            i + 1 + old_parent_values.len()
                         )
                     })
                     .collect();
@@ -87287,10 +87273,10 @@ impl Connection {
                     "UPDATE OR ABORT {} SET {} WHERE {}",
                     quote_identifier(child_table),
                     set_parts.join(", "),
-                    where_parts.join(" AND ")
+                    predicate
                 );
-                let mut params = new_parent_values.clone();
-                params.extend_from_slice(old_parent_values);
+                let mut params = old_parent_values.clone();
+                params.extend_from_slice(new_parent_values);
                 let result = {
                     let _cascade = self.enter_fk_cascade()?;
                     self.execute_with_params(&sql, &params).await
@@ -87299,6 +87285,7 @@ impl Connection {
                 self.queue_fk_action_survivors(
                     child_table,
                     child_columns,
+                    predicate,
                     old_parent_values,
                     &fsqlite_ast::TriggerEvent::Update(child_columns.clone()),
                 )
@@ -87307,22 +87294,18 @@ impl Connection {
             FkUpdateAction::SetNull {
                 child_table,
                 child_columns,
+                predicate,
                 old_parent_values,
             } => {
                 let set_parts: Vec<String> = child_columns
                     .iter()
                     .map(|col| format!("{} = NULL", quote_identifier(col)))
                     .collect();
-                let where_parts: Vec<String> = child_columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
-                    .collect();
                 let sql = format!(
                     "UPDATE OR ABORT {} SET {} WHERE {}",
                     quote_identifier(child_table),
                     set_parts.join(", "),
-                    where_parts.join(" AND ")
+                    predicate
                 );
                 let result = {
                     let _cascade = self.enter_fk_cascade()?;
@@ -87332,6 +87315,7 @@ impl Connection {
                 self.queue_fk_action_survivors(
                     child_table,
                     child_columns,
+                    predicate,
                     old_parent_values,
                     &fsqlite_ast::TriggerEvent::Update(child_columns.clone()),
                 )
@@ -87340,6 +87324,7 @@ impl Connection {
             FkUpdateAction::SetDefault {
                 child_table,
                 child_columns,
+                predicate,
                 child_defaults,
                 old_parent_values,
             } => {
@@ -87348,16 +87333,11 @@ impl Connection {
                     .zip(child_defaults)
                     .map(|(col, def)| format!("{} = {}", quote_identifier(col), def))
                     .collect();
-                let where_parts: Vec<String> = child_columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
-                    .collect();
                 let sql = format!(
                     "UPDATE OR ABORT {} SET {} WHERE {}",
                     quote_identifier(child_table),
                     set_parts.join(", "),
-                    where_parts.join(" AND ")
+                    predicate
                 );
                 let result = {
                     let _cascade = self.enter_fk_cascade()?;

@@ -234,3 +234,105 @@ fn fk_cascade_actions_match_rusqlite_oracle() {
         );
     });
 }
+
+/// An inbound FK compares child values with the parent's collation. A NOCASE
+/// child can legally reference two distinct BINARY parents with keys "a" and
+/// "A". Only one family may change when a parent row is deleted or updated.
+#[test]
+fn parent_collation_governs_foreign_key_actions() {
+    asupersync::test_utils::run_test(|| async {
+        for (parent, child) in [("BINARY", "NOCASE"), ("NOCASE", "BINARY")] {
+            for action in ["CASCADE", "SET NULL", "SET DEFAULT", "RESTRICT", "NO ACTION"] {
+                for change in ["DELETE", "UPDATE"] {
+                    let frank = Connection::open(":memory:").await.unwrap();
+                    let stock = rusqlite::Connection::open_in_memory().unwrap();
+                    let other = if parent == "BINARY" { "a" } else { "other" };
+                    let referent = if parent == "BINARY" { "A" } else { "a" };
+                    for sql in [
+                        "PRAGMA foreign_keys=ON".to_owned(),
+                        format!("CREATE TABLE p(k TEXT COLLATE {parent} PRIMARY KEY) WITHOUT ROWID"),
+                        format!("CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT COLLATE {child} DEFAULT 'fallback' REFERENCES p(k) ON DELETE {action} ON UPDATE {action})"),
+                        format!("INSERT INTO p VALUES ('A'),('{other}'),('fallback')"),
+                        format!("INSERT INTO c VALUES (1,'{referent}'),(2,'{other}')"),
+                    ] {
+                        stock.execute_batch(&sql).unwrap();
+                        frank.execute(&sql).await.unwrap();
+                    }
+                    let sql = if change == "DELETE" {
+                        "DELETE FROM p WHERE k='A'"
+                    } else {
+                        "UPDATE p SET k='Z' WHERE k='A'"
+                    };
+                    let stock_result = stock.execute(sql, []).map_err(|e| e.to_string());
+                    let frank_result = frank.execute(sql).await.map_err(|e| e.to_string());
+                    assert_eq!(frank_result, stock_result, "{parent} {action} {sql}");
+                    for probe in ["SELECT id,k FROM c ORDER BY id", "SELECT k FROM p ORDER BY k", "PRAGMA foreign_key_check"] {
+                        assert_eq!(fq(&frank, probe).await, rq(&stock, probe), "{parent} {action} {sql}: {probe}");
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn composite_fk_keeps_each_parent_collation_across_updates_and_triggers() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "PRAGMA foreign_keys=ON",
+            "CREATE TABLE p(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY, PRIMARY KEY(a,b))",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY,x TEXT COLLATE BINARY,y TEXT COLLATE NOCASE, FOREIGN KEY(x,y) REFERENCES p ON UPDATE CASCADE ON DELETE CASCADE)",
+            "CREATE TABLE audit(id, x, y)",
+            "CREATE TRIGGER cu AFTER UPDATE ON c BEGIN INSERT INTO audit VALUES (old.id,old.x,new.y); END",
+            "INSERT INTO p VALUES ('A','b'),('a','B')",
+            "INSERT INTO c VALUES (1,'a','b'),(2,'A','B')",
+            // An equivalent spelling is a new stored parent value, but neither
+            // CASCADE nor the attached child trigger should run.
+            "UPDATE p SET a='a' WHERE b='b'",
+            "UPDATE p SET a='new', b='z' WHERE b='b'",
+            "DELETE FROM p WHERE b='B'",
+        ] {
+            r.execute_batch(sql).unwrap();
+            f.execute(sql).await.unwrap();
+            if sql.starts_with("UPDATE") || sql.starts_with("DELETE") {
+                for probe in ["SELECT * FROM c ORDER BY id", "SELECT * FROM audit ORDER BY rowid", "PRAGMA foreign_key_check"] {
+                    assert_eq!(fq(&f, probe).await, rq(&r, probe), "{sql}: {probe}");
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn deferred_fk_and_self_reference_use_parent_collation() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "PRAGMA foreign_keys=ON",
+            "CREATE TABLE p(k TEXT COLLATE NOCASE PRIMARY KEY)",
+            "CREATE TABLE c(k TEXT COLLATE BINARY REFERENCES p DEFERRABLE INITIALLY DEFERRED)",
+            "INSERT INTO p VALUES ('A')",
+            "INSERT INTO c VALUES ('a')",
+            "BEGIN",
+            "DELETE FROM p",
+            "COMMIT",
+            "INSERT INTO p VALUES ('a')",
+            "COMMIT",
+            "CREATE TABLE node(k TEXT COLLATE NOCASE PRIMARY KEY, parent TEXT COLLATE BINARY REFERENCES node(k) ON DELETE RESTRICT)",
+            "PRAGMA foreign_keys=OFF",
+            "INSERT INTO node VALUES ('X','x')",
+            "PRAGMA foreign_keys=ON",
+            "DELETE FROM node WHERE k='X'",
+        ] {
+            let expected = r.execute_batch(sql).map_err(|e| e.to_string());
+            let actual = f.execute(sql).await.map(|_| ()).map_err(|e| e.to_string());
+            assert_eq!(actual, expected, "{sql}");
+        }
+        for probe in ["SELECT * FROM p", "SELECT * FROM c", "SELECT * FROM node", "PRAGMA foreign_key_check"] {
+            assert_eq!(fq(&f, probe).await, rq(&r, probe), "{probe}");
+        }
+    });
+}
