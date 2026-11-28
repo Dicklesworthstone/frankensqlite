@@ -94,6 +94,75 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-28 - WIN (landed as 5ce7d3abd; inside its prediction band in gain, past its gain kill line: join_no_index_5k_x_5k 211.23M -> 105.42M Ir, x9.04 -> x4.51 stock 3.54.1; time cells VOID under the time-void policy): an ephemeral index's staged build and IN / DISTINCT membership set are bounded by the temp budget instead of refused under 100 MiB (bd-w4pr1.13.9, serial read lane rounds 17-19, lever TB)
+
+- Target: join_no_index_5k_x_5k, the worst read row (x9.0 stock) no lever covered. d081a0f87 (bd-dwjnq.5) admitted the
+  staged automatic-index build (bd-w4pr1.13.15) and the membership set only when the FILE temp budget was at least
+  100 MiB, and the default budget is cache_size's 2,048,000 bytes, so every default connection built the join's
+  automatic index key by key into the spillable b-tree. Probe (r17): the same ELF with `PRAGMA temp.cache_size=-102400`
+  ran the row in 105.3M Ir instead of 211.1M.
+- Ledger preflight: 2026-11-12 WIN bd-w4pr1.13.15 (the staged build this restores; retry condition none); 2026-11-12
+  REJECTED general sorter (RSS 1.69x; this keeps the arena layout, and kill line 4 guards RSS); 2026-11-11 index seek
+  decode once (untouched). No entry rejects a bounded staged build or covers d081a0f87's admission.
+- Touched: `crates/fsqlite-vdbe/src/engine.rs` (`ShortcutBound`, `StagedIndexBuild::try_push` and its capacity
+  accounting, `MembershipSet::try_insert`, OpenAutoindex admission, IdxInsert's staged and set branches; the unused
+  `SORTER_DEFAULT_SPILL_THRESHOLD` removed), `crates/fsqlite-vdbe/src/lib.rs` (five `TempStoreStats` counters),
+  `crates/fsqlite-core/tests/bd_w4pr1_13_9_bounded_autoindex_oracle.rs` (keepers; local-only: no workflow names
+  fsqlite-core/tests).
+- Prediction (on the bead before the build, 2026-11-27 07:19Z): join_no_index_5k_x_5k 211.1M -> 100M-115M Ir (a gain
+  of 96M-111M), x4.3-x4.9 stock; rows whose IN / DISTINCT set fits in 2 MB fall too; every other row within +-0.05%;
+  peak RSS on a 200,000-entry automatic index no more than the parent's plus 2.5 MB.
+- Result: arms in one rch job on ovh-a (P = d4dce7e02 fsqlite-cargo 71a3d9b2990cf69b, L = P + the lever
+  177c5a0c41da02ae), callgrind on single ELFs on thinkstation1, stock sqlite3 3.54.1 (8056229856cf74fe) live in the
+  same run (rl18/tb_ir.sh; statement Ir = row minus the arm's own `SELECT 1;`). Every answer byte-equal to stock's
+  (19 rows, DISTINCT order included).
+  - join_no_index_5k_x_5k 211,229,398 -> 105,422,195 (-50.09%), x9.04 -> x4.51. The gain, 105.8M, is inside the
+    96M-111M band; the parent measured 211.2M here against r17's 211.1M, so the absolute 105.4M is too.
+  - Probe rows: 200,000-entry join 13.53G -> 11.55G (-14.6%, x9.23 -> x7.88); `IN (SELECT k FROM v2)` over 5k rows
+    199.0M -> 26.5M (-86.7%, x10.08 -> x1.34); IN over 1M rows -3.07% (x1.78 -> x1.73); DISTINCT a -0.22%, DISTINCT b
+    -0.72%.
+  - Other read rows: scan_filter_agg -0.0007%, group_by_1000_groups -0.019%, gb_a_sum_c +0.0002%, gb_a_mod10
+    -0.0003%, gb_id_mod100k +0.0002%, gb_id -0.0015%, rowid_lookups_200k +0.0015%, join_1M_to_pk_1000 +0.0058%,
+    order_by_text_limit10 -0.077%, window_row_number -0.006%, window_sum_over -0.0006%.
+  - count_star (a regression row; the lever runs none of its code): +12,406 Ir (+0.41%) in r18's one run, +0.18%
+    over 8 interleaved runs per arm, +0.29% with both ELFs on one database copy. Its delta is glibc allocator work,
+    so the allocator-split line (2026-11-27 18:30Z ruling) decides it, with the split shown: (1) non-allocator Ir
+    +1,583 / +1,690 on the row (+0.05%; +1,108 on the whole process under the pass-through shim), under +0.2% and
+    under the posted +0.1%; (2) dhat on the row (count_star minus SELECT 1): 399 blocks and 137,216 bytes in both
+    arms (the whole process is +80 bytes in the same 5,038 blocks at open: the five new 8-byte counters in two
+    `TempStoreStats`); (3) allocator-internal delta +8,872 Ir against a maximum of +26,438 over 10 nulls on the parent
+    ELF (4 transient 4,096-byte blocks at spread ordinals, trig10/shim/allocshim4.so; nulls +19,322..+26,438). It
+    passes. The delta follows the ELF, not the database. Part of it is the count walk's stack growth
+    (`RawVec<PageNumber>::grow_one` +2,965 Ir, `realloc` +3,124) under `snapshot_walk::push_children`, whose machine
+    code and self cost are identical in both ELFs.
+  - Peak RSS, the 200,000-entry join under the default budget (3 runs): P 45.1-46.9 MB, L 40.0-41.2 MB, stock
+    8.0-8.9 MB. jni: P 26.1-28.1 MB, L 25.4-26.8 MB. Kill line 4 (L above P + 2.5 MB) holds.
+  - Time: VOID (judge A/A fails; bd-j0jc0/bd-gvews). No judge was run.
+- Gate:
+  - Part 1 (d4dce7e02 + lever, ovh-a): vdbe lib 1,290/2 (the two bd_2dgf5 reds of that base, fixed since by
+    64174f795); the four new engine tests pass; existing keepers green (bd_dwjnq_5_temp_store_oracle,
+    join_composite_index_lookup_oracle, bd_select_distinct_semantics_oracle_probe, join_aggregate_lookup_oracle,
+    join_typeless_affinity_oracle, bd_k8ebx_numeric_text_join_map_oracle, bd_54sjx_grouped_join_scan_order_oracle,
+    hfdt_gbou9l_json_exists). Keepers 1 and 2 were red on one assertion of the keeper itself (a filtered row join that
+    builds no automatic index on the executed path); revised to assert the counters on the count joins, before any
+    measurement. Mutants m1, m2, m3 red.
+  - Part 2 (same tree, ovh-a): revised keeper 3/3; m2 red (2 of 3), m3 red (2 of 3). Its clippy and core lib did not
+    compile: main's bd-7wn08 test-helper E0271 in cte_cursor_budget.rs, fixed on main by df4e80578.
+  - Part 3 (committed, rebased on origin/main 6861feaf8, ovh-a): vdbe lib 1,292/0; all 9 keeper targets green; m1
+    against the revised keeper red (3 of 3); golden_bytecode_snapshots 10/10, hot_arm_stream_reachability 1/1,
+    issue_531_grouped_index_input 15/15; core lib 4,247/1.
+  - The core lib red, `test_correlated_exists_direct_probe_preserves_sqlite_comparison_semantics` (a :memory: EXISTS
+    over a compound derived table answers [["1"]], stock []), is main's: identical with TB reversed and with TB in
+    one job (part 4, on b03e52d11), and on origin/main 40e6f515e (the SQL lane's job Y2). TB's CLI arms answer stock's
+    [] on that query.
+  - Clippy -D warnings (part 5, ovh-a, -j 1): clean on fsqlite-vdbe and fsqlite-core, all targets. Parts 3 and 4
+    stopped at two reds of main's own (codegen.rs:38775 too_long_first_doc_paragraph from 6467f7289;
+    connection.rs:128332 redundant_locals from b08f5db54), patched for that step only.
+  - rustfmt: ignored crates (fsqlite-vdbe, fsqlite-core). ubs: 0 critical (the test file, lib.rs, engine.rs).
+  - Landed after a conflict-free rebase onto 7dced8123; none of the 16 intervening commits touches fsqlite-vdbe.
+- Retry condition: none for the admission. The jni row is still x4.5: stock builds its automatic index into a b-tree
+  too, so what is left is the per-insert cost of the staged build's sort and layout and the probe loop.
+
 ## 2026-11-28 - WIN (landed as d3dc34786; exact instruction counts, inside its prediction band, past its gain kill line: -2,354 Ir per FULL autocommit INSERT, x8.20 -> x8.09 stock 3.54.1; time cells VOID (judge A/A fails; bd-j0jc0/bd-gvews), not needed for the verdict): the mvcc ConcurrentRegistry's session maps hash their minted ids with foldhash instead of SipHash (bd-fuwx0, commit-path lane rounds 2-4, lever L4 = option O-C1, hashing part 3)
 
 - Target: the autocommit one-row INSERT's commit path. After L1 (56e28f1df) about 14 SipHash-1-3 lookups per
