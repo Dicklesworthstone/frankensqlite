@@ -86010,6 +86010,9 @@ impl Connection {
                 &self.statement_fk_set_default_changes,
             )
         });
+        if outermost {
+            self.last_fk_violation_was_deferred.set(false);
+        }
         let depth_guard =
             StatementFkValidationDepthGuard::try_enter(&self.statement_fk_validation_depth)?;
         let result = body().await;
@@ -86031,6 +86034,21 @@ impl Connection {
             }
         };
         if !validate_retained_rows {
+            // bd-cffn1 / GH#542: inline statement-body FK validation (such as
+            // PreparedInsertFkPlan from bd-5ofes) can raise ForeignKeyViolation
+            // before reaching the queued validation pass below. Apply the same
+            // immediate-FK last_insert_rowid preservation rule here so single-row
+            // non-journaled INSERTs never leak the rejected row's rowid.
+            if matches!(result, Err(FrankenError::ForeignKeyViolation))
+                && preserve_last_insert_rowid_on_immediate_fk_failure
+                && !self.last_fk_violation_was_deferred.get()
+            {
+                self.record_fk_validation_error_state(
+                    self.last_changes.get(),
+                    previous_last_insert_rowid,
+                    self.statement_fk_set_default_changes.get(),
+                );
+            }
             return result;
         }
 
