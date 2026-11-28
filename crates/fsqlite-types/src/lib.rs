@@ -7,6 +7,7 @@
     feature(portable_simd)
 )]
 
+pub mod btree_layout;
 pub mod cx;
 pub mod ecs;
 pub mod encoding;

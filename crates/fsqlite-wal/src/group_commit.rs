@@ -159,6 +159,7 @@ pub struct FrameSubmission {
 
 /// A batch of frames from a single transaction, submitted atomically.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct TransactionFrameBatch {
     /// Frames belonging to this transaction, in write order.
     pub frames: Vec<FrameSubmission>,
@@ -268,6 +269,19 @@ pub struct TransactionFrameBatch {
     /// snapshot under the append gate, and replaces the entire prior freelist
     /// and page-cache image.
     pub whole_image_replace: bool,
+    /// bd-reality-check-1022-llk6g.5.3: Sorted, deduplicated list of page
+    /// numbers in `frames` that were freshly allocated strictly beyond
+    /// `conflict_snapshot.snapshot_db_size` (never read from the snapshot and
+    /// never popped from the durable freelist). Only these pages are eligible
+    /// for Option A append-gate EOF renumbering when a peer process grew into
+    /// the same page-number range first.
+    pub eof_allocated_pages: Vec<u32>,
+    /// bd-reality-check-1022-llk6g.5.3: Set under the serialized WAL append
+    /// gate when this batch's fresh EOF pages were renumbered above the
+    /// durable floor. Signals Phase C to invalidate stale pre-renumber cache /
+    /// write-set entries and avoid returning aliased lease tails to the local
+    /// freelist.
+    pub eof_renumbered: bool,
 }
 
 /// WAL conflict horizon captured by a submitting transaction.
@@ -334,7 +348,19 @@ impl TransactionFrameBatch {
             route_watch_complete: false,
             explicit_db_size_shrink: None,
             whole_image_replace: false,
+            eof_allocated_pages: Vec::new(),
+            eof_renumbered: false,
         }
+    }
+
+    /// Attach the sorted list of freshly allocated EOF page numbers carried by
+    /// this batch (bd-reality-check-1022-llk6g.5.3).
+    #[must_use]
+    pub fn with_eof_allocated_pages(mut self, mut eof_allocated_pages: Vec<u32>) -> Self {
+        eof_allocated_pages.sort_unstable();
+        eof_allocated_pages.dedup();
+        self.eof_allocated_pages = eof_allocated_pages;
+        self
     }
 
     /// Attach the interior pages whose changes the batch's writes must

@@ -1390,6 +1390,7 @@ trait PendingGroupCommitTxnAttemptOperation: Send + Sync {
         group_allocator_delta: &PendingGroupCommitAllocatorDelta,
         apply_allocator_delta: bool,
         reconciled_durable_freelist: Option<&[u32]>,
+        eof_renumbered: bool,
     ) -> Result<()>;
 
     fn complete_not_committed_global(&self) -> Result<()>;
@@ -2464,6 +2465,7 @@ impl GroupCommitQueue {
             .iter()
             .rev()
             .find_map(|batch| batch.published_durable_freelist.as_deref());
+        let group_eof_renumbered = batches.iter().any(|batch| batch.eof_renumbered);
 
         let mut normalized_pager_inners = GroupCommitKeyedSet::default();
         for (batch_id, registered_epoch, operation) in &attempts {
@@ -2492,6 +2494,7 @@ impl GroupCommitQueue {
                 &group_allocator_delta,
                 apply_allocator_delta,
                 reconciled_durable_freelist,
+                group_eof_renumbered,
             )?;
         }
 
@@ -9916,6 +9919,7 @@ struct PendingGroupCommitNotCommittedState {
     reclaimed_abandoned_reservations: Vec<PageNumber>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct PendingGroupCommitTxnAttemptState {
     consumer: Option<Arc<GroupCommitEpochConsumer>>,
     batch_id: Option<u64>,
@@ -9925,6 +9929,7 @@ struct PendingGroupCommitTxnAttemptState {
     reclaimed_abandoned_reservations: Vec<PageNumber>,
     publication_intent: Option<ParallelWalPublicationIntent>,
     publication_applied: bool,
+    eof_renumbered: bool,
     transaction_exit_complete: bool,
     terminal: bool,
 }
@@ -9947,6 +9952,7 @@ struct PendingGroupCommitTxnAttempt<F: VfsFile> {
     whole_image_replace: bool,
     whole_image_cache: Option<Arc<ShardedPageCache>>,
     whole_image_reserved_per_page: Option<u8>,
+    page_cache: Option<Arc<ShardedPageCache>>,
     mode: TransactionMode,
     is_writer: bool,
     staged_page_high_water: u32,
@@ -9998,6 +10004,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
             whole_image_replace: false,
             whole_image_cache: None,
             whole_image_reserved_per_page: None,
+            page_cache: None,
             mode,
             is_writer,
             staged_page_high_water,
@@ -10012,10 +10019,23 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
                 reclaimed_abandoned_reservations,
                 publication_intent: None,
                 publication_applied: false,
+                eof_renumbered: false,
                 transaction_exit_complete: false,
                 terminal: false,
             }),
         }
+    }
+
+    fn with_page_cache(mut self, cache: Arc<ShardedPageCache>) -> Self {
+        self.page_cache = Some(cache);
+        self
+    }
+
+    fn was_eof_renumbered(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .eof_renumbered
     }
 
     fn with_whole_image_replace(
@@ -10024,6 +10044,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
         reserved_per_page: u8,
     ) -> Self {
         self.whole_image_replace = true;
+        self.page_cache = Some(Arc::clone(&cache));
         self.whole_image_cache = Some(cache);
         self.whole_image_reserved_per_page = Some(reserved_per_page);
         self
@@ -10283,6 +10304,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
         group_allocator_delta: &PendingGroupCommitAllocatorDelta,
         apply_allocator_delta: bool,
         reconciled_durable_freelist: Option<&[u32]>,
+        eof_renumbered: bool,
     ) -> Result<()> {
         let mut state = self
             .state
@@ -10325,6 +10347,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
                 .db_size
                 .max(self.committed_db_size)
                 .max(reconciled_upper)
+                .max(authorization.durability_receipt.certificate.db_size_pages)
         });
         let mut committed_freelist = if let Some(override_freelist) = &self.vacuum_override_freelist
         {
@@ -10346,6 +10369,17 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
                 list.extend(reconciled.iter().copied().filter_map(PageNumber::new));
                 let upper_bound = inner.next_page.saturating_sub(1).max(committed_db_size);
                 list = normalize_freelist(&list, upper_bound, inner.page_size);
+            }
+            if eof_renumbered && self.explicit_db_size_shrink.is_none() {
+                // bd-reality-check-1022-llk6g.5.3 / bd-ivhow: when append-gate
+                // EOF renumbering moved fresh allocations past a peer's growth,
+                // any pre-renumber unused EOF lease tail `<= committed_db_size`
+                // may now belong to that peer process. Never retain non-durable
+                // volatile freelist entries at or below `committed_db_size`.
+                list.retain(|page| {
+                    page.get() > committed_db_size
+                        || inner.durable_freelist_view.contains(&page.get())
+                });
             }
             list
         };
@@ -10369,6 +10403,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
         if apply_allocator_delta
             || self.vacuum_override_freelist.is_some()
             || reconciled_durable_freelist.is_some()
+            || eof_renumbered
         {
             inner.freelist = committed_freelist;
         }
@@ -10382,16 +10417,31 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
             .explicit_db_size_shrink
             .unwrap_or(publication_intent.db_size);
         inner.pointer_map = self.pointer_map_after_commit;
-        let next_unallocated_page = if inner.db_size >= 2 {
+        let lock_pg = crate::journal::lock_byte_page(inner.page_size);
+        let mut next_unallocated_page = if inner.db_size >= 2 {
             inner.db_size.saturating_add(1)
         } else {
             2
         };
+        if next_unallocated_page == lock_pg {
+            next_unallocated_page = next_unallocated_page.saturating_add(1);
+        }
         if self.explicit_db_size_shrink.is_some() {
             inner.next_page = next_unallocated_page;
             inner.durable_db_size_floor = None;
         } else {
             inner.next_page = inner.next_page.max(next_unallocated_page);
+        }
+        if eof_renumbered && self.explicit_db_size_shrink.is_none() {
+            let retained_db_size = inner.db_size;
+            inner
+                .abandoned_eof_reservations
+                .retain(|page| page.get() > retained_db_size);
+            inner.committed_metadata_needs_refresh = true;
+            if let Some(cache) = &self.page_cache {
+                cache.clear();
+            }
+            state.eof_renumbered = true;
         }
         if self.whole_image_replace {
             if let Some(cache) = &self.whole_image_cache {
@@ -12173,6 +12223,411 @@ fn dw8oe_trace_enabled() -> bool {
     trace_switch_enabled(&ENABLED, "DW8OE_TRACE")
 }
 
+/// Whether `FSQLITE_LLK6G53_TRACE` asks for append-gate EOF renumbering traces.
+fn llk6g53_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    trace_switch_enabled(&ENABLED, "FSQLITE_LLK6G53_TRACE")
+}
+
+/// Partition conflict pages reported since each batch's snapshot into:
+/// - `non_eof`: pre-existing pages (or pages without a positive snapshot base)
+///   that represent genuine MVCC first-committer-wins conflicts and MUST fail
+///   closed immediately.
+/// - `pure_eof`: pages that every conflicting batch freshly allocated strictly
+///   beyond its `snapshot_db_size` (`batch.eof_allocated_pages`). These are
+///   candidates for Option A append-gate EOF renumbering
+///   (bd-reality-check-1022-llk6g.5.3).
+fn partition_eof_alias_conflicts(
+    batches: &[TransactionFrameBatch],
+    conflict_pages: &[u32],
+) -> (Vec<u32>, Vec<u32>) {
+    let mut non_eof = Vec::new();
+    let mut pure_eof = Vec::new();
+    for &page in conflict_pages {
+        let mut seen_in_any_batch = false;
+        let mut all_fresh_eof = true;
+        for batch in batches {
+            if batch.conflict_pages.contains(&page) {
+                seen_in_any_batch = true;
+                let is_fresh_eof = batch.conflict_snapshot.is_some_and(|snapshot| {
+                    snapshot.snapshot_db_size > 0 && page > snapshot.snapshot_db_size
+                }) && batch.eof_allocated_pages.binary_search(&page).is_ok();
+                if !is_fresh_eof {
+                    all_fresh_eof = false;
+                    break;
+                }
+            }
+        }
+        if seen_in_any_batch && all_fresh_eof {
+            pure_eof.push(page);
+        } else {
+            non_eof.push(page);
+        }
+    }
+    (non_eof, pure_eof)
+}
+
+fn synthetic_page_one_compatible_with_durable(synth: &[u8], durable: &[u8]) -> bool {
+    synth.len() == durable.len()
+        && synth.len() >= DATABASE_HEADER_SIZE
+        && synth[0..24] == durable[0..24]
+        && synth[40..92] == durable[40..92]
+        && synth[100..] == durable[100..]
+}
+
+fn restamp_synthetic_page_one(durable_p1: &[u8], new_final_db_size: u32) -> Vec<u8> {
+    let mut out = durable_p1.to_vec();
+    let durable_cc = u32::from_be_bytes([out[24], out[25], out[26], out[27]]);
+    let durable_pc = u32::from_be_bytes([out[28], out[29], out[30], out[31]]);
+    let mut new_cc = durable_cc.wrapping_add(1);
+    if new_cc == 0 {
+        new_cc = 1;
+    }
+    let new_pc = durable_pc.max(new_final_db_size);
+    out[24..28].copy_from_slice(&new_cc.to_be_bytes());
+    out[28..32].copy_from_slice(&new_pc.to_be_bytes());
+    out[92..96].copy_from_slice(&new_cc.to_be_bytes());
+    out
+}
+
+struct EofRenumberPlanResult {
+    batches: Vec<TransactionFrameBatch>,
+    new_final_db_size: u32,
+    pages_remapped: usize,
+    pointers_rewritten: usize,
+}
+
+/// bd-reality-check-1022-llk6g.5.3 (Option A): under the serialized WAL append
+/// gate, when one or more batches allocated fresh EOF page numbers that alias a
+/// peer process's committed growth, pack those fresh EOF pages contiguously
+/// above `renumber_floor` and rewrite every interior-child, cell-overflow, and
+/// overflow-next 4-byte pointer using `fsqlite_types::btree_layout`'s
+/// fail-closed verified rewriter.
+///
+/// Returns `Ok(None)` without mutating pager allocator state whenever ANY
+/// eligibility guard or B-tree verification check fails, so the caller returns
+/// the exact original `BusySnapshot` error.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+async fn try_renumber_aliased_eof_batches_under_gate<F: VfsFile>(
+    cx: &Cx,
+    wal: &mut dyn WalBackend,
+    db_file: &SharedDbFile<F>,
+    inner_arc: &Arc<Mutex<PagerInner<F>>>,
+    batches: &[TransactionFrameBatch],
+    renumber_floor: u32,
+    pure_eof_conflicts: &[u32],
+) -> Result<Option<EofRenumberPlanResult>> {
+    if batches.is_empty() || renumber_floor == 0 {
+        return Ok(None);
+    }
+    let Some(frame_page_size) = batches
+        .iter()
+        .flat_map(|batch| batch.frames.iter())
+        .map(|frame| frame.page_data.len())
+        .next()
+    else {
+        return Ok(None);
+    };
+    if frame_page_size < DATABASE_HEADER_SIZE
+        || batches.iter().any(|batch| {
+            batch
+                .frames
+                .iter()
+                .any(|frame| frame.page_data.len() != frame_page_size)
+        })
+    {
+        return Ok(None);
+    }
+
+    let (page_size_obj, reserved_per_page, page_cipher) = {
+        let inner = inner_arc
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        if inner.pointer_map.uses_pointer_map() {
+            return Ok(None);
+        }
+        (
+            inner.page_size,
+            inner.reserved_per_page,
+            inner.page_cipher.clone(),
+        )
+    };
+    let Some(usable_size) = u32::try_from(frame_page_size)
+        .ok()
+        .and_then(|size| size.checked_sub(u32::from(reserved_per_page)))
+        .filter(|&usable| usable >= 480)
+    else {
+        return Ok(None);
+    };
+
+    let Some(durable_p1) =
+        read_durable_page_under_gate(cx, wal, db_file, &page_cipher, frame_page_size, 1).await?
+    else {
+        return Ok(None);
+    };
+    if durable_p1.len() != frame_page_size {
+        return Ok(None);
+    }
+    // Fail closed if on-disk auto_vacuum / incremental_vacuum is active or
+    // reserved_per_page drifted from our pager's view.
+    let largest_root_btree_page =
+        u32::from_be_bytes([durable_p1[52], durable_p1[53], durable_p1[54], durable_p1[55]]);
+    if largest_root_btree_page != 0 || durable_p1[20] != reserved_per_page {
+        return Ok(None);
+    }
+
+    // Collect every batch that carries any fresh EOF pages (either aliased with
+    // `renumber_floor` / `pure_eof_conflicts` OR extending past `renumber_floor`,
+    // so packing all growing batches contiguously above `start_after` leaves
+    // zero unwritten holes).
+    let mut growing_batch_specs: Vec<(usize, u32, Vec<u32>)> = Vec::new();
+    let mut saw_aliased_batch = false;
+    for (idx, batch) in batches.iter().enumerate() {
+        let Some(snapshot) = batch.conflict_snapshot.filter(|s| s.snapshot_db_size > 0) else {
+            // If any batch without a tracked snapshot carries a page above
+            // page 1 up to `renumber_floor`, we cannot prove it is non-aliased.
+            if batch.frames.iter().any(|f| f.page_number > 1) {
+                return Ok(None);
+            }
+            continue;
+        };
+        let snap_db_size = snapshot.snapshot_db_size;
+        let mut seen_pages: HashSet<u32> = HashSet::with_capacity(batch.frames.len());
+        let mut eof_pages: Vec<u32> = Vec::new();
+        let mut page_one_count = 0_usize;
+        let mut batch_is_aliased = false;
+        for frame in &batch.frames {
+            if !seen_pages.insert(frame.page_number) {
+                return Ok(None);
+            }
+            if frame.page_number == 1 {
+                page_one_count += 1;
+                if page_one_count > 1 {
+                    return Ok(None);
+                }
+            }
+            if frame.page_number > snap_db_size {
+                if batch
+                    .eof_allocated_pages
+                    .binary_search(&frame.page_number)
+                    .is_err()
+                {
+                    // Frame beyond `snapshot_db_size` was not freshly allocated
+                    // by this transaction (e.g. bd-o81ov lag): fail closed.
+                    return Ok(None);
+                }
+                if frame.page_number <= renumber_floor
+                    || pure_eof_conflicts.binary_search(&frame.page_number).is_ok()
+                {
+                    batch_is_aliased = true;
+                }
+                eof_pages.push(frame.page_number);
+            }
+        }
+        if eof_pages.is_empty() {
+            continue;
+        }
+        if batch_is_aliased {
+            saw_aliased_batch = true;
+        }
+        // Eligibility guards for every batch whose EOF pages will be repacked:
+        // - No direct Page 1 write (excludes DDL / schema / header writes).
+        // - No durable freelist publication, frees, or durable freelist pops.
+        // - Any synthetic Page 1 frame must match `durable_p1` everywhere
+        //   outside change_counter / page_count / freelist / version_valid_for.
+        if batch.conflict_pages.contains(&1)
+            || batch.published_durable_freelist.is_some()
+            || !batch.freed_pages.is_empty()
+            || !batch.consumed_durable_freelist_pages.is_empty()
+        {
+            return Ok(None);
+        }
+        if let Some(synth_p1) = batch.frames.iter().find(|f| f.page_number == 1)
+            && !synthetic_page_one_compatible_with_durable(&synth_p1.page_data, &durable_p1)
+        {
+            return Ok(None);
+        }
+        eof_pages.sort_unstable();
+        growing_batch_specs.push((idx, snap_db_size, eof_pages));
+    }
+
+    if !saw_aliased_batch || growing_batch_specs.is_empty() {
+        return Ok(None);
+    }
+
+    let lock_pg = crate::journal::lock_byte_page(page_size_obj);
+    let batch_count_u32 = u32::try_from(batches.len()).unwrap_or(u32::MAX);
+
+    for _attempt in 0..2_u8 {
+        let (start_after, sole_in_process_group, snapshot_next_page) = {
+            let inner = inner_arc
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            let sole = inner.active_transactions <= batch_count_u32;
+            let start = renumber_floor.max(inner.db_size);
+            if !sole && inner.next_page.saturating_sub(1) > start {
+                // Another uncommitted in-process transaction on this pager
+                // already holds EOF page leases above `start`; packing past it
+                // could leave an unwritten hole if that sibling aborts. Fail
+                // closed cleanly.
+                return Ok(None);
+            }
+            (start, sole, inner.next_page)
+        };
+
+        let mut cursor = start_after;
+        let mut batch_remaps: Vec<(usize, u32, HashMap<u32, u32>)> =
+            Vec::with_capacity(growing_batch_specs.len());
+        for (idx, snap_db_size, eof_pages) in &growing_batch_specs {
+            let mut remap: HashMap<u32, u32> = HashMap::with_capacity(eof_pages.len());
+            for &old_pg in eof_pages {
+                let Some(mut next_pg) = cursor.checked_add(1) else {
+                    return Ok(None);
+                };
+                if next_pg == lock_pg {
+                    let Some(after_lock) = next_pg.checked_add(1) else {
+                        return Ok(None);
+                    };
+                    next_pg = after_lock;
+                }
+                if PageNumber::new(next_pg).is_none() || next_pg == u32::MAX {
+                    return Ok(None);
+                }
+                cursor = next_pg;
+                remap.insert(old_pg, next_pg);
+            }
+            batch_remaps.push((*idx, *snap_db_size, remap));
+        }
+
+        let new_final_db_size = cursor;
+        let mut mutable_batches = batches.to_vec();
+        let mut total_pages_remapped = 0_usize;
+        let mut total_pointers_rewritten = 0_usize;
+        let mut any_page_one_present = false;
+        let mut last_growing_idx = 0_usize;
+
+        for (idx, snap_db_size, remap) in &batch_remaps {
+            last_growing_idx = *idx;
+            let batch = &mut mutable_batches[*idx];
+            let mut had_synthetic_p1 = false;
+            let mut owned_frames: Vec<(u32, Vec<u8>)> = Vec::with_capacity(batch.frames.len());
+            for frame in &batch.frames {
+                if frame.page_number == 1 {
+                    had_synthetic_p1 = true;
+                } else {
+                    owned_frames.push((frame.page_number, frame.page_data.clone()));
+                }
+            }
+            let stats = match fsqlite_types::btree_layout::rewrite_batch_eof_page_references(
+                &mut owned_frames,
+                *snap_db_size,
+                usable_size,
+                remap,
+            ) {
+                Ok(stats) => stats,
+                Err(rejection) => {
+                    tracing::warn!(
+                        target: "fsqlite.pager.commit",
+                        batch_id = batch.context.batch_id,
+                        ?rejection,
+                        "append-gate EOF renumbering rejected batch; failing closed"
+                    );
+                    return Ok(None);
+                }
+            };
+            total_pages_remapped += remap.len();
+            total_pointers_rewritten += stats.pointers_rewritten;
+
+            let mut rebuilt_frames: Vec<FrameSubmission> =
+                Vec::with_capacity(owned_frames.len() + usize::from(had_synthetic_p1));
+            if had_synthetic_p1 {
+                any_page_one_present = true;
+                rebuilt_frames.push(FrameSubmission {
+                    page_number: 1,
+                    page_data: restamp_synthetic_page_one(&durable_p1, new_final_db_size),
+                    db_size_if_commit: 0,
+                });
+            }
+            for (pgno, page_data) in owned_frames {
+                rebuilt_frames.push(FrameSubmission {
+                    page_number: pgno,
+                    page_data,
+                    db_size_if_commit: 0,
+                });
+            }
+            rebuilt_frames.sort_unstable_by_key(|frame| frame.page_number);
+            if let Some(last) = rebuilt_frames.last_mut() {
+                last.db_size_if_commit = new_final_db_size;
+            }
+            batch.frames = rebuilt_frames;
+            let mut new_eof_pages: Vec<u32> = remap.values().copied().collect();
+            new_eof_pages.sort_unstable();
+            batch.eof_allocated_pages = new_eof_pages;
+            for conflict_page in &mut batch.conflict_pages {
+                if let Some(&mapped) = remap.get(conflict_page) {
+                    *conflict_page = mapped;
+                }
+            }
+            batch.conflict_pages.sort_unstable();
+            batch.conflict_pages.dedup();
+            batch.eof_renumbered = true;
+        }
+
+        let durable_pc =
+            u32::from_be_bytes([durable_p1[28], durable_p1[29], durable_p1[30], durable_p1[31]]);
+        if !any_page_one_present
+            && !mutable_batches
+                .iter()
+                .any(|batch| batch.frames.iter().any(|frame| frame.page_number == 1))
+            && durable_pc < new_final_db_size
+        {
+            mutable_batches[last_growing_idx].frames.insert(
+                0,
+                FrameSubmission {
+                    page_number: 1,
+                    page_data: restamp_synthetic_page_one(&durable_p1, new_final_db_size),
+                    db_size_if_commit: 0,
+                },
+            );
+        }
+        let _ = promote_group_commit_page_one_headers(&mut mutable_batches, new_final_db_size);
+
+        // Commit the fresh high-water page reservation atomically under
+        // `PagerInner`, re-verifying no concurrent in-process allocator moved
+        // while we rewrote the frames.
+        let mut inner = inner_arc
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        let still_sole = inner.active_transactions <= batch_count_u32;
+        if still_sole != sole_in_process_group
+            || (!still_sole && inner.next_page != snapshot_next_page)
+            || inner.db_size > start_after
+        {
+            drop(inner);
+            continue;
+        }
+        let mut next_after = new_final_db_size.saturating_add(1);
+        if next_after == lock_pg {
+            next_after = next_after.saturating_add(1);
+        }
+        if still_sole {
+            inner.next_page = next_after;
+        } else {
+            inner.next_page = inner.next_page.max(next_after);
+        }
+        drop(inner);
+        return Ok(Some(EofRenumberPlanResult {
+            batches: mutable_batches,
+            new_final_db_size,
+            pages_remapped: total_pages_remapped,
+            pointers_rewritten: total_pointers_rewritten,
+        }));
+    }
+
+    Ok(None)
+}
+
 /// bd-9inpb allocator-race hunt: env-gated microsecond delay injected into the
 /// commit guard→append TOCTOU window (`FSQLITE_RACE_AMPLIFY_US`). The freelist
 /// resurrection/erasure/double-consumption guards validate against the physical
@@ -13621,7 +14076,10 @@ async fn release_commit_read_claim_for_write_wait<F: VfsFile + 'static>(
         let wal = wal_guard.as_mut();
         match conflicting_pages_since_batch_snapshots(cx, wal, batches).await {
             Ok((conflicts, _)) if !conflicts.is_empty() => {
-                return Err(busy_snapshot_on_pages(&conflicts));
+                let (non_eof_conflicts, _) = partition_eof_alias_conflicts(batches, &conflicts);
+                if !non_eof_conflicts.is_empty() {
+                    return Err(busy_snapshot_on_pages(&non_eof_conflicts));
+                }
             }
             // A route check (bd-1epn5, bd-p9wzl) is decided only under WRITE,
             // against the durable tree; until then the claim stays held and
@@ -29091,6 +29549,7 @@ where
             false,
             None,
             false,
+            Vec::new(),
             None,
             Vec::new(),
             Vec::new(),
@@ -29132,6 +29591,9 @@ where
         // bd-kvfbb: true when this commit publishes a complete validated
         // replacement image (in-place WAL VACUUM) as one atomic transaction.
         whole_image_replace: bool,
+        // bd-reality-check-1022-llk6g.5.3: freshly allocated EOF page numbers
+        // strictly beyond `allocation_base_db_size` written in this commit.
+        eof_allocated_pages: Vec<u32>,
         // bd-gh302/bd-0shxy: exact durable-freelist content this commit's
         // page-1/trunk frames publish (None when no freelist metadata is
         // serialized), plus the transaction's own freed and consumed
@@ -29289,6 +29751,7 @@ where
         let carries_freelist_publication = published_durable_freelist.is_some();
         let batch = batch
             .with_whole_image_replace(whole_image_replace)
+            .with_eof_allocated_pages(eof_allocated_pages)
             .with_freelist_publication(
                 published_durable_freelist,
                 freelist_publication_freed_pages,
@@ -30205,6 +30668,7 @@ where
                                     && batches[0].explicit_db_size_shrink.is_some();
                                 let t_append_conflict_check_start =
                                     detailed_metrics.then(Instant::now);
+                                let mut pure_eof_conflicts: Vec<u32> = Vec::new();
                                 if group_whole_image_replace {
                                     // bd-kvfbb: a whole-image WAL VACUUM commits
                                     // only when zero WAL commits or generation
@@ -30237,16 +30701,22 @@ where
                                     append_conflict_check_us =
                                         elapsed_profile_us(t_append_conflict_check_start);
                                 } else {
-                                    let (mut stale_conflict_pages, route_checks) =
+                                    let (stale_conflict_pages, route_checks) =
                                         conflicting_pages_since_batch_snapshots(cx, wal, &batches)
                                             .await?;
+                                    let (mut non_eof_conflicts, eof_alias_conflicts) =
+                                        partition_eof_alias_conflicts(
+                                            &batches,
+                                            &stale_conflict_pages,
+                                        );
+                                    pure_eof_conflicts = eof_alias_conflicts;
                                     // bd-1epn5, bd-p9wzl: a written page whose
                                     // snapshot parent another writer changed
                                     // conflicts unless the current tree still
                                     // reaches it where its keys belong. Worth
                                     // deriving only when nothing else conflicts;
                                     // the first failure refuses the flush.
-                                    if stale_conflict_pages.is_empty() && !route_checks.is_empty() {
+                                    if non_eof_conflicts.is_empty() && !route_checks.is_empty() {
                                         let page_size = batches
                                             .iter()
                                             .flat_map(|batch| batch.frames.iter())
@@ -30278,16 +30748,16 @@ where
                                                 None => false,
                                             };
                                             if !holds {
-                                                stale_conflict_pages.push(check.parent());
+                                                non_eof_conflicts.push(check.parent());
                                                 break;
                                             }
                                         }
                                     }
                                     append_conflict_check_us =
                                         elapsed_profile_us(t_append_conflict_check_start);
-                                    if !stale_conflict_pages.is_empty() {
+                                    if !non_eof_conflicts.is_empty() {
                                         return Err(FrankenError::BusySnapshot {
-                                            conflicting_pages: stale_conflict_pages
+                                            conflicting_pages: non_eof_conflicts
                                                 .iter()
                                                 .map(u32::to_string)
                                                 .collect::<Vec<_>>()
@@ -30357,31 +30827,140 @@ where
                                         conflicting_pages: "1".to_owned(),
                                     });
                                 }
-                                // bd-9inpb: EOF-growth anti-alias gate. Run
-                                // BEFORE commit-planned freelist reconciliation
-                                // so it checks this group's own Phase-A frames
+                                // bd-9inpb / bd-reality-check-1022-llk6g.5.3:
+                                // EOF-growth anti-alias gate + Option A
+                                // append-gate EOF renumbering. Run BEFORE
+                                // commit-planned freelist reconciliation so it
+                                // checks this group's own Phase-A frames
                                 // against peer growth (never confusing a
                                 // reconciled durable-freelist trunk above
                                 // flush_snapshot_db_size with an EOF alias).
-                                if let Some(durable_db_size_floor) = durable_db_size_floor
-                                    && durable_db_size_floor > flush_snapshot_db_size
+                                //
+                                // If the WAL has no committed frames (e.g. a
+                                // peer grew the file and ran a TRUNCATE
+                                // checkpoint), fall back to the main DB file's
+                                // current page count so post-truncate growth
+                                // is never missed.
+                                let main_file_floor = if durable_db_size_floor.is_none()
+                                    && (!pure_eof_conflicts.is_empty()
+                                        || batches
+                                            .iter()
+                                            .any(|batch| !batch.eof_allocated_pages.is_empty()))
                                 {
-                                    let mut aliased: Vec<u32> = batches
+                                    let frame_page_size = batches
+                                        .iter()
+                                        .flat_map(|batch| batch.frames.iter())
+                                        .map(|frame| frame.page_data.len())
+                                        .next()
+                                        .unwrap_or(0);
+                                    if let Ok(frame_page_size_u64) = u64::try_from(frame_page_size)
+                                        && frame_page_size_u64 > 0
+                                    {
+                                        let file_bytes = shared_db_file_read(&db_file, cx)
+                                            .await?
+                                            .file_size(cx)?;
+                                        let pages =
+                                            u32::try_from(file_bytes / frame_page_size_u64)
+                                                .unwrap_or(u32::MAX);
+                                        (pages > 0).then_some(pages)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                let effective_durable_floor =
+                                    durable_db_size_floor.or(main_file_floor);
+                                let mut aliased: Vec<u32> = if let Some(floor) =
+                                    effective_durable_floor
+                                    && floor > flush_snapshot_db_size
+                                {
+                                    batches
                                         .iter()
                                         .flat_map(|batch| batch.frames.iter())
                                         .map(|frame| frame.page_number)
                                         .filter(|&page| {
-                                            page > flush_snapshot_db_size
-                                                && page <= durable_db_size_floor
+                                            page > flush_snapshot_db_size && page <= floor
                                         })
-                                        .collect();
-                                    if !aliased.is_empty() {
-                                        aliased.sort_unstable();
-                                        aliased.dedup();
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                aliased.extend_from_slice(&pure_eof_conflicts);
+                                if !aliased.is_empty() {
+                                    aliased.sort_unstable();
+                                    aliased.dedup();
+                                    let renumber_floor = effective_durable_floor
+                                        .unwrap_or(0)
+                                        .max(aliased.iter().copied().max().unwrap_or(0));
+                                    let renumbered = if !group_explicit_shrink
+                                        && !group_whole_image_replace
+                                    {
+                                        try_renumber_aliased_eof_batches_under_gate(
+                                            cx,
+                                            wal,
+                                            &db_file,
+                                            inner_arc,
+                                            &batches,
+                                            renumber_floor,
+                                            &pure_eof_conflicts,
+                                        )
+                                        .await?
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(plan) = renumbered {
+                                        batches = Arc::from(plan.batches);
+                                        let (rebuilt_frame_refs, rebuilt_db_size) =
+                                            flatten_group_commit_batches(
+                                                plan.new_final_db_size,
+                                                &batches,
+                                            );
+                                        frame_count = rebuilt_frame_refs.len();
+                                        final_db_size = rebuilt_db_size;
+                                        wal_frame_payload_digest =
+                                            group_commit_frame_payload_digest(
+                                                &rebuilt_frame_refs,
+                                            )?;
+                                        if wal_encryption_active || prepared_batch.is_some() {
+                                            let mut prepared = wal
+                                                .prepare_append_frames(&rebuilt_frame_refs)?;
+                                            if let Some(prepared) = prepared.as_mut() {
+                                                wal.finalize_prepared_frames(cx, prepared)?;
+                                                if wal_encryption_active {
+                                                    wal_frame_payload_digest =
+                                                        group_commit_prepared_batch_payload_digest(
+                                                            prepared,
+                                                        )?;
+                                                }
+                                            }
+                                            prepared_batch = prepared;
+                                            if !wal_encryption_active {
+                                                fallback_reason =
+                                                    Some(ParallelWalFallbackReason::EofGrowth);
+                                            }
+                                        }
+                                        appended_frames_are_digested = true;
+                                        tracing::debug!(
+                                            target: "fsqlite.pager.commit",
+                                            snapshot_db_size = flush_snapshot_db_size,
+                                            renumber_floor,
+                                            new_final_db_size = final_db_size,
+                                            pages_remapped = plan.pages_remapped,
+                                            pointers_rewritten = plan.pointers_rewritten,
+                                            "renumbered aliased EOF pages above durable floor under append gate (bd-reality-check-1022-llk6g.5.3)"
+                                        );
+                                        if llk6g53_trace_enabled() {
+                                            eprintln!(
+                                                "LLK6G53_EOF_RENUMBER floor={renumber_floor} new_db_size={final_db_size} pages_remapped={} pointers_rewritten={}",
+                                                plan.pages_remapped, plan.pointers_rewritten
+                                            );
+                                        }
+                                    } else {
                                         tracing::warn!(
                                             target: "fsqlite.pager.commit",
                                             snapshot_db_size = flush_snapshot_db_size,
-                                            durable_db_size = durable_db_size_floor,
+                                            durable_db_size = ?effective_durable_floor,
                                             pages = ?aliased,
                                             "commit refused: EOF-growth pages alias a peer-committed range (bd-9inpb)"
                                         );
@@ -31982,11 +32561,19 @@ where
             .set(publication_intent.visible_commit_seq);
         self.published_db_size.set(publication_intent.db_size);
 
+        let eof_renumbered = attempt.was_eof_renumbered();
         if release {
-            if self.single_connection_fast_path_enabled() && !self.whole_image_replace {
+            if self.single_connection_fast_path_enabled()
+                && !self.whole_image_replace
+                && !eof_renumbered
+            {
                 self.drain_committed_cache_pages_into_cache();
             } else {
                 self.discard_committed_pages();
+                if eof_renumbered {
+                    self.txn_read_cache.borrow_mut().clear();
+                    self.reset_transaction_read_cache_budget();
+                }
             }
         } else {
             // Group consolidation may rewrite cloned Page 1 frames to the
@@ -33524,7 +34111,8 @@ where
                         std::mem::take(&mut pending_freed),
                         std::mem::take(&mut self.reclaimed_abandoned_reservations),
                         live_committed_allocations,
-                    );
+                    )
+                    .with_page_cache(Arc::clone(&self.cache));
                     if self.whole_image_replace {
                         attempt = attempt.with_whole_image_replace(
                             Arc::clone(&self.cache),
@@ -33760,6 +34348,22 @@ where
                 // WAL mode: Use group commit for same-process batching.
                 // commit_wal_group_commit will acquire consolidator.lock() first,
                 // then briefly inner.lock() for the actual WAL I/O.
+                let mut eof_allocated_pages: Vec<u32> = self
+                    .allocated_from_eof
+                    .iter()
+                    .copied()
+                    .chain(self.allocated_from_freelist.iter().copied().filter(|page| {
+                        !self.allocated_from_durable_freelist.contains(&page.get())
+                    }))
+                    .filter(|page| {
+                        page.get() > self.original_db_size
+                            && self.write_set.contains_key(page)
+                            && !pending_free_pages.contains(page)
+                    })
+                    .map(PageNumber::get)
+                    .collect();
+                eof_allocated_pages.sort_unstable();
+                eof_allocated_pages.dedup();
                 let t_wal_commit_start = pager_commit_profile_start(pager_commit_profile_active);
                 let result = Self::commit_wal_group_commit_with_snapshot(
                     cx,
@@ -33778,6 +34382,7 @@ where
                     !self.txn_read_cache_incomplete.get(),
                     self.truncated_db_size,
                     self.whole_image_replace,
+                    eof_allocated_pages,
                     published_durable_freelist.take(),
                     pending_free_pages.iter().map(|page| page.get()).collect(),
                     self.allocated_from_freelist
@@ -34530,7 +35135,8 @@ where
                         std::mem::take(&mut pending_freed),
                         std::mem::take(&mut self.reclaimed_abandoned_reservations),
                         live_committed_allocations,
-                    );
+                    )
+                    .with_page_cache(Arc::clone(&self.cache));
                     if self.whole_image_replace {
                         attempt = attempt.with_whole_image_replace(
                             Arc::clone(&self.cache),
@@ -34754,6 +35360,22 @@ where
 
                 if self.journal_mode == JournalMode::Wal {
                     drop(inner);
+                    let mut eof_allocated_pages: Vec<u32> = self
+                        .allocated_from_eof
+                        .iter()
+                        .copied()
+                        .chain(self.allocated_from_freelist.iter().copied().filter(|page| {
+                            !self.allocated_from_durable_freelist.contains(&page.get())
+                        }))
+                        .filter(|page| {
+                            page.get() > self.original_db_size
+                                && self.write_set.contains_key(page)
+                                && !pending_free_pages.contains(page)
+                        })
+                        .map(PageNumber::get)
+                        .collect();
+                    eof_allocated_pages.sort_unstable();
+                    eof_allocated_pages.dedup();
                     let result = Self::commit_wal_group_commit_with_snapshot(
                         cx,
                         &self.wal_backend,
@@ -34771,6 +35393,7 @@ where
                         !self.txn_read_cache_incomplete.get(),
                         self.truncated_db_size,
                         false,
+                        eof_allocated_pages,
                         published_durable_freelist.take(),
                         pending_free_pages.iter().map(|page| page.get()).collect(),
                         self.allocated_from_freelist
@@ -39678,6 +40301,7 @@ mod tests {
                     &group_delta,
                     true,
                     None,
+                    false,
                 )
                 .unwrap();
 
@@ -39747,6 +40371,7 @@ mod tests {
                     &group_delta,
                     true,
                     None,
+                    false,
                 )
                 .unwrap();
             txn.finish_authorized_wal_attempt(&cx, false).await.unwrap();
