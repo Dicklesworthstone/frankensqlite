@@ -4900,6 +4900,61 @@ impl PagerBackend {
         }
     }
 
+    async fn publish_validated_database_image_through_wal(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        source: &DatabaseImageReceipt,
+        expected_change_counter: u32,
+        candidate: &DatabaseImageReceipt,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(p) => {
+                p.publish_validated_database_image_through_wal(
+                    cx,
+                    path,
+                    source,
+                    expected_change_counter,
+                    candidate,
+                )
+                .await
+            }
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => {
+                p.publish_validated_database_image_through_wal(
+                    cx,
+                    path,
+                    source,
+                    expected_change_counter,
+                    candidate,
+                )
+                .await
+            }
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => {
+                p.publish_validated_database_image_through_wal(
+                    cx,
+                    path,
+                    source,
+                    expected_change_counter,
+                    candidate,
+                )
+                .await
+            }
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => {
+                p.publish_validated_database_image_through_wal(
+                    cx,
+                    path,
+                    source,
+                    expected_change_counter,
+                    candidate,
+                )
+                .await
+            }
+        }
+    }
+
     async fn publish_in_memory_database_image(
         &self,
         cx: &Cx,
@@ -82869,13 +82924,20 @@ impl Connection {
         // it is both impossible and unnecessary here. A writable source still
         // checkpoints as before.
         //
-        // bd-5unvm: VACUUM INTO only reads the logical database. When a peer's
-        // read mark keeps the checkpoint from emptying the WAL, it reads
-        // through the WAL the way stock SQLite does, with the WAL's committed
-        // horizon bound into its source receipt; an in-place VACUUM still
-        // needs the WAL folded into the main file it replaces.
+        // bd-5unvm / bd-kvfbb: In WAL mode, both `VACUUM INTO` and in-place
+        // `VACUUM` read the logical database through the WAL with its committed
+        // horizon bound into the source receipt. In-place WAL `VACUUM` publishes
+        // the rebuilt image through the WAL as one atomic transaction (matching
+        // stock SQLite), so it never needs a pre-rebuild TRUNCATE checkpoint or
+        // an exclusive main-file fence that blocks idle or reading peers.
         let vacuum_into = vacuum_stmt.into.is_some();
-        if !self.pager.is_readonly() && self.pager.journal_mode() == JournalMode::Wal {
+        let publish_through_wal = !vacuum_into
+            && self.path != ":memory:"
+            && self.pager.journal_mode() == JournalMode::Wal;
+        if !self.pager.is_readonly()
+            && self.pager.journal_mode() == JournalMode::Wal
+            && !publish_through_wal
+        {
             match self.pager.checkpoint(&cx, CheckpointMode::Truncate).await {
                 Ok(_) => {}
                 Err(FrankenError::Busy) if vacuum_into => {}
@@ -82906,7 +82968,7 @@ impl Connection {
 
         let source_receipt = if self.path == ":memory:" {
             None
-        } else if vacuum_into {
+        } else if vacuum_into || publish_through_wal {
             Some(self.pager.capture_vacuum_into_source_image(&cx).await?)
         } else {
             Some(self.pager.capture_vacuum_source_image(&cx).await?)
@@ -82927,7 +82989,7 @@ impl Connection {
                 detail: "VACUUM source has no initialized database header".to_owned(),
             })?;
         if let Some(source_receipt) = source_receipt.as_ref() {
-            let hydrated_source_receipt = if vacuum_into {
+            let hydrated_source_receipt = if vacuum_into || publish_through_wal {
                 self.pager.capture_vacuum_into_source_image(&cx).await?
             } else {
                 self.pager.capture_vacuum_source_image(&cx).await?
@@ -83155,11 +83217,15 @@ impl Connection {
                     detail: "VACUUM rebuilt image no longer has its reserved identity".to_owned(),
                 });
             }
-            let expected_change_counter = source_receipt
-                .header()
-                .change_counter
-                .wrapping_add(1)
-                .max(1);
+            let expected_change_counter = if publish_through_wal {
+                source_header.change_counter.wrapping_add(1).max(1)
+            } else {
+                source_receipt
+                    .header()
+                    .change_counter
+                    .wrapping_add(1)
+                    .max(1)
+            };
             let restored_candidate = self
                 .pager
                 .restore_vacuum_candidate_change_counter(
@@ -83190,14 +83256,35 @@ impl Connection {
                     ),
                 });
             }
-            self.pager
-                .publish_validated_database_image(
-                    &cx,
-                    rebuild_target.path(),
-                    source_receipt,
-                    &candidate_receipt,
-                )
-                .await?;
+            let publish_result = if publish_through_wal {
+                self.pager
+                    .publish_validated_database_image_through_wal(
+                        &cx,
+                        rebuild_target.path(),
+                        source_receipt,
+                        expected_change_counter,
+                        &candidate_receipt,
+                    )
+                    .await
+            } else {
+                self.pager
+                    .publish_validated_database_image(
+                        &cx,
+                        rebuild_target.path(),
+                        source_receipt,
+                        &candidate_receipt,
+                    )
+                    .await
+            };
+            if let Err(error) = publish_result {
+                let cleanup_cx = cx.create_child();
+                let _cleanup_mask = cleanup_cx.masked();
+                rebuild_target.cleanup_after_failure(
+                    &cleanup_cx,
+                    "VACUUM publication failed and rebuild-image cleanup was incomplete",
+                );
+                return Err(error);
+            }
 
             #[cfg(test)]
             if self.cancel_vacuum_after_publish_once.replace(false) {
@@ -83214,6 +83301,15 @@ impl Connection {
             self.rebind_after_committed_vacuum(&cx, restore_hydrated_rows)
                 .await?;
             self.pending_auto_vacuum.set(None);
+            if publish_through_wal {
+                // Best-effort non-blocking PASSIVE checkpoint: when no active
+                // reader pins an older WAL snapshot (solo connection or idle
+                // peer), backfill the rebuilt image into the main database file
+                // and truncate the reclaimed tail immediately. Active readers
+                // keep their snapshot untouched because PASSIVE stops at the
+                // lowest active read mark.
+                let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive).await;
+            }
             return Ok(());
         }
 

@@ -261,6 +261,13 @@ pub struct TransactionFrameBatch {
     /// and durability certificate must publish `new_db_size` directly instead of
     /// clamping upward with `max(current_db_size, ...)`.
     pub explicit_db_size_shrink: Option<u32>,
+    /// bd-kvfbb: True when this batch publishes a complete, semantically
+    /// validated database replacement image (in-place WAL `VACUUM`) as one
+    /// atomic WAL transaction. Such a batch must never be consolidated with
+    /// siblings, must observe zero intervening WAL commits since its begin
+    /// snapshot under the append gate, and replaces the entire prior freelist
+    /// and page-cache image.
+    pub whole_image_replace: bool,
 }
 
 /// WAL conflict horizon captured by a submitting transaction.
@@ -326,6 +333,7 @@ impl TransactionFrameBatch {
             route_watch_pages: Vec::new(),
             route_watch_complete: false,
             explicit_db_size_shrink: None,
+            whole_image_replace: false,
         }
     }
 
@@ -343,6 +351,13 @@ impl TransactionFrameBatch {
     #[must_use]
     pub const fn with_explicit_db_size_shrink(mut self, new_db_size: Option<u32>) -> Self {
         self.explicit_db_size_shrink = new_db_size;
+        self
+    }
+
+    /// Mark this batch as a whole-image database replacement (in-place WAL `VACUUM`, bd-kvfbb).
+    #[must_use]
+    pub const fn with_whole_image_replace(mut self, whole_image_replace: bool) -> Self {
+        self.whole_image_replace = whole_image_replace;
         self
     }
 

@@ -9944,6 +9944,9 @@ struct PendingGroupCommitTxnAttempt<F: VfsFile> {
     explicit_db_size_shrink: Option<u32>,
     vacuum_override_freelist: Option<Vec<PageNumber>>,
     pointer_map_after_commit: PointerMapState,
+    whole_image_replace: bool,
+    whole_image_cache: Option<Arc<ShardedPageCache>>,
+    whole_image_reserved_per_page: Option<u8>,
     mode: TransactionMode,
     is_writer: bool,
     staged_page_high_water: u32,
@@ -9992,6 +9995,9 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
             explicit_db_size_shrink,
             vacuum_override_freelist,
             pointer_map_after_commit,
+            whole_image_replace: false,
+            whole_image_cache: None,
+            whole_image_reserved_per_page: None,
             mode,
             is_writer,
             staged_page_high_water,
@@ -10010,6 +10016,17 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
                 terminal: false,
             }),
         }
+    }
+
+    fn with_whole_image_replace(
+        mut self,
+        cache: Arc<ShardedPageCache>,
+        reserved_per_page: u8,
+    ) -> Self {
+        self.whole_image_replace = true;
+        self.whole_image_cache = Some(cache);
+        self.whole_image_reserved_per_page = Some(reserved_per_page);
+        self
     }
 
     fn admit(&self, consumer: Arc<GroupCommitEpochConsumer>, batch_id: u64) -> Result<()> {
@@ -10376,6 +10393,26 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
         } else {
             inner.next_page = inner.next_page.max(next_unallocated_page);
         }
+        if self.whole_image_replace {
+            if let Some(cache) = &self.whole_image_cache {
+                cache.clear();
+            }
+            if let Some(reserved_per_page) = self.whole_image_reserved_per_page {
+                inner.reserved_per_page = reserved_per_page;
+            }
+            inner.freelist_repair_pending = false;
+            inner.freelist_repair_dropped = 0;
+            inner.abandoned_eof_reservations.clear();
+            clear_disowned_ledger(&inner);
+            if let Some(queue) = self.queue.upgrade() {
+                invalidate_disowned_ledger_generation(&queue);
+            }
+            inner.image_generation = inner
+                .maintenance_gate
+                .image_generation
+                .fetch_add(1, AtomicOrdering::AcqRel)
+                .wrapping_add(1);
+        }
         let certificate_commit_seq_lo = authorization.durability_receipt.certificate.commit_seq_lo;
         inner.note_own_wal_commit_first_seq(certificate_commit_seq_lo);
         inner.record_local_wal_commit_at(publication_intent.visible_commit_seq);
@@ -10397,15 +10434,23 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
         state.publication_intent = Some(publication_intent);
         state.resolution = PendingGroupCommitTxnResolution::Authorized(authorization);
         drop(inner);
-        self.published.publish_prepared_parallel_wal_group(
-            &self.cleanup_cx,
-            update,
-            complete_group_pages,
-            certificate_commit_seq_lo,
-        );
-        if let Some(new_db_size) = shrunk_to {
-            self.published
-                .publish_truncate_checkpoint(&self.cleanup_cx, update, new_db_size);
+        if self.whole_image_replace {
+            self.published.publish_replaced_parallel_wal_group(
+                &self.cleanup_cx,
+                update,
+                complete_group_pages,
+            );
+        } else {
+            self.published.publish_prepared_parallel_wal_group(
+                &self.cleanup_cx,
+                update,
+                complete_group_pages,
+                certificate_commit_seq_lo,
+            );
+            if let Some(new_db_size) = shrunk_to {
+                self.published
+                    .publish_truncate_checkpoint(&self.cleanup_cx, update, new_db_size);
+            }
         }
         self.published
             .bind_parallel_wal_publication(publication_intent);
@@ -11735,20 +11780,34 @@ impl<F: VfsFile> PagerInner<F> {
         }
 
         // Cross-process monotonicity (#70): never shrink self.db_size from a
-        // stale page-1 header we just happened to read from WAL. Auto-vacuum
-        // databases can legitimately shrink via FULL commit or
-        // PRAGMA incremental_vacuum, so accept authoritative header shrinks when
-        // pointer maps are active.
+        // stale page-1 header we just happened to read from WAL. Authoritative
+        // shrinks come from same-process image replacement, native WAL commit
+        // frames carrying `db_size`, a main-file truncation observed with an
+        // empty WAL (e.g., cross-process VACUUM followed by TRUNCATE
+        // checkpoint), or auto_vacuum pointer-map shrinks.
+        let file_truncated_with_empty_wal =
+            probe.wal_visible_commit_count == 0 && probe.file_size < self.committed_db_file_size_bytes;
+        let previous_db_size = self.db_size;
         self.db_size = if image_replaced
             || mode == CommittedStateRefreshMode::PostRecovery
             || self.journal_mode != JournalMode::Wal
             || probe.native_db_size.is_some()
+            || file_truncated_with_empty_wal
             || self.pointer_map.uses_pointer_map()
         {
             db_size
         } else {
             self.db_size.max(db_size)
         };
+        let db_shrunk = self.db_size < previous_db_size;
+        if db_shrunk && !image_replaced {
+            // A cross-process VACUUM or shrink invalidated pre-shrink volatile
+            // freelist / abandonment entries; drop them rather than re-parking
+            // old page numbers into the compacted layout below.
+            self.freelist.clear();
+            self.abandoned_eof_reservations.clear();
+            self.durable_db_size_floor = None;
+        }
         let effective_db_size = self.db_size;
         if wal_generation_changed && !image_replaced {
             preserve_above_extent_at_generation_boundary(self);
@@ -11848,7 +11907,7 @@ impl<F: VfsFile> PagerInner<F> {
             probe.wal_visible_commit_count
         };
 
-        if image_replaced {
+        if image_replaced || db_shrunk {
             publication.pages.publish_replaced_image(cx, PublishedPagerUpdate {
                 visible_commit_seq: self.commit_seq,
                 db_size: self.db_size,
@@ -11858,7 +11917,10 @@ impl<F: VfsFile> PagerInner<F> {
             });
             *publication.snapshot.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Arc::new(PagerCommittedSnapshot::from_inner(self));
-            self.image_generation = self.maintenance_gate.image_generation.load(AtomicOrdering::Acquire);
+            if image_replaced {
+                self.image_generation =
+                    self.maintenance_gate.image_generation.load(AtomicOrdering::Acquire);
+            }
         }
         Ok(CommittedStateRefresh {
             wal_snapshot_initialized: probe.wal_snapshot_initialized,
@@ -15205,12 +15267,13 @@ fn conflicting_pages_across_group_commit_batches(batches: &[TransactionFrameBatc
     }) {
         conflicts.insert(1);
     }
-    // bd-1q134: An explicit auto-vacuum shrink batch must never be consolidated
-    // with sibling batches that assume the pre-shrink database extent.
+    // bd-1q134 / bd-kvfbb: An explicit shrink or whole-image replacement batch
+    // must never be consolidated with sibling batches that assume the prior
+    // database extent or B-tree layout.
     if batches.len() > 1
         && batches
             .iter()
-            .any(|batch| batch.explicit_db_size_shrink.is_some())
+            .any(|batch| batch.explicit_db_size_shrink.is_some() || batch.whole_image_replace)
     {
         conflicts.insert(1);
     }
@@ -16618,6 +16681,39 @@ impl PublishedPagerState {
         self.finalize_publish(cx, update, page_set_size, start, true);
     }
 
+    /// Publish a wholesale WAL-backed image replacement (in-place WAL `VACUUM`,
+    /// bd-kvfbb) in a single seqlock generation: clears every stale published
+    /// page, installs the authoritative post-VACUUM `db_size` (including
+    /// shrinks), and loads the rebuilt pages.
+    fn publish_replaced_parallel_wal_group(
+        &self,
+        cx: &Cx,
+        update: PublishedPagerUpdate,
+        complete_group_pages: &HashMap<PageNumber, &[u8]>,
+    ) {
+        #[cfg(test)]
+        record_commit_fast_path_lock(CommitFastPathLockClass::PublishedPagerState);
+        let _publish_guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let start = Instant::now();
+        let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
+        self.pages.clear();
+        self.visible_commit_seq
+            .store(update.visible_commit_seq.get(), AtomicOrdering::Release);
+        self.db_size.store(update.db_size, AtomicOrdering::Release);
+        self.pages.insert_borrowed_batch(
+            complete_group_pages
+                .iter()
+                .map(|(&page_no, &bytes)| (page_no, bytes)),
+        );
+        let page_set_size = self.pages.len();
+        self.finalize_publish(cx, update, page_set_size, start, true);
+    }
+
     /// Validate and publish every page image covered by one durable group
     /// certificate. Direct callers use this convenience wrapper; retained
     /// recovery splits the two phases around exact-handle finalization.
@@ -17948,6 +18044,8 @@ where
                     truncated_db_size: None,
                     vacuum_override_freelist: None,
                     vacuum_relocated_conflict_pages: Vec::new(),
+                    whole_image_replace: false,
+                    whole_image_reserved_per_page: None,
                     wal_conflict_snapshot,
                     published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
                     published_db_size: Cell::new(bound_db_size),
@@ -18212,6 +18310,8 @@ where
                 truncated_db_size: None,
                 vacuum_override_freelist: None,
                 vacuum_relocated_conflict_pages: Vec::new(),
+                whole_image_replace: false,
+                whole_image_reserved_per_page: None,
                 wal_conflict_snapshot,
                 published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
                 published_db_size: Cell::new(bound_db_size),
@@ -18678,6 +18778,7 @@ where
             inner: &'a Mutex<PagerInner<F>>,
             published: &'a PublishedPagerState,
             cleanup_cx: Cx,
+            clear_disowned_on_drop: bool,
             active: bool,
         }
 
@@ -18703,8 +18804,10 @@ where
                 };
                 let _mask = self.cleanup_cx.masked();
                 inner.checkpoint_active = false;
-                inner.abandoned_eof_reservations.clear();
-                clear_disowned_ledger(&inner);
+                if self.clear_disowned_on_drop {
+                    inner.abandoned_eof_reservations.clear();
+                    clear_disowned_ledger(&inner);
+                }
                 self.published.publish_metadata_only(
                     &self.cleanup_cx,
                     PublishedPagerUpdate {
@@ -18719,11 +18822,25 @@ where
         }
 
         settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
-        let _maintenance_lease = self.maintenance_gate.enter_exclusive_maintenance()?;
+        // bd-kvfbb: a WAL-mode `ImageReadThroughWal` source-receipt capture
+        // only reads the main file + WAL horizon and never mutates either; it
+        // takes a shared transaction lease on the process-local maintenance
+        // gate so same-process active readers and uncommitted BEGIN CONCURRENT
+        // writers remain admitted (while still excluding whole-image exclusive
+        // maintenance and cross-process checkpointers/appenders via the WAL
+        // checkpoint lock below).
+        let shared_wal_read_fence = fence == MaintenanceFence::ImageReadThroughWal
+            && self.journal_mode() == JournalMode::Wal;
+        let _maintenance_lease = if shared_wal_read_fence {
+            self.maintenance_gate.enter_transaction()?
+        } else {
+            self.maintenance_gate.enter_exclusive_maintenance()?
+        };
         let mut activity_guard = MaintenanceActivityGuard {
             inner: &self.inner,
             published: self.published.as_ref(),
             cleanup_cx: cleanup_child_cx(cx),
+            clear_disowned_on_drop: !shared_wal_read_fence,
             active: false,
         };
         self.validate_namespace_binding()?;
@@ -18731,7 +18848,8 @@ where
             .inner
             .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
-        if inner.access_mode.is_readonly()
+        if (shared_wal_read_fence && inner.journal_mode != JournalMode::Wal)
+            || inner.access_mode.is_readonly()
             || inner.active_transactions != 0
             || inner.writer_active
             || inner.checkpoint_active
@@ -18826,8 +18944,10 @@ where
         // only after that handoff may observers see maintenance as inactive.
         drop(external_lock);
         inner.checkpoint_active = false;
-        inner.abandoned_eof_reservations.clear();
-        clear_disowned_ledger(&inner);
+        if !read_only_wal_fence {
+            inner.abandoned_eof_reservations.clear();
+            clear_disowned_ledger(&inner);
+        }
         self.published.publish_metadata_only(
             &cleanup_cx,
             PublishedPagerUpdate {
@@ -20403,6 +20523,263 @@ where
                 Ok(()) => Err(publication_err),
                 Err(close_err) => Err(FrankenError::internal(format!(
                     "VACUUM publication failed and candidate close also failed: publication={publication_err}; close={close_err}"
+                ))),
+            },
+        }
+    }
+
+    /// Publish a semantically-validated VACUUM image through the WAL as one
+    /// atomic WAL transaction (bd-kvfbb), matching stock SQLite's WAL-mode
+    /// `VACUUM`.
+    ///
+    /// Unlike [`Self::publish_validated_database_image`], this path never
+    /// acquires an exclusive main-file fence and never overwrites the main
+    /// database file in place while peers are attached. Idle peers and active
+    /// reading peers (both `fsqlite` and stock SQLite) continue running
+    /// unobstructed: active readers retain their pre-VACUUM snapshots until
+    /// they end, while the rebuilt image is committed atomically into the WAL
+    /// with `db_size = candidate.header.page_count` and verified against
+    /// `source` before staging and against the WAL tail under the serialized
+    /// WAL append gate.
+    #[allow(clippy::too_many_lines)]
+    pub async fn publish_validated_database_image_through_wal(
+        &self,
+        cx: &Cx,
+        image_path: &Path,
+        source: &DatabaseImageReceipt,
+        expected_change_counter: u32,
+        candidate: &DatabaseImageReceipt,
+    ) -> Result<()> {
+        if self.vfs.is_memory() {
+            return Err(FrankenError::Unsupported);
+        }
+
+        let image_full_path = self.vfs.full_pathname(cx, image_path)?;
+        self.ensure_vacuum_candidate_is_self_contained(cx, &image_full_path)?;
+        let journal_path = self
+            .vfs
+            .full_pathname(cx, &Self::journal_path(&self.db_path))?;
+        if image_full_path == journal_path || candidate.identity == source.identity {
+            return Err(FrankenError::CannotOpen {
+                path: image_full_path,
+            });
+        }
+
+        let candidate_flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+        let (mut candidate_file, _) = self.vfs.open_with_expected_identity(
+            cx,
+            &image_full_path,
+            candidate_flags,
+            candidate.identity,
+        )?;
+
+        let cleanup_cx = cleanup_child_cx(cx);
+        let publication_result = async {
+            self.ensure_vacuum_candidate_is_self_contained(cx, &image_full_path)?;
+            let expected_page_size = self.page_size();
+            let current_candidate = database_image_receipt_for_open_file(
+                cx,
+                &candidate_file,
+                Some(expected_page_size),
+            )
+            .await?;
+            if current_candidate != *candidate {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "VACUUM candidate identity or content changed after validation"
+                        .to_owned(),
+                });
+            }
+            if candidate.header.page_size != expected_page_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "VACUUM WAL candidate page size {} does not match live WAL page size {}",
+                        candidate.header.page_size.get(),
+                        expected_page_size.get()
+                    ),
+                });
+            }
+            if candidate.header.write_version != 2 || candidate.header.read_version != 2 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "VACUUM WAL candidate file-format versions ({}, {}) do not match WAL mode",
+                        candidate.header.write_version, candidate.header.read_version
+                    ),
+                });
+            }
+            if candidate.header.change_counter != expected_change_counter
+                || candidate.header.version_valid_for != expected_change_counter
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "VACUUM WAL candidate change-counter provenance mismatch: candidate={}, version_valid_for={}, expected={expected_change_counter}",
+                        candidate.header.change_counter, candidate.header.version_valid_for
+                    ),
+                });
+            }
+
+            let new_page_count = candidate.header.page_count;
+            if new_page_count == 0 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "VACUUM WAL candidate has zero pages".to_owned(),
+                });
+            }
+            let page_size = candidate.header.page_size;
+            let page_size_bytes = u64::from(page_size.get());
+            let page_size_usize = page_size.as_usize();
+            let rebuilt_freelist = load_freelist_from_disk(
+                cx,
+                &candidate_file,
+                &self.page_cipher,
+                page_size,
+                candidate.header.reserved_per_page,
+                new_page_count,
+                candidate.header.freelist_trunk,
+                candidate.header.freelist_count,
+            )
+            .await?;
+            let expected_freelist_len =
+                usize::try_from(candidate.header.freelist_count).map_err(|_| {
+                    FrankenError::OutOfRange {
+                        what: "VACUUM candidate freelist count".to_owned(),
+                        value: candidate.header.freelist_count.to_string(),
+                    }
+                })?;
+            if rebuilt_freelist.len() != expected_freelist_len {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "VACUUM WAL candidate freelist contains {} valid unique pages but header declares {}",
+                        rebuilt_freelist.len(),
+                        candidate.header.freelist_count
+                    ),
+                });
+            }
+
+            let mut txn = MvccPager::begin(self, cx, TransactionMode::Immediate).await?;
+            let commit_outcome = async {
+                if txn.journal_mode != JournalMode::Wal {
+                    return Err(FrankenError::BusySnapshot {
+                        conflicting_pages:
+                            "database left WAL mode while VACUUM was rebuilding".to_owned(),
+                    });
+                }
+
+                // Re-verify the source main file and pinned WAL horizon inside
+                // our Immediate WAL transaction before staging the replacement.
+                // Under the serialized WAL append gate, `whole_image_replace`
+                // additionally proves zero commits or resets occurred between
+                // `txn.wal_conflict_snapshot` and the physical WAL append.
+                let current_source = {
+                    let (db_file, live_page_size) = {
+                        let inner = self
+                            .inner
+                            .lock()
+                            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+                        (Arc::clone(&inner.db_file), inner.page_size)
+                    };
+                    let db_file = shared_db_file_read(&db_file, cx).await?;
+                    let mut receipt =
+                        vacuum_source_receipt_for_open_file(cx, &*db_file, live_page_size).await?;
+                    drop(db_file);
+                    let wal_handle = wal_backend_handle(&self.wal_backend)?;
+                    let wal = async_rwlock_read(&wal_handle, cx, "WAL backend").await?;
+                    if wal.frame_count() != 0 {
+                        let snapshot = wal
+                            .pinned_read_snapshot()
+                            .or_else(|| wal.published_snapshot())
+                            .ok_or(FrankenError::BusyRecovery)?;
+                        receipt.wal_horizon = Some(WalImageHorizon {
+                            generation: snapshot.generation,
+                            last_commit_frame: snapshot.last_commit_frame,
+                            commit_count: snapshot.commit_count,
+                        });
+                    }
+                    receipt
+                };
+                if current_source != *source {
+                    return Err(FrankenError::BusySnapshot {
+                        conflicting_pages: "VACUUM source image changed while rebuilding"
+                            .to_owned(),
+                    });
+                }
+
+                let lock_byte_page = crate::journal::lock_byte_page(page_size);
+                let mut page_buf = vec![0_u8; page_size_usize];
+                for raw_page_no in 1..=new_page_count {
+                    if raw_page_no == lock_byte_page {
+                        continue;
+                    }
+                    let page_no = PageNumber::new(raw_page_no).ok_or_else(|| {
+                        FrankenError::internal("VACUUM WAL candidate produced page 0")
+                    })?;
+                    let offset = u64::from(raw_page_no - 1)
+                        .checked_mul(page_size_bytes)
+                        .ok_or_else(|| FrankenError::OutOfRange {
+                            what: "VACUUM candidate page offset".to_owned(),
+                            value: raw_page_no.to_string(),
+                        })?;
+                    let bytes_read = candidate_file.read_fully(cx, &mut page_buf, offset).await?;
+                    if bytes_read != page_size_usize {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "short candidate read while staging WAL VACUUM page {raw_page_no}: got {bytes_read} of {page_size_usize}"
+                            ),
+                        });
+                    }
+                    insert_staged_page(
+                        &mut txn.write_set,
+                        &mut txn.write_pages_sorted,
+                        page_no,
+                        StagedPage::from_page_data(PageData::from_vec(page_buf.clone())),
+                    );
+                }
+
+                txn.writes_observed = true;
+                txn.truncated_db_size = Some(new_page_count);
+                txn.vacuum_override_freelist = Some(rebuilt_freelist);
+                txn.pointer_map = PointerMapState::from_header(
+                    candidate.header.largest_root_page,
+                    candidate.header.incremental_vacuum,
+                );
+                txn.whole_image_replace = true;
+                txn.whole_image_reserved_per_page = Some(candidate.header.reserved_per_page);
+
+                TransactionHandle::commit(&mut txn, cx).await
+            }
+            .await;
+
+            match commit_outcome {
+                Ok(()) => {
+                    clear_pending_disowned_for_path(&self.db_path);
+                    Ok(())
+                }
+                Err(error) => {
+                    if !txn.finished {
+                        let _cleanup_mask = cleanup_cx.masked();
+                        let _ = TransactionHandle::rollback(&mut txn, &cleanup_cx).await;
+                    }
+                    Err(error)
+                }
+            }
+        }
+        .await;
+
+        let _cleanup_mask = cleanup_cx.masked();
+        let close_result = candidate_file.close(&cleanup_cx);
+        match publication_result {
+            Ok(()) => {
+                if let Err(close_err) = close_result {
+                    tracing::error!(
+                        error = %close_err,
+                        candidate = %image_full_path.display(),
+                        "WAL VACUUM committed but candidate close failed"
+                    );
+                }
+                Ok(())
+            }
+            Err(publication_err) => match close_result {
+                Ok(()) => Err(publication_err),
+                Err(close_err) => Err(FrankenError::internal(format!(
+                    "WAL VACUUM publication failed and candidate close also failed: publication={publication_err}; close={close_err}"
                 ))),
             },
         }
@@ -25695,6 +26072,11 @@ where
     /// Tail pages relocated away by auto_vacuum; included in MVCC conflict
     /// surfaces so concurrent mutations to relocated pages fail closed.
     vacuum_relocated_conflict_pages: Vec<PageNumber>,
+    /// True when this transaction stages a complete, validated replacement
+    /// database image for in-place WAL `VACUUM` (bd-kvfbb).
+    whole_image_replace: bool,
+    /// Authoritative `reserved_per_page` carried by a whole-image replacement.
+    whole_image_reserved_per_page: Option<u8>,
     /// WAL visibility horizon captured for this exact transaction at BEGIN.
     /// The backend's shared pinned snapshot can be replaced when a sibling
     /// transaction begins, so commit-time FCW validation must not reread it.
@@ -27437,6 +27819,7 @@ where
             && !self.pointer_map.uses_pointer_map()
             && self.vacuum_override_freelist.is_none()
             && self.truncated_db_size.is_none()
+            && !self.whole_image_replace
             && !freelist_repair_pending
     }
 
@@ -28707,6 +29090,7 @@ where
             Vec::new(),
             false,
             None,
+            false,
             None,
             Vec::new(),
             Vec::new(),
@@ -28745,6 +29129,9 @@ where
         route_watch_pages: Vec<u32>,
         route_watch_complete: bool,
         explicit_db_size_shrink: Option<u32>,
+        // bd-kvfbb: true when this commit publishes a complete validated
+        // replacement image (in-place WAL VACUUM) as one atomic transaction.
+        whole_image_replace: bool,
         // bd-gh302/bd-0shxy: exact durable-freelist content this commit's
         // page-1/trunk frames publish (None when no freelist metadata is
         // serialized), plus the transaction's own freed and consumed
@@ -28901,6 +29288,7 @@ where
         .with_route_watch(route_watch_pages, route_watch_complete);
         let carries_freelist_publication = published_durable_freelist.is_some();
         let batch = batch
+            .with_whole_image_replace(whole_image_replace)
             .with_freelist_publication(
                 published_durable_freelist,
                 freelist_publication_freed_pages,
@@ -28952,6 +29340,7 @@ where
             // page the other just consumed.
             Some(ParallelWalFallbackReason::FreelistPublication)
         } else if explicit_db_size_shrink.is_some()
+            || whole_image_replace
             || write_pages_sorted.first() == Some(&PageNumber::ONE)
         {
             // bd-dw8oe / bd-1q134: page-1 header fields (and explicit auto-vacuum
@@ -29810,64 +30199,101 @@ where
                                 // after every operation that can advance the
                                 // backend's view of the durable tail.
                                 wal.preflight_native_append(cx).await?;
+                                let group_whole_image_replace =
+                                    batches.len() == 1 && batches[0].whole_image_replace;
+                                let group_explicit_shrink = batches.len() == 1
+                                    && batches[0].explicit_db_size_shrink.is_some();
                                 let t_append_conflict_check_start =
                                     detailed_metrics.then(Instant::now);
-                                let (mut stale_conflict_pages, route_checks) =
-                                    conflicting_pages_since_batch_snapshots(cx, wal, &batches)
-                                        .await?;
-                                // bd-1epn5, bd-p9wzl: a written page whose
-                                // snapshot parent another writer changed
-                                // conflicts unless the current tree still
-                                // reaches it where its keys belong. Worth
-                                // deriving only when nothing else conflicts;
-                                // the first failure refuses the flush.
-                                if stale_conflict_pages.is_empty() && !route_checks.is_empty() {
-                                    let page_size = batches
-                                        .iter()
-                                        .flat_map(|batch| batch.frames.iter())
-                                        .map(|frame| frame.page_data.len())
-                                        .next();
-                                    let page_cipher = {
-                                        let inner = inner_arc.lock().map_err(|_| {
-                                            FrankenError::internal(
-                                                "SimpleTransaction lock poisoned",
-                                            )
+                                if group_whole_image_replace {
+                                    // bd-kvfbb: a whole-image WAL VACUUM commits
+                                    // only when zero WAL commits or generation
+                                    // resets landed between its begin snapshot
+                                    // and this serialized append gate.
+                                    let expected_snapshot = batches[0]
+                                        .conflict_snapshot
+                                        .ok_or_else(|| FrankenError::BusySnapshot {
+                                            conflicting_pages: "1".to_owned(),
                                         })?;
-                                        inner.page_cipher.clone()
-                                    };
-                                    let mut durable = HashMap::new();
-                                    for check in route_checks {
-                                        let holds = match page_size {
-                                            Some(page_size) => {
-                                                route_check_holds(
-                                                    cx,
-                                                    wal,
-                                                    &db_file,
-                                                    &page_cipher,
-                                                    page_size,
-                                                    &mut durable,
-                                                    check,
+                                    let current_snapshot = wal
+                                        .published_snapshot()
+                                        .ok_or_else(|| FrankenError::BusySnapshot {
+                                            conflicting_pages: "1".to_owned(),
+                                        })?;
+                                    if current_snapshot.generation != expected_snapshot.generation
+                                        || current_snapshot.last_commit_frame
+                                            != expected_snapshot.last_commit_frame
+                                        || current_snapshot.commit_count
+                                            != expected_snapshot.commit_count
+                                    {
+                                        tracing::warn!(
+                                            target: "fsqlite.pager.commit",
+                                            "whole-image WAL VACUUM refused: WAL changed between begin and append gate (bd-kvfbb)"
+                                        );
+                                        return Err(FrankenError::BusySnapshot {
+                                            conflicting_pages: "1".to_owned(),
+                                        });
+                                    }
+                                    append_conflict_check_us =
+                                        elapsed_profile_us(t_append_conflict_check_start);
+                                } else {
+                                    let (mut stale_conflict_pages, route_checks) =
+                                        conflicting_pages_since_batch_snapshots(cx, wal, &batches)
+                                            .await?;
+                                    // bd-1epn5, bd-p9wzl: a written page whose
+                                    // snapshot parent another writer changed
+                                    // conflicts unless the current tree still
+                                    // reaches it where its keys belong. Worth
+                                    // deriving only when nothing else conflicts;
+                                    // the first failure refuses the flush.
+                                    if stale_conflict_pages.is_empty() && !route_checks.is_empty() {
+                                        let page_size = batches
+                                            .iter()
+                                            .flat_map(|batch| batch.frames.iter())
+                                            .map(|frame| frame.page_data.len())
+                                            .next();
+                                        let page_cipher = {
+                                            let inner = inner_arc.lock().map_err(|_| {
+                                                FrankenError::internal(
+                                                    "SimpleTransaction lock poisoned",
                                                 )
-                                                .await?
-                                            }
-                                            None => false,
+                                            })?;
+                                            inner.page_cipher.clone()
                                         };
-                                        if !holds {
-                                            stale_conflict_pages.push(check.parent());
-                                            break;
+                                        let mut durable = HashMap::new();
+                                        for check in route_checks {
+                                            let holds = match page_size {
+                                                Some(page_size) => {
+                                                    route_check_holds(
+                                                        cx,
+                                                        wal,
+                                                        &db_file,
+                                                        &page_cipher,
+                                                        page_size,
+                                                        &mut durable,
+                                                        check,
+                                                    )
+                                                    .await?
+                                                }
+                                                None => false,
+                                            };
+                                            if !holds {
+                                                stale_conflict_pages.push(check.parent());
+                                                break;
+                                            }
                                         }
                                     }
-                                }
-                                append_conflict_check_us =
-                                    elapsed_profile_us(t_append_conflict_check_start);
-                                if !stale_conflict_pages.is_empty() {
-                                    return Err(FrankenError::BusySnapshot {
-                                        conflicting_pages: stale_conflict_pages
-                                            .iter()
-                                            .map(u32::to_string)
-                                            .collect::<Vec<_>>()
-                                            .join(","),
-                                    });
+                                    append_conflict_check_us =
+                                        elapsed_profile_us(t_append_conflict_check_start);
+                                    if !stale_conflict_pages.is_empty() {
+                                        return Err(FrankenError::BusySnapshot {
+                                            conflicting_pages: stale_conflict_pages
+                                                .iter()
+                                                .map(u32::to_string)
+                                                .collect::<Vec<_>>()
+                                                .join(","),
+                                        });
+                                    }
                                 }
                                 // bd-9inpb allocator-race probe. Native append
                                 // attempts now retain WAL_WRITE and the main
@@ -29910,6 +30336,27 @@ where
                                             .await?
                                     }
                                 };
+                                // bd-kvfbb: if a peer shrunk the database (e.g.,
+                                // in-place WAL VACUUM or auto_vacuum) below this
+                                // transaction's begin snapshot, every page from
+                                // the pre-shrink layout — even pages above the
+                                // shrunk extent that the shrink commit did not
+                                // rewrite — is obsolete. Fail closed.
+                                if !group_explicit_shrink
+                                    && let Some(durable_db_size_floor) = durable_db_size_floor
+                                    && flush_snapshot_db_size > 0
+                                    && durable_db_size_floor < flush_snapshot_db_size
+                                {
+                                    tracing::warn!(
+                                        target: "fsqlite.pager.commit",
+                                        snapshot_db_size = flush_snapshot_db_size,
+                                        durable_db_size = durable_db_size_floor,
+                                        "commit refused: durable db_size shrunk below transaction snapshot (bd-kvfbb)"
+                                    );
+                                    return Err(FrankenError::BusySnapshot {
+                                        conflicting_pages: "1".to_owned(),
+                                    });
+                                }
                                 // bd-9inpb: EOF-growth anti-alias gate. Run
                                 // BEFORE commit-planned freelist reconciliation
                                 // so it checks this group's own Phase-A frames
@@ -29956,11 +30403,15 @@ where
                                 // from the CURRENT durable freelist right here
                                 // under `HeldAppendGate` while enforcing exact
                                 // durable-freelist reuse validation fail-closed.
-                                if let Some(frame_page_size) = batches
-                                    .iter()
-                                    .flat_map(|batch| batch.frames.iter())
-                                    .map(|frame| frame.page_data.len())
-                                    .next()
+                                // Whole-image WAL VACUUM replacements intentionally
+                                // discard the prior durable freelist and already
+                                // proved zero concurrent WAL commits above.
+                                if !group_whole_image_replace
+                                    && let Some(frame_page_size) = batches
+                                        .iter()
+                                        .flat_map(|batch| batch.frames.iter())
+                                        .map(|frame| frame.page_data.len())
+                                        .next()
                                 {
                                     let has_freelist_publication = batches
                                         .iter()
@@ -30183,8 +30634,6 @@ where
                                 // page-1 frame carries header db_size and
                                 // freelist bytes the prep promoted, so a group
                                 // with one still fails closed.
-                                let group_explicit_shrink = batches.len() == 1
-                                    && batches[0].explicit_db_size_shrink.is_some();
                                 if group_explicit_shrink {
                                     // bd-1q134: An explicit auto-vacuum / incremental-vacuum
                                     // shrink is allowed to lower db_size below the prior
@@ -31534,7 +31983,7 @@ where
         self.published_db_size.set(publication_intent.db_size);
 
         if release {
-            if self.single_connection_fast_path_enabled() {
+            if self.single_connection_fast_path_enabled() && !self.whole_image_replace {
                 self.drain_committed_cache_pages_into_cache();
             } else {
                 self.discard_committed_pages();
@@ -32859,7 +33308,7 @@ where
             // commit already uses for its own unstaged allocations, so the
             // gh302 exactness guard and cross-process conflict machinery
             // apply unchanged.
-            if self.journal_mode == JournalMode::Wal {
+            if self.journal_mode == JournalMode::Wal && !self.whole_image_replace {
                 // bd-ioq6x Face-2: adopt the in-range pages disowned by
                 // connections that dropped before reconciling their own pool.
                 // They flow through the identical no-committed-frame fold below
@@ -33007,11 +33456,22 @@ where
                     self.uses_commit_planned_freelist(inner.freelist_repair_pending);
                 commit_planned_reserved_per_page =
                     commit_reserved_per_page(&self.write_set, inner.reserved_per_page);
-                let freelist_dirty = self.freelist_metadata_dirty_with_pending_free_pages(
-                    &inner,
-                    committed_db_size,
-                    &pending_free_pages,
-                );
+                let freelist_dirty = if self.whole_image_replace {
+                    false
+                } else {
+                    self.freelist_metadata_dirty_with_pending_free_pages(
+                        &inner,
+                        committed_db_size,
+                        &pending_free_pages,
+                    )
+                };
+                if self.whole_image_replace {
+                    published_durable_freelist = self
+                        .vacuum_override_freelist
+                        .as_ref()
+                        .map(|pages| pages.iter().map(|page| page.get()).collect());
+                    published_for_durable_view = published_durable_freelist.clone();
+                }
                 // CRITICAL FIX (beads_rust#138): Do NOT push pages that become
                 // free into inner.freelist during Phase A. In the split-lock WAL
                 // commit path, inner.lock() is released between Phase A and Phase B.
@@ -33045,7 +33505,7 @@ where
                         })
                         .copied()
                         .collect();
-                    let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
+                    let mut attempt = PendingGroupCommitTxnAttempt::new(
                         &self.group_commit_queue,
                         Arc::clone(&self.inner),
                         Arc::clone(&self.db_file),
@@ -33064,7 +33524,15 @@ where
                         std::mem::take(&mut pending_freed),
                         std::mem::take(&mut self.reclaimed_abandoned_reservations),
                         live_committed_allocations,
-                    ));
+                    );
+                    if self.whole_image_replace {
+                        attempt = attempt.with_whole_image_replace(
+                            Arc::clone(&self.cache),
+                            self.whole_image_reserved_per_page
+                                .unwrap_or(inner.reserved_per_page),
+                        );
+                    }
+                    let attempt = Arc::new(attempt);
                     self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
                     wal_attempt = Some(attempt);
                 }
@@ -33179,7 +33647,9 @@ where
                 // grows (new pages allocated beyond current db_size). Without this,
                 // other connections reading page 1 from WAL won't see the updated
                 // page_count header, causing BusySnapshot errors.
-                let must_write_page1 = if self.journal_mode == JournalMode::Wal {
+                let must_write_page1 = if self.whole_image_replace {
+                    false
+                } else if self.journal_mode == JournalMode::Wal {
                     wal_page1_plan.requires_page_one_rewrite()
                         || wal_page1_plan.requires_page_count_advance()
                 } else {
@@ -33307,6 +33777,7 @@ where
                     route_watch_pages,
                     !self.txn_read_cache_incomplete.get(),
                     self.truncated_db_size,
+                    self.whole_image_replace,
                     published_durable_freelist.take(),
                     pending_free_pages.iter().map(|page| page.get()).collect(),
                     self.allocated_from_freelist
@@ -34034,7 +34505,7 @@ where
                         })
                         .copied()
                         .collect();
-                    let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
+                    let mut attempt = PendingGroupCommitTxnAttempt::new(
                         &self.group_commit_queue,
                         Arc::clone(&self.inner),
                         Arc::clone(&self.db_file),
@@ -34053,7 +34524,15 @@ where
                         std::mem::take(&mut pending_freed),
                         std::mem::take(&mut self.reclaimed_abandoned_reservations),
                         live_committed_allocations,
-                    ));
+                    );
+                    if self.whole_image_replace {
+                        attempt = attempt.with_whole_image_replace(
+                            Arc::clone(&self.cache),
+                            self.whole_image_reserved_per_page
+                                .unwrap_or(inner.reserved_per_page),
+                        );
+                    }
+                    let attempt = Arc::new(attempt);
                     self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
                     wal_attempt = Some(attempt);
                 }
@@ -34281,6 +34760,7 @@ where
                         route_watch_pages,
                         !self.txn_read_cache_incomplete.get(),
                         self.truncated_db_size,
+                        false,
                         published_durable_freelist.take(),
                         pending_free_pages.iter().map(|page| page.get()).collect(),
                         self.allocated_from_freelist
