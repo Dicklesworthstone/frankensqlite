@@ -94,6 +94,63 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-28 - REJECTED on its own regression lines (R1: rowid_lookups_200k +20.0% Ir, scan / GROUP BY / window rows +0.36%..+1.56%, all from an eviction victim search, preads unchanged), with the memory bound itself holding (pager keeper red on main, green with the fix): a read transaction's snapshot read cache counts its pages against the shared cache's cache_size budget (bd-hsvx3, serial read lane round 19, cache obedience R1; R2 not landed either: the same rows regress, the RSS line fails, and an e2e keeper turns red)
+
+- Target: bd-hsvx3. Since ee26108e3 (GH #525) a read transaction keeps up to cache_size page images in its snapshot
+  read cache, beside the shared cache's own cache_size, so a reader holds up to twice PRAGMA cache_size (join_100k at
+  -2000: peak RSS growth over SELECT 1 6.9-7.9 MB against stock 3.54.1's 2.0 MB, r18).
+- Ledger preflight: 2026-11-18 ABANDONED (bd-w4pr1.13 OWN1: `txn_read_cache` is the snapshot's record of observed images,
+  GH #129; dropping an entry means BusySnapshot after a peer commit and a lost conflict baseline); ee26108e3 (a zero
+  read budget ran join_100k at 2.2x / 3.5x CPU). So the read cache keeps its budget and never drops an entry; only
+  the shared cache gives way.
+- R1 (patch scratchpad rl19/hs/r1/): `ShardedPageCache::reserved_pages` (reserve_pages / release_reserved_pages;
+  `trim_to_page_budget` and the fast-path admission keep at most budget - reserved resident), and
+  `SimpleTransaction::txn_read_cache` a `TxnReadCache` whose every new entry reserves a page and whose remove / clear /
+  take / Drop release them. Touched `crates/fsqlite-pager/src/page_cache.rs`, `crates/fsqlite-pager/src/pager.rs`.
+- Keeper (fsqlite-pager lib): `bd_hsvx3_shared_cache_and_read_transaction_hold_at_most_the_cache_budget` (budget 8, a
+  64-page scan twice: shared + read cache <= 8 after every read; non-vacuity; a second reader; the budget refills
+  after both end) RED on main 40e6f515e ("shared cache 8 + transaction read cache 1 pages exceed cache_size 8"),
+  green with R1; mutants m1 (pins never reserved) and m2 (never released) red. Pager lib 1,163/0; core lib 4,247/1
+  (main's own red); core snapshot keepers green; e2e: bd_aztlm_page_cache_e2e q15 (asserts `cached_pages > 8` after a
+  read at budget 32) red with the fix and green on main; bd_aztlm_flat_hash_four_concurrent_writers red on main too
+  (identical, 3 of 3).
+- Prediction (on the bead before the build): join_100k at -2000 preads 0.9M-1.3M, Ir +5..+20%; scan / GROUP BY / window
+  rows within +-0.2%; page-revisiting rows +0..+8%. Kill lines: those rows +0.2% and +10%; join_100k +25% or preads
+  above 1.4M; RSS growth at -2000 not 40% under the parent's.
+- Result (arms P = 40e6f515e a65469efcc0ae439, L = P + R1 a9817ea8e1fdd448, one rch job on ovh-a; callgrind and strace
+  on thinkstation1, stock 3.54.1 live; every answer equal):
+  - join_100k ten joins: -2000 12,107.5M -> 13,946.2M Ir (+15.2%), preads 456,441 -> 779,836 (stock 1,020,795);
+    -128000 +0.02%. Per extra read 6,838 -> 6,355.
+  - Read rows (39 MB database, default cache_size): rowid_lookups_200k +20.0%, order_by_text_limit10 +1.56%,
+    scan_filter_agg +1.51%, group_by_1000_groups +0.87%, gb_a_mod10 +0.87%, gb_id +0.57%, tb_in_sub_1M +0.58%,
+    join_1M_to_pk_1000 +0.54%, window rows +0.52%, gb_id_mod100k +0.50%, gb_a_sum_c +0.36%; count_star -0.16%.
+    Read syscalls identical in both arms on every row.
+  - Cause (callgrind): rowid_lookups_200k `trim_to_page_budget` 118.9M -> 573.4M (the whole +452.8M), inside it
+    `take_clean_buffer` 84.7M -> 536.6M. Once the read cache pins the budget the shared cache's target is 0, so each
+    page read is admitted and evicted again, and the victim search walks a nearly empty fast array (~2,900 Ir a page).
+  - Peak RSS growth over SELECT 1 at -2000, two runs: P +7.6 / +7.4 MB, L +4.3 / +6.6 MB (stock +1.6 / +1.5): the
+    per-process base moves by 1-2 MB between runs, so the deltas are noisy; absolute peaks P 32.9 / 32.4 MB, L 28.5 /
+    29.6 MB.
+- R2 (R1 plus `ShardedPageCache::admits_pages()`; `read_page_copy_outside_wal` reads a miss uncached when the shared
+  cache admits nothing). Arms P = 3003a920f e137e200a877acf8, L = P + R2 9f0ff43d9e1fce35 (one rch job on
+  vmi1153651): join_100k at -2000 11,768.1M -> 14,578.8M Ir (+23.9%), preads 456,441 -> 779,836; rowid_lookups_200k
+  +20.3%, scan / GROUP BY / window rows +0.34%..+1.41%. The victim search is gone (trim 0.3M on rowid_lookups_200k);
+  the uncached read that replaces it costs 1,164.5M against the cached path's 746.1M, much of it a 4 KiB
+  `vec![0; page_size]` zero fill per read that callgrind counts at about one Ir per byte (unconfirmed by perf stat).
+  Peak RSS at -2000, two runs: absolute P 30.6 / 30.6 MB, L 27.9 / 27.9 MB; growth -39% / -14% (under the -40% line).
+  Both versions turn e2e `bd_aztlm_page_cache_e2e::q15_cache_budget_readonly_header_failure_keeps_runtime_change`
+  red (`cached_pages > 8` after a read at budget 32; green on main).
+- Not reached by the bound: `PageBufPool` retains up to 8 MiB of idle page buffers per pool
+  (`PAGE_BUF_POOL_MAX_IDLE_BYTES`), and `WalFramePageCache` up to 1,024 frames per connection, whatever cache_size.
+- Retry condition: all of (1) a design that keeps stock's cross-statement caching (stock's one cache keeps a
+  statement's pages for the next; here a statement's read-cache pages are dropped at its end while the shared cache
+  was squeezed, so join_100k reads each join's interior pages again): hand a finished transaction's images back to
+  the shared cache up to the budget; (2) the zero-target paths made cheap (no victim search over an empty fast array;
+  an uncached read into a pool buffer without zero fill), with perf stat user instructions for any rep-string delta;
+  (3) a coordinator or owner decision on q15's `cached_pages > 8` assertion, which observes the double holding this
+  bead removes; (4) if the close probe stays "RSS within 1.25x of stock", the pool's idle cap and the WAL frame cache
+  sized from cache_size too.
+
 ## 2026-11-28 - WIN: hot-lane `Opcode::Function` via `ScalarSites`, batched func call metrics, zero-alloc spilled 1-col key decode, and REAL fast paths in sorter/merge/index-prefix compare (bd-imwu9 / GH#489)
 
 - Target: GH#489 (`CREATE TABLE t AS SELECT * FROM generate_series(1, 1000000); CREATE INDEX a ON t (round(log10(value)));`),
