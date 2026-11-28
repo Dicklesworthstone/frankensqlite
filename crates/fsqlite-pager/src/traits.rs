@@ -540,6 +540,19 @@ pub trait WalBackend: Send + Sync {
         None
     }
 
+    /// Number of committed transactions within [`Self::pinned_read_snapshot`]
+    /// whose commit frames have already been backfilled into the database file
+    /// (`nBackfill` equivalent for the pinned snapshot, bd-r0n0h).
+    ///
+    /// Used by pager clock-base derivation when no logical parallel-WAL
+    /// certificate is present so commits already reflected in the main database
+    /// header `change_counter` are not double-counted on top of the WAL's full
+    /// visible commit count. Backends that do not track backfill return 0.
+    #[must_use]
+    fn pinned_backfilled_commit_count(&self) -> u64 {
+        0
+    }
+
     /// The frames of the pinned read snapshot and the WAL file's descriptor,
     /// for a [`crate::SnapshotPageReader`] of that snapshot (bd-w4pr1.13.11).
     ///
@@ -995,6 +1008,22 @@ pub trait WalBackend: Send + Sync {
     /// re-backfill-from-zero behavior.
     fn backfilled_frame_count(&self) -> usize {
         0
+    }
+
+    /// Number of committed transactions in the current WAL generation strictly
+    /// after the `frame_prefix`-frame prefix (`frame_index >= frame_prefix`,
+    /// bd-r0n0h).
+    ///
+    /// Used by partial (reader-clamped) checkpoints to stamp the main database
+    /// page-1 `change_counter` with the exact backfilled commit horizon instead
+    /// of leaping ahead to unbackfilled commits. Backends that do not track
+    /// per-frame commit boundaries return 0 (complete-checkpoint behavior).
+    fn committed_txn_count_after_frame<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _frame_prefix: u32,
+    ) -> WalFuture<'a, u64> {
+        Box::pin(async { Ok(0) })
     }
 
     /// Refresh and verify that this backend can retire an empty WAL.

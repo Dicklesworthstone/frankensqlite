@@ -235,6 +235,8 @@ struct WalPublishedSnapshot {
     generation: WalGenerationIdentity,
     last_commit_frame: Option<usize>,
     commit_count: u64,
+    /// Sorted 0-based indices of committed frames within `0..=last_commit_frame`.
+    commit_frames: Arc<Vec<usize>>,
     page_index: Arc<WalPageIndex>,
     index_is_partial: bool,
 }
@@ -247,6 +249,7 @@ impl WalPublishedSnapshot {
             generation,
             last_commit_frame: None,
             commit_count: 0,
+            commit_frames: Arc::new(Vec::new()),
             page_index: Arc::new(WalPageIndex::default()),
             index_is_partial: false,
         }
@@ -297,6 +300,7 @@ struct PendingWalAppendAttempt {
 struct WalPublicationDelta {
     page_index_updates: WalPageIndex,
     commit_count: u64,
+    commit_frames: Vec<usize>,
     index_is_partial: bool,
 }
 
@@ -376,6 +380,9 @@ pub struct WalBackendAdapter<F: VfsFile> {
     next_publication_seq: u64,
     /// Transaction-bounded read snapshot pinned at `begin_transaction()`.
     read_snapshot: Option<WalPublishedSnapshot>,
+    /// Backfilled frame prefix (`nBackfill`) observed when pinning
+    /// `read_snapshot` (bd-r0n0h).
+    pinned_backfilled_frames: usize,
     /// Frames appended after the last published commit horizon.
     pending_publication_frames: Vec<PendingPublicationFrame>,
     /// Highest commit frame staged by the append path but not yet published.
@@ -654,6 +661,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             published_snapshot: WalPublishedSnapshot::empty(0, generation),
             next_publication_seq: 1,
             read_snapshot: None,
+            pinned_backfilled_frames: 0,
             pending_publication_frames: Vec::new(),
             pending_publication_commit: None,
             pending_publication_generation: None,
@@ -703,6 +711,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             published_snapshot: WalPublishedSnapshot::empty(0, generation),
             next_publication_seq: 1,
             read_snapshot: None,
+            pinned_backfilled_frames: 0,
             pending_publication_frames: Vec::new(),
             pending_publication_commit: None,
             pending_publication_generation: None,
@@ -860,6 +869,28 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             .map(wal_publication_snapshot_from_published)
     }
 
+    /// Number of committed transactions in the pinned read snapshot whose
+    /// commit frames fall inside the observed backfilled prefix (`nBackfill`).
+    #[must_use]
+    pub fn pinned_backfilled_commit_count(&self) -> u64 {
+        let Some(snapshot) = self.read_snapshot.as_ref() else {
+            return 0;
+        };
+        let backfilled_frames = self.native_read_binding.as_ref().map_or(
+            self.pinned_backfilled_frames,
+            |binding| usize::try_from(binding.boundary().backfilled_frames).unwrap_or(usize::MAX),
+        );
+        if backfilled_frames == 0 {
+            return 0;
+        }
+        u64::try_from(
+            snapshot
+                .commit_frames
+                .partition_point(|&frame_index| frame_index < backfilled_frames),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
     /// Refresh this handle from disk and republish the latest committed WAL
     /// visibility summary without pinning a read transaction.
     pub async fn refresh_published_snapshot(&mut self, cx: &Cx) -> Result<WalPublicationSnapshot> {
@@ -881,6 +912,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// Discard published and pinned snapshots after external WAL mutation.
     fn invalidate_publication(&mut self) {
         self.read_snapshot = None;
+        self.pinned_backfilled_frames = 0;
         self.discard_pending_publication();
         self.published_snapshot = WalPublishedSnapshot::empty(
             self.published_snapshot.publication_seq,
@@ -955,6 +987,18 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         } else {
             Arc::new(delta.page_index_updates)
         };
+        let commit_frames = if extend_previous {
+            let mut commit_frames = std::mem::replace(
+                &mut self.published_snapshot.commit_frames,
+                Arc::new(Vec::new()),
+            );
+            if !delta.commit_frames.is_empty() {
+                Arc::make_mut(&mut commit_frames).extend(delta.commit_frames);
+            }
+            commit_frames
+        } else {
+            Arc::new(delta.commit_frames)
+        };
 
         let publication_seq = self.next_publication_seq;
         self.next_publication_seq = self.next_publication_seq.saturating_add(1);
@@ -964,6 +1008,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             generation,
             last_commit_frame,
             commit_count,
+            commit_frames,
             page_index,
             index_is_partial,
         };
@@ -1080,6 +1125,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             }
             if header.is_commit() {
                 delta.commit_count = delta.commit_count.saturating_add(1);
+                delta.commit_frames.push(frame_index);
             }
         }
         Ok(delta)
@@ -2425,6 +2471,14 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         } else {
             Arc::new(WalPageIndex::default())
         };
+        let mut commit_frames = if can_extend_previous {
+            std::mem::replace(
+                &mut self.published_snapshot.commit_frames,
+                Arc::new(Vec::new()),
+            )
+        } else {
+            Arc::new(Vec::new())
+        };
         let mut index_is_partial = if can_extend_previous {
             self.published_snapshot.index_is_partial
         } else {
@@ -2462,6 +2516,13 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             }
             if frame.is_commit {
                 commit_delta_count = commit_delta_count.saturating_add(1);
+                let commit_frames_vec = Arc::make_mut(&mut commit_frames);
+                if commit_frames_vec
+                    .last()
+                    .is_none_or(|&last| frame.frame_index > last)
+                {
+                    commit_frames_vec.push(frame.frame_index);
+                }
             }
         }
 
@@ -2474,6 +2535,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             // retain the async rebuild for the cases that genuinely need it.
             if can_extend_previous {
                 self.published_snapshot.page_index = page_index;
+                self.published_snapshot.commit_frames = commit_frames;
             }
             self.pending_publication_frames
                 .retain(|frame| frame.frame_index > last_commit_frame);
@@ -2488,6 +2550,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             generation,
             last_commit_frame: Some(last_commit_frame),
             commit_count: previous_commit_count.saturating_add(commit_delta_count),
+            commit_frames,
             page_index,
             index_is_partial,
         };
@@ -2738,6 +2801,8 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 }
             }
             self.publish_visible_snapshot(cx, frame_count.checked_sub(1), "begin_native_read").await?;
+            self.pinned_backfilled_frames =
+                usize::try_from(binding.boundary().backfilled_frames).unwrap_or(usize::MAX);
             self.read_snapshot = Some(self.published_snapshot.clone());
             self.native_read_binding = Some(binding);
             self.refresh_before_append = true;
@@ -2751,6 +2816,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 return Err(FrankenError::BusyRecovery);
             }
             self.read_snapshot = None;
+            self.pinned_backfilled_frames = 0;
             self.native_read_binding = None;
         }
         Ok(())
@@ -2778,15 +2844,21 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             if self.has_pending_publication() {
                 return Err(FrankenError::Busy);
             }
-            if self.native_reader_required() {
-                self.native_checkpoint_view(cx).await?;
-            }
+            let native_backfilled = if self.native_reader_required() {
+                self.native_checkpoint_view(cx)
+                    .await?
+                    .and_then(|view| usize::try_from(view.backfilled_frames).ok())
+            } else {
+                None
+            };
             // Establish a transaction-bounded snapshot once, instead of doing an
             // expensive refresh for every page read.
             self.wal.refresh(cx).await?;
             self.publish_latest_committed_snapshot(cx, "begin_transaction")
                 .await?;
             self.read_snapshot = Some(self.published_snapshot.clone());
+            self.pinned_backfilled_frames =
+                native_backfilled.unwrap_or_else(|| self.backfilled_frame_count());
             self.refresh_before_append = true;
             Ok(())
         })
@@ -2798,6 +2870,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
     fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
         Self::pinned_read_snapshot(self)
+    }
+
+    fn pinned_backfilled_commit_count(&self) -> u64 {
+        Self::pinned_backfilled_commit_count(self)
     }
 
     /// bd-w4pr1.13.11: the pinned snapshot's page index is shared, not
@@ -3772,6 +3848,46 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             }
             _ => 0,
         }
+    }
+
+    fn committed_txn_count_after_frame<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        frame_prefix: u32,
+    ) -> WalFuture<'a, u64> {
+        Box::pin(async move {
+            let prefix = usize::try_from(frame_prefix).unwrap_or(usize::MAX);
+            let generation = self.wal.generation_identity();
+            let last_commit_frame = self.wal.last_commit_frame(cx)?;
+            if self.published_snapshot.generation == generation
+                && self.published_snapshot.last_commit_frame == last_commit_frame
+            {
+                let in_prefix = self
+                    .published_snapshot
+                    .commit_frames
+                    .partition_point(|&frame_index| frame_index < prefix);
+                return Ok(u64::try_from(
+                    self.published_snapshot
+                        .commit_frames
+                        .len()
+                        .saturating_sub(in_prefix),
+                )
+                .unwrap_or(u64::MAX));
+            }
+            let Some(end) = last_commit_frame else {
+                return Ok(0);
+            };
+            if prefix > end {
+                return Ok(0);
+            }
+            let mut count = 0_u64;
+            for frame_index in prefix..=end {
+                if self.wal.read_frame_header(cx, frame_index).await?.is_commit() {
+                    count = count.saturating_add(1);
+                }
+            }
+            Ok(count)
+        })
     }
 
     fn validate_empty_wal_for_retirement<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
@@ -7330,6 +7446,10 @@ where
         self.inner.pinned_read_snapshot()
     }
 
+    fn pinned_backfilled_commit_count(&self) -> u64 {
+        self.inner.pinned_backfilled_commit_count()
+    }
+
     fn pinned_snapshot_frames(&self) -> Option<fsqlite_pager::WalSnapshotFrames> {
         WalBackend::pinned_snapshot_frames(&self.inner)
     }
@@ -7968,6 +8088,19 @@ where
 
     fn backfilled_frame_count(&self) -> usize {
         self.inner.backfilled_frame_count()
+    }
+
+    fn committed_txn_count_after_frame<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        frame_prefix: u32,
+    ) -> WalFuture<'a, u64> {
+        Box::pin(async move {
+            self.ensure_current_wal_path(cx).await?;
+            self.inner
+                .committed_txn_count_after_frame(cx, frame_prefix)
+                .await
+        })
     }
 
     fn checkpoint<'a>(

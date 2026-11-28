@@ -11399,9 +11399,14 @@ impl<F: VfsFile> PagerInner<F> {
             .commit_seq
             .get()
             .saturating_sub(previous_wal_visible_commit_count);
-        let (physical_wal_visible_commit_count, wal_generation, logical_visible_commit_seq, native_db_size) =
-            if self.journal_mode == JournalMode::Wal {
-                with_wal_backend(wal_backend, cx, |wal, cx| {
+        let (
+            physical_wal_visible_commit_count,
+            backfilled_wal_commit_count,
+            wal_generation,
+            logical_visible_commit_seq,
+            native_db_size,
+        ) = if self.journal_mode == JournalMode::Wal {
+            with_wal_backend(wal_backend, cx, |wal, cx| {
                 Box::pin(async move {
                     let native_binding = if native_reader_prepared && wal.native_reader_required() {
                         Some(wal.native_read_binding().ok_or(FrankenError::BusyRecovery)?)
@@ -11414,7 +11419,8 @@ impl<F: VfsFile> PagerInner<F> {
                         let pinned = snapshot.ok_or(FrankenError::BusyRecovery)?;
                         let header = binding.header();
                         let end = usize::try_from(header.mx_frame)
-                            .map_err(|_| FrankenError::BusyRecovery)?.checked_sub(1);
+                            .map_err(|_| FrankenError::BusyRecovery)?
+                            .checked_sub(1);
                         // The salts must agree only while a frame is visible.
                         // With none on either side the database file alone is
                         // the image: stock SQLite's unindexed empty header has
@@ -11435,6 +11441,7 @@ impl<F: VfsFile> PagerInner<F> {
                     } else {
                         wal.committed_txn_count(cx).await?
                     };
+                    let backfilled_commit_count = wal.pinned_backfilled_commit_count();
                     let logical_visible_commit_seq =
                         match (snapshot, wal.pinned_logical_read_snapshot(cx).await?) {
                             (Some(pinned), Some(logical))
@@ -11453,6 +11460,7 @@ impl<F: VfsFile> PagerInner<F> {
                         };
                     Ok((
                         physical_commit_count,
+                        backfilled_commit_count,
                         snapshot.map(|s| s.generation),
                         logical_visible_commit_seq,
                         native_binding.and_then(|binding| {
@@ -11463,9 +11471,9 @@ impl<F: VfsFile> PagerInner<F> {
                 })
             })
             .await?
-            } else {
-                (0, None, None, None)
-            };
+        } else {
+            (0, 0, None, None, None)
+        };
         let wal_snapshot_initialized = self.journal_mode == JournalMode::Wal;
 
         let cached_wal_base_is_current = self.journal_mode == JournalMode::Wal
@@ -11516,6 +11524,7 @@ impl<F: VfsFile> PagerInner<F> {
                     disk_header_requests_wal,
                 )
             };
+        let low_u32 = |value: u64| u32::try_from(value & u64::from(u32::MAX)).expect("masked to u32");
         // A parallel WAL group may collapse multiple logical commits behind a
         // single physical marker. A current-generation certificate can widen
         // that count only when it was bound above to this exact pinned read
@@ -11523,26 +11532,69 @@ impl<F: VfsFile> PagerInner<F> {
         // an absolute `CommitSeq` for the pinned WAL generation, so never add
         // `physical_wal_visible_commit_count` on top of an intermediate
         // passive-checkpoint `base_commit_seq` (bd-2ym3z).
-        let (wal_visible_commit_count, visible_commit_seq) =
+        //
+        // bd-r0n0h: preserve the fundamental clock pairing invariant
+        // `(visible_commit_seq - wal_visible_commit_count) ≡ db_change_counter (mod 2^32)`
+        // whenever a mid-generation refresh reads a main-file header already
+        // advanced by a non-resetting frame-copying checkpoint. Otherwise a
+        // subsequent WAL reset computes `delta = new_cc - backfilled_cc` on top
+        // of the pre-generation base and lags behind `CommitIndex`, causing
+        // permanent `BusySnapshot` refusals. And when no logical certificate is
+        // present, subtract `backfilled_wal_commit_count` from the disk header
+        // base so already-backfilled WAL commits are never double-counted.
+        let (wal_visible_commit_count, visible_commit_seq, effective_db_change_counter) =
             if let Some(logical_visible_commit_seq) = logical_visible_commit_seq {
                 let visible_commit_seq =
                     CommitSeq::new(logical_visible_commit_seq.get().max(base_commit_seq));
                 let wal_visible_commit_count = visible_commit_seq
                     .get()
                     .saturating_sub(base_commit_seq)
-                    .max(
-                        physical_wal_visible_commit_count
-                            .min(visible_commit_seq.get().saturating_sub(1)),
-                    );
-                (wal_visible_commit_count, visible_commit_seq)
+                    .max(physical_wal_visible_commit_count.min(visible_commit_seq.get()));
+                let effective_base_commit_seq = visible_commit_seq
+                    .get()
+                    .saturating_sub(wal_visible_commit_count);
+                let backfilled_base_advance =
+                    base_commit_seq.saturating_sub(effective_base_commit_seq);
+                let effective_db_change_counter = u64::from(
+                    low_u32(raw_base_change_counter).wrapping_sub(low_u32(backfilled_base_advance)),
+                );
+                (
+                    wal_visible_commit_count,
+                    visible_commit_seq,
+                    effective_db_change_counter,
+                )
+            } else if !cached_wal_base_is_current
+                && self.journal_mode == JournalMode::Wal
+                && physical_wal_visible_commit_count != 0
+                && backfilled_wal_commit_count != 0
+            {
+                let backfilled =
+                    backfilled_wal_commit_count.min(physical_wal_visible_commit_count);
+                let counted_backfilled = backfilled.min(base_commit_seq);
+                let effective_base_commit_seq = base_commit_seq.saturating_sub(counted_backfilled);
+                let visible_commit_seq = CommitSeq::new(
+                    effective_base_commit_seq.saturating_add(physical_wal_visible_commit_count),
+                );
+                let effective_db_change_counter = u64::from(
+                    low_u32(raw_base_change_counter).wrapping_sub(low_u32(counted_backfilled)),
+                );
+                (
+                    physical_wal_visible_commit_count,
+                    visible_commit_seq,
+                    effective_db_change_counter,
+                )
             } else {
                 let wal_visible_commit_count = physical_wal_visible_commit_count;
                 let visible_commit_seq =
                     CommitSeq::new(base_commit_seq.saturating_add(wal_visible_commit_count));
-                (wal_visible_commit_count, visible_commit_seq)
+                (
+                    wal_visible_commit_count,
+                    visible_commit_seq,
+                    raw_base_change_counter,
+                )
             };
         let durable_identity_changed = file_size != previous_file_size
-            || raw_base_change_counter != previous_db_change_counter
+            || effective_db_change_counter != previous_db_change_counter
             || wal_generation != previous_wal_generation
             || wal_visible_commit_count != previous_wal_visible_commit_count
             || native_db_size.is_some_and(|size| size != self.db_size);
@@ -11551,7 +11603,7 @@ impl<F: VfsFile> PagerInner<F> {
             file_size,
             wal_snapshot_initialized,
             durable_identity_changed,
-            db_change_counter: raw_base_change_counter,
+            db_change_counter: effective_db_change_counter,
             wal_generation,
             wal_visible_commit_count,
             native_db_size,
@@ -36993,6 +37045,11 @@ where
     dirty: bool,
     /// Exact fields last accepted/written before the verification read.
     page1_header_patch: Option<[u8; 12]>,
+    /// bd-r0n0h: explicit backfilled commit horizon for partial
+    /// (reader-clamped) checkpoints so `patch_page1_header` stamps the exact
+    /// horizon copied to the main database instead of leaping ahead to
+    /// unbackfilled commits. `None` uses `inner.commit_seq` (complete backfill).
+    target_change_counter: Option<u32>,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePagerCheckpointWriter<V> where V::File: Send + Sync {}
@@ -37002,6 +37059,10 @@ where
     V: Vfs + Send + Sync,
     V::File: Send + Sync,
 {
+    pub(crate) fn set_target_change_counter(&mut self, counter: u32) {
+        self.target_change_counter = Some(counter);
+    }
+
     /// Patch page 1 header fields that must remain globally consistent.
     ///
     /// This ensures external SQLite readers see:
@@ -37022,7 +37083,8 @@ where
                 Arc::clone(&inner.db_file),
                 inner.db_size,
                 inner.page_size.as_usize(),
-                inner.commit_seq.get() as u32,
+                self.target_change_counter
+                    .unwrap_or_else(|| inner.commit_seq.get() as u32),
             )
         };
 
@@ -37385,6 +37447,7 @@ where
             page_cipher: self.page_cipher.clone(),
             dirty: false,
             page1_header_patch: None,
+            target_change_counter: None,
         }
     }
 
@@ -38134,6 +38197,22 @@ where
             requested_mode = ?mode,
             "sampled the cross-process WAL reader horizon"
         );
+        // bd-r0n0h: when a peer reader clamps backfill to a prefix of the WAL,
+        // stamp the database page-1 header with the exact backfilled commit
+        // horizon rather than leaping ahead to unbackfilled commits.
+        if let Some(horizon) = oldest_reader_frame {
+            let unbackfilled_after = wal.committed_txn_count_after_frame(cx, horizon).await?;
+            let target_seq = {
+                let inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+                inner.commit_seq.get().saturating_sub(unbackfilled_after)
+            };
+            writer.set_target_change_counter(
+                u32::try_from(target_seq & u64::from(u32::MAX)).expect("masked to u32"),
+            );
+        }
         // Run the checkpoint from the beginning, clamped to the peer reader
         // horizon.
         let checkpoint_result = wal
@@ -78793,6 +78872,507 @@ mod tests {
                     "pre-generation base_commit_seq invariant must be preserved"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn bd_r0n0h_passive_checkpoint_fresh_open_then_truncate_does_not_lag_commit_seq() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::traits::{WalBackend, WalLogicalReadSnapshot, WalPublicationSnapshot};
+
+            struct SwitchableWalBackend {
+                snapshot: Arc<Mutex<WalPublicationSnapshot>>,
+                logical_snapshot: Arc<Mutex<Option<WalLogicalReadSnapshot>>>,
+            }
+
+            impl WalBackend for SwitchableWalBackend {
+                fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+                    Box::pin(async { Ok(()) })
+                }
+
+                fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
+                    Some(*self.snapshot.lock().unwrap())
+                }
+
+                fn pinned_logical_read_snapshot<'a>(
+                    &'a self,
+                    _cx: &'a Cx,
+                ) -> WalFuture<'a, Option<WalLogicalReadSnapshot>> {
+                    let logical = *self.logical_snapshot.lock().unwrap();
+                    Box::pin(async move { Ok(logical) })
+                }
+
+                fn append_frame<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    _page_number: u32,
+                    _page_data: &'a [u8],
+                    _db_size_if_commit: u32,
+                ) -> WalFuture<'a, ()> {
+                    Box::pin(async { Ok(()) })
+                }
+
+                fn read_page<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    _page_number: u32,
+                ) -> WalFuture<'a, Option<Vec<u8>>> {
+                    Box::pin(async { Ok(None) })
+                }
+
+                fn sync(&mut self, _cx: &Cx) -> Result<()> {
+                    Ok(())
+                }
+
+                fn frame_count(&self) -> usize {
+                    self.snapshot
+                        .lock()
+                        .unwrap()
+                        .last_commit_frame
+                        .map_or(0, |f| f + 1)
+                }
+
+                fn checkpoint<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    mode: crate::traits::CheckpointMode,
+                    _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
+                    _backfilled_frames: u32,
+                    _oldest_reader_frame: Option<u32>,
+                ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                    Box::pin(async move {
+                        Ok(crate::traits::CheckpointResult {
+                            total_frames: 0,
+                            frames_backfilled: 0,
+                            completed: true,
+                            wal_was_reset: false,
+                            requested_mode: mode,
+                            effective_mode: mode,
+                        })
+                    })
+                }
+            }
+
+            let cx = Cx::new();
+            let gen1 = WalGenerationIdentity {
+                checkpoint_seq: 1,
+                salts: fsqlite_wal::WalSalts {
+                    salt1: 0xAAAA_BBBB,
+                    salt2: 0xCCCC_DDDD,
+                },
+            };
+            let gen2 = WalGenerationIdentity {
+                checkpoint_seq: 2,
+                salts: fsqlite_wal::WalSalts {
+                    salt1: 0xAAAA_BBBC,
+                    salt2: 0x1234_5678,
+                },
+            };
+            let snapshot_slot = Arc::new(Mutex::new(WalPublicationSnapshot {
+                publication_seq: 8_504,
+                generation: gen1,
+                last_commit_frame: Some(8_503),
+                commit_count: 8_504,
+                latest_frame_entries: 10,
+                index_is_partial: false,
+            }));
+            let logical_slot = Arc::new(Mutex::new(Some(WalLogicalReadSnapshot {
+                generation: gen1,
+                last_commit_frame: Some(8_503),
+                visible_commit_seq: CommitSeq::new(8_505),
+            })));
+
+            let (pager, _) = test_pager().await;
+            pager
+                .set_wal_backend(Box::new(SwitchableWalBackend {
+                    snapshot: Arc::clone(&snapshot_slot),
+                    logical_snapshot: Arc::clone(&logical_slot),
+                }))
+                .expect("install WAL backend");
+            pager
+                .set_journal_mode(&cx, JournalMode::Wal)
+                .await
+                .expect("enable WAL mode");
+
+            let stamp_disk_cc = |cc: u32| {
+                let db_file = Arc::clone(&pager.inner.lock().unwrap().db_file);
+                let cx = cx.clone();
+                async move {
+                    let guard = shared_db_file_read(&db_file, &cx).await.unwrap();
+                    let mut page1 = vec![0_u8; 4_096];
+                    guard.read(&cx, &mut page1, 0).await.unwrap();
+                    let bytes = cc.to_be_bytes();
+                    page1[24..28].copy_from_slice(&bytes);
+                    page1[92..96].copy_from_slice(&bytes);
+                    guard.write(&cx, &page1, 0).await.unwrap();
+                }
+            };
+
+            // Main DB already stamped at 2,303 by a mid-generation PASSIVE checkpoint.
+            stamp_disk_cc(2_303).await;
+
+            // Fresh connection opens mid-generation: commit_seq = 2,303, db_change_counter = 2,303.
+            {
+                let mut inner = pager.inner.lock().unwrap();
+                inner.commit_seq = CommitSeq::new(2_303);
+                inner.committed_wal_generation = None;
+                inner.committed_wal_visible_commit_count = 0;
+                inner.committed_db_change_counter = 2_303;
+
+                let probe = inner
+                    .probe_visible_commit_seq(&cx, &pager.wal_backend, false)
+                    .await
+                    .expect("fresh-open probe after passive checkpoint");
+                assert_eq!(probe.visible_commit_seq, CommitSeq::new(8_505));
+                assert_eq!(probe.wal_visible_commit_count, 8_504);
+                assert_eq!(
+                    probe.db_change_counter, 1,
+                    "bd-r0n0h: db_change_counter must stay paired with the derived pre-generation base (1), not stay at backfilled 2,303"
+                );
+
+                // Apply the refreshed state as `refresh_committed_state_with_mode` does.
+                inner.commit_seq = probe.visible_commit_seq;
+                inner.committed_db_change_counter = probe.db_change_counter;
+                inner.committed_wal_generation = probe.wal_generation;
+                inner.committed_wal_visible_commit_count = probe.wal_visible_commit_count;
+            }
+
+            // Peer commits 1,000 more txns and runs TRUNCATE (stamping 9,505 and resetting WAL to empty gen2).
+            stamp_disk_cc(9_505).await;
+            *snapshot_slot.lock().unwrap() = WalPublicationSnapshot {
+                publication_seq: 8_505,
+                generation: gen2,
+                last_commit_frame: None,
+                commit_count: 0,
+                latest_frame_entries: 0,
+                index_is_partial: false,
+            };
+            *logical_slot.lock().unwrap() = None;
+
+            {
+                let inner = pager.inner.lock().unwrap();
+                let probe = inner
+                    .probe_visible_commit_seq(&cx, &pager.wal_backend, false)
+                    .await
+                    .expect("probe after peer TRUNCATE");
+                assert_eq!(
+                    probe.visible_commit_seq,
+                    CommitSeq::new(9_505),
+                    "bd-r0n0h: connection opened after PASSIVE must advance cleanly to 9,505 after TRUNCATE (not lag at 7,203 / 8,505)"
+                );
+                assert_eq!(probe.db_change_counter, 9_505);
+                assert_eq!(probe.wal_visible_commit_count, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn bd_r0n0h_no_cert_backfilled_commits_exact_clock_and_u32_wraparound() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::traits::{WalBackend, WalPublicationSnapshot};
+
+            struct NoCertBackfillWalBackend {
+                snapshot: Arc<Mutex<WalPublicationSnapshot>>,
+                backfilled_commits: Arc<Mutex<u64>>,
+            }
+
+            impl WalBackend for NoCertBackfillWalBackend {
+                fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+                    Box::pin(async { Ok(()) })
+                }
+
+                fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
+                    Some(*self.snapshot.lock().unwrap())
+                }
+
+                fn pinned_backfilled_commit_count(&self) -> u64 {
+                    *self.backfilled_commits.lock().unwrap()
+                }
+
+                fn append_frame<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    _page_number: u32,
+                    _page_data: &'a [u8],
+                    _db_size_if_commit: u32,
+                ) -> WalFuture<'a, ()> {
+                    Box::pin(async { Ok(()) })
+                }
+
+                fn read_page<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    _page_number: u32,
+                ) -> WalFuture<'a, Option<Vec<u8>>> {
+                    Box::pin(async { Ok(None) })
+                }
+
+                fn sync(&mut self, _cx: &Cx) -> Result<()> {
+                    Ok(())
+                }
+
+                fn frame_count(&self) -> usize {
+                    self.snapshot
+                        .lock()
+                        .unwrap()
+                        .last_commit_frame
+                        .map_or(0, |f| f + 1)
+                }
+
+                fn checkpoint<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    mode: crate::traits::CheckpointMode,
+                    _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
+                    _backfilled_frames: u32,
+                    _oldest_reader_frame: Option<u32>,
+                ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                    Box::pin(async move {
+                        Ok(crate::traits::CheckpointResult {
+                            total_frames: 0,
+                            frames_backfilled: 0,
+                            completed: true,
+                            wal_was_reset: false,
+                            requested_mode: mode,
+                            effective_mode: mode,
+                        })
+                    })
+                }
+            }
+
+            let cx = Cx::new();
+            let gen1 = WalGenerationIdentity {
+                checkpoint_seq: 1,
+                salts: fsqlite_wal::WalSalts {
+                    salt1: 0x2222_3333,
+                    salt2: 0x4444_5555,
+                },
+            };
+            let gen2 = WalGenerationIdentity {
+                checkpoint_seq: 2,
+                salts: fsqlite_wal::WalSalts {
+                    salt1: 0x2222_3334,
+                    salt2: 0x6666_7777,
+                },
+            };
+            let snapshot_slot = Arc::new(Mutex::new(WalPublicationSnapshot {
+                publication_seq: 1,
+                generation: gen1,
+                last_commit_frame: Some(9),
+                commit_count: 5,
+                latest_frame_entries: 5,
+                index_is_partial: false,
+            }));
+            let backfilled_slot = Arc::new(Mutex::new(5_u64));
+
+            let (pager, _) = test_pager().await;
+            pager
+                .set_wal_backend(Box::new(NoCertBackfillWalBackend {
+                    snapshot: Arc::clone(&snapshot_slot),
+                    backfilled_commits: Arc::clone(&backfilled_slot),
+                }))
+                .expect("install no-cert WAL backend");
+            pager
+                .set_journal_mode(&cx, JournalMode::Wal)
+                .await
+                .expect("enable WAL mode");
+
+            let stamp_disk_cc = |cc: u32| {
+                let db_file = Arc::clone(&pager.inner.lock().unwrap().db_file);
+                let cx = cx.clone();
+                async move {
+                    let guard = shared_db_file_read(&db_file, &cx).await.unwrap();
+                    let mut page1 = vec![0_u8; 4_096];
+                    guard.read(&cx, &mut page1, 0).await.unwrap();
+                    let bytes = cc.to_be_bytes();
+                    page1[24..28].copy_from_slice(&bytes);
+                    page1[92..96].copy_from_slice(&bytes);
+                    guard.write(&cx, &page1, 0).await.unwrap();
+                }
+            };
+
+            // 1. Complete PASSIVE (H_0 = 1, 5 commits backfilled -> H_disk = 6, C_total = 5, C_backfilled = 5).
+            stamp_disk_cc(6).await;
+            {
+                let mut inner = pager.inner.lock().unwrap();
+                inner.commit_seq = CommitSeq::new(6);
+                inner.committed_db_change_counter = 6;
+                inner.committed_wal_generation = None;
+                inner.committed_wal_visible_commit_count = 0;
+
+                let probe = inner
+                    .probe_visible_commit_seq(&cx, &pager.wal_backend, false)
+                    .await
+                    .unwrap();
+                assert_eq!(probe.visible_commit_seq, CommitSeq::new(6));
+                assert_eq!(probe.wal_visible_commit_count, 5);
+                assert_eq!(probe.db_change_counter, 1);
+            }
+
+            // 2. Partial PASSIVE (H_0 = 1, 5 commits in WAL, 3 backfilled -> H_disk = 4, C_total = 5, C_backfilled = 3).
+            stamp_disk_cc(4).await;
+            *backfilled_slot.lock().unwrap() = 3;
+            {
+                let mut inner = pager.inner.lock().unwrap();
+                inner.commit_seq = CommitSeq::new(4);
+                inner.committed_db_change_counter = 4;
+                inner.committed_wal_generation = None;
+                inner.committed_wal_visible_commit_count = 0;
+
+                let probe = inner
+                    .probe_visible_commit_seq(&cx, &pager.wal_backend, false)
+                    .await
+                    .unwrap();
+                assert_eq!(probe.visible_commit_seq, CommitSeq::new(6));
+                assert_eq!(probe.wal_visible_commit_count, 5);
+                assert_eq!(probe.db_change_counter, 1);
+            }
+
+            // 3. Stock SQLite young-DB edge case: H_disk = 1 < C_backfilled = 5 (stock PASSIVE without bumping header).
+            //    Probe 1 and Probe 2 (cached_wal_base_is_current) must agree identically (no second-read jump).
+            stamp_disk_cc(1).await;
+            *backfilled_slot.lock().unwrap() = 5;
+            {
+                let mut inner = pager.inner.lock().unwrap();
+                inner.commit_seq = CommitSeq::new(1);
+                inner.committed_db_change_counter = 1;
+                inner.committed_wal_generation = None;
+                inner.committed_wal_visible_commit_count = 0;
+
+                let probe1 = inner
+                    .probe_visible_commit_seq(&cx, &pager.wal_backend, false)
+                    .await
+                    .unwrap();
+                inner.commit_seq = probe1.visible_commit_seq;
+                inner.committed_db_change_counter = probe1.db_change_counter;
+                inner.committed_wal_generation = probe1.wal_generation;
+                inner.committed_wal_visible_commit_count = probe1.wal_visible_commit_count;
+
+                let probe2 = inner
+                    .probe_visible_commit_seq(&cx, &pager.wal_backend, false)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    probe2.visible_commit_seq, probe1.visible_commit_seq,
+                    "second no-op probe over stock-PASSIVE DB must not jump"
+                );
+            }
+
+            // 4. u32::MAX wraparound continuity: H_0 = u32::MAX - 2, 5 commits backfilled -> H_disk = 2 (2^32 + 2),
+            //    followed by 3 more commits + TRUNCATE -> H_disk = 5 (2^32 + 5).
+            let pre_wrap_base: u64 = u64::from(u32::MAX) - 2;
+            let wrapped_seq: u64 = pre_wrap_base + 5; // 2^32 + 2
+            stamp_disk_cc(2).await;
+            *backfilled_slot.lock().unwrap() = 5;
+            {
+                let mut inner = pager.inner.lock().unwrap();
+                inner.commit_seq = CommitSeq::new(wrapped_seq);
+                inner.committed_db_change_counter = 2;
+                inner.committed_wal_generation = None;
+                inner.committed_wal_visible_commit_count = 0;
+
+                let probe = inner
+                    .probe_visible_commit_seq(&cx, &pager.wal_backend, false)
+                    .await
+                    .unwrap();
+                assert_eq!(probe.visible_commit_seq, CommitSeq::new(wrapped_seq));
+                assert_eq!(probe.wal_visible_commit_count, 5);
+                assert_eq!(probe.db_change_counter, pre_wrap_base);
+
+                inner.commit_seq = probe.visible_commit_seq;
+                inner.committed_db_change_counter = probe.db_change_counter;
+                inner.committed_wal_generation = probe.wal_generation;
+                inner.committed_wal_visible_commit_count = probe.wal_visible_commit_count;
+            }
+
+            stamp_disk_cc(5).await;
+            *snapshot_slot.lock().unwrap() = WalPublicationSnapshot {
+                publication_seq: 2,
+                generation: gen2,
+                last_commit_frame: None,
+                commit_count: 0,
+                latest_frame_entries: 0,
+                index_is_partial: false,
+            };
+            *backfilled_slot.lock().unwrap() = 0;
+            {
+                let inner = pager.inner.lock().unwrap();
+                let probe = inner
+                    .probe_visible_commit_seq(&cx, &pager.wal_backend, false)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    probe.visible_commit_seq,
+                    CommitSeq::new(wrapped_seq + 3),
+                    "u32::MAX wraparound across PASSIVE + TRUNCATE must preserve exact 64-bit CommitSeq"
+                );
+                assert_eq!(probe.db_change_counter, 5);
+            }
+        });
+    }
+
+    #[test]
+    fn bd_r0n0h_partial_checkpoint_writer_stamps_backfilled_horizon() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::traits::CheckpointPageWriter as _;
+
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let ps = PageSize::DEFAULT.as_usize();
+
+            // Simulate commit_seq = 11 (10 WAL commits), while a partial
+            // checkpoint only backfills the first 4 commits (target counter = 5).
+            {
+                let mut inner = pager.inner.lock().unwrap();
+                inner.commit_seq = CommitSeq::new(11);
+            }
+            let mut writer = pager.checkpoint_writer();
+            writer.set_target_change_counter(5);
+            writer
+                .write_page(&cx, PageNumber::new(2).unwrap(), &vec![0x77; ps])
+                .await
+                .unwrap();
+            writer.sync(&cx).await.unwrap();
+
+            let txn = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            let raw_page1 = txn.get_page(&cx, PageNumber::ONE).await.unwrap().into_vec();
+            let header: [u8; DATABASE_HEADER_SIZE] =
+                raw_page1[..DATABASE_HEADER_SIZE].try_into().unwrap();
+            let parsed = DatabaseHeader::from_bytes(&header).unwrap();
+            assert_eq!(
+                parsed.change_counter, 5,
+                "partial checkpoint writer must stamp backfilled horizon (5), not full commit_seq (11)"
+            );
+            assert_eq!(parsed.version_valid_for, 5);
+            drop(txn);
+
+            // GH #384 still holds: a newer on-disk counter (e.g. 7) is never lowered by target=5.
+            let mut writer2 = pager.checkpoint_writer();
+            writer2.set_target_change_counter(7);
+            writer2
+                .write_page(&cx, PageNumber::new(2).unwrap(), &vec![0x88; ps])
+                .await
+                .unwrap();
+            writer2.sync(&cx).await.unwrap();
+
+            let mut writer3 = pager.checkpoint_writer();
+            writer3.set_target_change_counter(5);
+            writer3
+                .write_page(&cx, PageNumber::new(2).unwrap(), &vec![0x99; ps])
+                .await
+                .unwrap();
+            writer3.sync(&cx).await.unwrap();
+
+            let txn = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            let raw_page1 = txn.get_page(&cx, PageNumber::ONE).await.unwrap().into_vec();
+            let header: [u8; DATABASE_HEADER_SIZE] =
+                raw_page1[..DATABASE_HEADER_SIZE].try_into().unwrap();
+            let parsed = DatabaseHeader::from_bytes(&header).unwrap();
+            assert_eq!(
+                parsed.change_counter, 7,
+                "partial checkpoint writer must still preserve a newer on-disk change_counter"
+            );
+            assert_eq!(parsed.version_valid_for, 7);
         });
     }
 }
