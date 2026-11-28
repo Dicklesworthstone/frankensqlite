@@ -1514,15 +1514,9 @@ fn fetch_marker_record(markers_dir: &Path, commit_seq: u64) -> Result<CommitMark
             detail: "marker_id verification failed (reason=marker_mismatch)".to_owned(),
         });
     }
-    if index > 0 {
-        for i in 1..=index {
-            if records[i].prev_marker_id != records[i - 1].marker_id {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("marker hash chain gap at index {i} (reason=marker_chain_gap)"),
-                });
-            }
-        }
-    }
+    // `recover_valid_prefix` already ran `validate_successor` over every
+    // adjacent pair in `records`, rejecting any `prev_marker_id` mismatch with
+    // `MarkerError::HashChainMismatch` before returning.
     Ok(record.clone())
 }
 
