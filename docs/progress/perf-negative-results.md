@@ -94,6 +94,67 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-28 - WIN: compiled flat zero-copy correlated-EXISTS scan evaluator, pinned memo frames, sync EXISTS truthiness, fused unconstrained cross/inner join+WHERE with left-prefix pushdown, and streaming recursive CTE consumer filter (bd-m2tjm / GH#419)
+
+- Target: GH#419 (`sudo.sql` 1 puzzle + `sudomid3.sql` 2 harder puzzles from GH#419), plus general
+  correlated `EXISTS` scan probes, unconstrained `INNER`/`CROSS` joins with `WHERE`, and `UNION ALL`
+  recursive CTEs filtered by a single-table consumer `WHERE`.
+  Touched: `crates/fsqlite-core/src/connection.rs` (`CompiledScanProgram` / `compile_scan_exists_program`
+  / `run_compiled_scan_exists_probe`, `PinnedExistsFrame` / `arm_exists_probe_memo_pinned`,
+  `try_templated_scan_exists_probe` wired into `try_eval_expr_with_subqueries_sync`,
+  `ScanExistsProbePlan::bind` column binding + zero-copy inner row pass, `eval_join_expr` `OR`/`AND`
+  short-circuiting, `eval_scalar_call_args` `SmallVec<[SqliteValue; 4]>`, fused final unconstrained
+  `INNER`/`CROSS` join + `WHERE` with leading left-only `AND` prefix pushdown, Step 7 projection
+  `bind_functions`, `RecursiveCteConsumerFilter` streaming frontier + zero-clone `row.values` move),
+  `crates/fsqlite-core/tests/gh419_correlated_exists_probe_compile_count.rs` (paired live startup /
+  first / repeated A/B benchmark + stock-oracle edge cases).
+- Baseline (`9d724215d`, `hz3` AMD EPYC 7282 16-Core, shipped `--profile release-perf`, binary
+  sha256 `ad3bcc36dbc7b547...`, live bundled `rusqlite` 3.54.1 in the same invocation):
+  - `startup(:memory:, n=50)`: `0.073 ms` `[0.064..1.449]` vs stock `0.013 ms` (`5.39x`; negligible <0.1 ms).
+  - `sudo.sql`: first `534.04 ms` vs stock `86.98 ms` (`6.14x`); repeated (n=5) **`528.33 ms`**
+    `[525.68..529.40]` vs stock `86.09 ms` `[85.66..91.32]` (`6.14x`), `VmHWM=42,244 KiB`.
+  - `sudomid3.sql`: first `15,721.91 ms` vs stock `2,497.64 ms` (`6.29x`); repeated (n=3)
+    **`15,717.01 ms`** `[15,654.55..15,732.21]` vs stock `2,502.12 ms` `[2,501.18..2,510.39]`
+    (`6.28x`), `VmHWM=286,760 KiB` (~280 MiB).
+  - Native `perf record -F 999` on unstripped `-O3` (`lto=false`, `debug=line-tables-only`, `hz2`,
+    8,388 samples, 0 lost, `sudo.sql` x20 = 8.27 s) causally attributed >85% of CPU to the correlated
+    `EXISTS` scan probe and its fallback wrapper: `eval_join_expr` `40.32%` (boxed AST walk + no
+    `OR`/`AND` short-circuit), `__memmove_avx512` `5.73%`, `compare_join_expr_values` `4.80%`,
+    `<Expr as PartialEq>::eq` `3.79%` (deep AST equality per outer row), `refill_scan_template_slots`
+    `2.89%`, `SmallTextRepr::clone` `2.17%`, `invoke_resolved_scalar` `2.10%`, `SubstrFunc::invoke`
+    `2.10%`, `join_expr_explicit_collation` `1.96%`, `drop_glue::<SqliteValue>` `1.73%`,
+    `find_col_in_map` `1.54%` (missing `bind_expr` in `ScanExistsProbePlan::bind`),
+    `eval_expr_with_subqueries` async boxing `1.39%` + `try_eval_expr_truthiness_sync` `1.08%` +
+    `try_eval_expr_with_subqueries_sync` `0.86%` + `eval_expr_truthiness` `0.69%`, `malloc`/`free`
+    `3.08%`, `Vec<SqliteValue>::extend_trusted` `1.08%`, `try_templated_scan_exists_probe` `0.92%`.
+- Intermediate ablation (same `hz3` host, `--profile release-perf`, sha256 `198436631abc8ea4...`,
+  before removing the `connection_registry_differs_from_base` check that `ext-icu` sets by default,
+  so `CompiledScanProgram` was inactive and only Levers A+C+D+E+F ran):
+  - `sudo.sql` repeated: `377.92 ms` (`4.33x` stock, `-28.5%`); `sudomid3.sql` repeated: `10,612.20 ms`
+    (`4.27x` stock, `-32.5%`); `VmHWM` dropped `286,760 KiB -> 55,920 KiB` (`-80.5%`).
+- Candidate (same `hz3` host, `--profile release-perf`, binary sha256 `54db71991abfb11b...`,
+  2 full interleaved runs against live bundled `rusqlite` 3.54.1, `CompiledScanProgram` active and
+  pinned by `compiled_scan_exists_program_compiles_sudoku_predicate_bd_m2tjm`):
+  - Run 1: `startup` `0.075 ms`; `sudo.sql` first `166.07 ms` (`1.85x`), repeated **`165.02 ms`**
+    `[164.25..165.54]` vs stock `89.55 ms` `[88.56..90.08]` (**`1.84x`**, **3.20x faster** vs baseline);
+    `sudomid3.sql` first `4,550.63 ms` (`1.75x`), repeated **`4,543.09 ms`** `[4,537.73..4,543.29]` vs
+    stock `2,587.94 ms` `[2,582.23..2,597.52]` (**`1.76x`**, **3.46x faster** vs baseline),
+    `VmHWM=53,312 KiB` (**5.4x lower RSS**).
+  - Run 2: `startup` `0.074 ms`; `sudo.sql` first `167.39 ms` (`1.88x`), repeated **`165.11 ms`**
+    `[163.79..166.61]` vs stock `89.24 ms` (`1.85x`); `sudomid3.sql` first `4,554.08 ms` (`1.76x`),
+    repeated **`4,541.19 ms`** `[4,530.48..4,563.57]` vs stock `2,581.09 ms` (`1.76x`),
+    `VmHWM=58,332 KiB`.
+- Result: **WIN** — **3.20x–3.46x wall-time speedup** (`6.14x -> 1.84x` stock on `sudo.sql`,
+  `6.28x -> 1.76x` stock on `sudomid3.sql`, zero range overlap) and **5.4x peak RSS reduction**
+  (`280 MiB -> ~52 MiB`), with exact output parity verified against live `rusqlite` 3.54.1.
+- Retry condition for closing the residual ~`1.76x` gap to <=`1.0x`: profile `sudomid3.sql` after
+  this change; the remaining gap is expected in (1) per-generation `execute_join_select` setup &
+  MemTable rebuild (`frontier` copied into `MemTable` and rescanned each generation) plus `SELECT`
+  projection (`substr || z || substr` + `instr` via AST `eval_join_expr`), and (2) compiling the
+  recursive arm directly into VDBE bytecode (or a streaming coroutine without per-generation fallback
+  planning/table materialization). Do not micro-tune `CompiledScanProgram` further without a fresh
+  post-fix `perf record` showing `run_compiled_scan_exists_probe` still >30% of self time.
+
 ## 2026-11-28 - REJECTED on its own regression lines (R1: rowid_lookups_200k +20.0% Ir, scan / GROUP BY / window rows +0.36%..+1.56%, all from an eviction victim search, preads unchanged), with the memory bound itself holding (pager keeper red on main, green with the fix): a read transaction's snapshot read cache counts its pages against the shared cache's cache_size budget (bd-hsvx3, serial read lane round 19, cache obedience R1; R2 not landed either: the same rows regress, the RSS line fails, and an e2e keeper turns red)
 
 - Target: bd-hsvx3. Since ee26108e3 (GH #525) a read transaction keeps up to cache_size page images in its snapshot

@@ -54871,12 +54871,13 @@ impl Connection {
             src.append_col_map(&mut col_map);
         }
         let schema_snapshot = self.schema.borrow().clone();
-        let (col_collations, col_affinities) = self.join_source_collations_and_affinities(
-            &all_sources,
-            &table_sources,
-            &[],
-            &schema_snapshot,
-        );
+        let (col_collations, col_affinities, source_declared_blob_columns) = self
+            .join_source_collations_and_affinities(
+                &all_sources,
+                &table_sources,
+                &[],
+                &schema_snapshot,
+            );
         let using_column_projections = build_join_using_column_projections_from_sources(
             &table_sources,
             &from.joins,
@@ -54885,11 +54886,7 @@ impl Connection {
             &col_affinities,
         );
         let mut declared_blob_columns = self.builtin_json_key_columns(&all_sources, &col_map);
-        declared_blob_columns.extend(typeless_base_table_columns(
-            &all_sources,
-            &table_sources,
-            &schema_snapshot,
-        ));
+        declared_blob_columns.extend(source_declared_blob_columns);
         let hidden_column_indices = collect_join_hidden_column_indices(&table_sources);
         let using_skip_indices = collect_join_using_skip_indices(&table_sources, &from.joins);
         let coalesced_star_indices =
@@ -55897,14 +55894,10 @@ impl Connection {
         }
 
         let schema_snapshot = self.schema.borrow().clone();
-        let (col_collations, col_affinities) =
+        let (col_collations, col_affinities, source_declared_blob_columns) =
             self.join_source_collations_and_affinities(&all_sources, &table_sources, &[], &schema_snapshot);
         let mut declared_blob_columns = self.builtin_json_key_columns(&all_sources, &col_map);
-        declared_blob_columns.extend(typeless_base_table_columns(
-            &all_sources,
-            &table_sources,
-            &schema_snapshot,
-        ));
+        declared_blob_columns.extend(source_declared_blob_columns);
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
                 declared_json_keys: declared_blob_columns.clone(),
@@ -107035,18 +107028,15 @@ impl Connection {
         for src in &table_sources {
             src.append_col_map(&mut col_map);
         }
-        let (col_collations, col_affinities) = self.join_source_collations_and_affinities(
-            &all_sources,
-            &table_sources,
-            visible_ctes,
-            schema,
-        );
+        let (col_collations, col_affinities, source_declared_blob_columns) = self
+            .join_source_collations_and_affinities(
+                &all_sources,
+                &table_sources,
+                visible_ctes,
+                schema,
+            );
         let mut declared_blob_columns = self.builtin_json_key_columns(&all_sources, &col_map);
-        declared_blob_columns.extend(typeless_base_table_columns(
-            &all_sources,
-            &table_sources,
-            schema,
-        ));
+        declared_blob_columns.extend(source_declared_blob_columns);
         let hidden_column_indices = collect_join_hidden_column_indices(&table_sources);
         let using_skip_indices = collect_join_using_skip_indices(&table_sources, &effective.joins);
         let coalesced_star_indices =
@@ -107292,10 +107282,12 @@ impl Connection {
         affinities
     }
 
-    /// Indices, in the [`Self::build_join_col_affinities`] layout, of base-table
-    /// columns declared without a type. Their BLOB affinity is real, unlike the
-    /// BLOB placeholder a computed source column gets, so a comparison with a
-    /// TEXT column converts nothing (GH#428).
+    /// Indices, in the [`Self::build_join_col_affinities`] layout, of source
+    /// columns carrying a real declared BLOB affinity (typeless/BLOB base
+    /// columns, `CAST(... AS BLOB)`, mixed-type compound projections, and
+    /// views/CTEs/subqueries forwarding them). Unlike the BLOB placeholder an
+    /// affinity-less expression gets, a real BLOB affinity compares with a TEXT
+    /// column without conversion (GH#428).
     fn build_join_declared_blob_columns(&self, select: &SelectStatement) -> HashSet<usize> {
         let mut declared = HashSet::new();
         let SelectCore::Select {
@@ -107329,20 +107321,14 @@ impl Connection {
             };
             let column_names =
                 self.source_column_names_for_join_layout(effective_source, &visible_ctes);
-            if let TableOrSubquery::Table { name, .. } = effective_source
-                && !visible_ctes
-                    .iter()
-                    .any(|cte| cte.name.eq_ignore_ascii_case(&name.name))
-                && let Some(table) = schema
-                    .iter()
-                    .find(|table| table.name.eq_ignore_ascii_case(&name.name))
-            {
-                for (index, column) in table.columns.iter().enumerate().take(column_names.len()) {
-                    if affinity_char_to_type(column.affinity) == TypeAffinity::Blob {
-                        declared.insert(offset + index);
-                    }
-                }
-            }
+            let (_, _, source_declared_blob) =
+                self.source_result_metadata_for_join(effective_source, &visible_ctes, &schema);
+            declared.extend(
+                source_declared_blob
+                    .into_iter()
+                    .filter(|&idx| idx < column_names.len())
+                    .map(|idx| offset + idx),
+            );
             offset += column_names.len();
             if self
                 .hidden_rowid_projection_for_source(effective_source, &column_names)
@@ -107528,12 +107514,16 @@ impl Connection {
         source: &TableOrSubquery,
         visible_ctes: &[fsqlite_ast::Cte],
         schemas: &[TableSchema],
-    ) -> (Vec<Option<String>>, Vec<TypeAffinity>) {
+    ) -> (Vec<Option<String>>, Vec<TypeAffinity>, HashSet<usize>) {
         if let TableOrSubquery::TableFunction { name, .. } = source {
             let len = self
                 .table_function_result_column_names(name)
                 .map_or(1, |cols| cols.len());
-            return (vec![None; len], vec![TypeAffinity::Blob; len]);
+            return (
+                vec![None; len],
+                vec![TypeAffinity::Blob; len],
+                HashSet::new(),
+            );
         }
         let mut resolver = CteResultMetadataResolver::new(self, schemas);
         if !visible_ctes.is_empty() {
@@ -107545,12 +107535,21 @@ impl Connection {
             .iter()
             .map(|column| column.collation.clone())
             .collect();
+        let mut declared_blob = HashSet::new();
         let affinities = metadata
             .columns
             .iter()
-            .map(|column| column.affinity.unwrap_or(TypeAffinity::Blob))
+            .enumerate()
+            .map(|(index, column)| match column.affinity {
+                Some(TypeAffinity::Blob) => {
+                    declared_blob.insert(index);
+                    TypeAffinity::Blob
+                }
+                Some(affinity) => affinity,
+                None => TypeAffinity::Blob,
+            })
             .collect();
-        (collations, affinities)
+        (collations, affinities, declared_blob)
     }
 
     fn join_source_collations_and_affinities(
@@ -107559,13 +107558,17 @@ impl Connection {
         table_sources: &[JoinTableSource],
         visible_ctes: &[fsqlite_ast::Cte],
         schemas: &[TableSchema],
-    ) -> (Vec<Option<String>>, Vec<TypeAffinity>) {
+    ) -> (Vec<Option<String>>, Vec<TypeAffinity>, HashSet<usize>) {
         let mut col_collations = Vec::new();
         let mut col_affinities = Vec::new();
+        let mut declared_blob_columns = HashSet::new();
         for (source, table_source) in all_sources.iter().zip(table_sources) {
+            let col_offset = col_affinities.len();
             if let Some(meta) = &table_source.paren_join_meta {
                 col_collations.extend(meta.col_collations.iter().cloned());
                 col_affinities.extend(meta.col_affinities.iter().copied());
+                declared_blob_columns
+                    .extend(meta.declared_blob_columns.iter().map(|idx| col_offset + idx));
                 continue;
             }
             let effective_source = match source {
@@ -107579,20 +107582,27 @@ impl Connection {
                 }
                 other => *other,
             };
-            let (mut source_collations, mut source_affinities) =
+            let (mut source_collations, mut source_affinities, source_declared_blob) =
                 self.source_result_metadata_for_join(effective_source, visible_ctes, schemas);
-            source_collations.resize(table_source.col_names.len(), None);
-            source_collations.truncate(table_source.col_names.len());
+            let width = table_source.col_names.len();
+            source_collations.resize(width, None);
+            source_collations.truncate(width);
             col_collations.extend(source_collations);
-            source_affinities.resize(table_source.col_names.len(), TypeAffinity::Blob);
-            source_affinities.truncate(table_source.col_names.len());
+            source_affinities.resize(width, TypeAffinity::Blob);
+            source_affinities.truncate(width);
             col_affinities.extend(source_affinities);
+            declared_blob_columns.extend(
+                source_declared_blob
+                    .into_iter()
+                    .filter(|&idx| idx < width)
+                    .map(|idx| col_offset + idx),
+            );
             if table_source.hidden_rowid_projection.is_some() {
                 col_collations.push(None);
                 col_affinities.push(TypeAffinity::Integer);
             }
         }
-        (col_collations, col_affinities)
+        (col_collations, col_affinities, declared_blob_columns)
     }
 
     fn extend_join_source_collations(
@@ -107616,7 +107626,7 @@ impl Connection {
             other => other,
         };
         let column_names = self.source_column_names_for_join_layout(effective_source, visible_ctes);
-        let (mut source_collations, _) =
+        let (mut source_collations, _, _) =
             self.source_result_metadata_for_join(effective_source, visible_ctes, schema);
         source_collations.resize(column_names.len(), None);
         source_collations.truncate(column_names.len());
@@ -107650,7 +107660,7 @@ impl Connection {
             other => other,
         };
         let column_names = self.source_column_names_for_join_layout(effective_source, visible_ctes);
-        let (_, mut source_affinities) =
+        let (_, mut source_affinities, _) =
             self.source_result_metadata_for_join(effective_source, visible_ctes, schema);
         source_affinities.resize(column_names.len(), TypeAffinity::Blob);
         source_affinities.truncate(column_names.len());
@@ -109080,7 +109090,36 @@ impl Connection {
     /// the outermost level, clears) the memo on every exit path.
     fn arm_exists_probe_memo(&self) -> ExistsProbeMemoGuard<'_> {
         self.exists_probe_memo.borrow_mut().depth += 1;
-        ExistsProbeMemoGuard { conn: self }
+        ExistsProbeMemoGuard {
+            conn: self,
+            has_pinned_frame: false,
+        }
+    }
+
+    /// Arm the correlated-EXISTS memo while pinning all top-level `EXISTS`
+    /// subquery addresses reachable from `where_expr` (which stays immutably
+    /// borrowed for the entire lifetime of this guard) paired with `col_map`.
+    /// Within this frame, a pinned subquery address cannot be reused by a
+    /// transient AST, so templated probes skip per-row deep AST `PartialEq`.
+    fn arm_exists_probe_memo_pinned(
+        &self,
+        where_expr: &Expr,
+        col_map: &[(String, String, bool)],
+    ) -> ExistsProbeMemoGuard<'_> {
+        let mut exists_addrs = SmallVec::<[usize; 4]>::new();
+        collect_pinned_exists_subquery_addrs(where_expr, &mut exists_addrs);
+        let mut memo = self.exists_probe_memo.borrow_mut();
+        memo.depth += 1;
+        memo.pinned_frames.push(PinnedExistsFrame {
+            col_map_ptr: col_map.as_ptr() as usize,
+            col_map_len: col_map.len(),
+            outer_context_ptr: current_join_eval_collation_context_ptr(),
+            exists_addrs,
+        });
+        ExistsProbeMemoGuard {
+            conn: self,
+            has_pinned_frame: true,
+        }
     }
 
     fn builtin_json_key_columns(
@@ -109974,19 +110013,69 @@ impl Connection {
         let _join_expr_bindings_guard = JoinExprBindingsGuard::push_shared(bindings);
         let db = self.db.borrow();
         let table = db.get_table(plan.root_page)?;
-        let mut row: Vec<SqliteValue> = Vec::with_capacity(plan.col_map.len());
+        let expected_width = plan.col_map.len();
+        let mut row: Vec<SqliteValue> = Vec::new();
         for (rowid, values) in table.iter_rows() {
-            row.clear();
-            row.extend_from_slice(values);
-            // Short physical records (pre-ALTER ADD COLUMN) read as NULL,
-            // exactly as the join scan pads them.
-            row.resize(plan.col_map.len(), SqliteValue::Null);
-            if let Some(alias_index) = plan.rowid_alias_column_index
-                && let Some(alias_value) = row.get_mut(alias_index)
-            {
-                *alias_value = SqliteValue::Integer(rowid);
+            let eval_row: &[SqliteValue] =
+                if plan.rowid_alias_column_index.is_none() && values.len() == expected_width {
+                    values
+                } else {
+                    if row.capacity() < expected_width {
+                        row.reserve(expected_width - row.capacity());
+                    }
+                    row.clear();
+                    row.extend_from_slice(values);
+                    // Short physical records (pre-ALTER ADD COLUMN) read as NULL,
+                    // exactly as the join scan pads them.
+                    row.resize(expected_width, SqliteValue::Null);
+                    if let Some(alias_index) = plan.rowid_alias_column_index
+                        && let Some(alias_value) = row.get_mut(alias_index)
+                    {
+                        *alias_value = SqliteValue::Integer(rowid);
+                    }
+                    &row
+                };
+            match eval_join_predicate(where_expr, eval_row, &plan.col_map) {
+                Ok(true) => return Some(Ok(true)),
+                Ok(false) => {}
+                Err(error) => return Some(Err(error)),
             }
-            match eval_join_predicate(where_expr, &row, &plan.col_map) {
+        }
+        Some(Ok(false))
+    }
+
+    /// GH#419 / bd-m2tjm: scan the probe table with a precompiled flat sync
+    /// expression program. Zero per-probe AST refilling, zero per-row Vec
+    /// allocation, zero TLS/HashMap/Arc churn, short-circuiting AND/OR, and
+    /// zero-copy borrowed text slicing for ASCII `substr()`.
+    fn run_compiled_scan_exists_probe(
+        &self,
+        program: &CompiledScanProgram,
+        outer_row: &[SqliteValue],
+    ) -> Option<Result<bool>> {
+        let db = self.db.borrow();
+        let table = db.get_table(program.root_page)?;
+        let text_encoding = statement_text_encoding();
+        let mut outer_text_ascii: SmallVec<[bool; 4]> =
+            SmallVec::with_capacity(program.outer_text_slots.len());
+        for &slot in &program.outer_text_slots {
+            let is_ascii_no_nul = matches!(
+                outer_row.get(slot),
+                Some(SqliteValue::Text(st))
+                    if st.as_str_checked().is_some_and(|s| {
+                        s.as_bytes().iter().all(|&b| b != 0 && b < 0x80)
+                    })
+            );
+            outer_text_ascii.push(is_ascii_no_nul);
+        }
+        for (rowid, values) in table.iter_rows() {
+            match program.eval_predicate(
+                outer_row,
+                values,
+                rowid,
+                &outer_text_ascii,
+                text_encoding,
+            ) {
                 Ok(true) => return Some(Ok(true)),
                 Ok(false) => {}
                 Err(error) => return Some(Err(error)),
@@ -110002,12 +110091,13 @@ impl Connection {
     /// against a row of unique sentinel values. The leaves that come back
     /// carrying sentinel `i` are exactly the ones substitution fills from
     /// outer column `i`, with metadata that depends on the schema and the
-    /// outer column, never on the value. Later probes refill those leaves in
-    /// place from the real row. The function and collation bindings then stay
-    /// valid across probes, because refilling never moves a node. The
-    /// template lives in the query-scoped EXISTS memo, and each probe checks
-    /// it against the subquery itself, since a transient AST can reuse an
-    /// address. `None` falls back to the per-probe clone path.
+    /// outer column, never on the value. Later probes either execute the
+    /// compiled flat sync program directly against the outer row or refill
+    /// those leaves in place from the real row. The template lives in the
+    /// query-scoped EXISTS memo; pinned frames skip the per-row AST equality
+    /// check because their `where_expr` stays immutably borrowed for the whole
+    /// frame, while unpinned/transient ASTs validate against the subquery tree.
+    /// `None` falls back to the per-probe clone path.
     fn try_templated_scan_exists_probe(
         &self,
         subquery: &SelectStatement,
@@ -110015,6 +110105,34 @@ impl Connection {
         col_map: &[(String, String, bool)],
     ) -> Option<Result<bool>> {
         let key = std::ptr::from_ref(subquery) as usize;
+        let outer_context_ptr = current_join_eval_collation_context_ptr();
+        // Fast immutable path: when this subquery address is pinned in the
+        // active WHERE frame and already compiled into a `CompiledScanProgram`,
+        // execute it directly with zero AST comparison, zero map mutation,
+        // zero Arc clones, and zero TLS guard pushes.
+        {
+            let memo = self.exists_probe_memo.borrow();
+            if memo.depth == 0 {
+                return None;
+            }
+            if let Some(frame) = memo.pinned_frames.last()
+                && frame.col_map_ptr == col_map.as_ptr() as usize
+                && frame.col_map_len == col_map.len()
+                && frame.outer_context_ptr == outer_context_ptr
+                && frame.exists_addrs.contains(&key)
+                && let Some(template) = memo.scan_templates.get(&key)
+                && template.outer_width == row.len()
+            {
+                if let Some(ready) = template.ready.as_ref()
+                    && let Some(compiled) = ready.compiled.as_ref()
+                {
+                    return self.run_compiled_scan_exists_probe(compiled, row);
+                }
+                if template.ready.is_none() {
+                    return None;
+                }
+            }
+        }
         let outer_context = current_join_eval_collation_context_snapshot();
         let cached = {
             let mut memo = self.exists_probe_memo.borrow_mut();
@@ -110029,9 +110147,14 @@ impl Connection {
             {
                 template
             }
-            _ => self.build_scan_exists_template(subquery, col_map, row.len(), outer_context),
+            _ => self.with_fallback_function_registry(|| {
+                self.build_scan_exists_template(subquery, col_map, row.len(), outer_context)
+            }),
         };
         let result = template.ready.as_mut().and_then(|ready| {
+            if let Some(compiled) = ready.compiled.as_ref() {
+                return self.run_compiled_scan_exists_probe(compiled, row);
+            }
             let where_expr = scan_template_where_mut(&mut ready.substituted)?;
             let mut cursor = 0;
             if !refill_scan_template_slots(where_expr, &ready.slots, &mut cursor, row) {
@@ -110040,11 +110163,13 @@ impl Connection {
             let where_expr = scan_template_where(&ready.substituted)?;
             let _join_eval_collation_guard =
                 JoinEvalCollationContextGuard::push_shared(Arc::clone(&ready.plan.context));
-            self.run_scan_correlated_exists_probe(
-                &ready.plan,
-                where_expr,
-                Arc::clone(&ready.bindings),
-            )
+            self.with_fallback_function_registry(|| {
+                self.run_scan_correlated_exists_probe(
+                    &ready.plan,
+                    where_expr,
+                    Arc::clone(&ready.bindings),
+                )
+            })
         });
         self.exists_probe_memo
             .borrow_mut()
@@ -110095,16 +110220,27 @@ impl Connection {
         if !collect_scan_template_slots(original_where, substituted_where, outer_width, &mut slots) {
             return template;
         }
-        let bindings = {
+        let (bindings, compiled) = {
             let _join_eval_collation_guard =
                 JoinEvalCollationContextGuard::push_shared(Arc::clone(&plan.context));
-            plan.bind(substituted_where)
+            let bindings = plan.bind(substituted_where);
+            // Only `scalar_function_overridden` can displace builtin `substr` /
+            // `substring`; `connection_registry_differs_from_base` is set by
+            // default when `ext-icu` registers ICU-only functions and must not
+            // disable compiled scan probes.
+            let compiled = if !self.scalar_function_overridden.get() {
+                compile_scan_exists_program(original_where, substituted_where, outer_width, &plan)
+            } else {
+                None
+            };
+            (bindings, compiled)
         };
         template.ready = Some(ScanExistsProbeReady {
             substituted,
             slots,
             plan,
             bindings,
+            compiled,
         });
         template
     }
@@ -110382,7 +110518,15 @@ impl Connection {
             Expr::BoundOuterValue { value, .. } => Some(Ok(value.clone())),
             Expr::Column(..) => Some(eval_join_expr(expr, row, col_map)),
             Expr::Exists { subquery, not, .. } => {
-                self.try_direct_exists_probe(subquery, *not, row, col_map)
+                if let Some(result) = self.try_direct_exists_probe(subquery, *not, row, col_map) {
+                    return Some(result);
+                }
+                self.try_templated_scan_exists_probe(subquery, row, col_map)
+                    .map(|scanned| {
+                        scanned.map(|exists| {
+                            SqliteValue::Integer(i64::from(if *not { !exists } else { exists }))
+                        })
+                    })
             }
             Expr::Collate { expr: inner, .. } => {
                 self.try_eval_expr_with_subqueries_sync(inner, row, col_map)
@@ -117790,6 +117934,7 @@ impl Connection {
         // first, so hand the plain-scan consumer's row budget to the
         // materializer and let it stop at the same point.
         let consumer_row_budget = self.recursive_cte_consumer_row_budget(select);
+        let consumer_filter = self.recursive_cte_consumer_filter(select);
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
         let result = async {
             self.materialize_with_clause(
@@ -117797,6 +117942,7 @@ impl Connection {
                 params,
                 &mut temp_tables.tables,
                 consumer_row_budget.as_ref(),
+                consumer_filter.as_ref(),
             )
             .await?;
             // CTE temp tables have dynamically allocated root pages. Do not
@@ -119374,7 +119520,13 @@ impl Connection {
             "with_clause_materialization",
         )?;
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
-        self.materialize_with_clause(delete.with.as_ref(), params, &mut temp_tables.tables, None)
+        self.materialize_with_clause(
+            delete.with.as_ref(),
+            params,
+            &mut temp_tables.tables,
+            None,
+            None,
+        )
             .await?;
         let mut stripped = delete.clone();
         stripped.with = None;
@@ -119466,7 +119618,13 @@ impl Connection {
             "with_clause_materialization",
         )?;
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
-        self.materialize_with_clause(update.with.as_ref(), params, &mut temp_tables.tables, None)
+        self.materialize_with_clause(
+            update.with.as_ref(),
+            params,
+            &mut temp_tables.tables,
+            None,
+            None,
+        )
             .await?;
         let mut stripped = update.clone();
         stripped.with = None;
@@ -119564,7 +119722,13 @@ impl Connection {
             .cte_statement_reads_only_own_ctes(CteConsumer::Insert(insert))
             .then(|| self.suppress_memdb_row_hydration());
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
-        self.materialize_with_clause(insert.with.as_ref(), params, &mut temp_tables.tables, None)
+        self.materialize_with_clause(
+            insert.with.as_ref(),
+            params,
+            &mut temp_tables.tables,
+            None,
+            None,
+        )
             .await?;
         let mut stripped = insert.clone();
         stripped.with = None;
@@ -119619,6 +119783,7 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         temp_tables: &mut Vec<(String, i32)>,
         consumer_row_budget: Option<&RecursiveCteConsumerRowBudget>,
+        consumer_filter: Option<&RecursiveCteConsumerFilter>,
     ) -> Result<()> {
         let with_clause = with.ok_or_else(|| FrankenError::internal("expected CTE with clause"))?;
         let is_recursive = with_clause.recursive;
@@ -119662,8 +119827,16 @@ impl Connection {
                 let row_budget = consumer_row_budget
                     .filter(|budget| budget.cte_name.eq_ignore_ascii_case(cte_name))
                     .map(|budget| budget.rows);
-                self.materialize_recursive_cte(cte, params, &mut *temp_tables, row_budget)
-                    .await?;
+                let row_filter = consumer_filter
+                    .filter(|filter| filter.cte_name.eq_ignore_ascii_case(cte_name));
+                self.materialize_recursive_cte(
+                    cte,
+                    params,
+                    &mut *temp_tables,
+                    row_budget,
+                    row_filter,
+                )
+                .await?;
             } else {
                 let cte_rows = self
                     .execute_statement(&Statement::Select(cte.query.clone()), params)
@@ -119746,7 +119919,7 @@ impl Connection {
             "with_clause_materialization",
         )?;
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
-        self.materialize_with_clause(with, params, &mut temp_tables.tables, None)
+        self.materialize_with_clause(with, params, &mut temp_tables.tables, None, None)
             .await?;
         self.snapshot_materialized_temp_tables(&temp_tables.tables)
     }
@@ -120019,12 +120192,94 @@ impl Connection {
         })
     }
 
+    /// GH#419 / bd-m2tjm: when the consuming query reads a `UNION ALL`
+    /// recursive CTE once through a plain single-table `SELECT ... FROM cte
+    /// WHERE <pure filter>` (and no other CTE or subquery reads `cte`), only
+    /// rows satisfying `<pure filter>` can ever be observed after recursion
+    /// finishes. Streaming the frontier while retaining only matching rows
+    /// matches stock sqlite3's streaming memory profile instead of pinning
+    /// every dead intermediate generation in `all_rows` and `MemTable`.
+    fn recursive_cte_consumer_filter(
+        &self,
+        select: &SelectStatement,
+    ) -> Option<RecursiveCteConsumerFilter> {
+        let with = select.with.as_ref()?;
+        if !with.recursive || !select.body.compounds.is_empty() {
+            return None;
+        }
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            where_clause: Some(where_expr),
+            having,
+            ..
+        } = &select.body.select
+        else {
+            return None;
+        };
+        if !from.joins.is_empty() || !is_pure_recursive_cte_consumer_filter(where_expr) {
+            return None;
+        }
+        let TableOrSubquery::Table {
+            name: source,
+            alias,
+            ..
+        } = &from.source
+        else {
+            return None;
+        };
+        if source.schema.is_some() {
+            return None;
+        }
+        let is_recursive_cte = with.ctes.iter().any(|cte| {
+            cte.name.eq_ignore_ascii_case(&source.name)
+                && cte
+                    .query
+                    .body
+                    .compounds
+                    .iter()
+                    .any(|(_, core)| select_core_references_table(core, &cte.name))
+        });
+        if !is_recursive_cte {
+            return None;
+        }
+        // Any sibling CTE that also mentions this CTE needs the full table.
+        if with.ctes.iter().any(|cte| {
+            !cte.name.eq_ignore_ascii_case(&source.name)
+                && select_stmt_mentions_table_name(&cte.query, &source.name)
+        }) {
+            return None;
+        }
+        // Reject any subquery anywhere in the outer SELECT (it could read the
+        // unfiltered CTE table directly).
+        let has_subquery = columns.iter().any(|column| match column {
+            ResultColumn::Star | ResultColumn::TableStar(_) => false,
+            ResultColumn::Expr { expr, .. } => expr_contains_subquery_match(expr, &mut |_| true),
+        }) || having
+            .as_deref()
+            .is_some_and(|expr| expr_contains_subquery_match(expr, &mut |_| true))
+            || select
+                .order_by
+                .iter()
+                .any(|term| expr_contains_subquery_match(&term.expr, &mut |_| true));
+        if has_subquery {
+            return None;
+        }
+        let table_label = alias.as_deref().unwrap_or(&source.name).to_owned();
+        Some(RecursiveCteConsumerFilter {
+            cte_name: source.name.clone(),
+            table_label,
+            where_expr: where_expr.as_ref().clone(),
+        })
+    }
+
     async fn materialize_recursive_cte(
         &self,
         cte: &fsqlite_ast::Cte,
         params: Option<&[SqliteValue]>,
         temp_tables: &mut Vec<(String, i32)>,
         consumer_row_budget: Option<usize>,
+        consumer_filter: Option<&RecursiveCteConsumerFilter>,
     ) -> Result<()> {
         let cte_name = &cte.name;
         let col_names = self.recursive_cte_output_column_names(cte);
@@ -120199,6 +120454,93 @@ impl Connection {
         // generations can run at once: the output is `all_rows` in order.
         let stop_row_cap = output_row_cap.map(|cap| cap.saturating_add(cte_offset));
         let cx = self.op_cx_after_background_status();
+
+        // GH#419 / bd-m2tjm: streaming frontier materialization when the sole
+        // consumer filters a `UNION ALL` recursive CTE with a pure row-level
+        // predicate (e.g. `SELECT s FROM x WHERE ind = 0`). Dead generations
+        // are dropped immediately instead of pinning hundreds of thousands of
+        // intermediate rows in RAM and MemTable.
+        let has_any_union = cte
+            .query
+            .body
+            .compounds
+            .iter()
+            .any(|(op, _)| matches!(op, CompoundOp::Union));
+        if let Some(filter) = consumer_filter
+            && !has_union_arm
+            && !has_any_union
+            && cte_limit.is_none()
+            && cte_offset == 0
+            && consumer_row_budget.is_none()
+        {
+            let filter_col_map: Vec<(String, String, bool)> = col_names
+                .iter()
+                .map(|column| (filter.table_label.clone(), column.clone(), false))
+                .collect();
+            if expr_references_only_col_map(&filter.where_expr, &filter_col_map) {
+                let filter_context = Arc::new(JoinEvalCollationContext {
+                    declared_json_keys: (0..num_columns).collect(),
+                    column_collations: vec![None; num_columns],
+                    column_affinities: vec![TypeAffinity::Blob; num_columns],
+                    using_column_projections: HashMap::new(),
+                    registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+                });
+                let mut filter_bindings = JoinExprBindings::default();
+                filter_bindings.bind_expr(&filter.where_expr, &filter_col_map, None);
+                let filter_bindings = Arc::new(filter_bindings);
+                let mut kept_rows: Vec<Vec<SqliteValue>> = Vec::new();
+                let mut frontier: Vec<Vec<SqliteValue>> = all_rows;
+                while !frontier.is_empty() {
+                    cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                    {
+                        let _collation_guard =
+                            JoinEvalCollationContextGuard::push_shared(Arc::clone(&filter_context));
+                        let _bindings_guard =
+                            JoinExprBindingsGuard::push_shared(Arc::clone(&filter_bindings));
+                        for row in &frontier {
+                            if eval_join_predicate(&filter.where_expr, row, &filter_col_map)? {
+                                kept_rows.push(row.clone());
+                            }
+                        }
+                    }
+                    if recursive_arms_require_temp_table {
+                        let mut db = self.db.borrow_mut();
+                        if let Some(table) = db.get_table_mut(root_page) {
+                            table.clear();
+                            for (i, vals) in frontier.iter().enumerate() {
+                                table.insert_row(i as i64 + 1, vals.clone());
+                            }
+                        }
+                    }
+                    let mut new_rows: Vec<Vec<SqliteValue>> = Vec::new();
+                    for (_, execution_plan) in &recursive_arms {
+                        let arm_rows = match execution_plan {
+                            RecursiveCteArmExecutionPlan::Direct(plan) if plan.sync_evaluable => {
+                                Self::execute_recursive_cte_direct_eval_plan_sync(
+                                    plan, &frontier, params,
+                                )?
+                            }
+                            _ => {
+                                self.execute_recursive_cte_arm_select(
+                                    execution_plan,
+                                    &frontier,
+                                    params,
+                                )
+                                .await?
+                            }
+                        };
+                        new_rows.reserve(arm_rows.len());
+                        for row in arm_rows {
+                            new_rows.push(row.values);
+                        }
+                    }
+                    frontier = new_rows;
+                }
+                self.store_recursive_cte_rows(root_page, kept_rows);
+                return Ok(());
+            }
+        }
+
         // Iterate: feed working set to recursive arm, collect new rows, until
         // the fixpoint, a row cap, or cancellation. No round cap (GH#419).
         loop {
@@ -120242,8 +120584,8 @@ impl Connection {
                             .await?
                     }
                 };
-                for row in &arm_rows {
-                    let vals = row.values().to_vec();
+                for row in arm_rows {
+                    let vals = row.values;
                     match op {
                         CompoundOp::UnionAll => {
                             new_rows.push(vals);
@@ -121854,12 +122196,13 @@ impl Connection {
             src.append_col_map(&mut col_map);
         }
         let schema_snapshot = self.schema.borrow().clone();
-        let (col_collations, col_affinities) = self.join_source_collations_and_affinities(
-            &all_sources,
-            &table_sources,
-            visible_ctes,
-            &schema_snapshot,
-        );
+        let (col_collations, col_affinities, source_declared_blob_columns) = self
+            .join_source_collations_and_affinities(
+                &all_sources,
+                &table_sources,
+                visible_ctes,
+                &schema_snapshot,
+            );
         let using_column_projections = build_join_using_column_projections_from_sources(
             &table_sources,
             &effective.joins,
@@ -121868,11 +122211,7 @@ impl Connection {
             &col_affinities,
         );
         let mut declared_blob_columns = self.builtin_json_key_columns(&all_sources, &col_map);
-        declared_blob_columns.extend(typeless_base_table_columns(
-            &all_sources,
-            &table_sources,
-            &schema_snapshot,
-        ));
+        declared_blob_columns.extend(source_declared_blob_columns);
         let hidden_column_indices = collect_join_hidden_column_indices(&table_sources);
         let using_skip_indices = collect_join_using_skip_indices(&table_sources, &effective.joins);
         let coalesced_star_indices =
@@ -122555,12 +122894,13 @@ impl Connection {
             src.append_col_map(&mut col_map);
         }
         let schema_snapshot = self.schema.borrow().clone();
-        let (col_collations, col_affinities) = self.join_source_collations_and_affinities(
-            &all_sources,
-            &table_sources,
-            &visible_ctes,
-            &schema_snapshot,
-        );
+        let (col_collations, col_affinities, source_declared_blob_columns) = self
+            .join_source_collations_and_affinities(
+                &all_sources,
+                &table_sources,
+                &visible_ctes,
+                &schema_snapshot,
+            );
         let using_column_projections = build_join_using_column_projections_from_sources(
             &table_sources,
             &from.joins,
@@ -122569,11 +122909,7 @@ impl Connection {
             &col_affinities,
         );
         let mut declared_blob_columns = self.builtin_json_key_columns(&all_sources, &col_map);
-        declared_blob_columns.extend(typeless_base_table_columns(
-            &all_sources,
-            &table_sources,
-            &schema_snapshot,
-        ));
+        declared_blob_columns.extend(source_declared_blob_columns);
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
                 declared_json_keys: declared_blob_columns,
@@ -123342,6 +123678,161 @@ impl Connection {
                     )
                 })
                 .await?;
+            } else if join_idx + 1 == from.joins.len()
+                && effective_constraint.is_none()
+                && matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Cross)
+                && !where_already_applied
+                && params.is_none()
+                && let Some(raw_where_expr) = effective_where_clause_for_eval
+            {
+                // GH#419 / bd-m2tjm: fuse the final unconstrained INNER/CROSS
+                // join with the WHERE filter so rejected Cartesian pairs are
+                // never materialized (cloning left values once per left row
+                // instead of 2 * right.len() times), and evaluate any leading
+                // left-only AND prefix once per left row before scanning right.
+                let where_row_limit = (select.order_by.is_empty() && !is_distinct)
+                    .then_some(row_budget)
+                    .flatten();
+                if right_rows.is_empty() || where_row_limit == Some(0) {
+                    combined.clear();
+                    where_already_applied = true;
+                    break;
+                }
+                let membership_where = self.lower_json_key_exists_where(raw_where_expr, &col_map);
+                let where_expr = membership_where.as_ref().unwrap_or(raw_where_expr);
+                let mut conjuncts = SmallVec::<[&Expr; 4]>::new();
+                collect_same_binary_op_operands_small(where_expr, BinaryOp::And, &mut conjuncts);
+                if conjuncts
+                    .iter()
+                    .any(|operand| expr_is_constant_absorbing_for(operand, true))
+                {
+                    combined.clear();
+                    where_already_applied = true;
+                    break;
+                }
+                let can_push_left_prefix = using_skip.is_none()
+                    && current_join_eval_collation_context_snapshot()
+                        .is_none_or(|ctx| ctx.using_column_projections.is_empty());
+                let left_prefix_len = if can_push_left_prefix {
+                    conjuncts
+                        .iter()
+                        .take_while(|expr| {
+                            !expr_has_any_subquery(expr)
+                                && expr_uses_only_left_plain_columns(expr, &col_map, current_width)
+                        })
+                        .count()
+                } else {
+                    0
+                };
+                let left_prefix_bindings = if left_prefix_len > 0 {
+                    let mut bindings = JoinExprBindings::default();
+                    for expr in &conjuncts[..left_prefix_len] {
+                        bindings.bind_expr(expr, &col_map, None);
+                    }
+                    Some(Arc::new(bindings))
+                } else {
+                    None
+                };
+                let _where_bindings_guard = if expr_has_any_subquery(where_expr) {
+                    None
+                } else {
+                    let mut bindings = JoinExprBindings::default();
+                    bindings.bind_expr(where_expr, &col_map, using_skip);
+                    Some(JoinExprBindingsGuard::push(bindings))
+                };
+                let _exists_memo_guard = self.arm_exists_probe_memo_pinned(where_expr, &col_map);
+                let remaining_conjuncts = &conjuncts[left_prefix_len..];
+                let left_rows = std::mem::take(&mut combined);
+                let combined_width = current_width + right_width;
+                combined = self
+                    .with_in_subquery_memo(
+                        where_expr,
+                        Box::pin(async {
+                            let mut filtered: Vec<Vec<SqliteValue>> = Vec::new();
+                            let mut scratch: Vec<SqliteValue> =
+                                Vec::with_capacity(combined_width);
+                            'outer: for left_row in left_rows {
+                                if left_prefix_len > 0 {
+                                    let _left_guard = left_prefix_bindings
+                                        .as_ref()
+                                        .map(|b| JoinExprBindingsGuard::push_shared(Arc::clone(b)));
+                                    let mut left_ok = true;
+                                    for expr in &conjuncts[..left_prefix_len] {
+                                        // `expr_uses_only_left_plain_columns` admits no function
+                                        // calls, so no fallback function registry push is needed.
+                                        if !eval_join_predicate(expr, &left_row, &col_map)? {
+                                            left_ok = false;
+                                            break;
+                                        }
+                                    }
+                                    if !left_ok {
+                                        continue;
+                                    }
+                                }
+                                scratch.clear();
+                                scratch.extend_from_slice(&left_row);
+                                for right_row in right_rows {
+                                    scratch.truncate(current_width);
+                                    scratch.extend_from_slice(&right_row[..right_width]);
+                                    let keep = if remaining_conjuncts.is_empty() {
+                                        true
+                                    } else if remaining_conjuncts.len() == 1 {
+                                        let expr = remaining_conjuncts[0];
+                                        if let Some(sync_result) = self
+                                            .try_eval_expr_truthiness_sync(
+                                                expr, true, &scratch, &col_map,
+                                            )
+                                        {
+                                            sync_result?.unwrap_or(false)
+                                        } else {
+                                            lean_future(|| {
+                                                self.eval_expr_truthiness(
+                                                    expr, true, &scratch, &col_map, None,
+                                                )
+                                            })
+                                            .await?
+                                            .unwrap_or(false)
+                                        }
+                                    } else {
+                                        let mut all_ok = true;
+                                        for expr in remaining_conjuncts {
+                                            let passed = if let Some(sync_result) = self
+                                                .try_eval_expr_truthiness_sync(
+                                                    expr, true, &scratch, &col_map,
+                                                )
+                                            {
+                                                sync_result?.unwrap_or(false)
+                                            } else {
+                                                lean_future(|| {
+                                                    self.eval_expr_truthiness(
+                                                        expr, true, &scratch, &col_map, None,
+                                                    )
+                                                })
+                                                .await?
+                                                .unwrap_or(false)
+                                            };
+                                            if !passed {
+                                                all_ok = false;
+                                                break;
+                                            }
+                                        }
+                                        all_ok
+                                    };
+                                    if keep {
+                                        filtered.push(scratch.clone());
+                                        if where_row_limit
+                                            .is_some_and(|cap| filtered.len() >= cap)
+                                        {
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok::<_, FrankenError>(filtered)
+                        }),
+                    )
+                    .await?;
+                where_already_applied = true;
             } else {
                 let right_using_skip = table_sources[join_idx + 1]
                     .paren_join_meta
@@ -123393,7 +123884,7 @@ impl Connection {
             // can reuse a value-set built once instead of re-scanning the child
             // table for every outer row. The guard disarms+clears on exit so the
             // memo is never consulted across statements.
-            let _exists_memo_guard = self.arm_exists_probe_memo();
+            let _exists_memo_guard = self.arm_exists_probe_memo_pinned(where_expr, &col_map);
             combined = self
                 .with_in_subquery_memo(
                     where_expr,
@@ -123703,14 +124194,18 @@ impl Connection {
         // existing resolver; the common projection path gets direct indices.
         let projection_bindings_guard = if !has_subqueries && using_skip.is_none() {
             let mut bindings = JoinExprBindings::default();
-            for column in columns {
-                if let ResultColumn::Expr { expr, .. } = column {
-                    bindings.bind_expr(expr, &col_map, None);
+            self.with_fallback_function_registry(|| {
+                for column in columns {
+                    if let ResultColumn::Expr { expr, .. } = column {
+                        bindings.bind_expr(expr, &col_map, None);
+                        bindings.bind_functions(expr, &col_map);
+                    }
                 }
-            }
-            for expr in &extra_order_exprs {
-                bindings.bind_expr(expr, &col_map, None);
-            }
+                for expr in &extra_order_exprs {
+                    bindings.bind_expr(expr, &col_map, None);
+                    bindings.bind_functions(expr, &col_map);
+                }
+            });
             Some(JoinExprBindingsGuard::push(bindings))
         } else {
             None
@@ -131137,58 +131632,6 @@ fn table_or_subquery_result_collations(
             .unwrap_or_default(),
         TableOrSubquery::ParenJoin(from) => from_clause_result_collations(from, schemas),
     }
-}
-
-/// Combined-row indices of base-table columns whose BLOB affinity is declared
-/// (a column declared without a type, or as BLOB), laid out like
-/// [`Connection::join_source_collations_and_affinities`]. The join evaluator's affinity vector also
-/// uses BLOB for a derived source's computed column, which has NO affinity in
-/// SQLite; listing the genuinely declared ones lets a comparison against a
-/// TEXT column use SQLite's both-operands rule (no conversion) instead of
-/// coercing the typeless side to TEXT (GH#428).
-fn typeless_base_table_columns(
-    sources: &[&TableOrSubquery],
-    table_sources: &[JoinTableSource],
-    schemas: &[TableSchema],
-) -> HashSet<usize> {
-    let mut declared = HashSet::new();
-    let mut offset = 0usize;
-    for (source, table_source) in sources.iter().zip(table_sources) {
-        if let Some(meta) = &table_source.paren_join_meta {
-            declared.extend(meta.declared_blob_columns.iter().map(|idx| offset + idx));
-            offset += table_source.scan_width();
-            continue;
-        }
-        let effective_source = match source {
-            TableOrSubquery::ParenJoin(inner) => {
-                let unwrapped = unwrap_single_item_paren_join(inner);
-                if unwrapped.joins.is_empty() {
-                    &unwrapped.source
-                } else {
-                    *source
-                }
-            }
-            other => *other,
-        };
-        if let TableOrSubquery::Table { name, .. } = effective_source
-            && let Some(schema) = schemas
-                .iter()
-                .find(|schema| schema.name.eq_ignore_ascii_case(&name.name))
-        {
-            for (index, column) in schema
-                .columns
-                .iter()
-                .enumerate()
-                .take(table_source.col_names.len())
-            {
-                if affinity_char_to_type(column.affinity) == TypeAffinity::Blob {
-                    declared.insert(offset + index);
-                }
-            }
-        }
-        offset += table_source.scan_width();
-    }
-    declared
 }
 
 fn table_or_subquery_result_affinities(
@@ -142495,6 +142938,167 @@ fn skip_block_sql_comment_chars(chars: &mut std::iter::Peekable<std::str::Chars<
 struct RecursiveCteConsumerRowBudget {
     cte_name: String,
     rows: usize,
+}
+
+/// GH#419 / bd-m2tjm: pure row-level filter from a recursive CTE's sole
+/// consumer. See `Connection::recursive_cte_consumer_filter`.
+#[derive(Debug, Clone)]
+struct RecursiveCteConsumerFilter {
+    cte_name: String,
+    table_label: String,
+    where_expr: Expr,
+}
+
+/// Conservative syntactic check: true only for pure, deterministic,
+/// non-erroring filter predicates over columns and literals (no functions, no
+/// subqueries, no placeholders).
+fn is_pure_recursive_cte_consumer_filter(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(..) | Expr::Literal(..) => true,
+        Expr::IsNull { expr: inner, .. } => is_pure_recursive_cte_consumer_filter(inner),
+        Expr::UnaryOp {
+            op: UnaryOp::Not,
+            expr: inner,
+            ..
+        } => is_pure_recursive_cte_consumer_filter(inner),
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            op.truth_test(right).is_none()
+                && matches!(
+                    op,
+                    BinaryOp::And
+                        | BinaryOp::Or
+                        | BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                        | BinaryOp::Is
+                        | BinaryOp::IsNot
+                )
+                && is_pure_recursive_cte_consumer_filter(left)
+                && is_pure_recursive_cte_consumer_filter(right)
+        }
+        _ => false,
+    }
+}
+
+/// Conservative check whether a `SelectStatement` mentions `table_name` in any
+/// FROM clause (top-level or nested subquery/CTE).
+fn select_stmt_mentions_table_name(select: &SelectStatement, table_name: &str) -> bool {
+    if let Some(with) = &select.with
+        && with
+            .ctes
+            .iter()
+            .any(|cte| select_stmt_mentions_table_name(&cte.query, table_name))
+    {
+        return true;
+    }
+    let check_core = |core: &SelectCore| -> bool {
+        if select_core_references_table(core, table_name) {
+            return true;
+        }
+        let SelectCore::Select {
+            columns,
+            where_clause,
+            having,
+            ..
+        } = core
+        else {
+            return false;
+        };
+        let has_sub = |expr: &Expr| {
+            expr_contains_subquery_match(expr, &mut |sub| {
+                let s = match sub {
+                    SubqueryExprRef::Scalar(s)
+                    | SubqueryExprRef::Exists(s)
+                    | SubqueryExprRef::In(s) => s,
+                };
+                select_stmt_mentions_table_name(s, table_name)
+            })
+        };
+        columns.iter().any(|c| match c {
+            ResultColumn::Star | ResultColumn::TableStar(_) => false,
+            ResultColumn::Expr { expr, .. } => has_sub(expr),
+        }) || where_clause.as_deref().is_some_and(has_sub)
+            || having.as_deref().is_some_and(has_sub)
+    };
+    if check_core(&select.body.select) {
+        return true;
+    }
+    if select
+        .body
+        .compounds
+        .iter()
+        .any(|(_, core)| check_core(core))
+    {
+        return true;
+    }
+    select.order_by.iter().any(|term| {
+        expr_contains_subquery_match(&term.expr, &mut |sub| {
+            let s = match sub {
+                SubqueryExprRef::Scalar(s)
+                | SubqueryExprRef::Exists(s)
+                | SubqueryExprRef::In(s) => s,
+            };
+            select_stmt_mentions_table_name(s, table_name)
+        })
+    })
+}
+
+/// True when `expr` references only plain columns strictly to the left of
+/// `left_width` (no right-side columns, no FTS5 rank/MATCH, no subqueries).
+fn expr_uses_only_left_plain_columns(
+    expr: &Expr,
+    col_map: &[(String, String, bool)],
+    left_width: usize,
+) -> bool {
+    match expr {
+        Expr::Literal(..) | Expr::BoundOuterValue { .. } => true,
+        Expr::Column(col_ref, _) => {
+            find_col_in_map(col_map, col_ref.table.as_deref(), &col_ref.column, None)
+                .is_ok_and(|idx| idx < left_width)
+        }
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            !matches!(left.as_ref(), Expr::RowValue(..))
+                && !matches!(right.as_ref(), Expr::RowValue(..))
+                && op.truth_test(right).is_none()
+                && expr_uses_only_left_plain_columns(left, col_map, left_width)
+                && expr_uses_only_left_plain_columns(right, col_map, left_width)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => {
+            expr_uses_only_left_plain_columns(inner, col_map, left_width)
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            expr_uses_only_left_plain_columns(inner, col_map, left_width)
+                && expr_uses_only_left_plain_columns(low, col_map, left_width)
+                && expr_uses_only_left_plain_columns(high, col_map, left_width)
+        }
+        Expr::In {
+            expr: inner,
+            set: InSet::List(items),
+            ..
+        } => {
+            !matches!(inner.as_ref(), Expr::RowValue(..))
+                && expr_uses_only_left_plain_columns(inner, col_map, left_width)
+                && items
+                    .iter()
+                    .all(|item| expr_uses_only_left_plain_columns(item, col_map, left_width))
+        }
+        _ => false,
+    }
 }
 
 fn select_core_references_table(core: &SelectCore, table_name: &str) -> bool {
@@ -167383,6 +167987,74 @@ impl<T> Future for InSubqueryMemoFuture<'_, T> {
 /// extent of a SELECT, all cached value-sets stay valid across nested
 /// subquery evaluation, and the memo is empty between statements (no
 /// cross-statement staleness).
+/// Pinned active WHERE frame for `ExistsProbeMemo`: every address in
+/// `exists_addrs` belongs to an immutably borrowed `where_expr` alive for the
+/// duration of the frame, paired with an immutable `col_map` slice and
+/// collation context pointer.
+struct PinnedExistsFrame {
+    col_map_ptr: usize,
+    col_map_len: usize,
+    outer_context_ptr: usize,
+    exists_addrs: SmallVec<[usize; 4]>,
+}
+
+/// Collect top-level `Expr::Exists` subquery addresses reachable from `expr`
+/// without descending into nested `Expr::Subquery` or `Expr::Exists` bodies.
+fn collect_pinned_exists_subquery_addrs(expr: &Expr, out: &mut SmallVec<[usize; 4]>) {
+    match expr {
+        Expr::Exists { subquery, .. } => {
+            let addr = std::ptr::from_ref(subquery.as_ref()) as usize;
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_pinned_exists_subquery_addrs(left, out);
+            collect_pinned_exists_subquery_addrs(right, out);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => collect_pinned_exists_subquery_addrs(inner, out),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_pinned_exists_subquery_addrs(inner, out);
+            collect_pinned_exists_subquery_addrs(low, out);
+            collect_pinned_exists_subquery_addrs(high, out);
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_pinned_exists_subquery_addrs(op, out);
+            }
+            for (when, then) in whens {
+                collect_pinned_exists_subquery_addrs(when, out);
+                collect_pinned_exists_subquery_addrs(then, out);
+            }
+            if let Some(el) = else_expr {
+                collect_pinned_exists_subquery_addrs(el, out);
+            }
+        }
+        Expr::FunctionCall {
+            args: FunctionArgs::List(items),
+            ..
+        } => {
+            for item in items {
+                collect_pinned_exists_subquery_addrs(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Default)]
 struct ExistsProbeMemo {
     depth: u32,
@@ -167395,6 +168067,9 @@ struct ExistsProbeMemo {
     /// GH#419: scan-probe templates keyed by the `EXISTS` subquery's address,
     /// each validated against the subquery before use.
     scan_templates: std::collections::HashMap<usize, ScanExistsProbeTemplate>,
+    /// Active pinned WHERE frames whose top-level `EXISTS` subquery addresses
+    /// stay alive and immutable for the frame's lifetime.
+    pinned_frames: SmallVec<[PinnedExistsFrame; 2]>,
 }
 
 /// GH#419: what the correlated-EXISTS scan probe derives from the subquery's
@@ -167407,10 +168082,12 @@ struct ScanExistsProbePlan {
 }
 
 impl ScanExistsProbePlan {
-    /// Resolve the function calls and comparison collations of `where_expr`
-    /// once. Must run with `self.context` pushed, as the rows evaluate.
+    /// Resolve column indices, function calls, and comparison collations of
+    /// `where_expr` once. Must run with `self.context` pushed, as the rows
+    /// evaluate.
     fn bind(&self, where_expr: &Expr) -> Arc<JoinExprBindings> {
         let mut bindings = JoinExprBindings::default();
+        bindings.bind_expr(where_expr, &self.col_map, None);
         bindings.bind_functions(where_expr, &self.col_map);
         bindings.bind_comparison_collations(where_expr);
         Arc::new(bindings)
@@ -167438,6 +168115,1034 @@ struct ScanExistsProbeReady {
     slots: Vec<Option<usize>>,
     plan: ScanExistsProbePlan,
     bindings: Arc<JoinExprBindings>,
+    /// GH#419 / bd-m2tjm: flat zero-copy compiled evaluator for supported
+    /// WHERE trees, built once per query when no application scalar overrides
+    /// exist. `None` falls back to the refilled-AST `eval_join_expr` lane.
+    compiled: Option<CompiledScanProgram>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CompiledArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CompiledCmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Is,
+    IsNot,
+}
+
+enum CompiledCollation {
+    BinaryBuiltin,
+    NoCaseBuiltin,
+    RtrimBuiltin,
+    Custom {
+        name: String,
+        func: Arc<dyn CollationFunction>,
+    },
+}
+
+enum CompiledScanNode {
+    Literal(SqliteValue),
+    OuterCol(usize),
+    InnerCol(usize),
+    InnerRowId,
+    Arith {
+        left: u32,
+        right: u32,
+        op: CompiledArithOp,
+    },
+    Unary {
+        inner: u32,
+        op: UnaryOp,
+    },
+    IsNull {
+        inner: u32,
+        not: bool,
+    },
+    And {
+        left: u32,
+        right: u32,
+    },
+    Or {
+        left: u32,
+        right: u32,
+    },
+    Compare {
+        left: u32,
+        right: u32,
+        op: CompiledCmpOp,
+        affinity: Option<TypeAffinity>,
+        collation: CompiledCollation,
+    },
+    Substr {
+        src: u32,
+        start: u32,
+        len: Option<u32>,
+        outer_text_cache_idx: Option<usize>,
+    },
+    Cast {
+        inner: u32,
+        type_name: String,
+    },
+}
+
+/// GH#419 / bd-m2tjm: flat, immutable, zero-copy expression program for a
+/// correlated-EXISTS table scan.
+struct CompiledScanProgram {
+    root_page: i32,
+    nodes: Vec<CompiledScanNode>,
+    root: u32,
+    /// Outer column slots passed directly as arg 0 of `substr()`, whose
+    /// ASCII/no-NUL status is computed once per outer row before scanning.
+    outer_text_slots: SmallVec<[usize; 4]>,
+    registry: CollationRegistry,
+}
+
+enum ScanVal<'a> {
+    Null,
+    Int(i64),
+    TextSlice(&'a str),
+    Borrowed(&'a SqliteValue),
+    Owned(SqliteValue),
+}
+
+impl ScanVal<'_> {
+    #[inline]
+    fn is_null(&self) -> bool {
+        matches!(
+            self,
+            Self::Null | Self::Borrowed(SqliteValue::Null) | Self::Owned(SqliteValue::Null)
+        )
+    }
+
+    #[inline]
+    fn as_int(&self) -> Option<i64> {
+        match self {
+            Self::Int(n) => Some(*n),
+            Self::Borrowed(SqliteValue::Integer(n)) | Self::Owned(SqliteValue::Integer(n)) => {
+                Some(*n)
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn to_integer(&self) -> i64 {
+        match self {
+            Self::Null => 0,
+            Self::Int(n) => *n,
+            Self::TextSlice(s) => SqliteValue::Text(fsqlite_types::SmallText::new(s)).to_integer(),
+            Self::Borrowed(v) => v.to_integer(),
+            Self::Owned(v) => v.to_integer(),
+        }
+    }
+
+    #[inline]
+    fn text_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::TextSlice(s) => Some(s.as_bytes()),
+            Self::Borrowed(SqliteValue::Text(st)) | Self::Owned(SqliteValue::Text(st)) => {
+                Some(st.as_bytes_direct())
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn is_truthy(&self, text_encoding: TextEncoding) -> bool {
+        match self {
+            Self::Null => false,
+            Self::Int(n) => *n != 0,
+            Self::TextSlice(s) => {
+                SqliteValue::Text(fsqlite_types::SmallText::new(s)).is_sql_truthy_in(text_encoding)
+            }
+            Self::Borrowed(v) => v.is_sql_truthy_in(text_encoding),
+            Self::Owned(v) => v.is_sql_truthy_in(text_encoding),
+        }
+    }
+
+    #[inline]
+    fn to_cow(&self) -> Cow<'_, SqliteValue> {
+        match self {
+            Self::Null => Cow::Owned(SqliteValue::Null),
+            Self::Int(n) => Cow::Owned(SqliteValue::Integer(*n)),
+            Self::TextSlice(s) => Cow::Owned(SqliteValue::Text(fsqlite_types::SmallText::new(s))),
+            Self::Borrowed(v) => Cow::Borrowed(v),
+            Self::Owned(v) => Cow::Borrowed(v),
+        }
+    }
+
+    #[inline]
+    fn into_owned(self) -> SqliteValue {
+        match self {
+            Self::Null => SqliteValue::Null,
+            Self::Int(n) => SqliteValue::Integer(n),
+            Self::TextSlice(s) => SqliteValue::Text(fsqlite_types::SmallText::new(s)),
+            Self::Borrowed(v) => v.clone(),
+            Self::Owned(v) => v,
+        }
+    }
+}
+
+struct CompiledScanBuilder<'a> {
+    outer_width: usize,
+    plan: &'a ScanExistsProbePlan,
+    nodes: Vec<CompiledScanNode>,
+    outer_text_slots: SmallVec<[usize; 4]>,
+}
+
+impl CompiledScanBuilder<'_> {
+    fn push(&mut self, node: CompiledScanNode) -> Option<u32> {
+        let idx = u32::try_from(self.nodes.len()).ok()?;
+        self.nodes.push(node);
+        Some(idx)
+    }
+
+    fn register_outer_text_slot(&mut self, slot: usize) -> usize {
+        if let Some(pos) = self.outer_text_slots.iter().position(|&s| s == slot) {
+            pos
+        } else {
+            let pos = self.outer_text_slots.len();
+            self.outer_text_slots.push(slot);
+            pos
+        }
+    }
+
+    fn resolve_comparison_contract(
+        &self,
+        sub_left: &Expr,
+        sub_right: &Expr,
+    ) -> (Option<TypeAffinity>, CompiledCollation) {
+        let context = &self.plan.context;
+        let col_map = &self.plan.col_map;
+        let collation_name = join_comparison_collation(sub_left, sub_right, col_map);
+        let declared_blob_operand = |expr: &Expr| {
+            is_declared_json_key(expr, col_map, context)
+                || matches!(
+                    expr,
+                    Expr::BoundOuterValue {
+                        affinity: Some(TypeAffinity::Blob),
+                        ..
+                    }
+                )
+        };
+        let affinity = if !declared_blob_operand(sub_left) && !declared_blob_operand(sub_right) {
+            TypeAffinity::comparison_affinity(
+                join_expr_affinity(sub_left, col_map, context),
+                join_expr_affinity(sub_right, col_map, context),
+            )
+        } else {
+            match ComparisonAffinity::from_operands(
+                join_operand_expr_affinity(sub_left, col_map, context),
+                join_operand_expr_affinity(sub_right, col_map, context),
+            ) {
+                ComparisonAffinity::None | ComparisonAffinity::Blob => None,
+                ComparisonAffinity::Text => Some(TypeAffinity::Text),
+                ComparisonAffinity::Numeric
+                | ComparisonAffinity::Integer
+                | ComparisonAffinity::Real => Some(TypeAffinity::Numeric),
+            }
+        };
+        let effective_name = collation_name.as_deref().or_else(|| {
+            (!context.registry.uses_builtin_implementation("BINARY")).then_some("BINARY")
+        });
+        let collation = match effective_name {
+            None => CompiledCollation::BinaryBuiltin,
+            Some(name)
+                if name.eq_ignore_ascii_case("BINARY")
+                    && context.registry.uses_builtin_implementation("BINARY") =>
+            {
+                CompiledCollation::BinaryBuiltin
+            }
+            Some(name)
+                if name.eq_ignore_ascii_case("NOCASE")
+                    && context.registry.uses_builtin_implementation("NOCASE") =>
+            {
+                CompiledCollation::NoCaseBuiltin
+            }
+            Some(name)
+                if name.eq_ignore_ascii_case("RTRIM")
+                    && context.registry.uses_builtin_implementation("RTRIM") =>
+            {
+                CompiledCollation::RtrimBuiltin
+            }
+            Some(name) => {
+                if let Some(func) = context.registry.find(name) {
+                    CompiledCollation::Custom {
+                        name: name.to_owned(),
+                        func,
+                    }
+                } else {
+                    CompiledCollation::BinaryBuiltin
+                }
+            }
+        };
+        (affinity, collation)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn compile(&mut self, original: &Expr, substituted: &Expr) -> Option<u32> {
+        match (original, substituted) {
+            (Expr::Column(..), Expr::Column(col_ref, _)) => {
+                let idx = find_col_in_map(
+                    &self.plan.col_map,
+                    col_ref.table.as_deref(),
+                    &col_ref.column,
+                    None,
+                )
+                .ok()?;
+                if self.plan.rowid_alias_column_index == Some(idx) {
+                    self.push(CompiledScanNode::InnerRowId)
+                } else {
+                    self.push(CompiledScanNode::InnerCol(idx))
+                }
+            }
+            (Expr::Column(..), Expr::Literal(Literal::String(text), _)) => {
+                let slot = scan_template_sentinel_slot(text)?;
+                if slot >= self.outer_width {
+                    return None;
+                }
+                self.push(CompiledScanNode::OuterCol(slot))
+            }
+            (
+                Expr::Column(..),
+                Expr::BoundOuterValue {
+                    value: SqliteValue::Text(text),
+                    ..
+                },
+            ) => {
+                let slot = scan_template_sentinel_slot(text.as_str())?;
+                if slot >= self.outer_width {
+                    return None;
+                }
+                self.push(CompiledScanNode::OuterCol(slot))
+            }
+            (Expr::Literal(lit, _), Expr::Literal(..)) => {
+                self.push(CompiledScanNode::Literal(literal_to_join_value(lit)))
+            }
+            (Expr::Collate { expr: orig_inner, .. }, Expr::Collate { expr: sub_inner, .. }) => {
+                self.compile(orig_inner, sub_inner)
+            }
+            (
+                Expr::Cast {
+                    expr: orig_inner,
+                    type_name,
+                    ..
+                },
+                Expr::Cast {
+                    expr: sub_inner, ..
+                },
+            ) => {
+                let inner = self.compile(orig_inner, sub_inner)?;
+                self.push(CompiledScanNode::Cast {
+                    inner,
+                    type_name: type_name.name.clone(),
+                })
+            }
+            (
+                Expr::UnaryOp {
+                    op,
+                    expr: orig_inner,
+                    ..
+                },
+                Expr::UnaryOp {
+                    expr: sub_inner, ..
+                },
+            ) => {
+                let inner = self.compile(orig_inner, sub_inner)?;
+                self.push(CompiledScanNode::Unary { inner, op: *op })
+            }
+            (
+                Expr::IsNull {
+                    expr: orig_inner,
+                    not,
+                    ..
+                },
+                Expr::IsNull {
+                    expr: sub_inner, ..
+                },
+            ) => {
+                let inner = self.compile(orig_inner, sub_inner)?;
+                self.push(CompiledScanNode::IsNull { inner, not: *not })
+            }
+            (
+                Expr::BinaryOp {
+                    left: orig_l,
+                    op,
+                    right: orig_r,
+                    ..
+                },
+                Expr::BinaryOp {
+                    left: sub_l,
+                    right: sub_r,
+                    ..
+                },
+            ) => {
+                if op.truth_test(sub_r).is_some()
+                    || matches!(sub_l.as_ref(), Expr::RowValue(..))
+                    || matches!(sub_r.as_ref(), Expr::RowValue(..))
+                {
+                    return None;
+                }
+                let left = self.compile(orig_l, sub_l)?;
+                let right = self.compile(orig_r, sub_r)?;
+                match op {
+                    BinaryOp::And => self.push(CompiledScanNode::And { left, right }),
+                    BinaryOp::Or => self.push(CompiledScanNode::Or { left, right }),
+                    BinaryOp::Add => self.push(CompiledScanNode::Arith {
+                        left,
+                        right,
+                        op: CompiledArithOp::Add,
+                    }),
+                    BinaryOp::Subtract => self.push(CompiledScanNode::Arith {
+                        left,
+                        right,
+                        op: CompiledArithOp::Sub,
+                    }),
+                    BinaryOp::Multiply => self.push(CompiledScanNode::Arith {
+                        left,
+                        right,
+                        op: CompiledArithOp::Mul,
+                    }),
+                    BinaryOp::Divide => self.push(CompiledScanNode::Arith {
+                        left,
+                        right,
+                        op: CompiledArithOp::Div,
+                    }),
+                    BinaryOp::Modulo => self.push(CompiledScanNode::Arith {
+                        left,
+                        right,
+                        op: CompiledArithOp::Mod,
+                    }),
+                    BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Is
+                    | BinaryOp::IsNot => {
+                        let cmp_op = match op {
+                            BinaryOp::Eq => CompiledCmpOp::Eq,
+                            BinaryOp::Ne => CompiledCmpOp::Ne,
+                            BinaryOp::Lt => CompiledCmpOp::Lt,
+                            BinaryOp::Le => CompiledCmpOp::Le,
+                            BinaryOp::Gt => CompiledCmpOp::Gt,
+                            BinaryOp::Ge => CompiledCmpOp::Ge,
+                            BinaryOp::Is => CompiledCmpOp::Is,
+                            BinaryOp::IsNot => CompiledCmpOp::IsNot,
+                            _ => unreachable!(),
+                        };
+                        let (affinity, collation) = self.resolve_comparison_contract(sub_l, sub_r);
+                        self.push(CompiledScanNode::Compare {
+                            left,
+                            right,
+                            op: cmp_op,
+                            affinity,
+                            collation,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            (
+                Expr::FunctionCall {
+                    name,
+                    args: FunctionArgs::List(orig_args),
+                    filter: None,
+                    over: None,
+                    distinct: false,
+                    ..
+                },
+                Expr::FunctionCall {
+                    args: FunctionArgs::List(sub_args),
+                    ..
+                },
+            ) if (name.eq_ignore_ascii_case("substr") || name.eq_ignore_ascii_case("substring"))
+                && matches!(orig_args.len(), 2 | 3)
+                && orig_args.len() == sub_args.len()
+                && i32::try_from(orig_args.len())
+                    .is_ok_and(|arity| current_application_function_kind(name, arity).is_none()) =>
+            {
+                let src = self.compile(&orig_args[0], &sub_args[0])?;
+                let start = self.compile(&orig_args[1], &sub_args[1])?;
+                let len = if orig_args.len() == 3 {
+                    Some(self.compile(&orig_args[2], &sub_args[2])?)
+                } else {
+                    None
+                };
+                let outer_text_cache_idx = match self.nodes[src as usize] {
+                    CompiledScanNode::OuterCol(slot) => Some(self.register_outer_text_slot(slot)),
+                    _ => None,
+                };
+                self.push(CompiledScanNode::Substr {
+                    src,
+                    start,
+                    len,
+                    outer_text_cache_idx,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+fn compile_scan_exists_program(
+    original_where: &Expr,
+    substituted_where: &Expr,
+    outer_width: usize,
+    plan: &ScanExistsProbePlan,
+) -> Option<CompiledScanProgram> {
+    let mut builder = CompiledScanBuilder {
+        outer_width,
+        plan,
+        nodes: Vec::with_capacity(32),
+        outer_text_slots: SmallVec::new(),
+    };
+    let root = builder.compile(original_where, substituted_where)?;
+    Some(CompiledScanProgram {
+        root_page: plan.root_page,
+        nodes: builder.nodes,
+        root,
+        outer_text_slots: builder.outer_text_slots,
+        registry: plan.context.registry.clone(),
+    })
+}
+
+impl CompiledScanProgram {
+    #[inline]
+    fn eval_predicate(
+        &self,
+        outer_row: &[SqliteValue],
+        inner_row: &[SqliteValue],
+        rowid: i64,
+        outer_text_ascii: &[bool],
+        text_encoding: TextEncoding,
+    ) -> Result<bool> {
+        Ok(self
+            .eval_bool(
+                self.root,
+                outer_row,
+                inner_row,
+                rowid,
+                outer_text_ascii,
+                text_encoding,
+            )?
+            .unwrap_or(false))
+    }
+
+    fn eval_bool(
+        &self,
+        node_idx: u32,
+        outer_row: &[SqliteValue],
+        inner_row: &[SqliteValue],
+        rowid: i64,
+        outer_text_ascii: &[bool],
+        text_encoding: TextEncoding,
+    ) -> Result<Option<bool>> {
+        match &self.nodes[node_idx as usize] {
+            CompiledScanNode::And { left, right } => {
+                match self.eval_bool(
+                    *left,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )? {
+                    Some(false) => Ok(Some(false)),
+                    Some(true) => self.eval_bool(
+                        *right,
+                        outer_row,
+                        inner_row,
+                        rowid,
+                        outer_text_ascii,
+                        text_encoding,
+                    ),
+                    None => match self.eval_bool(
+                        *right,
+                        outer_row,
+                        inner_row,
+                        rowid,
+                        outer_text_ascii,
+                        text_encoding,
+                    )? {
+                        Some(false) => Ok(Some(false)),
+                        _ => Ok(None),
+                    },
+                }
+            }
+            CompiledScanNode::Or { left, right } => {
+                match self.eval_bool(
+                    *left,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )? {
+                    Some(true) => Ok(Some(true)),
+                    Some(false) => self.eval_bool(
+                        *right,
+                        outer_row,
+                        inner_row,
+                        rowid,
+                        outer_text_ascii,
+                        text_encoding,
+                    ),
+                    None => match self.eval_bool(
+                        *right,
+                        outer_row,
+                        inner_row,
+                        rowid,
+                        outer_text_ascii,
+                        text_encoding,
+                    )? {
+                        Some(true) => Ok(Some(true)),
+                        _ => Ok(None),
+                    },
+                }
+            }
+            CompiledScanNode::IsNull { inner, not } => {
+                let val = self.eval_val(
+                    *inner,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )?;
+                let is_null = val.is_null();
+                Ok(Some(if *not { !is_null } else { is_null }))
+            }
+            CompiledScanNode::Unary {
+                inner,
+                op: UnaryOp::Not,
+            } => Ok(self
+                .eval_bool(
+                    *inner,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )?
+                .map(|b| !b)),
+            CompiledScanNode::Compare {
+                left,
+                right,
+                op,
+                affinity,
+                collation,
+            } => {
+                let lv = self.eval_val(
+                    *left,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )?;
+                let rv = self.eval_val(
+                    *right,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )?;
+                Ok(self.eval_compare(&lv, &rv, *op, *affinity, collation, text_encoding))
+            }
+            _ => {
+                let val = self.eval_val(
+                    node_idx,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )?;
+                if val.is_null() {
+                    Ok(None)
+                } else {
+                    Ok(Some(val.is_truthy(text_encoding)))
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn eval_compare(
+        &self,
+        lv: &ScanVal<'_>,
+        rv: &ScanVal<'_>,
+        op: CompiledCmpOp,
+        affinity: Option<TypeAffinity>,
+        collation: &CompiledCollation,
+        text_encoding: TextEncoding,
+    ) -> Option<bool> {
+        let l_null = lv.is_null();
+        let r_null = rv.is_null();
+        if l_null || r_null {
+            return match op {
+                CompiledCmpOp::Is => Some(l_null && r_null),
+                CompiledCmpOp::IsNot => Some(!(l_null && r_null)),
+                _ => None,
+            };
+        }
+        // Fast path 1: both TEXT, no numeric coercion affinity.
+        if !matches!(
+            affinity,
+            Some(TypeAffinity::Integer | TypeAffinity::Real | TypeAffinity::Numeric)
+        ) && let (Some(lb), Some(rb)) = (lv.text_bytes(), rv.text_bytes())
+        {
+            let ord = match collation {
+                CompiledCollation::BinaryBuiltin
+                    if text_encoding == TextEncoding::Utf8
+                        || (lb.is_ascii() && rb.is_ascii()) =>
+                {
+                    if matches!(op, CompiledCmpOp::Eq | CompiledCmpOp::Is) {
+                        return Some(lb == rb);
+                    }
+                    if matches!(op, CompiledCmpOp::Ne | CompiledCmpOp::IsNot) {
+                        return Some(lb != rb);
+                    }
+                    Some(lb.cmp(rb))
+                }
+                CompiledCollation::BinaryBuiltin => None,
+                CompiledCollation::NoCaseBuiltin => {
+                    Some(fsqlite_func::collation::NoCaseCollation.compare(lb, rb))
+                }
+                CompiledCollation::RtrimBuiltin => {
+                    Some(fsqlite_func::collation::RtrimCollation.compare(lb, rb))
+                }
+                CompiledCollation::Custom { func, .. } => Some(func.compare(lb, rb)),
+            };
+            if let Some(ord) = ord {
+                return Some(apply_compiled_cmp_op(op, ord));
+            }
+        }
+        // Fast path 2: both INTEGER, no TEXT coercion affinity.
+        if affinity != Some(TypeAffinity::Text)
+            && let (Some(a), Some(b)) = (lv.as_int(), rv.as_int())
+        {
+            return Some(apply_compiled_cmp_op(op, a.cmp(&b)));
+        }
+        // General fallback: exact `cmp_values_with_affinity`.
+        let lc = lv.to_cow();
+        let rc = rv.to_cow();
+        let coll_name = match collation {
+            CompiledCollation::BinaryBuiltin => None,
+            CompiledCollation::NoCaseBuiltin => Some("NOCASE"),
+            CompiledCollation::RtrimBuiltin => Some("RTRIM"),
+            CompiledCollation::Custom { name, .. } => Some(name.as_str()),
+        };
+        let ord = cmp_values_with_affinity(&lc, &rc, affinity, coll_name, &self.registry);
+        Some(apply_compiled_cmp_op(op, ord))
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
+    fn eval_val<'a>(
+        &'a self,
+        node_idx: u32,
+        outer_row: &'a [SqliteValue],
+        inner_row: &'a [SqliteValue],
+        rowid: i64,
+        outer_text_ascii: &[bool],
+        text_encoding: TextEncoding,
+    ) -> Result<ScanVal<'a>> {
+        match &self.nodes[node_idx as usize] {
+            CompiledScanNode::Literal(val) => Ok(ScanVal::Borrowed(val)),
+            CompiledScanNode::OuterCol(slot) => Ok(outer_row
+                .get(*slot)
+                .map_or(ScanVal::Null, ScanVal::Borrowed)),
+            CompiledScanNode::InnerCol(col) => Ok(inner_row
+                .get(*col)
+                .map_or(ScanVal::Null, ScanVal::Borrowed)),
+            CompiledScanNode::InnerRowId => Ok(ScanVal::Int(rowid)),
+            CompiledScanNode::Arith { left, right, op } => {
+                let lv = self.eval_val(
+                    *left,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )?;
+                let rv = self.eval_val(
+                    *right,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )?;
+                if let (Some(a), Some(b)) = (lv.as_int(), rv.as_int()) {
+                    return Ok(match op {
+                        CompiledArithOp::Add => match a.checked_add(b) {
+                            Some(res) => ScanVal::Int(res),
+                            None => ScanVal::Owned(
+                                SqliteValue::Integer(a).sql_add(&SqliteValue::Integer(b)),
+                            ),
+                        },
+                        CompiledArithOp::Sub => match a.checked_sub(b) {
+                            Some(res) => ScanVal::Int(res),
+                            None => ScanVal::Owned(
+                                SqliteValue::Integer(a).sql_sub(&SqliteValue::Integer(b)),
+                            ),
+                        },
+                        CompiledArithOp::Mul => match a.checked_mul(b) {
+                            Some(res) => ScanVal::Int(res),
+                            None => ScanVal::Owned(
+                                SqliteValue::Integer(a).sql_mul(&SqliteValue::Integer(b)),
+                            ),
+                        },
+                        CompiledArithOp::Div => {
+                            if b == 0 {
+                                ScanVal::Null
+                            } else {
+                                match a.checked_div(b) {
+                                    Some(res) => ScanVal::Int(res),
+                                    None => ScanVal::Owned(
+                                        SqliteValue::Integer(a).sql_div(&SqliteValue::Integer(b)),
+                                    ),
+                                }
+                            }
+                        }
+                        CompiledArithOp::Mod => {
+                            if b == 0 {
+                                ScanVal::Null
+                            } else {
+                                ScanVal::Int(a.checked_rem(b).unwrap_or(0))
+                            }
+                        }
+                    });
+                }
+                let lc = lv.to_cow();
+                let rc = rv.to_cow();
+                let out = match op {
+                    CompiledArithOp::Add => lc.sql_add(&rc),
+                    CompiledArithOp::Sub => lc.sql_sub(&rc),
+                    CompiledArithOp::Mul => lc.sql_mul(&rc),
+                    CompiledArithOp::Div => lc.sql_div(&rc),
+                    CompiledArithOp::Mod => lc.sql_rem(&rc),
+                };
+                Ok(ScanVal::Owned(out))
+            }
+            CompiledScanNode::Unary { inner, op } => {
+                let val = self.eval_val(
+                    *inner,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )?;
+                Ok(match op {
+                    UnaryOp::Plus => val,
+                    UnaryOp::Negate => {
+                        if let Some(n) = val.as_int() {
+                            n.checked_neg().map_or_else(
+                                || ScanVal::Owned(SqliteValue::Float(-(n as f64))),
+                                ScanVal::Int,
+                            )
+                        } else if let ScanVal::Borrowed(SqliteValue::Float(f))
+                        | ScanVal::Owned(SqliteValue::Float(f)) = &val
+                        {
+                            ScanVal::Owned(SqliteValue::Float(-*f))
+                        } else {
+                            ScanVal::Null
+                        }
+                    }
+                    UnaryOp::Not => {
+                        if val.is_null() {
+                            ScanVal::Null
+                        } else {
+                            ScanVal::Int(i64::from(!val.is_truthy(text_encoding)))
+                        }
+                    }
+                    UnaryOp::BitNot => {
+                        if val.is_null() {
+                            ScanVal::Null
+                        } else {
+                            ScanVal::Int(!val.to_integer())
+                        }
+                    }
+                })
+            }
+            CompiledScanNode::IsNull { inner, not } => {
+                let val = self.eval_val(
+                    *inner,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )?;
+                let is_null = val.is_null();
+                Ok(ScanVal::Int(i64::from(if *not { !is_null } else { is_null })))
+            }
+            CompiledScanNode::And { .. }
+            | CompiledScanNode::Or { .. }
+            | CompiledScanNode::Compare { .. } => {
+                Ok(match self.eval_bool(
+                    node_idx,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )? {
+                    None => ScanVal::Null,
+                    Some(b) => ScanVal::Int(i64::from(b)),
+                })
+            }
+            CompiledScanNode::Cast { inner, type_name } => {
+                let val = self.eval_val(
+                    *inner,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )?;
+                Ok(ScanVal::Owned(apply_cast(val.into_owned(), type_name)))
+            }
+            CompiledScanNode::Substr {
+                src,
+                start,
+                len,
+                outer_text_cache_idx,
+            } => {
+                let src_val = self.eval_val(
+                    *src,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )?;
+                let start_val = self.eval_val(
+                    *start,
+                    outer_row,
+                    inner_row,
+                    rowid,
+                    outer_text_ascii,
+                    text_encoding,
+                )?;
+                let len_val = match len {
+                    Some(len_idx) => Some(self.eval_val(
+                        *len_idx,
+                        outer_row,
+                        inner_row,
+                        rowid,
+                        outer_text_ascii,
+                        text_encoding,
+                    )?),
+                    None => None,
+                };
+                if src_val.is_null()
+                    || start_val.is_null()
+                    || len_val.as_ref().is_some_and(ScanVal::is_null)
+                {
+                    return Ok(ScanVal::Null);
+                }
+                // Zero-copy ASCII-without-NUL fast path: slices directly into
+                // the borrowed outer/inner string with zero `SmallText` alloc.
+                let borrowed_ascii_str: Option<&'a str> = match &src_val {
+                    ScanVal::TextSlice(s) => Some(*s),
+                    ScanVal::Borrowed(SqliteValue::Text(st)) => {
+                        if let Some(cache_idx) = *outer_text_cache_idx {
+                            outer_text_ascii[cache_idx].then_some(st.as_str())
+                        } else {
+                            st.as_str_checked().filter(|s| {
+                                s.as_bytes().iter().all(|&b| b != 0 && b < 0x80)
+                            })
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(s) = borrowed_ascii_str {
+                    let s_len = s.len() as i64;
+                    let mut p1 = i64::from(start_val.to_integer() as i32);
+                    let mut p2 = len_val
+                        .as_ref()
+                        .map_or(1_000_000_000_i64, |v| i64::from(v.to_integer() as i32));
+                    let neg_p2 = p2 < 0;
+                    if neg_p2 {
+                        p2 = p2.saturating_neg();
+                    }
+                    if p1 < 0 {
+                        p1 = p1.saturating_add(s_len);
+                        if p1 < 0 {
+                            p2 = p2.saturating_add(p1);
+                            p1 = 0;
+                        }
+                    } else if p1 > 0 {
+                        p1 -= 1;
+                    } else if p2 > 0 {
+                        p2 -= 1;
+                    }
+                    if neg_p2 {
+                        p1 = p1.saturating_sub(p2);
+                        if p1 < 0 {
+                            p2 = p2.saturating_add(p1);
+                            p1 = 0;
+                        }
+                    }
+                    if p1.saturating_add(p2) > s_len {
+                        p2 = s_len.saturating_sub(p1);
+                    }
+                    if p2 <= 0 {
+                        return Ok(ScanVal::TextSlice(""));
+                    }
+                    let start_idx = p1 as usize;
+                    let end_idx = (p1 + p2) as usize;
+                    return Ok(ScanVal::TextSlice(&s[start_idx..end_idx]));
+                }
+                // Exact fallback for UTF-8 multibyte, embedded NUL, BLOB, or
+                // owned/non-text `src`.
+                use fsqlite_func::ScalarFunction;
+                let res = if let Some(lv) = len_val {
+                    let args = [src_val.into_owned(), start_val.into_owned(), lv.into_owned()];
+                    fsqlite_func::builtins::SubstrFunc.invoke(&args)?
+                } else {
+                    let args = [src_val.into_owned(), start_val.into_owned()];
+                    fsqlite_func::builtins::SubstrFunc.invoke(&args)?
+                };
+                Ok(ScanVal::Owned(res))
+            }
+        }
+    }
+}
+
+#[inline]
+fn apply_compiled_cmp_op(op: CompiledCmpOp, ord: std::cmp::Ordering) -> bool {
+    match op {
+        CompiledCmpOp::Eq | CompiledCmpOp::Is => ord == std::cmp::Ordering::Equal,
+        CompiledCmpOp::Ne | CompiledCmpOp::IsNot => ord != std::cmp::Ordering::Equal,
+        CompiledCmpOp::Lt => ord == std::cmp::Ordering::Less,
+        CompiledCmpOp::Le => ord != std::cmp::Ordering::Greater,
+        CompiledCmpOp::Gt => ord == std::cmp::Ordering::Greater,
+        CompiledCmpOp::Ge => ord != std::cmp::Ordering::Less,
+    }
 }
 
 impl ScanExistsProbeTemplate {
@@ -167751,16 +169456,21 @@ fn exact_i64_for_float(value: f64) -> Option<i64> {
 /// depth and clears the cached value-sets once the outermost loop finishes.
 struct ExistsProbeMemoGuard<'a> {
     conn: &'a Connection,
+    has_pinned_frame: bool,
 }
 
 impl Drop for ExistsProbeMemoGuard<'_> {
     fn drop(&mut self) {
         let mut memo = self.conn.exists_probe_memo.borrow_mut();
+        if self.has_pinned_frame {
+            memo.pinned_frames.pop();
+        }
         memo.depth = memo.depth.saturating_sub(1);
         if memo.depth == 0 {
             memo.linear_rows_scanned.clear();
             memo.sets.clear();
             memo.scan_templates.clear();
+            memo.pinned_frames.clear();
         }
     }
 }
@@ -167777,6 +169487,81 @@ mod exists_value_set_tests {
     use std::future::{Future, poll_fn};
     use std::sync::Arc;
     use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn compiled_scan_exists_program_compiles_sudoku_predicate_bd_m2tjm() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE digits(z TEXT, lp INTEGER)")
+                .await
+                .unwrap();
+            for d in 1..=9 {
+                conn.execute(&format!("INSERT INTO digits VALUES ('{d}', {d})"))
+                    .await
+                    .unwrap();
+            }
+            let op_cx = conn.op_cx_after_background_status();
+            if conn.retained_autocommit_txn.borrow().is_some() {
+                conn.flush_retained_autocommit_txn(&op_cx).await.unwrap();
+            }
+            conn.reload_memdb_from_pager(&op_cx).await.unwrap();
+            assert!(conn.join_mem_scan_safe());
+            let sql = "SELECT 1 FROM digits AS lp \
+                WHERE z.z = substr(s, ((ind-1)/9)*9 + lp, 1) \
+                   OR z.z = substr(s, ((ind-1)%9) + (lp-1)*9 + 1, 1) \
+                   OR z.z = substr(s, (((ind-1)/3) % 3) * 3 + ((ind-1)/27) * 27 + lp + ((lp-1) / 3) * 6, 1)";
+            let (statement, _) = fsqlite_parser::parse_first_statement_with_tail(sql)
+                .unwrap()
+                .unwrap();
+            let Statement::Select(subquery) = statement else {
+                panic!("expected SELECT");
+            };
+            let col_map = vec![
+                ("x".to_owned(), "s".to_owned(), false),
+                ("x".to_owned(), "ind".to_owned(), false),
+                ("z".to_owned(), "z".to_owned(), false),
+                ("z".to_owned(), "lp".to_owned(), false),
+            ];
+            let template = conn.with_fallback_function_registry(|| {
+                conn.build_scan_exists_template(&subquery, &col_map, 4, None)
+            });
+            let ready = template
+                .ready
+                .as_ref()
+                .expect("Sudoku EXISTS subquery must build a scan template");
+            let compiled = ready
+                .compiled
+                .as_ref()
+                .expect("Sudoku EXISTS subquery must compile into CompiledScanProgram");
+            assert_eq!(compiled.outer_text_slots.as_slice(), &[0]);
+
+            let board = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79";
+            // ind = 3 (row 0, col 2): '5' conflicts in row 0, '4' is legal.
+            let conflict_row = vec![
+                SqliteValue::from(board),
+                SqliteValue::Integer(3),
+                SqliteValue::from("5"),
+                SqliteValue::Integer(5),
+            ];
+            assert!(
+                conn.run_compiled_scan_exists_probe(compiled, &conflict_row)
+                    .unwrap()
+                    .unwrap()
+            );
+            let legal_row = vec![
+                SqliteValue::from(board),
+                SqliteValue::Integer(3),
+                SqliteValue::from("4"),
+                SqliteValue::Integer(4),
+            ];
+            assert!(
+                !conn
+                    .run_compiled_scan_exists_probe(compiled, &legal_row)
+                    .unwrap()
+                    .unwrap()
+            );
+        });
+    }
 
     #[test]
     fn lazy_in_memo_isolates_non_lifo_pending_executions() {
@@ -192304,6 +194089,15 @@ fn current_join_eval_collation_context_snapshot() -> Option<Arc<JoinEvalCollatio
     CURRENT_JOIN_EVAL_COLLATION_CONTEXT.with(|stack| stack.borrow().last().cloned())
 }
 
+fn current_join_eval_collation_context_ptr() -> usize {
+    CURRENT_JOIN_EVAL_COLLATION_CONTEXT.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .map_or(0, |ctx| Arc::as_ptr(ctx) as usize)
+    })
+}
+
 fn current_join_using_column_projection(column_name: &str) -> Option<JoinUsingProjection> {
     // Evaluated for every unqualified column reference on every row. Borrow
     // the current context in place (nothing here re-enters the stack), and
@@ -192426,14 +194220,16 @@ fn evaluated_arg_json_subtype(expr: &Expr) -> u32 {
 
 /// Evaluate a scalar call's arguments with `eval`, together with the subtype
 /// each one carries (see `evaluated_arg_json_subtype`).
+type ScalarCallArgs = (SmallVec<[SqliteValue; 4]>, SmallVec<[u32; 4]>);
+
 fn eval_scalar_call_args(
     args: &FunctionArgs,
     mut eval: impl FnMut(&Expr) -> Result<SqliteValue>,
-) -> Result<(Vec<SqliteValue>, SmallVec<[u32; 4]>)> {
+) -> Result<ScalarCallArgs> {
     let FunctionArgs::List(exprs) = args else {
-        return Ok((Vec::new(), SmallVec::new()));
+        return Ok((SmallVec::new(), SmallVec::new()));
     };
-    let mut values = Vec::with_capacity(exprs.len());
+    let mut values = SmallVec::with_capacity(exprs.len());
     let mut subtypes = SmallVec::with_capacity(exprs.len());
     for expr in exprs {
         LAST_VARYING_RESULT_SUBTYPE.with(|cell| cell.set(0));
@@ -196391,6 +198187,15 @@ pub(crate) fn eval_join_expr(
                 return eval_join_row_value_comparison(left, *op, right, row, col_map);
             }
             let lv = eval_join_expr(left, row, col_map)?;
+            // Short-circuit SQLite three-valued OR/AND on decisive non-NULL LHS
+            // (TRUE OR x == 1, FALSE AND x == 0), matching SQLite's OP_If /
+            // OP_IfNot and avoiding wasted RHS evaluation on disjunctions.
+            if matches!(op, BinaryOp::Or) && !lv.is_null() && is_sqlite_truthy(&lv) {
+                return Ok(SqliteValue::Integer(1));
+            }
+            if matches!(op, BinaryOp::And) && !lv.is_null() && !is_sqlite_truthy(&lv) {
+                return Ok(SqliteValue::Integer(0));
+            }
             let rv = eval_join_expr(right, row, col_map)?;
             Ok(eval_join_binary_op(left, &lv, *op, right, &rv, col_map))
         }
