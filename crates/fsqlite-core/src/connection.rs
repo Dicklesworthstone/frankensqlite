@@ -48949,6 +48949,50 @@ impl Connection {
                     || (returning_needs_select_path && !pins_one_row)
                     || ((computes_new_images || update_may_fire_replace_callbacks)
                         && (effective_update.from.is_some() || !pins_one_row));
+                // bd-p5k2i: when SET subqueries cannot observe earlier writes
+                // in the same statement (no self-read directly or through
+                // views/CTEs/virtual tables, no UPDATE triggers, no active FK
+                // actions, no replace-victim callbacks, no correlated
+                // RETURNING, no OR FAIL), compute every qualifying row's
+                // locator and SET values in ONE SELECT over the target table
+                // and apply them with one compiled single-row UPDATE program.
+                let can_batch_correlated_set = set_needs_select_path
+                    && effective_update.from.is_none()
+                    && !computes_new_images
+                    && !update_may_fire_replace_callbacks
+                    && !returning_needs_select_path
+                    && effective_update.or_conflict != Some(fsqlite_ast::ConflictAction::Fail)
+                    && self.update_can_batch_correlated_set_select(&effective_update, table_name);
+                if can_batch_correlated_set
+                    && let Some((locator_columns, set_columns, evaluated_rows)) =
+                        lean_future(|| {
+                            self.materialize_batched_correlated_set_update_rows(
+                                &effective_update,
+                                params,
+                            )
+                        })
+                        .await?
+                {
+                    self.log_mem_execution_fallback(
+                        "update",
+                        "update_row_by_row_correlated_set_fallback",
+                    )?;
+                    self.log_mem_execution_fallback(
+                        "update",
+                        "update_batched_correlated_set_select",
+                    )?;
+                    return boxed_future(|| {
+                        self.execute_batched_update_from_precomputed_rows(
+                            cx,
+                            &effective_update,
+                            params,
+                            &locator_columns,
+                            &set_columns,
+                            &evaluated_rows,
+                        )
+                    })
+                    .await;
+                }
                 let replay_locators = if !needs_row_by_row_replay {
                     None
                 } else if effective_update.from.is_some() {
@@ -65434,6 +65478,285 @@ impl Connection {
             .map(|(column, _)| column.to_owned())
             .collect();
         Ok(Some((locator_columns, set_columns, rows)))
+    }
+
+    /// bd-p5k2i: whether an uncompiled correlated-SET UPDATE can evaluate every
+    /// target row's SET values in one SELECT over the target before applying
+    /// the writes by locator. Declines any SET expression that reads the target
+    /// table (directly, transitively through views/CTEs, or through a live
+    /// virtual table) and any `OR REPLACE` / column `ON CONFLICT REPLACE` that
+    /// reassigns a locator column.
+    fn update_can_batch_correlated_set_select(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        table_name: &str,
+    ) -> bool {
+        let Ok(set_pairs) = Self::update_set_pairs(update) else {
+            return false;
+        };
+        if self.update_set_reads_target_table(&set_pairs, table_name) {
+            return false;
+        }
+        let may_replace = update.or_conflict == Some(fsqlite_ast::ConflictAction::Replace)
+            || self.table_declares_replace_conflict(
+                table_name,
+                update.table.name.schema.as_deref(),
+            );
+        if may_replace
+            && let Ok(Some(locator_columns)) = self.dml_replay_locator_columns(&update.table)
+            && set_pairs.iter().any(|(column, _)| {
+                locator_columns
+                    .iter()
+                    .any(|locator| locator.eq_ignore_ascii_case(column))
+                    || ["rowid", "_rowid_", "oid"]
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(column))
+            })
+        {
+            return false;
+        }
+        true
+    }
+
+    /// bd-p5k2i: whether any SET expression in `set_pairs` can read
+    /// `table_name`, directly, transitively through any view or CTE, or through
+    /// a live virtual table (such as an external-content FTS5 table).
+    fn update_set_reads_target_table(
+        &self,
+        set_pairs: &[(&str, &Expr)],
+        table_name: &str,
+    ) -> bool {
+        let target_lower = table_name.to_ascii_lowercase();
+        let mut pending = Vec::new();
+        for (_, value) in set_pairs {
+            let _ = visit_expr_qualified_names(value, &mut |name| {
+                pending.push(name.name.to_ascii_lowercase());
+                Ok(())
+            });
+        }
+        let views = self.views.borrow();
+        let mut expanded = HashSet::new();
+        while let Some(name) = pending.pop() {
+            if name == target_lower || self.has_live_vtab_instance(&name) {
+                return true;
+            }
+            if expanded.insert(name.clone()) {
+                for view in views
+                    .iter()
+                    .filter(|view| view.name.eq_ignore_ascii_case(&name))
+                {
+                    let _ = visit_select_qualified_names(&view.query, &mut |inner| {
+                        pending.push(inner.name.to_ascii_lowercase());
+                        Ok(())
+                    });
+                }
+            }
+        }
+        false
+    }
+
+    /// bd-p5k2i: evaluate every qualifying target row's locator and SET values
+    /// in a single SELECT over the target table, sorted in row-key order
+    /// (matching [`Self::materialize_dml_replay_locators`]).
+    async fn materialize_batched_correlated_set_update_rows(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<(Vec<String>, Vec<String>, Vec<Vec<SqliteValue>>)>> {
+        let Some(locator_columns) = self.dml_replay_locator_columns(&update.table)? else {
+            return Ok(None);
+        };
+        let set_pairs = Self::update_set_pairs(update)?;
+        let projections = locator_columns
+            .iter()
+            .map(|column| Self::build_limit_scope_projection_expr(&update.table, column))
+            .chain(set_pairs.iter().map(|(_, value)| (*value).clone()))
+            .map(|expr| ResultColumn::Expr { expr, alias: None })
+            .collect();
+        let select = Self::build_single_table_select(
+            &update.table,
+            projections,
+            update.where_clause.as_ref(),
+            &[],
+            None,
+        );
+        let mut rows: Vec<Vec<SqliteValue>> = self
+            .execute_statement(&Statement::Select(select), params)
+            .await?
+            .into_iter()
+            .map(|row| row.values().to_vec())
+            .collect();
+        if rows.len() > 1 {
+            match self.without_rowid_row_key_order(&update.table)? {
+                None => rows.sort_by(|left, right| cmp_sqlite_values(&left[0], &right[0])),
+                Some(key_order) => {
+                    let registry = lock_unpoisoned(self.collation_registry.as_ref()).clone();
+                    rows.sort_by(|left, right| {
+                        compare_without_rowid_row_keys(&key_order, &registry, |position, _| {
+                            (left.get(position), right.get(position))
+                        })
+                    });
+                }
+            }
+        }
+        let set_columns = set_pairs
+            .into_iter()
+            .map(|(column, _)| column.to_owned())
+            .collect();
+        Ok(Some((locator_columns, set_columns, rows)))
+    }
+
+    /// bd-p5k2i: apply precomputed `(locator..., set_values...)` rows from one
+    /// single-SELECT pass using one compiled parameterized single-row UPDATE
+    /// program, avoiding per-row statement dispatch, AST cloning, and MemDB
+    /// reload churn while preserving full VDBE constraint, index, STRICT,
+    /// WITHOUT ROWID, RETURNING, change-count, and rollback semantics.
+    async fn execute_batched_update_from_precomputed_rows(
+        &self,
+        cx: &Cx,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+        locator_columns: &[String],
+        set_columns: &[String],
+        evaluated_rows: &[Vec<SqliteValue>],
+    ) -> Result<Vec<Row>> {
+        if evaluated_rows.is_empty() {
+            self.record_statement_changes(0);
+            return Ok(Vec::new());
+        }
+        let row_value_count = locator_columns.len() + set_columns.len();
+        let has_returning = !update.returning.is_empty();
+        let caller_params = if has_returning {
+            params.unwrap_or(&[])
+        } else {
+            &[]
+        };
+        let parameter_base = if has_returning {
+            Self::dml_replay_statement_parameter_slots(DmlRowReplay::UpdateFrom {
+                update,
+                set_columns,
+            })?
+            .max(caller_params.len())
+        } else {
+            0
+        };
+        if parameter_base + row_value_count
+            > usize::try_from(MAX_VARIABLE_NUMBER).unwrap_or(usize::MAX)
+        {
+            return self
+                .execute_dml_row_by_row(
+                    DmlRowReplay::UpdateFrom {
+                        update,
+                        set_columns,
+                    },
+                    params,
+                    locator_columns,
+                    evaluated_rows,
+                )
+                .await;
+        }
+
+        let mut slots = (parameter_base + 1..).map(|slot| {
+            Expr::Placeholder(
+                PlaceholderType::Numbered(u32::try_from(slot).unwrap_or(u32::MAX)),
+                Span::ZERO,
+            )
+        });
+        let locator_slots: Vec<Expr> = slots.by_ref().take(locator_columns.len()).collect();
+        let set_slots: Vec<Expr> = slots.take(set_columns.len()).collect();
+        let Statement::Update(row_update) = self.build_dml_replay_row_statement(
+            DmlRowReplay::UpdateFrom {
+                update,
+                set_columns,
+            },
+            locator_columns,
+            locator_slots,
+            set_slots,
+        )?
+        else {
+            return Err(FrankenError::Internal(
+                "batched correlated UPDATE replay did not build an UPDATE statement".to_owned(),
+            ));
+        };
+        let program = self.compile_table_update(&row_update)?;
+
+        let previous_total_changes = self.total_changes.get();
+        let previous_last_insert_rowid = self.current_last_insert_rowid();
+        let memdb_stmt_guard = MemDbStatementGuard::enter(&self.db);
+        let mut row_params = if parameter_base > 0 {
+            Vec::with_capacity(parameter_base + row_value_count)
+        } else {
+            Vec::new()
+        };
+        let mut statement_changes = 0usize;
+        let mut returning_rows = Vec::new();
+        let mut execution_result = Ok(());
+
+        for row in evaluated_rows {
+            if row.len() != row_value_count {
+                execution_result = Err(FrankenError::Internal(format!(
+                    "batched correlated UPDATE row arity mismatch: expected {row_value_count}, got {}",
+                    row.len()
+                )));
+                break;
+            }
+            let bind_slice: &[SqliteValue] = if parameter_base == 0 {
+                row.as_slice()
+            } else {
+                row_params.clear();
+                row_params.extend_from_slice(caller_params);
+                row_params.resize(parameter_base, SqliteValue::Null);
+                row_params.extend_from_slice(row);
+                row_params.as_slice()
+            };
+            match self
+                .execute_table_program_with_cx(
+                    &program,
+                    Some(bind_slice),
+                    false,
+                    TableExecutionRuntimeRequirements::read_path(),
+                    cx,
+                    true,
+                    Vec::new(),
+                    None,
+                    false,
+                )
+                .await
+            {
+                Ok((rows, affected, _)) => {
+                    statement_changes = statement_changes.saturating_add(affected);
+                    if has_returning {
+                        returning_rows.extend(rows);
+                    }
+                }
+                Err(error) => {
+                    if self.internal_statement_savepoint_depth.get() > 0 {
+                        self.restore_change_tracking_state(
+                            0,
+                            previous_total_changes,
+                            previous_last_insert_rowid,
+                        );
+                    } else {
+                        self.set_statement_change_count(statement_changes);
+                        self.record_table_program_error_state(
+                            statement_changes,
+                            (statement_changes > 0).then(|| self.current_last_insert_rowid()),
+                        );
+                    }
+                    execution_result = Err(error);
+                    break;
+                }
+            }
+        }
+
+        let unwind = execution_result.as_ref().is_err_and(|error| {
+            !self.statement_failure_keeps_rows(false, error)
+                && !self.statement_failure_keeps_rows_via_elided_stmt_journal(error)
+        });
+        memdb_stmt_guard.finish(unwind);
+        execution_result?;
+        self.record_statement_changes(statement_changes);
+        Ok(returning_rows)
     }
 
     /// bd-hga35: whether a RETURNING list holds a correlated subquery the
