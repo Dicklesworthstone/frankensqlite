@@ -4412,9 +4412,10 @@ impl PagerBackend {
         #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
         {
             let requested = Path::new(path);
-            #[cfg(target_os = "linux")]
-            let resolved = IoUringVfs::new().full_pathname(cx, requested)?;
-            #[cfg(all(unix, not(target_os = "linux")))]
+            // `IoUringVfs::full_pathname` delegates directly to `UnixVfs::full_pathname`;
+            // avoid allocating and immediately tearing down a throwaway `io_uring` ring
+            // on every `Connection::open` (bd-w4pr1.37).
+            #[cfg(unix)]
             let resolved = UnixVfs::new().full_pathname(cx, requested)?;
             #[cfg(target_os = "windows")]
             let resolved = fsqlite_vfs::WindowsVfs::new().full_pathname(cx, requested)?;
@@ -6114,9 +6115,12 @@ impl PagerBackend {
                 wal_file_present_with_vfs(vfs.as_ref(), cx, &wal_path)
             }
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(_) => {
-                let vfs = IoUringVfs::new();
-                wal_file_present_with_vfs(&vfs, cx, &wal_path)
+            Self::IoUring(p) => {
+                // Reuse the pager's existing VFS handle instead of allocating
+                // and dropping a throwaway `io_uring` ring just to stat `-wal`
+                // (bd-w4pr1.37).
+                let vfs = p.vfs_handle();
+                wal_file_present_with_vfs(vfs.as_ref(), cx, &wal_path)
             }
             #[cfg(all(feature = "native", unix))]
             Self::Unix(_) => {

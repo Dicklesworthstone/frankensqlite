@@ -160,33 +160,54 @@ const STATEMENTS: [&str; 9] = [
     "UPDATE {or}u SET c = c + v.nc FROM src AS v WHERE v.k = 3 AND u.a > 3",
 ];
 
-async fn run_case(
-    schema: &Schema,
-    trigger: (&str, &str),
+const RESET_ROWS_BASE: &str = "DELETE FROM u; DELETE FROM log;
+     INSERT INTO u(a, b, c, d) VALUES (1, 10, 1, 2), (2, 20, 2, 3), (3, 30, 3, 4),
+       (4, 40, 4, 5), (5, 50, 5, 6);";
+
+const RESET_ROWS_FK: &str = "DELETE FROM child; DELETE FROM u; DELETE FROM log;
+     INSERT INTO u(a, b, c, d) VALUES (1, 10, 1, 2), (2, 20, 2, 3), (3, 30, 3, 4),
+       (4, 40, 4, 5), (5, 50, 5, 6);
+     INSERT INTO child VALUES (10), (30);";
+
+fn check_stock_integrity(conn: &rusqlite::Connection) -> Vec<String> {
+    conn.prepare("PRAGMA integrity_check")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+struct CaseContext<'a> {
+    schema: &'a Schema,
+    trigger: (&'static str, &'static str),
     fk: bool,
+    reset_sql: &'static str,
+    stock_setup: &'a str,
+}
+
+async fn run_case(
+    ctx: &CaseContext<'_>,
+    frank: &Connection,
+    stock_checker: &rusqlite::Connection,
     sql: &str,
     failures: &mut Vec<String>,
 ) {
-    let label = format!("[{} | {} | fk={fk}] {sql}", schema.name, trigger.0);
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("frank.db");
-    let path_str = path.to_str().expect("utf-8 path").to_owned();
-    let frank = Connection::open(&path_str).await.expect("open");
-    let stock = rusqlite::Connection::open_in_memory().expect("stock open");
-    let fk_setup = if fk {
-        "PRAGMA foreign_keys = ON;
-         CREATE TABLE child(cb REFERENCES u(b) ON UPDATE CASCADE);
-         INSERT INTO child VALUES (10), (30);"
-    } else {
-        ""
-    };
-    let setup = format!("{} {SEED} {} {fk_setup}", schema.ddl, trigger.1);
-    frank.execute_batch(&setup).await.expect("frank setup");
-    stock.execute_batch(&setup).expect("stock setup");
+    let label = format!(
+        "[{} | {} | fk={}] {sql}",
+        ctx.schema.name, ctx.trigger.0, ctx.fk
+    );
+    frank
+        .execute_batch(&format!("BEGIN; {} COMMIT;", ctx.reset_sql))
+        .await
+        .expect("frank reset");
 
-    let frank_before = single_integer(&frank_rows(&frank, "SELECT total_changes()").await);
+    let stock = rusqlite::Connection::open_in_memory().expect("stock open");
+    stock.execute_batch(ctx.stock_setup).expect("stock setup");
+
+    let frank_before = single_integer(&frank_rows(frank, "SELECT total_changes()").await);
     let stock_before = single_integer(&stock_rows(&stock, "SELECT total_changes()"));
-    let frank_result = frank_run(&frank, sql).await;
+    let frank_result = frank_run(frank, sql).await;
     let stock_result = stock_run(&stock, sql);
     match (&frank_result, &stock_result) {
         (Ok(f), Ok(s)) if f != s => failures.push(format!(
@@ -202,15 +223,15 @@ async fn run_case(
         }
     }
     let mut queries = vec![
-        schema.check,
+        ctx.schema.check,
         "SELECT ev FROM log ORDER BY seq",
         "SELECT changes()",
     ];
-    if fk {
+    if ctx.fk {
         queries.push("SELECT cb FROM child ORDER BY rowid");
     }
     for query in queries {
-        let (f, s) = (frank_rows(&frank, query).await, stock_rows(&stock, query));
+        let (f, s) = (frank_rows(frank, query).await, stock_rows(&stock, query));
         if f != s {
             failures.push(format!(
                 "{label} :: `{query}` differs:\n  frank {f:?}\n  stock {s:?}"
@@ -218,23 +239,15 @@ async fn run_case(
         }
     }
     let frank_delta =
-        single_integer(&frank_rows(&frank, "SELECT total_changes()").await) - frank_before;
+        single_integer(&frank_rows(frank, "SELECT total_changes()").await) - frank_before;
     let stock_delta = single_integer(&stock_rows(&stock, "SELECT total_changes()")) - stock_before;
     if frank_delta != stock_delta {
         failures.push(format!(
             "{label} :: total_changes() delta {frank_delta} vs SQLite {stock_delta}"
         ));
     }
-    frank.close().await.expect("close");
 
-    let checked = rusqlite::Connection::open(&path).expect("stock open of fsqlite file");
-    let verdict: Vec<String> = checked
-        .prepare("PRAGMA integrity_check")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
+    let verdict = check_stock_integrity(stock_checker);
     if verdict != ["ok"] {
         failures.push(format!("{label} :: stock integrity_check: {verdict:?}"));
     }
@@ -248,12 +261,69 @@ fn update_from_with_triggers_and_fks_matches_stock_in_every_conflict_mode() {
         for schema in &SCHEMAS {
             for trigger in TRIGGERS {
                 for fk in [false, true] {
+                    // One file-backed DB per (schema, trigger, fk) group (18 DBs
+                    // instead of 972) with mutable rows reset between the 54
+                    // autocommit UPDATE ... FROM cases. Live stock SQLite
+                    // `PRAGMA integrity_check` still runs after every single one
+                    // of the 972 cases (via a read-only handle) and again after
+                    // close/checkpoint, without 972x open/close fsync & io_uring
+                    // storms that stalled 11-15+ min on shared-disk Contabo
+                    // workers (bd-w4pr1.37).
+                    let dir = tempfile::tempdir().expect("group temp dir");
+                    let path = dir.path().join("frank.db");
+                    let path_str = path.to_str().expect("utf-8 path").to_owned();
+                    let frank = Connection::open(&path_str).await.expect("open");
+                    frank
+                        .execute("PRAGMA synchronous = OFF;")
+                        .await
+                        .expect("synchronous=OFF");
+
+                    let fk_pragma = if fk { "PRAGMA foreign_keys = ON;" } else { "" };
+                    let fk_ddl = if fk {
+                        "CREATE TABLE child(cb REFERENCES u(b) ON UPDATE CASCADE);
+                         INSERT INTO child VALUES (10), (30);"
+                    } else {
+                        ""
+                    };
+                    let setup_body = format!("{} {SEED} {} {fk_ddl}", schema.ddl, trigger.1);
+                    let setup_sql = format!("{fk_pragma} BEGIN; {setup_body} COMMIT;");
+                    frank.execute_batch(&setup_sql).await.expect("frank setup");
+
+                    let stock_checker = rusqlite::Connection::open_with_flags(
+                        &path,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .expect("stock read-only open of fsqlite file");
+                    let ctx = CaseContext {
+                        schema,
+                        trigger,
+                        fk,
+                        reset_sql: if fk { RESET_ROWS_FK } else { RESET_ROWS_BASE },
+                        stock_setup: &setup_sql,
+                    };
+
                     for template in STATEMENTS {
                         for mode in MODES {
                             let sql = template.replace("{or}", mode);
-                            run_case(schema, trigger, fk, &sql, &mut failures).await;
+                            run_case(&ctx, &frank, &stock_checker, &sql, &mut failures).await;
                             cases += 1;
                         }
+                    }
+
+                    drop(stock_checker);
+                    frank.close().await.expect("close");
+
+                    let post_close = rusqlite::Connection::open_with_flags(
+                        &path,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .expect("stock post-close open of fsqlite file");
+                    let verdict = check_stock_integrity(&post_close);
+                    if verdict != ["ok"] {
+                        failures.push(format!(
+                            "[{} | {} | fk={fk}] post-close stock integrity_check: {verdict:?}",
+                            schema.name, trigger.0
+                        ));
                     }
                 }
             }
@@ -317,6 +387,7 @@ fn update_or_ignore_from_alias_with_trigger_and_parameter() {
             frank_rows(&frank, "SELECT ev FROM log").await,
             vec![vec![SqliteValue::from("3:99")]]
         );
+        frank.close().await.expect("close");
     });
 }
 
@@ -343,5 +414,6 @@ fn replayed_update_or_rollback_reports_the_constraint_error() {
         );
         let check = "SELECT (SELECT group_concat(b) FROM u), (SELECT count(*) FROM log)";
         assert_eq!(frank_rows(&frank, check).await, stock_rows(&stock, check));
+        frank.close().await.expect("close");
     });
 }
