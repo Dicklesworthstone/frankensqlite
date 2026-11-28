@@ -1049,7 +1049,16 @@ fn bd_ncivz_2_epoch_fence_waits_for_active_core_observation() {
         let observer_ref = Arc::clone(&coordinator);
         let observer = handle
             .try_spawn(async move {
-                sleep(wall_now(), Duration::from_millis(8)).await;
+                // Synchronize deterministically on epoch publication rather than
+                // racing a fixed wall-clock sleep against a tight fence timeout (bd-gp7t8).
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while observer_ref.current_epoch() != 1 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fence should publish epoch 1 before timing out"
+                    );
+                    yield_now().await;
+                }
                 observer_ref
                     .observe_epoch(0)
                     .expect("core 0 observation should succeed");
@@ -1061,7 +1070,7 @@ fn bd_ncivz_2_epoch_fence_waits_for_active_core_observation() {
 
         let fence_ref = Arc::clone(&coordinator);
         let next_epoch = spawn_blocking(move || {
-            fence_ref.advance_epoch_and_wait(&[0, 1], Duration::from_millis(200))
+            fence_ref.advance_epoch_and_wait(&[0, 1], Duration::from_secs(5))
         })
         .await
         .expect("fence should complete after observations");
@@ -1095,7 +1104,7 @@ fn bd_ncivz_2_append_during_epoch_fence_stays_in_previous_epoch_lane() {
         let advance = handle
             .try_spawn(async move {
                 spawn_blocking(move || {
-                    advance_ref.advance_epoch_and_wait(&[0], Duration::from_millis(200))
+                    advance_ref.advance_epoch_and_wait(&[0], Duration::from_secs(5))
                 })
                 .await
             })
@@ -1110,7 +1119,7 @@ fn bd_ncivz_2_append_during_epoch_fence_stays_in_previous_epoch_lane() {
         // that, at which point the task was never polled at all and this
         // deadline expired every single run. Awaiting `yield_now()` returns
         // control to the executor, which is what the loop actually needs.
-        let deadline = Instant::now() + Duration::from_millis(200);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while coordinator.current_epoch() != 1 {
             assert!(
                 Instant::now() < deadline,
@@ -1191,7 +1200,14 @@ fn bd_ncivz_2_group_commit_flushes_epoch_across_cores() {
         let observer_ref = Arc::clone(&coordinator);
         let observer = handle
             .try_spawn(async move {
-                sleep(wall_now(), Duration::from_millis(6)).await;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while observer_ref.current_epoch() != 1 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "group commit epoch advance should publish epoch 1 before timing out"
+                    );
+                    yield_now().await;
+                }
                 observer_ref
                     .observe_epoch(0)
                     .expect("core 0 observation should succeed");
@@ -1202,11 +1218,9 @@ fn bd_ncivz_2_group_commit_flushes_epoch_across_cores() {
             .expect("observer task should spawn");
 
         let advance_ref = Arc::clone(&coordinator);
-        spawn_blocking(move || {
-            advance_ref.advance_epoch_and_wait(&[0, 1], Duration::from_millis(200))
-        })
-        .await
-        .expect("epoch advance should succeed");
+        spawn_blocking(move || advance_ref.advance_epoch_and_wait(&[0, 1], Duration::from_secs(5)))
+            .await
+            .expect("epoch advance should succeed");
         observer.await;
 
         let batch = coordinator
@@ -1221,7 +1235,7 @@ fn bd_ncivz_2_group_commit_flushes_epoch_across_cores() {
         coordinator.mark_epoch_durable(0);
         assert_eq!(coordinator.durable_epoch(), Some(0));
         coordinator
-            .wait_until_epoch_durable(0, Duration::from_millis(25))
+            .wait_until_epoch_durable(0, Duration::from_secs(5))
             .expect("durability wait should pass");
     });
 }
@@ -1247,7 +1261,7 @@ fn bd_ncivz_2_writers_block_until_epoch_is_durable() {
         let waiter = handle
             .try_spawn(async move {
                 spawn_blocking(move || {
-                    waiter_ref.wait_until_epoch_durable(0, Duration::from_millis(600))
+                    waiter_ref.wait_until_epoch_durable(0, Duration::from_secs(5))
                 })
                 .await
             })
@@ -1260,7 +1274,7 @@ fn bd_ncivz_2_writers_block_until_epoch_is_durable() {
         );
 
         let advance_ref = Arc::clone(&coordinator);
-        spawn_blocking(move || advance_ref.advance_epoch_and_wait(&[], Duration::from_millis(25)))
+        spawn_blocking(move || advance_ref.advance_epoch_and_wait(&[], Duration::from_secs(5)))
             .await
             .expect("advancing with no active fence set should succeed");
         assert_eq!(

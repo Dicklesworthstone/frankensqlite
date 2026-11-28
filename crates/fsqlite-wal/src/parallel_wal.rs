@@ -4562,11 +4562,14 @@ mod tests {
 
         let initial_epoch = coordinator.current_epoch();
 
-        // Start the ticker and wait for several epochs.
+        // Start the ticker and wait for the epoch counter to advance (bd-gp7t8).
         coordinator
             .start_on_runtime(&runtime.handle(), &cx)
             .expect("start should succeed");
-        std::thread::sleep(Duration::from_millis(50));
+        let advance_deadline = Instant::now() + Duration::from_secs(5);
+        while coordinator.current_epoch() == initial_epoch && Instant::now() < advance_deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
         coordinator.stop();
 
         let final_epoch = coordinator.current_epoch();
@@ -4593,7 +4596,16 @@ mod tests {
             .start_on_runtime(&runtime.handle(), &parent_cx)
             .expect("initial start should succeed");
         parent_cx.cancel();
-        std::thread::sleep(Duration::from_millis(15));
+        // Wait deterministically for the cancelled ticker task to clear its
+        // running flag instead of racing a fixed 15ms sleep (bd-gp7t8).
+        let stop_deadline = Instant::now() + Duration::from_secs(5);
+        while coordinator.is_running() {
+            assert!(
+                Instant::now() < stop_deadline,
+                "cancelled epoch ticker should exit and clear running flag before restart"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
 
         let replacement_cx = test_cx();
         coordinator

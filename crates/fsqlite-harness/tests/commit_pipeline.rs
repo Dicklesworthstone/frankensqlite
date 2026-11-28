@@ -162,10 +162,7 @@ fn test_backpressure_blocks_at_capacity() {
         drop(permit);
     });
 
-    wait_until(
-        || started.load(Ordering::SeqCst),
-        Duration::from_millis(200),
-    );
+    wait_until(|| started.load(Ordering::SeqCst), Duration::from_secs(5));
     thread::sleep(Duration::from_millis(20));
     assert!(
         !acquired.load(Ordering::SeqCst),

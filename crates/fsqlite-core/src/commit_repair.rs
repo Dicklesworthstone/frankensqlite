@@ -73,6 +73,8 @@ struct LogicalCapacity {
     available: Mutex<usize>,
     max_permits: usize,
     changed: Condvar,
+    #[cfg(test)]
+    waiters: std::sync::atomic::AtomicUsize,
 }
 
 impl LogicalCapacity {
@@ -82,6 +84,8 @@ impl LogicalCapacity {
             available: Mutex::new(normalized),
             max_permits: normalized,
             changed: Condvar::new(),
+            #[cfg(test)]
+            waiters: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -101,7 +105,11 @@ impl LogicalCapacity {
                 return None;
             }
 
+            #[cfg(test)]
+            self.waiters.fetch_add(1, Ordering::AcqRel);
             let wait_result = self.changed.wait_timeout(available, remaining);
+            #[cfg(test)]
+            self.waiters.fetch_sub(1, Ordering::AcqRel);
             let (guard, _) = wait_result.unwrap_or_else(std::sync::PoisonError::into_inner);
             available = guard;
         }
@@ -119,6 +127,11 @@ impl LogicalCapacity {
 
     fn max_permits(&self) -> usize {
         self.max_permits
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.waiters.load(Ordering::Acquire)
     }
 }
 
@@ -361,6 +374,12 @@ impl TwoPhaseCommitSender {
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.shared.capacity()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn waiter_count(&self) -> usize {
+        self.shared.logical_capacity.waiter_count()
     }
 }
 
@@ -1557,6 +1576,31 @@ mod commit_repair_async_tests {
 
     #[test]
     fn test_wait_for_background_repair_inside_runtime_requeues_instead_of_blocking() {
+        #[derive(Debug)]
+        struct GatedRepairGenerator {
+            gate: Arc<(Mutex<bool>, Condvar)>,
+        }
+
+        impl RepairSymbolGenerator for GatedRepairGenerator {
+            fn generate_repair_symbols(
+                &self,
+                _commit_seq: u64,
+                systematic_symbols: &[u8],
+            ) -> Result<Vec<u8>> {
+                let (lock, cv) = &*self.gate;
+                let mut released = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*released {
+                    released = cv
+                        .wait(released)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                Ok(vec![0x5A; systematic_symbols.len()])
+            }
+        }
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let coordinator_runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("coordinator runtime");
@@ -1568,14 +1612,18 @@ mod commit_repair_async_tests {
             coordinator_runtime,
             &root_cx,
             InMemoryCommitRepairIo::default(),
-            DeterministicRepairGenerator::new(Duration::from_millis(25), 64),
+            GatedRepairGenerator {
+                gate: Arc::clone(&gate),
+            },
         ));
         coordinator
             .commit(&[0xCD; 64])
             .expect("commit should schedule repair");
 
         // From inside a runtime context the join must refuse to block and
-        // re-queue the in-flight handle instead of deadlocking.
+        // re-queue the in-flight handle instead of deadlocking. Holding the
+        // generator gate keeps the background worker deterministically in
+        // flight regardless of scheduler load (bd-gp7t8).
         let outer_runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("outer runtime");
@@ -1586,8 +1634,21 @@ mod commit_repair_async_tests {
             wait_result.is_err(),
             "in-flight workers cannot be joined from inside a runtime context"
         );
+        assert_eq!(
+            coordinator.pending_background_repair_count(),
+            1,
+            "refused inside-runtime wait must re-queue the in-flight repair worker"
+        );
 
-        // From outside any runtime context the re-queued handle joins fine.
+        // Release the background worker and join it from outside any runtime context.
+        {
+            let (lock, cv) = &*gate;
+            let mut released = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *released = true;
+            cv.notify_all();
+        }
         coordinator
             .wait_for_background_repair()
             .expect("outside a runtime context the re-queued worker must join");
@@ -2242,31 +2303,44 @@ mod two_phase_pipeline_tests {
         let permit_b = sender_b
             .reserve(&Cx::new())
             .expect("reserve should succeed");
+        assert_eq!(sender.occupancy(), 2);
 
         let (tx, rx) = std_mpsc::channel();
         let sender_for_worker = sender.clone();
         let join = thread::spawn(move || {
-            let started = Instant::now();
             let permit = sender_for_worker
                 .reserve(&Cx::new())
                 .expect("reserve should succeed");
-            let elapsed = started.elapsed();
-            tx.send(elapsed)
-                .expect("elapsed send should succeed for backpressure test");
+            let seq = permit.reservation_seq();
+            tx.send(seq)
+                .expect("reservation seq send should succeed for backpressure test");
             drop(permit);
         });
 
-        thread::sleep(Duration::from_millis(30));
-        drop(permit_a);
-        drop(permit_b);
-
-        let elapsed = rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("blocked reserve should eventually unblock");
+        // Wait deterministically until the worker is parked inside
+        // LogicalCapacity::acquire_for rather than asserting wall-clock sleep
+        // durations (bd-gp7t8).
+        let waiter_deadline = Instant::now() + Duration::from_secs(5);
+        while sender.waiter_count() == 0 {
+            assert!(
+                Instant::now() < waiter_deadline,
+                "worker thread should block waiting for capacity before timeout"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(sender.occupancy(), 2);
         assert!(
-            elapsed >= Duration::from_millis(20),
-            "reserve should block until capacity frees"
+            matches!(rx.try_recv(), Err(std_mpsc::TryRecvError::Empty)),
+            "reserve must remain blocked while channel is at full capacity"
         );
+
+        // Freeing one permit must wake and unblock the waiting reservation.
+        drop(permit_a);
+        let seq = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocked reserve should unblock once capacity frees");
+        assert_eq!(seq, 3);
+        drop(permit_b);
         join.join().expect("thread join must succeed");
     }
 

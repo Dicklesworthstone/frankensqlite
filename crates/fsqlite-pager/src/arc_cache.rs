@@ -1649,6 +1649,12 @@ impl ArcCache {
     fn inflight_count(&self) -> usize {
         self.inflight.lock().len()
     }
+
+    #[cfg(test)]
+    fn inflight_waiters(&self, key: &CacheKey) -> usize {
+        let slot = self.inflight.lock().get(key).cloned();
+        slot.map_or(0, |slot| slot.state.lock().waiters)
+    }
 }
 
 impl std::fmt::Debug for ArcCache {
@@ -2697,12 +2703,21 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..8 {
             let cache_ref = Arc::clone(&cache);
+            let cache_probe = AssertUnwindSafe(Arc::clone(&cache));
             let calls_ref = Arc::clone(&load_calls);
             handles.push(thread::spawn(move || {
                 cache_ref
                     .request_async(k, || -> Result<CachedPage, &'static str> {
                         let _ = calls_ref.fetch_add(1, AtomicOrdering::SeqCst);
-                        thread::sleep(Duration::from_millis(20));
+                        // Wait deterministically for at least one peer to register as a
+                        // singleflight waiter on this inflight slot rather than relying on
+                        // a fixed wall-clock sleep window (bd-gp7t8).
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        while cache_probe.inflight_waiters(&k) == 0
+                            && std::time::Instant::now() < deadline
+                        {
+                            thread::yield_now();
+                        }
                         Ok(page(k, 4096))
                     })
                     .expect("singleflight request should not fail")

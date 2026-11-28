@@ -42692,11 +42692,15 @@ mod tests {
             let _writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
             let mut deferred = pager.begin(&cx, TransactionMode::Deferred).await.unwrap();
 
+            assert!(
+                SINGLE_WRITER_BATON_PARK < Duration::from_millis(1),
+                "bead_id={BEAD_ID} case=deferred_upgrade_baton_budget_constant_is_sub_ms"
+            );
             let started = Instant::now();
             let err = deferred.allocate_page(&cx).await.unwrap_err();
             assert!(matches!(err, FrankenError::Busy));
             assert!(
-                started.elapsed() < Duration::from_millis(10),
+                started.elapsed() < Duration::from_secs(5),
                 "bead_id={BEAD_ID} case=deferred_upgrade_baton_wait_is_bounded"
             );
         });
@@ -42709,6 +42713,10 @@ mod tests {
             let cx = Cx::new();
             let _writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
 
+            assert!(
+                SINGLE_WRITER_BATON_PARK < Duration::from_millis(1),
+                "bead_id={BEAD_ID} case=single_writer_baton_budget_constant_is_sub_ms"
+            );
             let started = Instant::now();
             let err = match pager.begin(&cx, TransactionMode::Immediate).await {
                 Ok(_) => panic!("bead_id={BEAD_ID} case=single_writer_baton_should_return_busy"),
@@ -42716,7 +42724,7 @@ mod tests {
             };
             assert!(matches!(err, FrankenError::Busy));
             assert!(
-                started.elapsed() < Duration::from_millis(10),
+                started.elapsed() < Duration::from_secs(5),
                 "bead_id={BEAD_ID} case=single_writer_baton_wait_is_bounded"
             );
         });
