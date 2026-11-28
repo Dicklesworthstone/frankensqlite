@@ -34428,9 +34428,12 @@ where
                     committed_db_size,
                     &pending_free_pages_for_retain,
                 );
+            let mut db_size_changed_for_retain =
+                committed_db_size != inner.db_size || self.truncated_db_size.is_some();
             let mut single_connection_fast_path = self.single_connection_fast_path_enabled();
             let mut metadata_only_single_connection_fast_path = single_connection_fast_path
                 && !freelist_dirty_for_retain
+                && !db_size_changed_for_retain
                 && !self.write_set.contains_key(&PageNumber::ONE);
             let mut defer_private_memory_flush =
                 self.memory_db_bump_alloc && metadata_only_single_connection_fast_path;
@@ -34454,9 +34457,12 @@ where
                     committed_db_size,
                     &pending_free_pages_for_retain,
                 );
+                db_size_changed_for_retain =
+                    committed_db_size != inner.db_size || self.truncated_db_size.is_some();
                 single_connection_fast_path = self.single_connection_fast_path_enabled();
                 metadata_only_single_connection_fast_path = single_connection_fast_path
                     && !freelist_dirty_for_retain
+                    && !db_size_changed_for_retain
                     && !self.write_set.contains_key(&PageNumber::ONE);
                 defer_private_memory_flush =
                     self.memory_db_bump_alloc && metadata_only_single_connection_fast_path;
@@ -34651,10 +34657,14 @@ where
                     wal_page1_plan.requires_page_one_rewrite()
                         || wal_page1_plan.requires_page_count_advance()
                 } else if self.vfs.is_memory() {
-                    // B3.4: :memory: journal mode skips page 1 header update unless:
+                    // B3.4 + bd-gjlhh: :memory: journal mode skips page 1 header update unless:
                     // 1. freelist_dirty (freelist count in header must match), OR
-                    // 2. page 1 is explicitly dirty in write_set
-                    freelist_dirty || self.write_set.contains_key(&PageNumber::ONE)
+                    // 2. db_size changed (page_count in header must match for PRAGMA page_count
+                    //    and PRAGMA integrity_check), OR
+                    // 3. page 1 is explicitly dirty in write_set
+                    freelist_dirty
+                        || db_size_changed_for_retain
+                        || self.write_set.contains_key(&PageNumber::ONE)
                 } else {
                     true
                 };
