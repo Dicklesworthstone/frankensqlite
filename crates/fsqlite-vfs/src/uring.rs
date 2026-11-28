@@ -56,6 +56,19 @@ const IO_URING_WRITE_CONFORMAL_BREACH_MSG: &str = "io_uring write conformal tail
 const IO_URING_READ_ERROR_FALLBACK_MSG: &str = "io_uring read error fallback";
 const IO_URING_WRITE_ERROR_FALLBACK_MSG: &str = "io_uring write error fallback";
 const IO_URING_DRIVER_FAILED_MSG: &str = "shared io_uring driver failed";
+/// bd-2sf0f: the runtime's disable reason when a ring read passed
+/// [`IO_URING_READ_DEADLINE`] without a completion.
+#[cfg(feature = "linux-asupersync-uring")]
+const IO_URING_READ_DEADLINE_MSG: &str = "io_uring read deadline";
+/// bd-2sf0f: how long a submitted ring request may go without a completion
+/// before the driver acts on it. A READ past it is answered `TimedOut` (its
+/// caller rereads through the Unix path, and the runtime is disabled: this
+/// ring lost or stalled a completion). A WRITE past it is reported once and
+/// still waited for, because a second write of a range must never be issued
+/// while the first may still land (2026-11-19 rule). Far above any device
+/// read, far below busy_timeout scales.
+#[cfg(feature = "linux-asupersync-uring")]
+const IO_URING_READ_DEADLINE: Duration = Duration::from_secs(5);
 const IO_URING_MAX_RW_CHUNK_BYTES: usize = 64 * 1024;
 #[cfg(feature = "linux-asupersync-uring")]
 const IO_URING_ASUPERSYNC_INIT_FAILED_MSG: &str = "asupersync shared io_uring backend init failed";
@@ -161,6 +174,52 @@ static FORCE_ASUPERSYNC_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 static FORCE_ASUPERSYNC_WRITE_ABORT: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_DRIVER_WAIT_FAIL: AtomicBool = AtomicBool::new(false);
+/// `IoUringRuntime::hold_cqes` bits.
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+const HOLD_READ_CQES: u8 = 1;
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+const HOLD_WRITE_CQES: u8 = 2;
+
+/// bd-2sf0f: a ring write still in flight past [`IO_URING_READ_DEADLINE`],
+/// as the driver reports it once (at warn level) and keeps waiting.
+#[cfg(feature = "linux-asupersync-uring")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LateWriteReport {
+    request_id: u64,
+    opcode: &'static str,
+    file_kind: &'static str,
+    offset: u64,
+    len: usize,
+    age_ms: u64,
+}
+
+/// The kind of database file `file` is, from its path's suffix: `main`,
+/// `wal`, `wal-cert`, `shm`, `journal`, `temp` (an unlinked file), `other`
+/// (not a path, such as a pipe) or `unknown`. Diagnostics only (bd-2sf0f).
+#[cfg(feature = "linux-asupersync-uring")]
+fn ring_file_kind(file: &File) -> &'static str {
+    let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) else {
+        return "unknown";
+    };
+    let target = target.to_string_lossy();
+    if !target.starts_with('/') {
+        return "other";
+    }
+    if target.ends_with(" (deleted)") {
+        return "temp";
+    }
+    if target.ends_with("-wal") {
+        "wal"
+    } else if target.ends_with("-wal-cert") || target.ends_with("-wal-cert-head") {
+        "wal-cert"
+    } else if target.ends_with("-shm") {
+        "shm"
+    } else if target.ends_with("-journal") {
+        "journal"
+    } else {
+        "main"
+    }
+}
 
 /// Process-wide io-wq worker limits for rings created after
 /// [`set_iowq_max_workers`], bounded in the high 32 bits and unbounded in the
@@ -239,6 +298,11 @@ fn duration_to_micros_saturated(duration: std::time::Duration) -> u64 {
     }
 }
 
+#[cfg(feature = "linux-asupersync-uring")]
+fn duration_to_millis_saturated(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn next_chunk_end(total: usize, len: usize) -> usize {
     let remaining = len - total;
     total + remaining.min(IO_URING_MAX_RW_CHUNK_BYTES)
@@ -308,13 +372,48 @@ struct DriverRequest {
     file: Arc<File>,
     offset: u64,
     kind: DriverRequestKind,
-    completion: SendPermit<DriverCompletion>,
+    /// The waiter's answer. `None` once the read deadline answered it
+    /// (bd-2sf0f): the request stays in flight, its buffer owned here, until
+    /// its CQE arrives.
+    completion: Option<SendPermit<DriverCompletion>>,
     write_completion: Option<VfsWriteCompletionSource>,
+    /// When the driver staged the request's SQE (bd-2sf0f).
+    staged_at: Option<Instant>,
+    /// Whether the driver has acted on the request passing the deadline:
+    /// a read answered `TimedOut`, a write reported (bd-2sf0f).
+    past_deadline: bool,
 }
 
 #[cfg(feature = "linux-asupersync-uring")]
 impl DriverRequest {
+    /// The read deadline answered this request's waiter; the request waits
+    /// only for its CQE.
+    const fn is_abandoned(&self) -> bool {
+        self.completion.is_none()
+    }
+
+    fn answer(&mut self, completion: DriverCompletion) {
+        if let Some(permit) = self.completion.take() {
+            let _ = permit.send(completion);
+        }
+    }
+
     fn complete(mut self, result: i32) {
+        let Some(permit) = self.completion.take() else {
+            // The read deadline answered this request's waiter. The kernel is
+            // done with the buffer now; it is dropped, not recycled (the
+            // runtime that abandoned the read is disabled).
+            info!(
+                event = "io_uring_abandoned_read_completed",
+                request_id = self.id,
+                result,
+                age_ms = self
+                    .staged_at
+                    .map_or(0, |at| duration_to_millis_saturated(at.elapsed())),
+                "an io_uring read answered by the read deadline reached its CQE (bd-2sf0f)"
+            );
+            return;
+        };
         let operation = self.kind.operation();
         let completion_event = match &self.kind {
             DriverRequestKind::Read(_) => "read_at_complete",
@@ -366,26 +465,24 @@ impl DriverRequest {
             result,
             "io_uring request completed"
         );
-        let _ = self.completion.send(completion);
+        let _ = permit.send(completion);
     }
 
     fn fail(mut self, kind: io::ErrorKind, message: &str) {
         if let Some(write_completion) = &mut self.write_completion {
             write_completion.complete_error();
         }
-        let _ = self
-            .completion
-            .send(DriverCompletion::Failed(io::Error::new(
-                kind,
-                message.to_owned(),
-            )));
+        self.answer(DriverCompletion::Failed(io::Error::new(
+            kind,
+            message.to_owned(),
+        )));
     }
 
     fn cancel(mut self) {
         if let Some(write_completion) = &mut self.write_completion {
             write_completion.complete_error();
         }
-        let _ = self.completion.send(DriverCompletion::Cancelled);
+        self.answer(DriverCompletion::Cancelled);
     }
 }
 
@@ -488,6 +585,19 @@ struct IoUringRuntime {
     read_buffers: Mutex<Vec<Vec<u8>>>,
     #[cfg(test)]
     driver_wait: Duration,
+    /// Test-only: [`IO_URING_READ_DEADLINE`] for this runtime.
+    #[cfg(test)]
+    read_deadline: Duration,
+    /// Test-only: the driver holds back the CQEs of in-flight requests of
+    /// these kinds (`HOLD_READ_CQES`, `HOLD_WRITE_CQES`), as a ring that
+    /// consumed an SQE and posted no completion looks to it (bd-2sf0f).
+    #[cfg(test)]
+    hold_cqes: AtomicU8,
+    #[cfg(test)]
+    held_cqes: Mutex<Vec<(u64, i32)>>,
+    /// Test-only: every report of a write past the deadline.
+    #[cfg(test)]
+    late_write_reports: Mutex<Vec<LateWriteReport>>,
     /// Test-only: the conformal latency policy still records this runtime's
     /// samples but does not disable it (bd-dti3t). The policy's sample window
     /// is process-wide, so in a test binary the other tests' samples decide
@@ -619,6 +729,14 @@ impl IoUringRuntime {
                 read_buffers: Mutex::new(Vec::new()),
                 #[cfg(test)]
                 driver_wait: IO_URING_DRIVER_WAIT,
+                #[cfg(test)]
+                read_deadline: IO_URING_READ_DEADLINE,
+                #[cfg(test)]
+                hold_cqes: AtomicU8::new(0),
+                #[cfg(test)]
+                held_cqes: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                late_write_reports: Mutex::new(Vec::new()),
                 #[cfg(test)]
                 latency_policy_suspended: AtomicBool::new(false),
                 iowq_max_workers,
@@ -809,8 +927,10 @@ impl IoUringRuntime {
                 file,
                 offset,
                 kind,
-                completion,
+                completion: Some(completion),
                 write_completion: write_completion.map(VfsWriteCompletionSource::new),
+                staged_at: None,
+                past_deadline: false,
             });
             (id, std::mem::take(&mut queue.waiting))
         };
@@ -1001,6 +1121,14 @@ impl IoUringRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut inflight = HashMap::<u64, DriverRequest>::new();
+        // bd-2sf0f: when the next in-flight request can pass the deadline,
+        // and whether the deadline has abandoned any read.
+        #[cfg(test)]
+        let deadline = self.read_deadline;
+        #[cfg(not(test))]
+        let deadline = IO_URING_READ_DEADLINE;
+        let mut next_deadline_check: Option<Instant> = None;
+        let mut abandoned_reads = false;
 
         loop {
             let (requests, cancellations) = {
@@ -1024,6 +1152,11 @@ impl IoUringRuntime {
                 Ordering::Relaxed,
             );
 
+            let now = Instant::now();
+            if !requests.is_empty() {
+                // A later request cannot pass the deadline before an earlier one.
+                next_deadline_check.get_or_insert(now + deadline);
+            }
             let mut submission_error = None;
             let mut staged_requests = 0;
             let mut staged_cancellations = 0;
@@ -1034,6 +1167,7 @@ impl IoUringRuntime {
                 let request = inflight
                     .get_mut(&id)
                     .expect("newly inserted request must remain present");
+                request.staged_at = Some(now);
                 let len = u32::try_from(request.kind.len())
                     .expect("VFS chunks are bounded below u32::MAX");
                 let entry = match &mut request.kind {
@@ -1122,7 +1256,18 @@ impl IoUringRuntime {
                 .collect::<Vec<_>>();
             self.finish_completions(&mut inflight, completed);
 
-            if inflight.is_empty() {
+            if next_deadline_check.is_some_and(|due| now >= due) {
+                next_deadline_check = self.enforce_request_deadlines(
+                    &mut inflight,
+                    now,
+                    deadline,
+                    &mut abandoned_reads,
+                );
+            }
+
+            if inflight.is_empty()
+                || (abandoned_reads && Self::only_lost_reads_remain(&inflight, now, deadline))
+            {
                 let should_stop = {
                     let mut queue = self
                         .queue
@@ -1136,6 +1281,7 @@ impl IoUringRuntime {
                     }
                 };
                 if should_stop {
+                    Self::leak_lost_reads(&mut inflight);
                     return;
                 }
                 continue;
@@ -1163,12 +1309,181 @@ impl IoUringRuntime {
         }
     }
 
+    /// bd-2sf0f: act once on each in-flight request staged at least the read
+    /// deadline before `now`, and return when the next one can pass it.
+    ///
+    /// A READ is answered `TimedOut`. Its caller rereads the range through
+    /// the Unix path (`read_data_path`'s fallback), and the runtime is
+    /// disabled first, so the process stops using a ring that lost or stalled
+    /// a completion and the disable reason names the deadline. The request
+    /// stays in flight with its buffer, which the kernel may still write,
+    /// until its CQE arrives; its cancellation is queued. Abandoning a read is
+    /// safe: it changes no file byte, and a second read of the range is
+    /// harmless.
+    ///
+    /// A WRITE is reported once at warn level and still waited for: a second
+    /// write of a range must never be issued while the first may still land
+    /// (2026-11-19 rule). The report names the request, so the next capture
+    /// of a stuck ring says which request it was.
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn enforce_request_deadlines(
+        &self,
+        inflight: &mut HashMap<u64, DriverRequest>,
+        now: Instant,
+        deadline: Duration,
+        abandoned_reads: &mut bool,
+    ) -> Option<Instant> {
+        let mut next_check: Option<Instant> = None;
+        let mut cancellations = Vec::new();
+        for request in inflight.values_mut() {
+            let Some(staged_at) = request.staged_at else {
+                continue;
+            };
+            if request.past_deadline {
+                continue;
+            }
+            let due = staged_at + deadline;
+            if now < due {
+                next_check = Some(next_check.map_or(due, |at| at.min(due)));
+                continue;
+            }
+            request.past_deadline = true;
+            let age_ms = duration_to_millis_saturated(now.duration_since(staged_at));
+            let len = request.kind.len();
+            if matches!(request.kind, DriverRequestKind::Write(_)) {
+                let report = LateWriteReport {
+                    request_id: request.id,
+                    opcode: "IORING_OP_WRITE",
+                    file_kind: ring_file_kind(&request.file),
+                    offset: request.offset,
+                    len,
+                    age_ms,
+                };
+                warn!(
+                    event = "io_uring_write_past_deadline",
+                    request_id = report.request_id,
+                    opcode = report.opcode,
+                    file_kind = report.file_kind,
+                    offset = report.offset,
+                    len = report.len,
+                    age_ms = report.age_ms,
+                    "an io_uring write is still in flight past the deadline; still waiting for \
+                     its completion (writes have no deadline, bd-2sf0f)"
+                );
+                #[cfg(test)]
+                self.late_write_reports
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(report);
+                continue;
+            }
+            self.disable(IO_URING_READ_DEADLINE_MSG);
+            warn!(
+                event = "io_uring_read_deadline",
+                request_id = request.id,
+                opcode = "IORING_OP_READ",
+                file_kind = ring_file_kind(&request.file),
+                offset = request.offset,
+                len,
+                age_ms,
+                "an io_uring read passed its deadline without a completion; answered TimedOut, \
+                 reread through the unix path, backend disabled (bd-2sf0f)"
+            );
+            request.answer(DriverCompletion::Failed(io::Error::new(
+                io::ErrorKind::TimedOut,
+                IO_URING_READ_DEADLINE_MSG,
+            )));
+            *abandoned_reads = true;
+            cancellations.push(request.id);
+        }
+        for request_id in cancellations {
+            self.cancel_request(request_id);
+        }
+        next_check
+    }
+
+    /// bd-2sf0f: every request still in flight is a read the deadline
+    /// answered whose CQE has not arrived a second deadline period later (its
+    /// cancellation was queued a full period ago).
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn only_lost_reads_remain(
+        inflight: &HashMap<u64, DriverRequest>,
+        now: Instant,
+        deadline: Duration,
+    ) -> bool {
+        let grace = deadline.saturating_mul(2);
+        inflight.values().all(|request| {
+            request.is_abandoned()
+                && request
+                    .staged_at
+                    .is_some_and(|at| now.duration_since(at) >= grace)
+        })
+    }
+
+    /// bd-2sf0f: the driver stops with reads whose CQEs never arrived. The
+    /// kernel may still write into their buffers, so the buffers are leaked,
+    /// never freed or recycled, and their ids stay live. The runtime is
+    /// disabled, so no driver reaps this ring again.
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn leak_lost_reads(inflight: &mut HashMap<u64, DriverRequest>) {
+        if inflight.is_empty() {
+            return;
+        }
+        warn!(
+            event = "io_uring_lost_reads_leaked",
+            requests = inflight.len(),
+            "io_uring reads answered by the read deadline never reached a CQE; their buffers \
+             are leaked and the driver stops (bd-2sf0f)"
+        );
+        for (_, request) in inflight.drain() {
+            let DriverRequest { kind, .. } = request;
+            let (DriverRequestKind::Read(data) | DriverRequestKind::Write(data)) = kind;
+            std::mem::forget(data);
+        }
+    }
+
+    /// Test-only: keep back the CQEs of in-flight requests whose kind
+    /// `hold_cqes` names, releasing them once it no longer does.
+    #[cfg(all(test, feature = "linux-asupersync-uring"))]
+    fn hold_test_cqes(
+        &self,
+        inflight: &HashMap<u64, DriverRequest>,
+        completed: Vec<(u64, i32)>,
+    ) -> Vec<(u64, i32)> {
+        let hold = self.hold_cqes.load(Ordering::Acquire);
+        let mut held = self
+            .held_cqes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if hold == 0 && held.is_empty() {
+            return completed;
+        }
+        let mut released = Vec::with_capacity(held.len() + completed.len());
+        let mut still_held = Vec::new();
+        for (user_data, result) in held.drain(..).chain(completed) {
+            let bit = match inflight.get(&user_data).map(|request| &request.kind) {
+                Some(DriverRequestKind::Read(_)) => HOLD_READ_CQES,
+                Some(DriverRequestKind::Write(_)) => HOLD_WRITE_CQES,
+                None => 0,
+            };
+            if hold & bit == 0 {
+                released.push((user_data, result));
+            } else {
+                still_held.push((user_data, result));
+            }
+        }
+        *held = still_held;
+        released
+    }
+
     #[cfg(feature = "linux-asupersync-uring")]
     fn finish_completions(
         &self,
         inflight: &mut HashMap<u64, DriverRequest>,
         completed: Vec<(u64, i32)>,
     ) {
+        #[cfg(test)]
+        let completed = self.hold_test_cqes(inflight, completed);
         for (user_data, result) in completed {
             if user_data & IO_URING_CANCEL_TAG != 0 {
                 continue;
@@ -2579,6 +2894,453 @@ mod tests {
         );
     }
 
+    /// bd-2sf0f (read deadline): a ring READ the kernel holds without a
+    /// completion (an empty pipe: the SQE is consumed and no CQE comes) is
+    /// answered `TimedOut` once the 5 s read deadline passes, and not before;
+    /// the runtime is disabled with the deadline's reason; the request stays
+    /// live, its buffer owned by the driver, until its CQE (the kernel's
+    /// answer to the queued cancellation) arrives, and then the driver stops.
+    /// Red on main: no answer comes, and the watchdog fails the test at the
+    /// deadline plus 3 s.
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn bd_2sf0f_a_ring_read_without_a_completion_is_answered_timed_out_at_the_deadline() {
+        /// Ends the pipe read on drop, so no driver outlives a failed run.
+        struct PipeReleaser(File);
+        impl Drop for PipeReleaser {
+            fn drop(&mut self) {
+                let _ = self.0.write_all(b"x");
+            }
+        }
+        const DEADLINE: Duration = Duration::from_secs(5);
+
+        let _guard = io_uring_test_guard();
+        let proof = test_runtime().handle().spawn(async {
+            let driver_cx = NativeCx::current().expect("runtime task should install Cx");
+            let native_cx = NativeCx::for_testing();
+            let cx = Cx::new();
+            cx.set_native_cx(native_cx.clone());
+            let runtime = Arc::new(IoUringRuntime::new());
+            assert!(
+                runtime.is_available(),
+                "requires io_uring: {}",
+                runtime.status()
+            );
+            let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe should open");
+            let _release = PipeReleaser(File::from(write_fd));
+            let (request_id, mut receiver) = runtime
+                .enqueue_read(&cx, &native_cx, Arc::new(File::from(read_fd)), 1, 0)
+                .expect("pipe read should enqueue");
+            let started = Instant::now();
+            runtime
+                .ensure_driver(&driver_cx)
+                .expect("driver should start");
+            let watchdog = started + DEADLINE + Duration::from_secs(3);
+            let completion = loop {
+                match receiver.try_recv() {
+                    Ok(completion) => break completion,
+                    Err(oneshot::TryRecvError::Empty) => {
+                        assert!(
+                            Instant::now() < watchdog,
+                            "a ring read without a completion got no answer within the 5 s \
+                             read deadline plus 3 s"
+                        );
+                        // Yield, never block: the driver starts on this
+                        // runtime's blocking pool.
+                        asupersync::runtime::yield_now().await;
+                    }
+                    Err(oneshot::TryRecvError::Closed) => {
+                        panic!("the driver dropped the read's answer")
+                    }
+                }
+            };
+            let answered_after = started.elapsed();
+            assert!(
+                matches!(
+                    completion,
+                    DriverCompletion::Failed(ref error)
+                        if error.kind() == io::ErrorKind::TimedOut
+                            && error.to_string() == "io_uring read deadline"
+                ),
+                "{completion:?}"
+            );
+            assert!(
+                answered_after >= DEADLINE,
+                "answered before the deadline: {answered_after:?}"
+            );
+            assert!(!runtime.is_available());
+            assert_eq!(runtime.disable_reason(), Some("io_uring read deadline"));
+            let reaped_by = Instant::now() + Duration::from_secs(2);
+            loop {
+                let (live, active) = {
+                    let queue = runtime.queue.lock().unwrap();
+                    (queue.live.contains(&request_id), queue.active)
+                };
+                if !live && !active {
+                    break;
+                }
+                assert!(
+                    Instant::now() < reaped_by,
+                    "the abandoned read's cancellation CQE was not reaped (live={live}, \
+                     driver active={active})"
+                );
+                asupersync::runtime::yield_now().await;
+            }
+            assert!(
+                runtime.submitted_cancellations.load(Ordering::Acquire) >= 1,
+                "the abandoned read's cancellation must reach the kernel"
+            );
+        });
+        test_runtime().block_on(proof);
+    }
+
+    /// bd-2sf0f (read deadline), through the VFS: a page read whose ring CQE
+    /// the driver holds back (as a ring that consumed the SQE and posted no
+    /// completion looks to it) returns the file's bytes through the Unix path
+    /// at the deadline; the runtime is disabled with the deadline's reason
+    /// and the next read is the Unix path's; the ring buffer is not returned
+    /// to the pool while its CQE is outstanding, and once the CQE arrives the
+    /// driver drops it and stops. Negative: with nothing held, the same read
+    /// completes on the ring and leaves the runtime enabled.
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn bd_2sf0f_a_vfs_read_whose_cqe_is_held_returns_the_file_bytes_through_unix() {
+        const PAGE: usize = 4096;
+        let _guard = io_uring_test_guard();
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        assert!(vfs.is_available(), "requires io_uring: {}", vfs.status());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("held_read.db");
+        let seeded: Vec<u8> = (0..PAGE * 2)
+            .map(|index| u8::try_from(index % 251).expect("below 251"))
+            .collect();
+        std::fs::write(&path, &seeded).expect("seed write");
+        let (file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create_unlocked())
+            .expect("open should succeed");
+        let runtime = Arc::clone(&vfs.runtime);
+        // Only the deadline may disable this runtime here: the latency
+        // window is process-wide (bd-dti3t).
+        runtime
+            .latency_policy_suspended
+            .store(true, Ordering::Release);
+        let submitted = || runtime.submitted_requests.load(Ordering::Acquire);
+
+        let before = submitted();
+        let mut page = vec![0_u8; PAGE];
+        let read = block_on_test(&cx, file.read(&cx, &mut page, 0)).expect("ring read");
+        assert_eq!((read, &page[..]), (PAGE, &seeded[..PAGE]));
+        assert_eq!(submitted() - before, 1, "negative: the read is the ring's");
+        assert!(
+            runtime.is_available(),
+            "negative: a read that completes leaves the runtime enabled"
+        );
+
+        // The next ring read takes this buffer from the pool.
+        let marker = vec![0_u8; PAGE];
+        let marker_ptr = marker.as_ptr();
+        *runtime.read_buffers.lock().unwrap() = vec![marker];
+        let pooled_marker = || {
+            runtime
+                .read_buffers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|buffer| buffer.as_ptr() == marker_ptr)
+        };
+        runtime.hold_cqes.store(HOLD_READ_CQES, Ordering::Release);
+        // Watchdog: a read nothing answers would block this thread for good.
+        let (answered, watchdog_rx) = std::sync::mpsc::channel::<()>();
+        let watchdog_runtime = Arc::clone(&runtime);
+        let watchdog = std::thread::spawn(move || {
+            if watchdog_rx
+                .recv_timeout(IO_URING_READ_DEADLINE + Duration::from_secs(3))
+                .is_err()
+            {
+                watchdog_runtime.hold_cqes.store(0, Ordering::Release);
+            }
+        });
+        let before = submitted();
+        let mut page = vec![0_u8; PAGE];
+        let started = Instant::now();
+        let second_page = u64::try_from(PAGE).expect("page size fits u64");
+        let read = block_on_test(&cx, file.read(&cx, &mut page, second_page));
+        let answered_after = started.elapsed();
+        let _ = answered.send(());
+        watchdog.join().expect("watchdog thread");
+        assert_eq!(
+            read.expect("a held read must still return the file's bytes"),
+            PAGE
+        );
+        assert_eq!(page, seeded[PAGE..]);
+        assert_eq!(
+            submitted() - before,
+            1,
+            "the read was submitted to the ring"
+        );
+        assert!(
+            answered_after >= IO_URING_READ_DEADLINE
+                && answered_after < IO_URING_READ_DEADLINE + Duration::from_secs(2),
+            "a held read must be answered at the 5 s deadline: {answered_after:?}"
+        );
+        assert_eq!(runtime.disable_reason(), Some(IO_URING_READ_DEADLINE_MSG));
+        {
+            let queue = runtime.queue.lock().unwrap();
+            assert_eq!(
+                queue.live.len(),
+                1,
+                "the abandoned read stays in flight until its CQE"
+            );
+            assert!(queue.active, "the driver keeps waiting for the CQE");
+        }
+        assert!(
+            !pooled_marker(),
+            "the abandoned read's buffer must not be recycled before its CQE"
+        );
+
+        let before = submitted();
+        let mut again = vec![0_u8; PAGE];
+        let read = block_on_test(&cx, file.read(&cx, &mut again, 0)).expect("unix read");
+        assert_eq!((read, &again[..]), (PAGE, &seeded[..PAGE]));
+        assert_eq!(submitted(), before, "a disabled runtime submits no read");
+
+        runtime.hold_cqes.store(0, Ordering::Release);
+        let reaped_by = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (live, active) = {
+                let queue = runtime.queue.lock().unwrap();
+                (queue.live.len(), queue.active)
+            };
+            if live == 0 && !active {
+                break;
+            }
+            assert!(
+                Instant::now() < reaped_by,
+                "the released CQE was not reaped (live={live}, driver active={active})"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !pooled_marker(),
+            "an abandoned read's buffer is dropped once its CQE arrives, not recycled"
+        );
+    }
+
+    /// Test-only: stop holding a runtime's CQEs on drop, so a failed run
+    /// leaves no driver waiting on a held completion.
+    #[cfg(feature = "linux-asupersync-uring")]
+    struct ReleaseHeldCqes(Arc<IoUringRuntime>);
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    impl Drop for ReleaseHeldCqes {
+        fn drop(&mut self) {
+            self.0.hold_cqes.store(0, Ordering::Release);
+        }
+    }
+
+    /// bd-2sf0f: a read answered by the deadline whose CQE never arrives does
+    /// not keep the driver running: a second deadline period after the read
+    /// was staged the driver stops, leaving the request live and its buffer
+    /// leaked (never freed or recycled: the kernel may still write it). The
+    /// runtime admits no request afterwards.
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn bd_2sf0f_a_read_whose_cqe_never_arrives_is_leaked_and_the_driver_stops() {
+        const DEADLINE: Duration = Duration::from_millis(500);
+        let _guard = io_uring_test_guard();
+        let proof = test_runtime().handle().spawn(async {
+            let driver_cx = NativeCx::current().expect("runtime task should install Cx");
+            let native_cx = NativeCx::for_testing();
+            let cx = Cx::new();
+            cx.set_native_cx(native_cx.clone());
+            let mut runtime = IoUringRuntime::new();
+            assert!(
+                runtime.is_available(),
+                "requires io_uring: {}",
+                runtime.status()
+            );
+            runtime.read_deadline = DEADLINE;
+            let runtime = Arc::new(runtime);
+            let _release = ReleaseHeldCqes(Arc::clone(&runtime));
+            runtime.hold_cqes.store(HOLD_READ_CQES, Ordering::Release);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("lost_read.db");
+            std::fs::write(&path, [0x3C_u8; 512]).expect("seed write");
+            let file = Arc::new(File::open(&path).expect("open"));
+            let marker = vec![0_u8; 512];
+            // An address, not a pointer: this future is sent to the runtime.
+            let marker_addr = marker.as_ptr().addr();
+            *runtime.read_buffers.lock().unwrap() = vec![marker];
+            let (request_id, mut receiver) = runtime
+                .enqueue_read(&cx, &native_cx, Arc::clone(&file), 512, 0)
+                .expect("read should enqueue");
+            let started = Instant::now();
+            runtime
+                .ensure_driver(&driver_cx)
+                .expect("driver should start");
+            let watchdog = started + DEADLINE * 4;
+            let completion = loop {
+                match receiver.try_recv() {
+                    Ok(completion) => break completion,
+                    Err(oneshot::TryRecvError::Empty) => {
+                        assert!(
+                            Instant::now() < watchdog,
+                            "a read with a held CQE got no answer within four deadlines"
+                        );
+                        asupersync::runtime::yield_now().await;
+                    }
+                    Err(oneshot::TryRecvError::Closed) => {
+                        panic!("the driver dropped the read's answer")
+                    }
+                }
+            };
+            assert!(
+                matches!(
+                    completion,
+                    DriverCompletion::Failed(ref error) if error.kind() == io::ErrorKind::TimedOut
+                ),
+                "{completion:?}"
+            );
+            loop {
+                let active = runtime.queue.lock().unwrap().active;
+                if !active {
+                    break;
+                }
+                assert!(
+                    Instant::now() < watchdog,
+                    "the driver kept running on a lost read past four deadlines"
+                );
+                asupersync::runtime::yield_now().await;
+            }
+            let stopped_after = started.elapsed();
+            assert!(
+                stopped_after >= DEADLINE * 2,
+                "the driver gave a lost read up before its second deadline period: \
+                 {stopped_after:?}"
+            );
+            assert!(
+                runtime.queue.lock().unwrap().live.contains(&request_id),
+                "a lost read's id stays live"
+            );
+            assert!(
+                !runtime
+                    .read_buffers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|buffer| buffer.as_ptr().addr() == marker_addr),
+                "a lost read's buffer must never be recycled"
+            );
+            assert!(matches!(
+                runtime.enqueue_read(&cx, &native_cx, file, 512, 0),
+                Err(FrankenError::Io(ref error)) if error.kind() == io::ErrorKind::Unsupported
+            ));
+        });
+        test_runtime().block_on(proof);
+    }
+
+    /// bd-2sf0f (write diagnostics): a ring WRITE still in flight past the
+    /// deadline is reported once, naming its opcode, file kind, offset,
+    /// length and age, and is still waited for: it is not answered while its
+    /// CQE is held, it completes as written once the CQE arrives, and the
+    /// runtime stays enabled. No behavior change for writes.
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn bd_2sf0f_a_write_past_the_deadline_is_reported_once_and_still_waited_for() {
+        const DEADLINE: Duration = Duration::from_millis(200);
+        let _guard = io_uring_test_guard();
+        let proof = test_runtime().handle().spawn(async {
+            let driver_cx = NativeCx::current().expect("runtime task should install Cx");
+            let native_cx = NativeCx::for_testing();
+            let cx = Cx::new();
+            cx.set_native_cx(native_cx.clone());
+            let mut runtime = IoUringRuntime::new();
+            assert!(
+                runtime.is_available(),
+                "requires io_uring: {}",
+                runtime.status()
+            );
+            runtime.read_deadline = DEADLINE;
+            let runtime = Arc::new(runtime);
+            let _release = ReleaseHeldCqes(Arc::clone(&runtime));
+            runtime.hold_cqes.store(HOLD_WRITE_CQES, Ordering::Release);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("late_write.db");
+            let file = Arc::new(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                    .expect("open"),
+            );
+            let (request_id, mut receiver) = runtime
+                .enqueue_write(
+                    &cx,
+                    &native_cx,
+                    Arc::clone(&file),
+                    vec![0x5A; 4096],
+                    8192,
+                    None,
+                )
+                .expect("write should enqueue");
+            let started = Instant::now();
+            runtime
+                .ensure_driver(&driver_cx)
+                .expect("driver should start");
+            while started.elapsed() < DEADLINE * 3 {
+                assert!(
+                    matches!(receiver.try_recv(), Err(oneshot::TryRecvError::Empty)),
+                    "a write must not be answered while its CQE is held"
+                );
+                asupersync::runtime::yield_now().await;
+            }
+            assert!(
+                runtime.is_available(),
+                "a write past the deadline must not disable the runtime"
+            );
+            let reports = runtime.late_write_reports.lock().unwrap().clone();
+            assert_eq!(reports.len(), 1, "reported exactly once: {reports:?}");
+            let report = &reports[0];
+            assert_eq!(
+                (
+                    report.request_id,
+                    report.opcode,
+                    report.file_kind,
+                    report.offset,
+                    report.len
+                ),
+                (request_id, "IORING_OP_WRITE", "main", 8192, 4096)
+            );
+            assert!(
+                report.age_ms >= 200,
+                "the reported age is the request's: {report:?}"
+            );
+            runtime.hold_cqes.store(0, Ordering::Release);
+            let completion = receiver
+                .recv(&native_cx)
+                .await
+                .expect("the released write completes");
+            assert!(
+                matches!(
+                    completion,
+                    DriverCompletion::Write {
+                        bytes_written: 4096
+                    }
+                ),
+                "{completion:?}"
+            );
+            let mut back = vec![0_u8; 4096];
+            file.read_exact_at(&mut back, 8192).expect("read back");
+            assert!(back.iter().all(|byte| *byte == 0x5A));
+            assert!(runtime.is_available());
+            assert_eq!(runtime.late_write_reports.lock().unwrap().len(), 1);
+        });
+        test_runtime().block_on(proof);
+    }
+
     #[cfg(feature = "linux-asupersync-uring")]
     #[test]
     fn test_hot_reads_route_inline_and_ring_only_files_keep_the_ring() {
@@ -2921,8 +3683,10 @@ mod tests {
                 file,
                 offset: 0,
                 kind: DriverRequestKind::Write(vec![1, 2, 3, 4]),
-                completion: permit,
+                completion: Some(permit),
                 write_completion: Some(VfsWriteCompletionSource::new(source_completion)),
+                staged_at: None,
+                past_deadline: false,
             }
             .complete(4);
 
