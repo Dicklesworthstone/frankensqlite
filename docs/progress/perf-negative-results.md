@@ -94,6 +94,53 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-28 - LANDED (robustness, not a perf lever; admitted under the time-void policy, owner 2026-11-28; originally killed on a time LOSE at Ir 1.0000, 5623baec2): the 5 s io_uring read deadline and late-write report in the shared ring driver (bd-2sf0f)
+
+- Supersedes the 2026-11-26 entry "A 5 s io_uring read deadline and late-write report in the shared ring driver
+  (bd-2sf0f): killed by a replicated cold-scan cycles LOSE" (5623baec2). That kill rested only on cold_scan cycles:u
+  1.0175 / 1.0199 at Ir 0.9999 / 1.0000. Under the owner's time-void policy (2026-11-28; judge v2b's A/A fails,
+  bd-j0jc0/bd-gvews, f2593d053), a time LOSE no longer kills a lever on a row whose exact Ir is inside its line. That
+  LOSE (under 2%) is also below the policy's 3.5% investigation threshold.
+- What: crates/fsqlite-vfs/src/uring.rs only, the patch of 5623baec2, rebased unchanged (perf-lnab
+  scripts/jr1/c2sf0f.patch, sha 41ef0556; uring.rs unchanged from 891d64197 to the landing base).
+  - A ring READ with no completion after 5 s is answered TimedOut and reread through the Unix path. The ring is
+    disabled, and the read's buffer is kept until its CQE.
+  - A ring WRITE past 5 s is reported once and still waited for.
+- Correctness, re-gated on the tip 6861feaf8:
+  - keeper 1 is RED on main (0/1, watchdog 8.00 s);
+  - the mutant (the deadline check never fires) is RED on keepers 1-4;
+  - the lever passes 5/5 keepers three times, and the vfs lib 547/0 with 2 ignored;
+  - clippy -D warnings on fsqlite-vfs all targets is rc 0 (rch hz4);
+  - the core cross-process battery, 14 targets, is rc 0, and gh534 with fault-injection passes 12/12 (rch hz4;
+    uring.rs unchanged from 6861feaf8 to the landing base).
+- Exact Ir, stock 3.54.1 live. Arms from one rch job on vmi1227854 (P d44d34ed, C 25a36f72); thinkstation1.
+  - Write rows (cm1 shapes, per row), callgrind with io_uring refused, C/P over two runs:
+    - ins_full 1.0004 / 1.0020 (x8.45 stock);
+    - ins_normal 0.9974 / 0.9934 (x8.35);
+    - txn10 0.9996 / 0.9993 (x4.09);
+    - point 1.0002 / 0.9999 (x3.89).
+  - The same rows with io_uring ALLOWED (perf stat instructions:u, medians of 7):
+    - ins_full 1.0002 (x12.61);
+    - ins_normal 1.0031 (x12.43);
+    - txn10 1.0006 (x4.76);
+    - point 1.0021 (x3.97).
+  - Read rows (callgrind, whole run, 2 reps):
+    - rowid_lookups_200k 0.9993 / 0.9997 (x4.87);
+    - scan_filter_agg 0.9999 / 1.0000 (x2.80);
+    - count_star 1.0013 / 1.0013 (x1.14);
+    - base (open + SELECT 1) 1.0019 / 1.0017, a per-process constant of about 7.5k Ir.
+  - Every row is inside probe item 3's +0.5% line and the posted 1.005. The same ELF varies by up to 0.8% per unit
+    between runs on ins_normal.
+  - Time cells: VOID (judge A/A fails; bd-j0jc0/bd-gvews).
+- Correction to 5623baec2's "the rows never run this code": that held for read-only scripts. With io_uring allowed,
+  the write rows enter the VFS ring: 816-820 io_uring_enter on ins_full_400, 800 of them single-SQE submits from
+  IoUringRuntime's driver task (strace -f -k, symbolized). So the io_uring-allowed instructions column measures the
+  lever's per-pass check, and it is flat.
+- Evidence: bd-2sf0f comments of 2026-11-28; scratchpad cr15/jk.log, cr15/jgc2.log, cr15/local_r15a.log,
+  cr15/local_r15b.log.
+- Retry: none needed; this is landed. If a time verdict is ever wanted, re-judge cold_scan and the write rows under a
+  judge whose A/A passes (bd-j0jc0). Do not revert on a time cell alone while the policy holds.
+
 ## 2026-11-27 - REJECTED (measurement host, not a lever): the performance governor alone does not make judge v2b time verdicts admissible; the host A/A failed on its void rule, 3 voids in 5 runs on byte-identical code (bd-j0jc0 / bd-gvews, judge retest lane round 1)
 
 - Question: the owner decided "fix host, retest" (2026-11-25). With thinkstation1 on the performance governor (64
