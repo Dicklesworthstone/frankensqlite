@@ -208,7 +208,7 @@ use fsqlite_types::{
     SchemaEpoch, SecureDeleteMode, StrictColumnType, TableId, TextEncoding, WitnessKey,
 };
 
-use crate::temp_store::{TempStoreRuntime, TrackedTempFile};
+use crate::temp_store::{TempStoreRuntime, TempStoreStats, TrackedTempFile};
 use crate::{
     SchemaEvaluationContext, TableIndexMetaMap, VdbeProgram, enter_vdbe_decode_profile_stage,
     enter_vdbe_execute_profile_stage,
@@ -2355,14 +2355,6 @@ enum DecodeCacheInvalidationReason {
     WriteMutation,
     PseudoRowChange,
 }
-
-/// Default spill threshold: 100 MiB.
-///
-/// When in-memory sort data exceeds this limit, the sorter flushes sorted
-/// runs to a temporary file. C SQLite's equivalent is configurable via
-/// `SQLITE_CONFIG_PMASZ`; this is a compile-time default that could be
-/// exposed via `PRAGMA temp_store_max_size` in a future enhancement.
-const SORTER_DEFAULT_SPILL_THRESHOLD: usize = 100 * 1024 * 1024;
 
 /// Number of 64-bit words in a Bloom filter (8192 bits = 1 KiB).
 const BLOOM_FILTER_WORDS: usize = 128;
@@ -7031,6 +7023,156 @@ impl MembershipMemo {
     }
 }
 
+/// The most an ephemeral index's in-memory shortcut ([`StagedIndexBuild`] or
+/// [`MembershipSet`]) may hold when `PRAGMA temp_store` resolves to FILE:
+/// the temp budget, the same bound the spillable b-tree's resident pages
+/// have (lever TB, bd-w4pr1.13.9). A shortcut that would pass it moves what
+/// it holds into that b-tree, which spills to a temp file past the budget as
+/// stock's temp b-tree does. Without a bound (`temp_store` MEMORY) there is
+/// no file to spill to, and the shortcut is unbounded as the b-tree is.
+///
+/// `held` is what the shortcut counts against `limit`; dropping the bound
+/// records the most it held in [`TempStoreStats`].
+#[derive(Debug)]
+struct ShortcutBound {
+    limit: usize,
+    held: usize,
+    stats: Arc<TempStoreStats>,
+}
+
+impl ShortcutBound {
+    fn new(limit: usize, stats: &Arc<TempStoreStats>) -> Self {
+        Self {
+            limit,
+            held: 0,
+            stats: Arc::clone(stats),
+        }
+    }
+}
+
+impl Drop for ShortcutBound {
+    fn drop(&mut self) {
+        self.stats.record_in_memory_index_bytes(self.held);
+    }
+}
+
+/// The records inserted into an ephemeral index opened with
+/// [`OPFLAG_STAGED_BUILD`] (a join's automatic index, bd-w4pr1.13.15), held
+/// in one arena until `IdxBulkLoad` with P3 = P1 builds the index from them.
+///
+/// Inserting them one at a time in table order sought each one's place from
+/// the root and balanced a full leaf with two siblings. Sorted once with the
+/// index's own comparator ([`BtCursor::compare_index_records`]) they are laid
+/// out as pages in one pass. The arena costs the record bytes plus one offset
+/// per record; the general sorter kept a decoded copy of every key as well.
+///
+/// With a [`ShortcutBound`] the arena counts its two vectors' capacities,
+/// each record's slot in the sort order `build_staged_index` makes included,
+/// and grows them only within the bound: an insert that does not fit is
+/// refused, and the caller builds the index from what is held and inserts
+/// that record, and every later one, into the b-tree (bd-w4pr1.13.9).
+#[derive(Debug)]
+struct StagedIndexBuild {
+    /// The records, back to back.
+    bytes: Vec<u8>,
+    /// Where each record ends in `bytes`.
+    ends: Vec<usize>,
+    bound: Option<ShortcutBound>,
+}
+
+/// What a bounded [`StagedIndexBuild`] counts per record besides its bytes:
+/// its end offset, and its slot in `build_staged_index`'s sort order.
+const STAGED_RECORD_OVERHEAD: usize = 2 * std::mem::size_of::<usize>();
+/// The least a bounded [`StagedIndexBuild`] grows its record bytes to.
+const STAGED_MIN_BYTES: usize = 1024;
+/// The least a bounded [`StagedIndexBuild`] grows its record count to.
+const STAGED_MIN_RECORDS: usize = 64;
+
+/// The bytes a bounded [`StagedIndexBuild`] counts for `bytes` record-byte
+/// and `records` record capacities.
+const fn staged_held_bytes(bytes: usize, records: usize) -> usize {
+    bytes.saturating_add(records.saturating_mul(STAGED_RECORD_OVERHEAD))
+}
+
+/// The capacities a bounded [`StagedIndexBuild`] grows its two vectors to so
+/// they take `bytes_needed` record bytes and `records_needed` records:
+/// doubled, as `Vec` grows, where that stays within `limit`, and otherwise
+/// each grown by at most half of what `limit` leaves, so the other keeps
+/// room to grow too. `None` when even the exact needs pass `limit`.
+fn staged_capacities(
+    (bytes_capacity, bytes_needed): (usize, usize),
+    (records_capacity, records_needed): (usize, usize),
+    limit: usize,
+) -> Option<(usize, usize)> {
+    let least_bytes = bytes_capacity.max(bytes_needed);
+    let least_records = records_capacity.max(records_needed);
+    let least = staged_held_bytes(least_bytes, least_records);
+    if least > limit {
+        return None;
+    }
+    let mut bytes = if bytes_needed > bytes_capacity {
+        bytes_capacity
+            .saturating_mul(2)
+            .max(bytes_needed)
+            .max(STAGED_MIN_BYTES)
+    } else {
+        bytes_capacity
+    };
+    let mut records = if records_needed > records_capacity {
+        records_capacity
+            .saturating_mul(2)
+            .max(records_needed)
+            .max(STAGED_MIN_RECORDS)
+    } else {
+        records_capacity
+    };
+    if staged_held_bytes(bytes, records) > limit {
+        let share = (limit - least) / 2;
+        bytes = bytes.min(least_bytes.saturating_add(share));
+        records = records.min(least_records.saturating_add(share / STAGED_RECORD_OVERHEAD));
+    }
+    Some((bytes, records))
+}
+
+impl StagedIndexBuild {
+    const fn new(bound: Option<ShortcutBound>) -> Self {
+        Self {
+            bytes: Vec::new(),
+            ends: Vec::new(),
+            bound,
+        }
+    }
+
+    /// Stage `record`, or, with nothing staged, `false` when holding it would
+    /// take a bounded arena past its bound.
+    fn try_push(&mut self, record: &[u8]) -> bool {
+        if let Some(bound) = self.bound.as_mut() {
+            let bytes_needed = self.bytes.len().saturating_add(record.len());
+            let records_needed = self.ends.len().saturating_add(1);
+            if bytes_needed > self.bytes.capacity() || records_needed > self.ends.capacity() {
+                let Some((bytes, records)) = staged_capacities(
+                    (self.bytes.capacity(), bytes_needed),
+                    (self.ends.capacity(), records_needed),
+                    bound.limit,
+                ) else {
+                    return false;
+                };
+                self.bytes.reserve_exact(bytes - self.bytes.len());
+                self.ends.reserve_exact(records - self.ends.len());
+                bound.held = staged_held_bytes(self.bytes.capacity(), self.ends.capacity());
+            }
+        }
+        self.bytes.extend_from_slice(record);
+        self.ends.push(self.bytes.len());
+        true
+    }
+
+    fn record(&self, index: usize) -> &[u8] {
+        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+        &self.bytes[start..self.ends[index]]
+    }
+}
+
 /// The keys of an ephemeral index opened with [`OPFLAG_MEMBERSHIP_SET`]
 /// (bd-w4pr1.13.15), held in a hash set instead of the cursor's b-tree.
 ///
@@ -7042,42 +7184,44 @@ impl MembershipMemo {
 ///
 /// A record with no canonical form ends set mode for the cursor:
 /// `VdbeEngine::spill_membership_set` inserts the keys held so far into the
-/// b-tree and the cursor continues as an ordinary index.
-/// The records inserted into an ephemeral index opened with
-/// [`OPFLAG_STAGED_BUILD`] (a join's automatic index, bd-w4pr1.13.15), held
-/// in one arena until `IdxBulkLoad` with P3 = P1 builds the index from them.
-///
-/// Inserting them one at a time in table order sought each one's place from
-/// the root and balanced a full leaf with two siblings. Sorted once with the
-/// index's own comparator ([`BtCursor::compare_index_records`]) they are laid
-/// out as pages in one pass. The arena costs the record bytes plus one offset
-/// per record; the general sorter kept a decoded copy of every key as well.
-#[derive(Debug, Default)]
-struct StagedIndexBuild {
-    /// The records, back to back.
-    bytes: Vec<u8>,
-    /// Where each record ends in `bytes`.
-    ends: Vec<usize>,
-}
-
-impl StagedIndexBuild {
-    fn push(&mut self, record: &[u8]) {
-        self.bytes.extend_from_slice(record);
-        self.ends.push(self.bytes.len());
-    }
-
-    fn record(&self, index: usize) -> &[u8] {
-        let start = if index == 0 { 0 } else { self.ends[index - 1] };
-        &self.bytes[start..self.ends[index]]
-    }
-}
-
+/// b-tree and the cursor continues as an ordinary index. So does a new key
+/// that would take a bounded set past its [`ShortcutBound`] (bd-w4pr1.13.9).
 #[derive(Debug)]
 struct MembershipSet {
     keys: HashSet<Box<[u8]>>,
     /// Whether TEXT key fields compare by their stored bytes: every key
     /// column uses built-in BINARY and the database is UTF-8.
     text_is_bytewise: bool,
+    bound: Option<ShortcutBound>,
+}
+
+/// What a bounded [`MembershipSet`] counts for a key of `len` bytes: its
+/// boxed allocation (8 bytes of header, rounded up to 16, at least 32), and
+/// its share of the hash table, a 16-byte slot and a control byte per bucket
+/// at up to 16/7 buckets a key just after the table doubles.
+const fn membership_key_cost(len: usize) -> usize {
+    let chunk = len.saturating_add(8).next_multiple_of(16);
+    let chunk = if chunk < 32 { 32 } else { chunk };
+    chunk + 40
+}
+
+impl MembershipSet {
+    /// Hold `key`, or `false` when the set lacks it and holding it would take
+    /// a bounded set past its bound.
+    fn try_insert(&mut self, key: Cow<'_, [u8]>) -> bool {
+        if let Some(bound) = self.bound.as_mut() {
+            let cost = membership_key_cost(key.len());
+            if bound.held.saturating_add(cost) > bound.limit {
+                return self.keys.contains(key.as_ref());
+            }
+            if self.keys.insert(key.into_owned().into_boxed_slice()) {
+                bound.held += cost;
+            }
+            return true;
+        }
+        self.keys.insert(key.into_owned().into_boxed_slice());
+        true
+    }
 }
 
 /// Whether some INTEGER equals `real` under the index's numeric comparison
@@ -12688,6 +12832,7 @@ impl VdbeEngine {
         if self.storage_cursor_memdb_count_shortcuts_safe {
             self.mark_storage_table_dirty(cursor_id);
         }
+        self.temp_store_runtime.stats().record_staged_index_build();
         Ok(())
     }
 
@@ -15224,15 +15369,21 @@ impl VdbeEngine {
                         let cx = self.derive_execution_cx();
                         let temp_runtime = self.temp_store_runtime.clone();
                         let use_spillable_temp_btree = temp_runtime.is_file_backed();
-                        // When a tight file-backed budget is active, route keys
-                        // through the spillable B-tree rather than an unbounded
-                        // in-memory MembershipSet or StagedIndexBuild buffer.
-                        let allow_unbounded_in_memory_shortcuts = !use_spillable_temp_btree
-                            || temp_runtime.budget_bytes() >= SORTER_DEFAULT_SPILL_THRESHOLD;
+                        // bd-w4pr1.13.9 (lever TB): a membership set or a
+                        // staged build is admitted whatever the budget. Under
+                        // a FILE temp store it holds at most the budget, past
+                        // which it moves what it holds into the spillable
+                        // b-tree below (`ShortcutBound`).
+                        let shortcut_bound = || {
+                            use_spillable_temp_btree.then(|| {
+                                ShortcutBound::new(
+                                    temp_runtime.budget_bytes(),
+                                    temp_runtime.stats(),
+                                )
+                            })
+                        };
                         let autoindex_collations = extract_collation_names_owned(&op.p4);
-                        let membership_set = if !allow_unbounded_in_memory_shortcuts
-                            || (op.p5 & OPFLAG_MEMBERSHIP_SET) == 0
-                        {
+                        let membership_set = if (op.p5 & OPFLAG_MEMBERSHIP_SET) == 0 {
                             None
                         } else {
                             let text_is_bytewise = matches!(self.text_encoding, TextEncoding::Utf8)
@@ -15242,15 +15393,16 @@ impl VdbeEngine {
                                         .as_deref()
                                         .is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
                                 });
+                            temp_runtime.stats().record_membership_set_opened();
                             Some(Box::new(MembershipSet {
                                 keys: HashSet::new(),
                                 text_is_bytewise,
+                                bound: shortcut_bound(),
                             }))
                         };
-                        let staged_build = (allow_unbounded_in_memory_shortcuts
-                            && membership_set.is_none()
+                        let staged_build = (membership_set.is_none()
                             && (op.p5 & OPFLAG_STAGED_BUILD) != 0)
-                            .then(Box::<StagedIndexBuild>::default);
+                            .then(|| Box::new(StagedIndexBuild::new(shortcut_bound())));
                         let backend = if use_spillable_temp_btree {
                             let store = TempSpillPageStore::with_empty_index(
                                 root_pgno,
@@ -17188,19 +17340,26 @@ impl VdbeEngine {
                     // bd-w4pr1.13.15: a staged build keeps a plain insert's
                     // record until IdxBulkLoad builds the index from all of
                     // them. An insert with index semantics a plain one lacks
-                    // builds the index first and takes the ordinary path.
+                    // builds the index first and takes the ordinary path, as
+                    // does one that would take the arena past its temp budget
+                    // (bd-w4pr1.13.9): the index is built from the records
+                    // held, and this one and every later one go to the b-tree.
                     if let Some(staged) = self
                         .storage_cursors
                         .get_mut(&cursor_id)
                         .and_then(|sc| sc.staged_build.as_deref_mut())
                     {
                         if op.p5 == 0 {
-                            staged.push(&key_blob);
-                            if sideband_active {
-                                self.make_record_lookaside.replace_cleared_buf(key_blob);
+                            if staged.try_push(&key_blob) {
+                                if sideband_active {
+                                    self.make_record_lookaside.replace_cleared_buf(key_blob);
+                                }
+                                pc += 1;
+                                continue;
                             }
-                            pc += 1;
-                            continue;
+                            self.temp_store_runtime
+                                .stats()
+                                .record_staged_index_budget_spill();
                         }
                         if let Err(error) = self.build_staged_index(cursor_id).await {
                             if sideband_active {
@@ -17212,8 +17371,10 @@ impl VdbeEngine {
 
                     // bd-w4pr1.13.15: a membership set takes the key into
                     // its hash set and leaves its b-tree empty. A key with no
-                    // canonical form, or an insert with index semantics the
-                    // set does not model, ends set mode first.
+                    // canonical form, an insert with index semantics the set
+                    // does not model, or a new key that would take the set
+                    // past its temp budget (bd-w4pr1.13.9) ends set mode
+                    // first.
                     if let Some(set) = self
                         .storage_cursors
                         .get_mut(&cursor_id)
@@ -17222,12 +17383,16 @@ impl VdbeEngine {
                         if op.p5 == 0
                             && let Some(key) = membership_set_key(&key_blob, set.text_is_bytewise)
                         {
-                            set.keys.insert(key.into_owned().into_boxed_slice());
-                            if sideband_active {
-                                self.make_record_lookaside.replace_cleared_buf(key_blob);
+                            if set.try_insert(key) {
+                                if sideband_active {
+                                    self.make_record_lookaside.replace_cleared_buf(key_blob);
+                                }
+                                pc += 1;
+                                continue;
                             }
-                            pc += 1;
-                            continue;
+                            self.temp_store_runtime
+                                .stats()
+                                .record_membership_set_budget_spill();
                         }
                         if let Err(error) = self.spill_membership_set(cursor_id).await {
                             if sideband_active {
@@ -27891,10 +28056,22 @@ mod tests {
 
     /// Build and execute a program, returning results.
     fn run_program(build: impl FnOnce(&mut ProgramBuilder)) -> Vec<Vec<SqliteValue>> {
+        run_program_with_temp_runtime(None, build)
+    }
+
+    /// [`run_program`] under `temp_runtime` when given, else the engine's
+    /// default temp store.
+    fn run_program_with_temp_runtime(
+        temp_runtime: Option<crate::temp_store::TempStoreRuntime>,
+        build: impl FnOnce(&mut ProgramBuilder),
+    ) -> Vec<Vec<SqliteValue>> {
         let mut b = ProgramBuilder::new();
         build(&mut b);
         let prog = b.finish().expect("program should build");
         let mut engine = VdbeEngine::new(prog.register_count());
+        if let Some(temp_runtime) = temp_runtime {
+            engine.set_temp_store_runtime(temp_runtime);
+        }
         let outcome = run_async(engine.execute(&prog)).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         engine
@@ -35965,7 +36142,18 @@ mod tests {
         inserts: &[SetKey],
         probes: &[SetKey],
     ) -> Vec<i64> {
-        let rows = run_program(|b| {
+        run_membership_program_in(None, open_p5, collation, inserts, probes)
+    }
+
+    /// [`run_membership_program`] under `temp_runtime` when given.
+    fn run_membership_program_in(
+        temp_runtime: Option<crate::temp_store::TempStoreRuntime>,
+        open_p5: u16,
+        collation: &P4,
+        inserts: &[SetKey],
+        probes: &[SetKey],
+    ) -> Vec<i64> {
+        let rows = run_program_with_temp_runtime(temp_runtime, |b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             let cursor_id = 1;
@@ -36122,6 +36310,285 @@ mod tests {
                 "{collation}: empty set"
             );
         }
+    }
+
+    /// A FILE temp store of `budget` bytes with its own counters.
+    fn tb_file_runtime(
+        budget: usize,
+    ) -> (
+        crate::temp_store::TempStoreRuntime,
+        Arc<crate::temp_store::TempStoreStats>,
+    ) {
+        use crate::temp_store::{OsTempFileBackend, TempStoreMode, TempStoreRuntime, TempStoreStats};
+        let stats = Arc::new(TempStoreStats::new());
+        let runtime = TempStoreRuntime::new(
+            TempStoreMode::File,
+            budget,
+            None,
+            Some(Arc::new(OsTempFileBackend)),
+            Arc::clone(&stats),
+        );
+        (runtime, stats)
+    }
+
+    /// bd-w4pr1.13.9 (lever TB): a bounded staged arena counts its vectors'
+    /// capacities, and never counts past its limit however its records are
+    /// sized. It is refused only when even an exact fit would pass the limit,
+    /// and holds a fair share of what an exact-fit arena would before that.
+    /// Every record it took reads back. An arena that grew as `Vec` does
+    /// (doubling) would count past the limit in most of these cases.
+    #[test]
+    fn test_bounded_staged_arena_never_counts_past_its_limit() {
+        use crate::temp_store::TempStoreStats;
+        for limit in [0_usize, 1, 100, 1024, 4096, 65_536, 2_048_000] {
+            for record_len in [1_usize, 6, 37, 300] {
+                let stats = Arc::new(TempStoreStats::new());
+                let mut staged = StagedIndexBuild::new(Some(ShortcutBound::new(limit, &stats)));
+                let record: Vec<u8> = (0..record_len)
+                    .map(|i| u8::try_from(i % 251).unwrap())
+                    .collect();
+                let mut staged_count = 0_usize;
+                while staged.try_push(&record) {
+                    staged_count += 1;
+                    let held = staged_held_bytes(staged.bytes.capacity(), staged.ends.capacity());
+                    assert!(held <= limit, "limit {limit} record {record_len}: held {held}");
+                    assert_eq!(staged.bound.as_ref().map(|bound| bound.held), Some(held));
+                }
+                let exact = staged_held_bytes(
+                    staged.bytes.capacity().max(staged.bytes.len() + record_len),
+                    staged.ends.capacity().max(staged.ends.len() + 1),
+                );
+                assert!(
+                    exact > limit,
+                    "limit {limit} record {record_len}: refused at {staged_count} records \
+                     though {exact} bytes would fit"
+                );
+                let exact_fit = limit / (record_len + STAGED_RECORD_OVERHEAD);
+                assert!(
+                    4 * staged_count + 4 >= exact_fit,
+                    "limit {limit} record {record_len}: only {staged_count} of {exact_fit} records"
+                );
+                for index in 0..staged_count {
+                    assert_eq!(staged.record(index), record.as_slice());
+                }
+                let held = staged.bound.as_ref().map_or(0, |bound| bound.held);
+                drop(staged);
+                assert_eq!(
+                    stats.snapshot().in_memory_index_bytes_peak,
+                    u64::try_from(held).unwrap()
+                );
+            }
+        }
+        // Unbounded (temp_store MEMORY): never refused.
+        let mut staged = StagedIndexBuild::new(None);
+        for _ in 0..100_000 {
+            assert!(staged.try_push(&[1, 2, 3, 4, 5, 6]));
+        }
+        assert_eq!(staged.ends.len(), 100_000);
+    }
+
+    /// bd-w4pr1.13.9 (lever TB): a bounded membership set refuses a NEW key
+    /// that would pass its limit, and only that: a key it holds is still
+    /// held when it is full, so DISTINCT over many duplicates never spills
+    /// for them.
+    #[test]
+    fn test_bounded_membership_set_refuses_only_new_keys_past_its_limit() {
+        use crate::temp_store::TempStoreStats;
+        assert_eq!(membership_key_cost(0), 72);
+        assert_eq!(membership_key_cost(24), 72);
+        assert_eq!(membership_key_cost(25), 88);
+        let cost = membership_key_cost(4);
+        let stats = Arc::new(TempStoreStats::new());
+        let mut set = MembershipSet {
+            keys: HashSet::new(),
+            text_is_bytewise: true,
+            bound: Some(ShortcutBound::new(3 * cost + cost / 2, &stats)),
+        };
+        for key in 0..3_u8 {
+            assert!(set.try_insert(Cow::Owned(vec![key; 4])));
+            assert!(set.try_insert(Cow::Owned(vec![key; 4])), "a duplicate costs nothing");
+        }
+        assert!(
+            !set.try_insert(Cow::Owned(vec![3; 4])),
+            "a fourth new key passes the limit"
+        );
+        assert_eq!(set.keys.len(), 3);
+        assert!(
+            set.try_insert(Cow::Borrowed(&[1, 1, 1, 1])),
+            "a key the full set holds is still held"
+        );
+        assert_eq!(set.bound.as_ref().map(|bound| bound.held), Some(3 * cost));
+        drop(set);
+        assert_eq!(
+            stats.snapshot().in_memory_index_bytes_peak,
+            u64::try_from(3 * cost).unwrap()
+        );
+    }
+
+    /// bd-w4pr1.13.9 (lever TB): under a FILE temp budget a membership set is
+    /// still admitted, holds keys until the next new one would pass the
+    /// budget, then moves into its b-tree; every probe answers as the b-tree
+    /// arm (flag clear) does. Budgets: one that spills at the first key, one
+    /// that spills after five, and one that never spills.
+    #[test]
+    fn test_membership_set_spills_past_its_temp_budget_and_answers_as_the_index() {
+        let inserts = [
+            SetKey::Int(1),
+            SetKey::Real(2.5),
+            SetKey::Text("a"),
+            SetKey::Real(3.0),
+            SetKey::Int(9_007_199_254_740_993),
+            SetKey::Real(-0.0),
+            SetKey::Real(1e300),
+            SetKey::Blob(b"a"),
+            SetKey::Int(-129),
+            SetKey::Null,
+            SetKey::Int(1),
+            SetKey::Real(3.0),
+        ];
+        let probes = [
+            SetKey::Real(1.0),
+            SetKey::Int(2),
+            SetKey::Real(2.5),
+            SetKey::Text("a"),
+            SetKey::Text("A"),
+            SetKey::Int(3),
+            SetKey::Int(9_007_199_254_740_992),
+            SetKey::Int(9_007_199_254_740_993),
+            SetKey::Real(0.0),
+            SetKey::Real(1e300),
+            SetKey::Blob(b"a"),
+            SetKey::Int(-129),
+            SetKey::Int(-128),
+            SetKey::Null,
+        ];
+        let reference = run_membership_program(0, &P4::None, &inserts, &probes);
+        assert_eq!(reference, vec![1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0, 1]);
+        let key_cost = membership_key_cost(9);
+        for (budget, spills) in [(1, 1), (5 * key_cost + key_cost / 2, 1), (64 << 20, 0)] {
+            let (runtime, stats) = tb_file_runtime(budget);
+            assert_eq!(
+                run_membership_program_in(
+                    Some(runtime),
+                    OPFLAG_MEMBERSHIP_SET,
+                    &P4::None,
+                    &inserts,
+                    &probes,
+                ),
+                reference,
+                "budget {budget}"
+            );
+            let snapshot = stats.snapshot();
+            assert_eq!(snapshot.membership_sets_opened, 1, "budget {budget}");
+            assert_eq!(
+                snapshot.membership_set_budget_spills, spills,
+                "budget {budget}: {snapshot:?}"
+            );
+            assert!(
+                snapshot.in_memory_index_bytes_peak <= u64::try_from(budget).unwrap(),
+                "budget {budget}: {snapshot:?}"
+            );
+        }
+    }
+
+    /// Fill an ephemeral index opened with [`OPFLAG_STAGED_BUILD`] from
+    /// `(key, rowid)` rows under `temp_runtime`, build it with `IdxBulkLoad`
+    /// P3 = P1, and read its records back in index order.
+    fn run_staged_autoindex(
+        temp_runtime: crate::temp_store::TempStoreRuntime,
+        rows: &[(i32, i32)],
+    ) -> Vec<Vec<u8>> {
+        let mut engine = VdbeEngine::new(16);
+        engine.set_temp_store_runtime(temp_runtime);
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r_key = b.alloc_regs(2);
+        let r_record = b.alloc_reg();
+        b.emit_op(Opcode::OpenAutoindex, 1, 2, 0, P4::None, OPFLAG_STAGED_BUILD);
+        for (key, rowid) in rows {
+            b.emit_op(Opcode::Integer, *key, r_key, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, *rowid, r_key + 1, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_key, 2, r_record, P4::None, 0);
+            b.emit_op(Opcode::IdxInsert, 1, r_record, 0, P4::None, 0);
+        }
+        b.emit_op(Opcode::IdxBulkLoad, 1, 0, 1, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let program = b.finish().expect("program should build");
+        run_async(engine.execute(&program)).expect("staged autoindex program should run");
+        let cursor = engine
+            .storage_cursors
+            .get_mut(&1)
+            .expect("autoindex cursor should remain open");
+        let mut stored = Vec::new();
+        if run_async(cursor.cursor.first(&cursor.cx)).expect("index scan should start") {
+            loop {
+                stored.push(run_async(cursor.cursor.payload(&cursor.cx)).expect("index payload"));
+                if !run_async(cursor.cursor.next(&cursor.cx)).expect("index scan should advance") {
+                    break;
+                }
+            }
+        }
+        stored
+    }
+
+    /// bd-w4pr1.13.9 (lever TB): a join's staged automatic index under a FILE
+    /// temp budget too small for its records builds from what it holds when
+    /// the next record would pass the budget, takes the rest into the
+    /// spillable b-tree, and holds exactly the inserted records in index
+    /// order, (key, rowid). A spill that laid the held records out unsorted
+    /// fails here; so does a bound that never spills (the spill count), or
+    /// one that counts past the budget (the peak).
+    #[test]
+    fn test_staged_autoindex_spills_past_its_temp_budget_in_index_order() {
+        use crate::temp_store::{OsTempFileBackend, TempStoreMode, TempStoreRuntime, TempStoreStats};
+        let rows: Vec<(i32, i32)> = (1..=600).map(|i| ((i * 37) % 101, i)).collect();
+        let mut sorted = rows.clone();
+        sorted.sort_unstable();
+        let expected: Vec<Vec<u8>> = sorted
+            .iter()
+            .map(|&(key, rowid)| {
+                encode_record(&[
+                    SqliteValue::Integer(i64::from(key)),
+                    SqliteValue::Integer(i64::from(rowid)),
+                ])
+            })
+            .collect();
+        for (budget, spills) in [(1024_usize, 1_u64), (64 << 20, 0)] {
+            let (runtime, stats) = tb_file_runtime(budget);
+            assert_eq!(run_staged_autoindex(runtime, &rows), expected, "budget {budget}");
+            let snapshot = stats.snapshot();
+            assert_eq!(snapshot.staged_index_builds, 1, "budget {budget}: {snapshot:?}");
+            assert_eq!(
+                snapshot.staged_index_budget_spills, spills,
+                "budget {budget}: {snapshot:?}"
+            );
+            assert!(
+                snapshot.in_memory_index_bytes_peak > 0
+                    && snapshot.in_memory_index_bytes_peak <= u64::try_from(budget).unwrap(),
+                "budget {budget}: {snapshot:?}"
+            );
+            if spills > 0 {
+                assert!(
+                    snapshot.temp_index_spill_events > 0,
+                    "the index past a 1 KiB budget must spill pages: {snapshot:?}"
+                );
+            }
+        }
+        // temp_store MEMORY: no bound, no spill, the same records.
+        let stats = Arc::new(TempStoreStats::new());
+        let memory = TempStoreRuntime::new(
+            TempStoreMode::Memory,
+            1024,
+            None,
+            Some(Arc::new(OsTempFileBackend)),
+            Arc::clone(&stats),
+        );
+        assert_eq!(run_staged_autoindex(memory, &rows), expected);
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.staged_index_builds, 1);
+        assert_eq!(snapshot.staged_index_budget_spills, 0);
     }
 
     #[test]

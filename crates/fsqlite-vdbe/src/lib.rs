@@ -3356,6 +3356,19 @@ pub mod temp_store {
         pub temp_files_closed: u64,
         pub active_temp_files: u64,
         pub memory_only_allocations: u64,
+        /// Ephemeral indexes built from a staged arena (bd-w4pr1.13.15).
+        pub staged_index_builds: u64,
+        /// Staged arenas built early because the next record would have
+        /// taken them past the temp budget (bd-w4pr1.13.9).
+        pub staged_index_budget_spills: u64,
+        /// Ephemeral indexes opened as membership sets (bd-w4pr1.13.15).
+        pub membership_sets_opened: u64,
+        /// Membership sets moved into their b-tree because a new key would
+        /// have taken them past the temp budget (bd-w4pr1.13.9).
+        pub membership_set_budget_spills: u64,
+        /// The most bytes one staged arena or membership set counted against
+        /// its temp budget (bd-w4pr1.13.9).
+        pub in_memory_index_bytes_peak: u64,
     }
 
     /// Atomic live counters shared across a connection's temporary structures.
@@ -3375,6 +3388,11 @@ pub mod temp_store {
         temp_files_closed: AtomicU64,
         active_temp_files: AtomicU64,
         memory_only_allocations: AtomicU64,
+        staged_index_builds: AtomicU64,
+        staged_index_budget_spills: AtomicU64,
+        membership_sets_opened: AtomicU64,
+        membership_set_budget_spills: AtomicU64,
+        in_memory_index_bytes_peak: AtomicU64,
     }
 
     impl Default for TempStoreStats {
@@ -3401,6 +3419,11 @@ pub mod temp_store {
                 temp_files_closed: AtomicU64::new(0),
                 active_temp_files: AtomicU64::new(0),
                 memory_only_allocations: AtomicU64::new(0),
+                staged_index_builds: AtomicU64::new(0),
+                staged_index_budget_spills: AtomicU64::new(0),
+                membership_sets_opened: AtomicU64::new(0),
+                membership_set_budget_spills: AtomicU64::new(0),
+                in_memory_index_bytes_peak: AtomicU64::new(0),
             }
         }
 
@@ -3445,6 +3468,29 @@ pub mod temp_store {
             self.memory_only_allocations.fetch_add(1, Ordering::Relaxed);
         }
 
+        pub fn record_staged_index_build(&self) {
+            self.staged_index_builds.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn record_staged_index_budget_spill(&self) {
+            self.staged_index_budget_spills
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn record_membership_set_opened(&self) {
+            self.membership_sets_opened.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn record_membership_set_budget_spill(&self) {
+            self.membership_set_budget_spills
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn record_in_memory_index_bytes(&self, bytes: usize) {
+            self.in_memory_index_bytes_peak
+                .fetch_max(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+
         fn record_file_opened(&self) {
             self.temp_files_opened.fetch_add(1, Ordering::Relaxed);
             self.active_temp_files.fetch_add(1, Ordering::Relaxed);
@@ -3476,6 +3522,17 @@ pub mod temp_store {
                 temp_files_closed: self.temp_files_closed.load(Ordering::Relaxed),
                 active_temp_files: self.active_temp_files.load(Ordering::Relaxed),
                 memory_only_allocations: self.memory_only_allocations.load(Ordering::Relaxed),
+                staged_index_builds: self.staged_index_builds.load(Ordering::Relaxed),
+                staged_index_budget_spills: self
+                    .staged_index_budget_spills
+                    .load(Ordering::Relaxed),
+                membership_sets_opened: self.membership_sets_opened.load(Ordering::Relaxed),
+                membership_set_budget_spills: self
+                    .membership_set_budget_spills
+                    .load(Ordering::Relaxed),
+                in_memory_index_bytes_peak: self
+                    .in_memory_index_bytes_peak
+                    .load(Ordering::Relaxed),
             }
         }
     }
