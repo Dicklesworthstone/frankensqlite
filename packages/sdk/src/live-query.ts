@@ -164,7 +164,7 @@ export async function watchQuery<Row extends Record<string, unknown> = Record<st
     const captured = request!;
     const operation = async (): Promise<void> => {
       try {
-        const value = await queue.transaction(async (tx) => {
+        const value = await queue.readTransaction(async (tx) => {
           const result = await tx.query<Row>(captured.sql, captured.params);
           return Object.freeze({ ...result, throughSequence: queue.changeSequence });
         }, settings);

@@ -630,6 +630,14 @@ export class FrankenDB {
     return this.#transaction(null, (tx) => work(tx), undefined, options);
   }
 
+  /** Read a consistent snapshot. Transactional writes roll back even when the callback succeeds. */
+  readTransaction<T>(
+    work: (tx: FrankenTransaction) => T | Promise<T>,
+    options?: TransactionOptions,
+  ): Promise<T> {
+    return this.#transaction(null, (tx) => work(tx), undefined, options, undefined, "rollback");
+  }
+
   /**
    * Opt-in whole-transaction replay for confirmed SQLite BUSY conflicts.
    * Each callback runs in a fresh transaction after the preceding rollback.
@@ -670,6 +678,7 @@ export class FrankenDB {
     beforeCommit?: () => void,
     options?: TransactionOptions,
     retry?: { owner: object; recovery: RetryRecovery },
+    finish: "commit" | "rollback" = "commit",
   ): Promise<T> {
     this.#assertOwner(parent, retry?.owner);
     const policy = captureTransactionOptions(options);
@@ -718,7 +727,7 @@ export class FrankenDB {
       beforeCommit?.();
       this.#checkCancellation(scope);
       settling = true;
-      await this.#client.transaction("commit", scope.id);
+      await this.#client.transaction(finish, scope.id);
       return result;
     } catch (error: unknown) {
       settling = true;

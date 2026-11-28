@@ -283,6 +283,26 @@ export class FrankenDBQueue {
     work: (tx: FrankenTransaction) => T | Promise<T>,
     options?: QueuedTransactionOptions,
   ): Promise<T> {
+    return this.#runTransaction(work, options, false);
+  }
+
+  /**
+   * Read after all earlier jobs, using one SQL snapshot. The queue rolls back
+   * the scope before delivering its value. Reads never publish a checkpoint or
+   * table-change notification, even when the callback used a write statement.
+   */
+  readTransaction<T>(
+    work: (tx: FrankenTransaction) => T | Promise<T>,
+    options?: QueuedTransactionOptions,
+  ): Promise<T> {
+    return this.#runTransaction(work, options, true);
+  }
+
+  #runTransaction<T>(
+    work: (tx: FrankenTransaction) => T | Promise<T>,
+    options: QueuedTransactionOptions | undefined,
+    readOnly: boolean,
+  ): Promise<T> {
     let timeoutMs: number | undefined;
     const admission: QueuedJobOptions = {};
     try {
@@ -302,6 +322,12 @@ export class FrankenDBQueue {
         const transactionOptions: TransactionOptions = {};
         if (signal !== undefined) transactionOptions.signal = signal;
         if (timeoutMs !== undefined) transactionOptions.timeoutMs = timeoutMs;
+        if (readOnly) {
+          return this.#db.readTransaction(async (tx) => {
+            await this.#journal?.verifyRead(tx);
+            return work(tx);
+          }, transactionOptions);
+        }
         if (this.#journal === null) {
           return this.#finishTransaction(await this.#db.transaction(work, transactionOptions), []);
         }

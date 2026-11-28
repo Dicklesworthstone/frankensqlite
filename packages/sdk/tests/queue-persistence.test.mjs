@@ -12,7 +12,7 @@ import {
   ModelObjectStore,
 } from "../../worker/tests/helpers/indexeddb-model.mjs";
 import { sqliteSnapshotWorker } from "../../worker/tests/helpers/snapshot-sqlite-core.mjs";
-import { FrankenDBQueue } from "../src/index.ts";
+import { FrankenDBQueue, watchQuery } from "../src/index.ts";
 import { deferred, drain, observe } from "./helpers/controlled-worker.ts";
 
 const { databases } = installIndexedDbModel();
@@ -30,6 +30,32 @@ const rows = (q) =>
 const schema = (q) =>
   q.transaction((tx) => tx.execute("CREATE TABLE items(id INTEGER PRIMARY KEY,value TEXT UNIQUE)"));
 const stored = (name) => databases.get(`frankensqlite:snapshot:v1:${name}`).values.get("head");
+
+test("live reads never publish snapshots or leak changes from a read transaction", limits, async (t) => {
+  let exports = 0;
+  const { queue } = await open(undefined, { beforeExport() { exports++; } }, { checkpointOnCommit: true });
+  t.after(() => queue.close());
+  await schema(queue);
+  const initial = queue.snapshotRevision;
+  const watch = await watchQuery(queue, "SELECT value FROM items ORDER BY id", { tables: ["items"] });
+  t.after(() => watch.return());
+  assert.deepEqual((await watch.next()).value.rowArrays, []);
+  assert.equal(queue.snapshotRevision, initial);
+  const pending = watch.next();
+  const speculative = await queue.readTransaction(async tx => {
+    await tx.transaction(child => child.execute("INSERT INTO items VALUES(1,'temporary')"));
+    return (await tx.query("SELECT value FROM items")).rowArrays;
+  });
+  assert.deepEqual(speculative, [["temporary"]]);
+  assert.equal(queue.changeSequence, 0n);
+  assert.equal(exports, 1);
+  await queue.transaction(tx => tx.execute("INSERT INTO items VALUES(1,'durable')"));
+  const committed = queue.snapshotRevision;
+  assert.notEqual(committed, initial);
+  assert.deepEqual((await pending).value.rowArrays, [["durable"]]);
+  assert.equal(queue.snapshotRevision, committed);
+  assert.equal(exports, 2);
+});
 async function imageRows(bytes) {
   const dir = await mkdtemp(join(tmpdir(), "fsqlite-queued-image-")),
     path = join(dir, "image.sqlite");

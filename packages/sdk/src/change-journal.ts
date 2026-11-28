@@ -153,6 +153,10 @@ export class TableChangeJournal {
     );
   }
 
+  async verifyRead(tx: FrankenTransaction): Promise<void> {
+    if (this.#watches.size > 0) await this.#verify(tx, this.#watches);
+  }
+
   /** Return dirty tables only after the enclosing SQL COMMIT has succeeded. */
   async run<T>(
     db: FrankenDB,
