@@ -51589,13 +51589,14 @@ impl Connection {
         source_rows: &'a [Row],
     ) -> Pin<Box<dyn Future<Output = Result<InsertSelectReplayOutcome>> + 'a>> {
         Box::pin(async move {
-            let outcome = self.execute_insert_select_row_stream(insert, true, async |emitter| {
-                for row in source_rows {
-                    emitter.emit_row(row.values()).await?;
-                }
-                Ok(())
-            })
-            .await?;
+            let outcome = self
+                .execute_insert_select_row_stream(insert, true, false, async |emitter| {
+                    for row in source_rows {
+                        emitter.emit_row(row.values()).await?;
+                    }
+                    Ok(())
+                })
+                .await?;
             self.set_statement_change_count(outcome.changes);
             Ok(outcome)
         })
@@ -51621,14 +51622,19 @@ impl Connection {
         // Per-row replay already updates total_changes and excludes REPLACE's
         // implicit deletes; only the statement count is accumulated here.
         // Boxing retains the indirection needed by recursive row replay.
-        let outcome = Box::pin(self.execute_insert_select_row_stream(insert, true, async |emitter| {
-            for morsel in &morsels {
-                for row in &morsel.rows {
-                    emitter.emit_row(row).await?;
+        let outcome = Box::pin(self.execute_insert_select_row_stream(
+            insert,
+            true,
+            false,
+            async |emitter| {
+                for morsel in &morsels {
+                    for row in &morsel.rows {
+                        emitter.emit_row(row).await?;
+                    }
                 }
-            }
-            Ok(())
-        }))
+                Ok(())
+            },
+        ))
         .await?;
         self.set_statement_change_count(outcome.changes);
         Ok(outcome.changes)
@@ -54416,10 +54422,14 @@ impl Connection {
     /// were all evaluated before the stream started (a materialized SELECT
     /// chunk, VALUES, morsels), so nothing is read between rows; only such a
     /// SELECT-fed stream may run the compiled-row kernel (bd-fpr5g lever 5).
+    /// `flush_per_row` disables 32-row batching so every emitted row updates
+    /// connection state (e.g. `last_insert_rowid()`) before the producer
+    /// evaluates the next source row (bd-qdve2).
     async fn execute_insert_select_row_stream<F>(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         source_rows_materialized: bool,
+        flush_per_row: bool,
         mut producer: F,
     ) -> Result<InsertSelectReplayOutcome>
     where
@@ -54462,7 +54472,7 @@ impl Connection {
                 } else {
                     None
                 };
-                let batch_rows = if prepared.is_some() {
+                let batch_rows = if prepared.is_some() && !flush_per_row {
                     self.insert_select_replay_batch_rows(insert, source_column_count)
                 } else {
                     0
@@ -54610,10 +54620,11 @@ impl Connection {
             return Ok(None);
         }
         let source_is_unwritten = self.insert_select_source_is_unwritten(insert, select_stmt);
+        let flush_per_row = select_may_observe_change_tracking(select_stmt);
         let mut streamed = false;
         let outcome = self
-            .execute_insert_select_row_stream(insert, false, async |emitter| {
-                if source_is_unwritten {
+            .execute_insert_select_row_stream(insert, false, flush_per_row, async |emitter| {
+                if source_is_unwritten && insert.returning.is_empty() {
                     streamed = self
                         .try_stream_single_table_select_rows_in_chunks(
                             select_stmt,
@@ -54631,6 +54642,16 @@ impl Connection {
                         )
                         .await?;
                 }
+                if !streamed {
+                    streamed = self
+                        .try_stream_general_insert_select_rows(
+                            insert,
+                            select_stmt,
+                            params,
+                            async |source_row| emitter.emit_row(source_row).await,
+                        )
+                        .await?;
+                }
                 Ok(())
             })
             .await?;
@@ -54642,6 +54663,910 @@ impl Connection {
         } else {
             Ok(None)
         }
+    }
+
+    /// bd-qdve2: general per-row streaming source for `INSERT ... SELECT`
+    /// fallback shapes that stock SQLite does NOT materialize up front
+    /// (indexed/covering base tables, `generate_series` with expressions/hidden
+    /// columns/`last_insert_rowid()`, `json_each` and other table-valued
+    /// functions, and `INNER`/`LEFT`/`CROSS`/comma/`NATURAL`/`USING` joins with
+    /// arbitrary `WHERE` and projection expressions).
+    ///
+    /// Evaluates `ON`, `WHERE`, and `SELECT` expressions strictly one row at a
+    /// time right before `emit_row`, holding `InsertSelectSourceCounts` around
+    /// source evaluation so `changes()`/`total_changes()` stay at pre-statement
+    /// values while `last_insert_rowid()` advances live per inserted row.
+    /// Pipeline breakers (`ORDER BY`, `GROUP BY`, `HAVING`, window functions,
+    /// aggregates, compounds, `RIGHT`/`FULL` joins) and stock `useTempTable`
+    /// shapes (`RETURNING`, target triggers, self-referencing target, CTEs,
+    /// subqueries) decline cleanly (`Ok(false)`).
+    #[allow(clippy::too_many_lines)]
+    async fn try_stream_general_insert_select_rows<F>(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        select_stmt: &fsqlite_ast::SelectStatement,
+        params: Option<&[SqliteValue]>,
+        mut emit_row: F,
+    ) -> Result<bool>
+    where
+        F: std::ops::AsyncFnMut(&[SqliteValue]) -> Result<()>,
+    {
+        if insert.with.is_some()
+            || !insert.returning.is_empty()
+            || self.insert_select_target_has_triggers(insert)
+            || self.skip_statement_memdb_refresh.get()
+            || (self.fk_enforcement_enabled() && self.insert_may_delete_fk_parent_victim(insert))
+            || select_stmt.with.is_some()
+            || !select_stmt.body.compounds.is_empty()
+            || !select_stmt.order_by.is_empty()
+            || has_window_functions(select_stmt)
+            || self.has_implicit_aggregation_with_registry(select_stmt)
+            || select_contains_subquery_matching(select_stmt, self, &|_, _| true)
+            || select_contains_match_operator(select_stmt)
+        {
+            return Ok(false);
+        }
+        let target_name = &insert.table.name;
+        if Self::extract_table_names_from_select(select_stmt)
+            .iter()
+            .any(|source| source.eq_ignore_ascii_case(target_name))
+        {
+            return Ok(false);
+        }
+
+        let bound_select = bind_placeholders_in_select_for_fallback(select_stmt, params)?;
+        let SelectCore::Select {
+            distinct,
+            columns,
+            from: Some(from),
+            where_clause,
+            group_by,
+            having,
+            windows,
+        } = &bound_select.body.select
+        else {
+            return Ok(false);
+        };
+        if !group_by.is_empty()
+            || having.is_some()
+            || !windows.is_empty()
+            || columns.is_empty()
+        {
+            return Ok(false);
+        }
+        for join in &from.joins {
+            if !matches!(
+                join.join_type.kind,
+                JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+            ) {
+                return Ok(false);
+            }
+            if matches!(&join.constraint, Some(JoinConstraint::On(expr)) if expr_has_any_subquery(expr))
+            {
+                return Ok(false);
+            }
+        }
+
+        let all_sources: Vec<&TableOrSubquery> = std::iter::once(&from.source)
+            .chain(from.joins.iter().map(|join| &join.table))
+            .collect();
+        let mut table_sources: Vec<JoinTableSource> = Vec::with_capacity(all_sources.len());
+        let mut active_ctes = Vec::new();
+        for source in &all_sources {
+            match source {
+                TableOrSubquery::Table {
+                    name,
+                    alias,
+                    time_travel,
+                    ..
+                } => {
+                    if time_travel.is_some()
+                        || self.has_live_vtab_instance(&name.name)
+                        || self.local_view_index_for_relation(name).is_some()
+                    {
+                        return Ok(false);
+                    }
+                    let col_names = self.table_or_subquery_result_column_names(
+                        source,
+                        &[],
+                        &mut active_ctes,
+                    );
+                    if col_names.is_empty() {
+                        return Ok(false);
+                    }
+                    table_sources.push(JoinTableSource {
+                        binding_name: Some(name.clone()),
+                        scan_cache_key: join_scan_cache_key(name),
+                        table_name: name.name.clone(),
+                        alias: alias.clone(),
+                        hidden_columns: HashSet::new(),
+                        hidden_rowid_projection: join_hidden_rowid_projection(
+                            &col_names,
+                            self.table_binding_supports_hidden_rowid_for_scan(name),
+                        ),
+                        col_names,
+                        paren_join_meta: None,
+                    });
+                }
+                TableOrSubquery::TableFunction {
+                    name, args, alias, ..
+                } => {
+                    if args.iter().any(expr_references_any_column) {
+                        return Ok(false);
+                    }
+                    let Some((col_names, hidden_columns)) =
+                        self.table_function_column_metadata(name)
+                    else {
+                        return Ok(false);
+                    };
+                    let hidden_rowid_projection = join_hidden_rowid_projection(&col_names, true);
+                    table_sources.push(JoinTableSource {
+                        binding_name: None,
+                        scan_cache_key: format!("table_function:{}", name.to_ascii_lowercase()),
+                        table_name: name.clone(),
+                        alias: alias.clone(),
+                        col_names,
+                        hidden_columns,
+                        hidden_rowid_projection,
+                        paren_join_meta: None,
+                    });
+                }
+                TableOrSubquery::Subquery { .. } | TableOrSubquery::ParenJoin(_) => {
+                    return Ok(false);
+                }
+            }
+        }
+
+        let prep_cx = self.op_cx_after_background_status();
+        self.prepare_streaming_join_select_read_boundary(&bound_select, &prep_cx)
+            .await?;
+        self.validate_join_using_columns(&bound_select)?;
+
+        let mut col_map: Vec<(String, String, bool)> = Vec::new();
+        for src in &table_sources {
+            src.append_col_map(&mut col_map);
+        }
+        let schema_snapshot = self.schema.borrow().clone();
+        let (col_collations, col_affinities) = self.join_source_collations_and_affinities(
+            &all_sources,
+            &table_sources,
+            &[],
+            &schema_snapshot,
+        );
+        let using_column_projections = build_join_using_column_projections_from_sources(
+            &table_sources,
+            &from.joins,
+            &col_map,
+            &col_collations,
+            &col_affinities,
+        );
+        let mut declared_blob_columns = self.builtin_json_key_columns(&all_sources, &col_map);
+        declared_blob_columns.extend(typeless_base_table_columns(
+            &all_sources,
+            &table_sources,
+            &schema_snapshot,
+        ));
+        let hidden_column_indices = collect_join_hidden_column_indices(&table_sources);
+        let using_skip_indices = collect_join_using_skip_indices(&table_sources, &from.joins);
+        let coalesced_star_indices =
+            collect_join_coalesced_star_indices(&table_sources, &from.joins);
+        let using_skip: Option<&HashSet<usize>> = if using_skip_indices.is_empty() {
+            None
+        } else {
+            Some(&using_skip_indices)
+        };
+        let join_coll_ctx = Arc::new(JoinEvalCollationContext {
+            declared_json_keys: declared_blob_columns,
+            column_collations: col_collations,
+            column_affinities: col_affinities,
+            using_column_projections,
+            registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+        });
+        let using_skip_arc = using_skip.map(|skip| Arc::new(skip.clone()));
+
+        {
+            let _coll_guard = JoinEvalCollationContextGuard::push_shared(Arc::clone(&join_coll_ctx));
+            let _using_guard = using_skip_arc
+                .as_ref()
+                .map(|skip| JoinUsingSkipGuard::push_shared(Arc::clone(skip)));
+            validate_join_select_column_references(
+                columns,
+                &from.joins,
+                &all_sources,
+                where_clause.as_deref(),
+                &col_map,
+                using_skip,
+                &[],
+            )?;
+        }
+
+        let resolved_limit = self.resolve_expression_only_limit(&bound_select, None).await?;
+        if resolved_limit.as_ref().is_some_and(|lim| lim.limit == 0) {
+            return Ok(true);
+        }
+        let mut offset_remaining = resolved_limit
+            .as_ref()
+            .map_or(0usize, |lim| usize::try_from(lim.offset.max(0)).unwrap_or(usize::MAX));
+        let mut limit_remaining = resolved_limit.as_ref().and_then(|lim| {
+            (lim.limit >= 0).then(|| usize::try_from(lim.limit).unwrap_or(usize::MAX))
+        });
+
+        let where_bindings = where_clause.as_deref().map(|expr| {
+            let mut bindings = JoinExprBindings::default();
+            bindings.bind_expr(expr, &col_map, using_skip);
+            Arc::new(bindings)
+        });
+        let proj_bindings = if using_skip.is_none() {
+            let mut bindings = JoinExprBindings::default();
+            for column in columns {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    bindings.bind_expr(expr, &col_map, None);
+                }
+            }
+            Some(Arc::new(bindings))
+        } else {
+            None
+        };
+        let star_column_indices: Vec<usize> = if columns
+            .iter()
+            .any(|col| matches!(col, ResultColumn::Star))
+        {
+            Self::join_star_column_indices(
+                &col_map,
+                &hidden_column_indices,
+                &using_skip_indices,
+            )
+        } else {
+            Vec::new()
+        };
+        let table_star_column_indices: Vec<Option<Vec<usize>>> = columns
+            .iter()
+            .map(|col| match col {
+                ResultColumn::TableStar(table_name) => Some(Self::join_table_star_column_indices(
+                    &all_sources,
+                    &col_map,
+                    &hidden_column_indices,
+                    table_name,
+                )),
+                _ => None,
+            })
+            .collect();
+        let is_distinct = *distinct == Distinctness::Distinct;
+        let distinct_meta = is_distinct.then(|| {
+            let distinct_collations =
+                self.select_result_collations_for_connection(&bound_select, &schema_snapshot);
+            let distinct_coll_snapshot =
+                lock_unpoisoned(self.collation_registry.as_ref()).clone();
+            (distinct_collations, distinct_coll_snapshot)
+        });
+        let mut seen_distinct: Vec<Vec<SqliteValue>> = Vec::new();
+        let source_changes = self.last_changes.get();
+        let source_total = self.total_changes.get();
+
+        // Evaluate one raw joined/source row (WHERE -> projection -> DISTINCT ->
+        // OFFSET -> LIMIT) with thread-local join guards active, then drop all
+        // guards BEFORE calling `emit_row` so inner INSERT replay never sees
+        // outer join bindings or stale source counts.
+        let mut projected_row = Vec::with_capacity(columns.len());
+        let mut evaluate_and_emit = async |raw_row: &[SqliteValue],
+                                           apply_where: bool|
+               -> Result<std::ops::ControlFlow<()>> {
+            let should_emit = {
+                let _source_counts =
+                    InsertSelectSourceCounts::enter(self, source_changes, source_total);
+                let _coll_guard =
+                    JoinEvalCollationContextGuard::push_shared(Arc::clone(&join_coll_ctx));
+                let _using_guard = using_skip_arc
+                    .as_ref()
+                    .map(|skip| JoinUsingSkipGuard::push_shared(Arc::clone(skip)));
+
+                let keep = if apply_where
+                    && let Some(where_expr) = where_clause.as_deref()
+                {
+                    let _wb_guard = where_bindings
+                        .as_ref()
+                        .map(|bindings| JoinExprBindingsGuard::push_shared(Arc::clone(bindings)));
+                    if let Some(sync_result) =
+                        self.try_eval_expr_truthiness_sync(where_expr, true, raw_row, &col_map)
+                    {
+                        sync_result?.unwrap_or(false)
+                    } else {
+                        lean_future(|| {
+                            self.eval_expr_truthiness(where_expr, true, raw_row, &col_map, None)
+                        })
+                        .await?
+                        .unwrap_or(false)
+                    }
+                } else {
+                    true
+                };
+                if !keep {
+                    false
+                } else {
+                    let _pb_guard = proj_bindings
+                        .as_ref()
+                        .map(|bindings| JoinExprBindingsGuard::push_shared(Arc::clone(bindings)));
+                    projected_row.clear();
+                    for (col, table_star_indices) in
+                        columns.iter().zip(&table_star_column_indices)
+                    {
+                        match col {
+                            ResultColumn::Star => {
+                                for &i in &star_column_indices {
+                                    if let Some(v) = raw_row.get(i) {
+                                        projected_row.push(join_star_column_value(
+                                            raw_row,
+                                            i,
+                                            v,
+                                            &col_map,
+                                            &coalesced_star_indices,
+                                        ));
+                                    }
+                                }
+                            }
+                            ResultColumn::TableStar(_) => {
+                                if let Some(indices) = table_star_indices.as_deref() {
+                                    for &idx in indices {
+                                        projected_row.push(
+                                            raw_row.get(idx).cloned().unwrap_or(SqliteValue::Null),
+                                        );
+                                    }
+                                }
+                            }
+                            ResultColumn::Expr { expr, .. } => {
+                                projected_row.push(self.eval_join_expr_with_using_registry(
+                                    expr, raw_row, &col_map, using_skip,
+                                )?);
+                            }
+                        }
+                    }
+                    true
+                }
+            };
+            if !should_emit {
+                return Ok(std::ops::ControlFlow::Continue(()));
+            }
+            if let Some((ref distinct_collations, ref distinct_coll_snapshot)) = distinct_meta {
+                let is_dup = seen_distinct.iter().any(|existing| {
+                    existing.len() == projected_row.len()
+                        && existing.iter().zip(&projected_row).enumerate().all(
+                            |(ci, (a, b))| {
+                                let coll =
+                                    distinct_collations.get(ci).and_then(Option::as_deref);
+                                cmp_sqlite_values_collated_snapshot(
+                                    a,
+                                    b,
+                                    coll,
+                                    distinct_coll_snapshot,
+                                ) == std::cmp::Ordering::Equal
+                            },
+                        )
+                });
+                if is_dup {
+                    return Ok(std::ops::ControlFlow::Continue(()));
+                }
+                seen_distinct.push(projected_row.clone());
+            }
+            if offset_remaining > 0 {
+                offset_remaining -= 1;
+                return Ok(std::ops::ControlFlow::Continue(()));
+            }
+            emit_row(&projected_row).await?;
+            if let Some(remaining) = limit_remaining.as_mut() {
+                *remaining = remaining.saturating_sub(1);
+                if *remaining == 0 {
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            }
+            Ok(std::ops::ControlFlow::Continue(()))
+        };
+
+        // ── Loop A: builtin `generate_series(start, stop[, step])` in O(1) memory ──
+        if from.joins.is_empty()
+            && let TableOrSubquery::TableFunction { name, args, .. } = &from.source
+            && name.eq_ignore_ascii_case("generate_series")
+            && (2..=3).contains(&args.len())
+            && self.builtin_generate_series_module().is_some()
+            && let Some((start, stop, step)) = parse_const_generate_series_range(args)
+        {
+            let has_hidden_rowid = table_sources[0].hidden_rowid_projection.is_some();
+            let mut raw_row = Vec::with_capacity(table_sources[0].scan_width());
+            let mut rowid: i64 = 1;
+            let mut next_val = (start <= stop).then_some(start);
+            while let Some(v) = next_val {
+                next_val = v.checked_add(step).filter(|next| *next <= stop);
+                raw_row.clear();
+                raw_row.push(SqliteValue::Integer(v));
+                raw_row.push(SqliteValue::Integer(start));
+                raw_row.push(SqliteValue::Integer(stop));
+                raw_row.push(SqliteValue::Integer(step));
+                if has_hidden_rowid {
+                    raw_row.push(SqliteValue::Integer(rowid));
+                }
+                rowid = rowid.saturating_add(1);
+                if evaluate_and_emit(&raw_row, true).await?.is_break() {
+                    break;
+                }
+            }
+            return Ok(true);
+        }
+
+        // ── Loop B & C: single-table optimized raw scans (covering index or keyset chunked) ──
+        if from.joins.is_empty()
+            && let TableOrSubquery::Table {
+                name,
+                alias,
+                index_hint,
+                ..
+            } = &from.source
+        {
+            let primary_source = &table_sources[0];
+            let primary_width = primary_source.scan_width();
+            // Loop C: covering-index scan (bd-1bs3h) — scan only referenced raw
+            // columns so VDBE picks the exact covering index in stock order,
+            // then evaluate WHERE and projection expressions per row.
+            if self.select_uses_covering_full_scan(&bound_select)
+                && let Some((slot_indices, raw_select)) = build_covering_raw_column_select(
+                    primary_source,
+                    name,
+                    alias.as_deref(),
+                    index_hint.as_ref(),
+                    columns,
+                    where_clause.as_deref(),
+                    self.local_join_binding_table(name)
+                        .and_then(|(_, rowid_alias)| rowid_alias),
+                )
+            {
+                let rows = {
+                    let _tt_guard = (!self.memdb_rows_loaded.get())
+                        .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
+                    self.execute_statement(&Statement::Select(raw_select), None)
+                        .await?
+                };
+                let mut raw_row = vec![SqliteValue::Null; primary_width];
+                for row in rows {
+                    raw_row.fill(SqliteValue::Null);
+                    for (&slot, val) in slot_indices.iter().zip(row.values) {
+                        if slot < primary_width {
+                            raw_row[slot] = val;
+                        }
+                    }
+                    if evaluate_and_emit(&raw_row, true).await?.is_break() {
+                        break;
+                    }
+                }
+                return Ok(true);
+            }
+
+            // Loop B: chunked rowid keyset raw scan (O(10,000) memory) when
+            // stock reads the table in rowid order.
+            if self.insert_select_keyset_rowid(&bound_select).is_some()
+                && self.active_txn.borrow().is_some()
+                && index_hint.is_none()
+                && let Some(rowid_name) = primary_source.hidden_rowid_projection.as_deref()
+            {
+                let chunk_rows =
+                    usize::try_from(Self::INSERT_SELECT_CHUNK_SIZE).unwrap_or(usize::MAX);
+                let scan_sql = build_join_scan_sql(primary_source);
+                let first_sql = format!(
+                    "{scan_sql} ORDER BY {rowid_name} LIMIT {}",
+                    Self::INSERT_SELECT_CHUNK_SIZE
+                );
+                let next_sql = format!(
+                    "{scan_sql} WHERE {rowid_name} > ?1 ORDER BY {rowid_name} LIMIT {}",
+                    Self::INSERT_SELECT_CHUNK_SIZE
+                );
+                let rowid_index = primary_width.saturating_sub(1);
+                let mut after_rowid: Option<i64> = None;
+                'chunks: loop {
+                    let rows = {
+                        let _tt_guard = (!self.memdb_rows_loaded.get())
+                            .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
+                        match after_rowid {
+                            None => self.query(&first_sql).await?,
+                            Some(rowid) => {
+                                self.query_with_params(&next_sql, &[SqliteValue::Integer(rowid)])
+                                    .await?
+                            }
+                        }
+                    };
+                    let chunk_len = rows.len();
+                    if chunk_len == 0 {
+                        break;
+                    }
+                    let Some(&SqliteValue::Integer(last_rowid)) =
+                        rows.last().and_then(|r| r.values.get(rowid_index))
+                    else {
+                        return Err(FrankenError::Internal(format!(
+                            "INSERT ... SELECT chunked scan of `{}` returned a row without its rowid",
+                            primary_source.table_name
+                        )));
+                    };
+                    after_rowid = Some(last_rowid);
+                    for mut row in rows {
+                        if row.values.len() != primary_width {
+                            row.values.resize(primary_width, SqliteValue::Null);
+                        }
+                        if evaluate_and_emit(&row.values, true).await?.is_break() {
+                            break 'chunks;
+                        }
+                    }
+                    if chunk_len < chunk_rows {
+                        break;
+                    }
+                }
+                return Ok(true);
+            }
+
+            // Single table with a pure index-usable WHERE (e.g. `WHERE b > 'b2'`):
+            // evaluate the pure WHERE via VDBE so index scan order is preserved,
+            // then stream projections per row.
+            if let Some(where_expr) = where_clause.as_deref()
+                && expr_is_pure_index_where(where_expr)
+                && self
+                    .local_join_binding_table(name)
+                    .is_some_and(|(table, _)| {
+                        table_where_may_use_secondary_index(&table, where_expr)
+                    })
+            {
+                let raw_select = build_full_raw_column_select_with_where(
+                    primary_source,
+                    name,
+                    alias.as_deref(),
+                    index_hint.as_ref(),
+                    Some(where_expr.clone()),
+                );
+                let rows = {
+                    let _tt_guard = (!self.memdb_rows_loaded.get())
+                        .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
+                    self.execute_statement(&Statement::Select(raw_select), None)
+                        .await?
+                };
+                for mut row in rows {
+                    if row.values.len() != primary_width {
+                        row.values.resize(primary_width, SqliteValue::Null);
+                    }
+                    if evaluate_and_emit(&row.values, false).await?.is_break() {
+                        break;
+                    }
+                }
+                return Ok(true);
+            }
+        }
+
+        // ── Loop D: general single-table, TVF (`json_each`, etc.), and multi-table JOINs ──
+        let mut scanned_cache: HashMap<String, Vec<Vec<SqliteValue>>> = HashMap::new();
+        let mut table_rows: Vec<Vec<Vec<SqliteValue>>> = Vec::with_capacity(table_sources.len());
+        for (i, (ast_src, src)) in all_sources.iter().zip(&table_sources).enumerate() {
+            match ast_src {
+                TableOrSubquery::TableFunction { name, args, .. } => {
+                    let include_hidden_rowid = src.hidden_rowid_projection.is_some();
+                    let mut row_data = lean_future(|| {
+                        self.execute_table_function_rows(name, args, None, include_hidden_rowid)
+                    })
+                    .await?;
+                    let scan_width = src.scan_width();
+                    for row in &mut row_data {
+                        if row.len() != scan_width {
+                            row.resize(scan_width, SqliteValue::Null);
+                        }
+                    }
+                    table_rows.push(row_data);
+                }
+                TableOrSubquery::Table { .. } => {
+                    if let Some(cached) = scanned_cache.get(&src.scan_cache_key) {
+                        table_rows.push(cached.clone());
+                        continue;
+                    }
+                    let mut row_data = if let Some(row_data) = self.try_scan_join_source_from_memdb(src)
+                    {
+                        row_data
+                    } else if let Some(result) =
+                        lean_future(|| self.try_scan_join_source_from_pager(src, None)).await
+                    {
+                        result?
+                    } else {
+                        let scan_sql = build_join_scan_sql(src);
+                        let _tt_guard = (!self.memdb_rows_loaded.get())
+                            .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
+                        let rows = lean_future(|| self.query(&scan_sql)).await?;
+                        rows.into_iter().map(|r| r.values).collect()
+                    };
+                    let scan_width = src.scan_width();
+                    for row in &mut row_data {
+                        if row.len() != scan_width {
+                            row.resize(scan_width, SqliteValue::Null);
+                        }
+                    }
+                    if table_sources[i + 1..]
+                        .iter()
+                        .any(|later| later.scan_cache_key.eq(&src.scan_cache_key))
+                    {
+                        scanned_cache.insert(src.scan_cache_key.clone(), row_data.clone());
+                    }
+                    table_rows.push(row_data);
+                }
+                TableOrSubquery::Subquery { .. } | TableOrSubquery::ParenJoin(_) => {
+                    unreachable!("subquery and paren-join declined above");
+                }
+            }
+        }
+
+        enum StreamingGeneralJoinStep {
+            Hash(StreamingHashJoinPlan),
+            NestedLoop {
+                left_width: usize,
+                right_width: usize,
+                kind: JoinKind,
+                constraint: Option<JoinConstraint>,
+                using_left_slots: Option<Vec<SmallVec<[usize; 4]>>>,
+            },
+        }
+
+        let from_joins_are_all_inner = from.joins.iter().all(|join| {
+            matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Cross)
+        });
+        let mut join_steps: Vec<StreamingGeneralJoinStep> = Vec::with_capacity(from.joins.len());
+        for (join_idx, join) in from.joins.iter().enumerate() {
+            let left_width: usize = table_sources[..=join_idx]
+                .iter()
+                .map(JoinTableSource::scan_width)
+                .sum();
+            let right_width = table_sources[join_idx + 1].scan_width();
+            let base_constraint = if join.join_type.natural {
+                let left_cols: Vec<&str> = table_sources[..=join_idx]
+                    .iter()
+                    .flat_map(JoinTableSource::visible_column_names)
+                    .collect();
+                let right_src = &table_sources[join_idx + 1];
+                let shared: Vec<String> = right_src
+                    .visible_column_names()
+                    .into_iter()
+                    .filter(|c| left_cols.iter().any(|l| l.eq_ignore_ascii_case(c)))
+                    .map(str::to_owned)
+                    .collect();
+                Some(JoinConstraint::Using(shared))
+            } else {
+                join.constraint.clone()
+            };
+            let effective_constraint = match (base_constraint, where_clause.as_deref()) {
+                (None | Some(JoinConstraint::On(_)), Some(where_expr))
+                    if from_joins_are_all_inner =>
+                {
+                    let mut terms = where_equi_terms_for_join_step(
+                        where_expr,
+                        &col_map,
+                        left_width,
+                        right_width,
+                    );
+                    if terms.is_empty() {
+                        join.constraint.clone()
+                    } else {
+                        if let Some(JoinConstraint::On(on_expr)) = &join.constraint {
+                            terms.insert(0, on_expr.clone());
+                        }
+                        rebuild_and_terms(terms).map(JoinConstraint::On)
+                    }
+                }
+                (constraint, _) => constraint,
+            };
+            let using_left_slots = match effective_constraint.as_ref() {
+                Some(JoinConstraint::Using(cols)) if join.join_type.natural => {
+                    join_using_left_coalesce_slots(&table_sources, join_idx, cols, true, false)
+                }
+                _ => None,
+            };
+
+            let hash_plan = {
+                let _coll_guard =
+                    JoinEvalCollationContextGuard::push_shared(Arc::clone(&join_coll_ctx));
+                let _using_guard = using_skip_arc
+                    .as_ref()
+                    .map(|skip| JoinUsingSkipGuard::push_shared(Arc::clone(skip)));
+                if let Some(JoinConstraint::On(on_expr)) = effective_constraint.as_ref()
+                    && let Some(equi_pairs) =
+                        try_extract_equi_join_indices(on_expr, &col_map, left_width)
+                    && join_hash_pairs_are_binary(&equi_pairs, left_width)
+                    && let Some(hash_pairs) = hash_join_pairs_with_modes(&equi_pairs, left_width)
+                {
+                    Some(StreamingHashJoinPlan {
+                        left_width,
+                        right_width,
+                        kind: if matches!(join.join_type.kind, JoinKind::Left) {
+                            JoinKind::Left
+                        } else {
+                            JoinKind::Inner
+                        },
+                        right_index: build_streaming_hash_join_index(
+                            &table_rows[join_idx + 1],
+                            &hash_pairs,
+                        ),
+                        hash_pairs,
+                        predicate: on_expr.clone(),
+                    })
+                } else {
+                    None
+                }
+            };
+            if let Some(plan) = hash_plan {
+                join_steps.push(StreamingGeneralJoinStep::Hash(plan));
+            } else {
+                join_steps.push(StreamingGeneralJoinStep::NestedLoop {
+                    left_width,
+                    right_width,
+                    kind: join.join_type.kind,
+                    constraint: effective_constraint,
+                    using_left_slots,
+                });
+            }
+        }
+
+        struct GeneralJoinFrame {
+            join_idx: usize,
+            len_before_join: usize,
+            matching_right_rows: Vec<usize>,
+            emit_left_null: bool,
+            next_candidate: usize,
+        }
+
+        let total_width: usize = table_sources.iter().map(JoinTableSource::scan_width).sum();
+        let primary_width = table_sources[0].scan_width();
+        let mut current_row = Vec::with_capacity(total_width);
+        let mut frames = Vec::with_capacity(join_steps.len());
+
+        'outer: for primary_row in &table_rows[0] {
+            current_row.clear();
+            current_row.extend_from_slice(&primary_row[..primary_width]);
+            frames.clear();
+            let mut join_idx = 0usize;
+
+            loop {
+                if let Some(step) = join_steps.get(join_idx) {
+                    let len_before_join = current_row.len();
+                    let right_rows = &table_rows[join_idx + 1];
+                    let (right_width, kind, matching_right_rows) = {
+                        let _source_counts =
+                            InsertSelectSourceCounts::enter(self, source_changes, source_total);
+                        let _coll_guard = JoinEvalCollationContextGuard::push_shared(Arc::clone(
+                            &join_coll_ctx,
+                        ));
+                        let _using_guard = using_skip_arc
+                            .as_ref()
+                            .map(|skip| JoinUsingSkipGuard::push_shared(Arc::clone(skip)));
+                        let mut matches_vec = Vec::new();
+                        match step {
+                            StreamingGeneralJoinStep::Hash(plan) => {
+                                debug_assert_eq!(current_row.len(), plan.left_width);
+                                if let Some(bucket_candidates) =
+                                    build_canonical_hash_join_key(
+                                        &current_row,
+                                        &plan.hash_pairs,
+                                        false,
+                                    )
+                                    .as_ref()
+                                    .and_then(|key| plan.right_index.get(key))
+                                    .map(Vec::as_slice)
+                                {
+                                    for &right_row_index in bucket_candidates {
+                                        let right_row = &right_rows[right_row_index];
+                                        current_row
+                                            .extend_from_slice(&right_row[..plan.right_width]);
+                                        let matched = self.with_fallback_function_registry(|| {
+                                            eval_join_predicate(
+                                                &plan.predicate,
+                                                &current_row,
+                                                &col_map,
+                                            )
+                                        })?;
+                                        current_row.truncate(len_before_join);
+                                        if matched {
+                                            matches_vec.push(right_row_index);
+                                        }
+                                    }
+                                }
+                                (plan.right_width, plan.kind, matches_vec)
+                            }
+                            StreamingGeneralJoinStep::NestedLoop {
+                                left_width,
+                                right_width,
+                                kind,
+                                constraint,
+                                using_left_slots,
+                            } => {
+                                debug_assert_eq!(current_row.len(), *left_width);
+                                for (right_row_index, right_row) in right_rows.iter().enumerate() {
+                                    current_row.extend_from_slice(&right_row[..*right_width]);
+                                    let matched = match constraint.as_ref() {
+                                        None => true,
+                                        Some(JoinConstraint::On(expr)) => {
+                                            self.with_fallback_function_registry(|| {
+                                                eval_join_predicate(expr, &current_row, &col_map)
+                                            })?
+                                        }
+                                        Some(JoinConstraint::Using(cols)) => eval_using_constraint(
+                                            cols,
+                                            &current_row,
+                                            &col_map,
+                                            *left_width,
+                                            using_left_slots.as_deref(),
+                                            using_skip,
+                                            None,
+                                        ),
+                                    };
+                                    current_row.truncate(len_before_join);
+                                    if matched {
+                                        matches_vec.push(right_row_index);
+                                    }
+                                }
+                                (*right_width, *kind, matches_vec)
+                            }
+                        }
+                    };
+
+                    let emit_left_null =
+                        matching_right_rows.is_empty() && matches!(kind, JoinKind::Left);
+                    let candidate_count = if matching_right_rows.is_empty() {
+                        usize::from(emit_left_null)
+                    } else {
+                        matching_right_rows.len()
+                    };
+                    if candidate_count > 0 {
+                        if let Some(&right_row_index) = matching_right_rows.first() {
+                            let right_row = &right_rows[right_row_index];
+                            current_row.extend_from_slice(&right_row[..right_width]);
+                        } else {
+                            current_row
+                                .extend(std::iter::repeat_n(SqliteValue::Null, right_width));
+                        }
+                        frames.push(GeneralJoinFrame {
+                            join_idx,
+                            len_before_join,
+                            matching_right_rows,
+                            emit_left_null,
+                            next_candidate: 1,
+                        });
+                        join_idx = join_idx.saturating_add(1);
+                        continue;
+                    }
+                } else if evaluate_and_emit(&current_row, true).await?.is_break() {
+                    break 'outer;
+                }
+
+                let next_branch = loop {
+                    let Some(frame) = frames.last_mut() else {
+                        break None;
+                    };
+                    current_row.truncate(frame.len_before_join);
+                    let candidate_count = if frame.matching_right_rows.is_empty() {
+                        usize::from(frame.emit_left_null)
+                    } else {
+                        frame.matching_right_rows.len()
+                    };
+                    if frame.next_candidate < candidate_count {
+                        let right_row_index =
+                            frame.matching_right_rows.get(frame.next_candidate).copied();
+                        frame.next_candidate = frame.next_candidate.saturating_add(1);
+                        break Some((frame.join_idx, right_row_index));
+                    }
+                    frames.pop();
+                };
+                let Some((next_join_idx, right_row_index)) = next_branch else {
+                    break;
+                };
+                let right_width = match &join_steps[next_join_idx] {
+                    StreamingGeneralJoinStep::Hash(plan) => plan.right_width,
+                    StreamingGeneralJoinStep::NestedLoop { right_width, .. } => *right_width,
+                };
+                if let Some(right_row_index) = right_row_index {
+                    let right_row = &table_rows[next_join_idx + 1][right_row_index];
+                    current_row.extend_from_slice(&right_row[..right_width]);
+                } else {
+                    current_row.extend(std::iter::repeat_n(SqliteValue::Null, right_width));
+                }
+                join_idx = next_join_idx.saturating_add(1);
+            }
+        }
+        Ok(true)
     }
 
     async fn try_stream_simple_join_select_rows_with_scanner<F, S>(
@@ -190468,6 +191393,297 @@ fn series_chunk_select(select: &mut SelectStatement, low: i64, high: i64, step: 
     }
 }
 
+/// bd-qdve2: parse constant integer `(start, stop, step)` arguments for
+/// `generate_series(start, stop[, step])` with `step >= 1`.
+fn parse_const_generate_series_range(args: &[Expr]) -> Option<(i64, i64, i64)> {
+    let parse_int = |expr: &Expr| match expr {
+        Expr::Literal(Literal::Integer(value), _)
+        | Expr::BoundOuterValue {
+            value: SqliteValue::Integer(value),
+            ..
+        } => Some(*value),
+        Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr,
+            ..
+        } => match expr.as_ref() {
+            Expr::Literal(Literal::Integer(value), _) => value.checked_neg(),
+            _ => None,
+        },
+        _ => None,
+    };
+    let start = parse_int(args.first()?)?;
+    let stop = parse_int(args.get(1)?)?;
+    let step = args.get(2).map_or(Some(1), parse_int)?;
+    (step >= 1).then_some((start, stop, step))
+}
+
+/// bd-qdve2: whether a `WHERE` expression consists solely of pure column/literal
+/// comparisons and logical operators that cannot raise a runtime error or
+/// observe connection state, so pushing it into a single-table raw index scan
+/// preserves stock's index order without changing error ordering.
+fn expr_is_pure_index_where(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(..) | Expr::Column(..) | Expr::BoundOuterValue { .. } => true,
+        Expr::UnaryOp {
+            op: UnaryOp::Not | UnaryOp::Plus,
+            expr,
+            ..
+        }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. } => expr_is_pure_index_where(expr),
+        Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr,
+            ..
+        } => matches!(
+            expr.as_ref(),
+            Expr::Literal(Literal::Integer(n), _) if *n != i64::MIN
+        ) || matches!(expr.as_ref(), Expr::Literal(Literal::Float(_), _)),
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            matches!(
+                op,
+                BinaryOp::And
+                    | BinaryOp::Or
+                    | BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Is
+                    | BinaryOp::IsNot
+            ) && expr_is_pure_index_where(left)
+                && expr_is_pure_index_where(right)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_is_pure_index_where(expr)
+                && expr_is_pure_index_where(low)
+                && expr_is_pure_index_where(high)
+        }
+        Expr::In {
+            expr,
+            set: InSet::List(items),
+            ..
+        } => expr_is_pure_index_where(expr) && items.iter().all(expr_is_pure_index_where),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_is_pure_index_where(expr)
+                && expr_is_pure_index_where(pattern)
+                && escape
+                    .as_deref()
+                    .is_none_or(expr_is_pure_index_where)
+        }
+        _ => false,
+    }
+}
+
+/// bd-qdve2: whether a single-table `WHERE` clause may cause SQLite's planner
+/// to walk a secondary index rather than rowid order.
+fn table_where_may_use_secondary_index(table: &TableSchema, where_expr: &Expr) -> bool {
+    if table
+        .indexes
+        .iter()
+        .any(|index| index.columns.is_empty() || index.where_clause.is_some())
+    {
+        return true;
+    }
+    let mut names_index_column = false;
+    for_each_column_ref_in_expr(where_expr, &mut |column_ref| {
+        names_index_column |= table.indexes.iter().any(|index| {
+            index
+                .columns
+                .first()
+                .is_some_and(|leading| leading.eq_ignore_ascii_case(&column_ref.column))
+        });
+    });
+    names_index_column
+}
+
+/// bd-qdve2: build a raw-column `SELECT` over only the columns referenced by a
+/// covering-index full scan so VDBE walks the exact covering index in stock
+/// order (bd-1bs3h) without evaluating user `WHERE` or projection expressions.
+#[allow(clippy::too_many_arguments)]
+fn build_covering_raw_column_select(
+    source: &JoinTableSource,
+    name: &QualifiedName,
+    alias: Option<&str>,
+    index_hint: Option<&fsqlite_ast::IndexHint>,
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    rowid_alias_slot: Option<usize>,
+) -> Option<(Vec<usize>, SelectStatement)> {
+    let mut slot_indices: Vec<usize> = Vec::new();
+    let mut failed = false;
+    let hidden_rowid_slot = source
+        .hidden_rowid_projection
+        .as_ref()
+        .map(|_| source.col_names.len());
+    let mut note_col = |col_ref: &ColumnRef| {
+        if let Some(pos) = source
+            .col_names
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(&col_ref.column))
+        {
+            if !slot_indices.contains(&pos) {
+                slot_indices.push(pos);
+            }
+            return;
+        }
+        if is_hidden_rowid_alias_name(&col_ref.column)
+            && let Some(slot) = hidden_rowid_slot.or(rowid_alias_slot)
+        {
+            if !slot_indices.contains(&slot) {
+                slot_indices.push(slot);
+            }
+            return;
+        }
+        failed = true;
+    };
+    for col in columns {
+        match col {
+            ResultColumn::Star | ResultColumn::TableStar(_) => return None,
+            ResultColumn::Expr { expr, .. } => for_each_column_ref_in_expr(expr, &mut note_col),
+        }
+    }
+    if let Some(where_expr) = where_clause {
+        for_each_column_ref_in_expr(where_expr, &mut note_col);
+    }
+    if failed {
+        return None;
+    }
+    let result_columns: Vec<ResultColumn> = if slot_indices.is_empty() {
+        vec![ResultColumn::Expr {
+            expr: Expr::Literal(Literal::Integer(1), Span::ZERO),
+            alias: None,
+        }]
+    } else {
+        slot_indices
+            .iter()
+            .map(|&slot| {
+                let col_name = if let Some(named) = source.col_names.get(slot) {
+                    named.as_str()
+                } else {
+                    source
+                        .hidden_rowid_projection
+                        .as_deref()
+                        .unwrap_or("rowid")
+                };
+                ResultColumn::Expr {
+                    expr: Expr::Column(
+                        ColumnRef {
+                            schema: None,
+                            table: None,
+                            column: Arc::from(col_name),
+                        },
+                        Span::ZERO,
+                    ),
+                    alias: None,
+                }
+            })
+            .collect()
+    };
+    let raw_select = SelectStatement {
+        with: None,
+        body: fsqlite_ast::SelectBody {
+            select: SelectCore::Select {
+                distinct: Distinctness::All,
+                columns: result_columns,
+                from: Some(fsqlite_ast::FromClause {
+                    source: TableOrSubquery::Table {
+                        name: name.clone(),
+                        alias: alias.map(str::to_owned),
+                        index_hint: index_hint.cloned(),
+                        time_travel: None,
+                    },
+                    joins: Vec::new(),
+                }),
+                where_clause: None,
+                group_by: Vec::new(),
+                having: None,
+                windows: Vec::new(),
+            },
+            compounds: Vec::new(),
+        },
+        order_by: Vec::new(),
+        limit: None,
+    };
+    Some((slot_indices, raw_select))
+}
+
+/// bd-qdve2: build a raw-column `SELECT` of every column in `source` (plus its
+/// hidden rowid, if any) with an optional pure `WHERE` predicate so VDBE runs
+/// any index range scan in stock order without evaluating user projections.
+fn build_full_raw_column_select_with_where(
+    source: &JoinTableSource,
+    name: &QualifiedName,
+    alias: Option<&str>,
+    index_hint: Option<&fsqlite_ast::IndexHint>,
+    where_clause: Option<Expr>,
+) -> SelectStatement {
+    let mut result_columns: Vec<ResultColumn> = source
+        .col_names
+        .iter()
+        .map(|col_name| ResultColumn::Expr {
+            expr: Expr::Column(
+                ColumnRef {
+                    schema: None,
+                    table: None,
+                    column: Arc::from(col_name.as_str()),
+                },
+                Span::ZERO,
+            ),
+            alias: None,
+        })
+        .collect();
+    if let Some(rowid_name) = source.hidden_rowid_projection.as_deref() {
+        result_columns.push(ResultColumn::Expr {
+            expr: Expr::Column(
+                ColumnRef {
+                    schema: None,
+                    table: None,
+                    column: Arc::from(rowid_name),
+                },
+                Span::ZERO,
+            ),
+            alias: None,
+        });
+    }
+    SelectStatement {
+        with: None,
+        body: fsqlite_ast::SelectBody {
+            select: SelectCore::Select {
+                distinct: Distinctness::All,
+                columns: result_columns,
+                from: Some(fsqlite_ast::FromClause {
+                    source: TableOrSubquery::Table {
+                        name: name.clone(),
+                        alias: alias.map(str::to_owned),
+                        index_hint: index_hint.cloned(),
+                        time_travel: None,
+                    },
+                    joins: Vec::new(),
+                }),
+                where_clause: where_clause.map(Box::new),
+                group_by: Vec::new(),
+                having: None,
+                windows: Vec::new(),
+            },
+            compounds: Vec::new(),
+        },
+        order_by: Vec::new(),
+        limit: None,
+    }
+}
+
 fn build_join_scan_sql(source: &JoinTableSource) -> String {
     let mut projections = source
         .col_names
@@ -191483,8 +192699,12 @@ struct JoinUsingSkipGuard;
 
 impl JoinUsingSkipGuard {
     fn push(skip: &HashSet<usize>) -> Self {
+        Self::push_shared(Arc::new(skip.clone()))
+    }
+
+    fn push_shared(skip: Arc<HashSet<usize>>) -> Self {
         CURRENT_JOIN_USING_SKIP_INDICES.with(|stack| {
-            stack.borrow_mut().push(Arc::new(skip.clone()));
+            stack.borrow_mut().push(skip);
         });
         Self
     }

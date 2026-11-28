@@ -312,12 +312,9 @@ const SCENARIOS: &[Scenario] = &[
     },
 ];
 
-/// A source whose evaluation fails part way. fsqlite evaluates such a source
-/// before inserting any row, so the error is reported with nothing inserted
-/// and `last_insert_rowid()` unchanged; stock inserts the rows before the
-/// failing one first and leaves `last_insert_rowid()` at the last of them.
-/// That difference predates batching (bd-qdve2), so this scenario compares
-/// the error, the contents and the change counts, not `last_insert_rowid()`.
+/// A source whose evaluation fails part way. Both the error and
+/// `last_insert_rowid()` (advanced to the last row inserted before the source
+/// failure) match stock SQLite (bd-qdve2).
 const SOURCE_ERROR: &[Scenario] = &[Scenario {
     name: "a source error",
     steps: &[
@@ -373,8 +370,7 @@ async fn compare_scenarios(scenarios: &[Scenario], counters: &str) -> (Vec<Strin
 fn insert_select_batched_replay_matches_stock() {
     asupersync::test_utils::run_test(|| async {
         let (mut diffs, mut statements) = compare_scenarios(SCENARIOS, COUNTERS).await;
-        let (source_diffs, source_statements) =
-            compare_scenarios(SOURCE_ERROR, "SELECT changes(), total_changes()").await;
+        let (source_diffs, source_statements) = compare_scenarios(SOURCE_ERROR, COUNTERS).await;
         diffs.extend(source_diffs);
         statements += source_statements;
         assert!(

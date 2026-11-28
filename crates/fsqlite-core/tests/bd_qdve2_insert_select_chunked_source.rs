@@ -732,3 +732,212 @@ fn bd_1bs3h_covering_full_scan_and_insert_select_matches_stock() {
         );
     });
 }
+
+/// bd-qdve2 MUST: per-row streaming error ordering and `last_insert_rowid()`
+/// across base-table (plain & indexed), table-valued-function
+/// (`generate_series` & `json_each`), and join (`INNER`, `LEFT`, `CROSS`,
+/// `USING`) sources, plus `last_insert_rowid()`/`changes()`/`total_changes()`
+/// visibility inside the source SELECT and pipeline-breaker shapes (`ORDER BY`,
+/// triggers, self-read) compared verbatim against rusqlite's bundled SQLite.
+#[test]
+fn bd_qdve2_insert_select_per_row_streaming_matches_stock() {
+    let json_60: String = format!(
+        "[{}]",
+        (1..=60)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let json_60_unique = format!(
+        "INSERT INTO u SELECT CASE WHEN value = 50 THEN abs(-9223372036854775807 - 1) ELSE value END \
+         FROM json_each('{json_60}')"
+    );
+    let json_60_overflow = format!(
+        "INSERT INTO u2 SELECT CASE WHEN value = 50 THEN abs(-9223372036854775807 - 1) ELSE value END \
+         FROM json_each('{json_60}')"
+    );
+    let scenarios: Vec<(&str, Vec<String>, Vec<&str>)> = vec![
+        (
+            "base table (plain): UNIQUE at 40 beats overflow at 50 + lir advances",
+            vec![
+                "CREATE TABLE src(x INT)".into(),
+                "INSERT INTO src SELECT value FROM generate_series(1, 60)".into(),
+                "CREATE TABLE u(a INT UNIQUE)".into(),
+                "INSERT INTO u VALUES (40)".into(),
+                "INSERT INTO u SELECT CASE WHEN x = 50 THEN abs(-9223372036854775807 - 1) ELSE x END FROM src".into(),
+                "CREATE TABLE u2(a INT)".into(),
+                "INSERT INTO u2 SELECT CASE WHEN x = 50 THEN abs(-9223372036854775807 - 1) ELSE x END FROM src".into(),
+                "INSERT INTO u SELECT x FROM src WHERE CASE WHEN x = 50 THEN abs(-9223372036854775807 - 1) ELSE 1 END".into(),
+            ],
+            vec!["SELECT count(*), sum(a) FROM u", "SELECT count(*) FROM u2"],
+        ),
+        (
+            "base table (indexed + explicit txn + OR FAIL + RETURNING): per-row streaming",
+            vec![
+                "CREATE TABLE src(x INT, pad TEXT)".into(),
+                "INSERT INTO src SELECT value, 'p' || value FROM generate_series(1, 60)".into(),
+                "CREATE INDEX src_x ON src(x)".into(),
+                "CREATE TABLE u(a INT UNIQUE)".into(),
+                "INSERT INTO u VALUES (40)".into(),
+                "INSERT INTO u SELECT CASE WHEN x = 50 THEN abs(-9223372036854775807 - 1) ELSE x END FROM src".into(),
+                "INSERT INTO u SELECT CASE WHEN x = 50 THEN abs(-9223372036854775807 - 1) ELSE x END FROM src RETURNING a".into(),
+                "BEGIN".into(),
+                "INSERT INTO u VALUES (100)".into(),
+                "INSERT INTO u SELECT CASE WHEN x = 50 THEN abs(-9223372036854775807 - 1) ELSE x END FROM src".into(),
+                "INSERT OR FAIL INTO u SELECT CASE WHEN x = 50 THEN abs(-9223372036854775807 - 1) ELSE x END FROM src".into(),
+                "COMMIT".into(),
+            ],
+            vec!["SELECT count(*), min(a), max(a), sum(a) FROM u"],
+        ),
+        (
+            "table-valued functions (generate_series + hidden col + RETURNING + json_each)",
+            vec![
+                "CREATE TABLE u(a INT UNIQUE)".into(),
+                "INSERT INTO u VALUES (40)".into(),
+                "INSERT INTO u SELECT CASE WHEN value = 50 THEN abs(-9223372036854775807 - 1) ELSE value END FROM generate_series(1, 60)".into(),
+                "INSERT INTO u SELECT CASE WHEN value = 50 THEN abs(-9223372036854775807 - 1) ELSE value END FROM generate_series(1, 60) RETURNING a".into(),
+                "INSERT INTO u SELECT CASE WHEN value = 50 THEN abs(-9223372036854775807 - 1) ELSE value + start - 1 END FROM generate_series(1, 60)".into(),
+                json_60_unique,
+                "CREATE TABLE u2(a INT)".into(),
+                "INSERT INTO u2 SELECT CASE WHEN value = 50 THEN abs(-9223372036854775807 - 1) ELSE value END FROM generate_series(1, 60)".into(),
+                json_60_overflow,
+            ],
+            vec!["SELECT count(*), sum(a) FROM u", "SELECT count(*) FROM u2"],
+        ),
+        (
+            "joins (INNER, LEFT, CROSS/comma, USING): UNIQUE at 40 beats overflow at 50",
+            vec![
+                "CREATE TABLE s1(x INT, tag TEXT)".into(),
+                "CREATE TABLE s2(x INT, note TEXT)".into(),
+                "INSERT INTO s1 SELECT value, 'a' || value FROM generate_series(1, 60)".into(),
+                "INSERT INTO s2 SELECT value, 'b' || value FROM generate_series(1, 60) WHERE value <> 15".into(),
+                "CREATE TABLE u(a INT UNIQUE)".into(),
+                "INSERT INTO u VALUES (40)".into(),
+                "INSERT INTO u SELECT CASE WHEN s1.x = 50 THEN abs(-9223372036854775807 - 1) ELSE s1.x END FROM s1 INNER JOIN s2 ON s1.x = s2.x".into(),
+                "INSERT INTO u SELECT CASE WHEN s1.x = 50 THEN abs(-9223372036854775807 - 1) ELSE s1.x END FROM s1 LEFT JOIN s2 ON s1.x = s2.x".into(),
+                "INSERT INTO u SELECT CASE WHEN s1.x = 50 THEN abs(-9223372036854775807 - 1) ELSE s1.x END FROM s1, s2 WHERE s1.x = s2.x".into(),
+                "INSERT INTO u SELECT CASE WHEN x = 50 THEN abs(-9223372036854775807 - 1) ELSE x END FROM s1 JOIN s2 USING (x)".into(),
+                "INSERT INTO u SELECT s1.x FROM s1 INNER JOIN s2 ON s1.x = s2.x WHERE CASE WHEN s1.x = 50 THEN abs(-9223372036854775807 - 1) ELSE 1 END".into(),
+                "CREATE TABLE u2(a INT)".into(),
+                "INSERT INTO u2 SELECT CASE WHEN s1.x = 50 THEN abs(-9223372036854775807 - 1) ELSE s1.x END FROM s1 INNER JOIN s2 ON s1.x = s2.x".into(),
+            ],
+            vec!["SELECT count(*), sum(a) FROM u", "SELECT count(*) FROM u2"],
+        ),
+        (
+            "source reads last_insert_rowid(), changes(), total_changes() per row",
+            vec![
+                "CREATE TABLE s(a INT)".into(),
+                "CREATE INDEX s_a ON s(a)".into(),
+                "INSERT INTO s VALUES (10), (20), (30)".into(),
+                "CREATE TABLE s_plain(a INT)".into(),
+                "INSERT INTO s_plain VALUES (10), (20), (30)".into(),
+                "CREATE TABLE s2(a INT)".into(),
+                "INSERT INTO s2 VALUES (10), (20), (30)".into(),
+                "CREATE TABLE t_plain(a INT, r INT, c INT, tc INT)".into(),
+                "INSERT INTO t_plain SELECT a, last_insert_rowid(), changes(), total_changes() FROM s_plain".into(),
+                "CREATE TABLE t_idx(a INT, r INT, c INT, tc INT)".into(),
+                "INSERT INTO t_idx SELECT a, last_insert_rowid(), changes(), total_changes() FROM s".into(),
+                "CREATE TABLE t_gs(a INT, r INT, c INT, tc INT)".into(),
+                "INSERT INTO t_gs SELECT value, last_insert_rowid(), changes(), total_changes() FROM generate_series(1, 4)".into(),
+                "CREATE TABLE t_je(a INT, r INT, c INT, tc INT)".into(),
+                "INSERT INTO t_je SELECT value, last_insert_rowid(), changes(), total_changes() FROM json_each('[100,200,300]')".into(),
+                "CREATE TABLE t_join(a INT, r INT, c INT, tc INT)".into(),
+                "INSERT INTO t_join SELECT s.a, last_insert_rowid(), changes(), total_changes() FROM s INNER JOIN s2 ON s.a = s2.a".into(),
+                "CREATE TABLE t_ign(a INT UNIQUE, r INT)".into(),
+                "INSERT INTO t_ign VALUES (20, -1)".into(),
+                "INSERT OR IGNORE INTO t_ign SELECT a, last_insert_rowid() FROM s_plain".into(),
+            ],
+            vec![
+                "SELECT rowid, a, r, c, tc FROM t_plain ORDER BY rowid",
+                "SELECT rowid, a, r, c, tc FROM t_idx ORDER BY rowid",
+                "SELECT rowid, a, r, c, tc FROM t_gs ORDER BY rowid",
+                "SELECT rowid, a, r, c, tc FROM t_je ORDER BY rowid",
+                "SELECT rowid, a, r, c, tc FROM t_join ORDER BY rowid",
+                "SELECT rowid, a, r FROM t_ign ORDER BY rowid",
+            ],
+        ),
+        (
+            "pipeline breakers & useTempTable shapes stay stock-identical",
+            vec![
+                "CREATE TABLE src(x INT)".into(),
+                "INSERT INTO src SELECT value FROM generate_series(1, 60)".into(),
+                "CREATE TABLE u(a INT UNIQUE)".into(),
+                "INSERT INTO u VALUES (40)".into(),
+                // ORDER BY materializes/sorts before inserting: overflow at 50 beats UNIQUE at 40.
+                "INSERT INTO u SELECT CASE WHEN x = 50 THEN abs(-9223372036854775807 - 1) ELSE x END FROM src ORDER BY x".into(),
+                // Target trigger forces useTempTable before inserting.
+                "CREATE TABLE log(v INT)".into(),
+                "CREATE TABLE ut(a INT UNIQUE)".into(),
+                "INSERT INTO ut VALUES (40)".into(),
+                "CREATE TRIGGER tr_ut AFTER INSERT ON ut BEGIN INSERT INTO log VALUES (NEW.a); END".into(),
+                "INSERT INTO ut SELECT CASE WHEN x = 50 THEN abs(-9223372036854775807 - 1) ELSE x END FROM src".into(),
+                // Self-referencing target forces useTempTable before inserting.
+                "CREATE TABLE self_t(a INT UNIQUE)".into(),
+                "INSERT INTO self_t SELECT value FROM generate_series(1, 60)".into(),
+                "INSERT INTO self_t SELECT CASE WHEN a = 50 THEN abs(-9223372036854775807 - 1) ELSE a + 100 END FROM self_t".into(),
+            ],
+            vec![
+                "SELECT count(*), sum(a) FROM u",
+                "SELECT count(*), sum(a) FROM ut",
+                "SELECT count(*) FROM log",
+                "SELECT count(*) FROM self_t",
+            ],
+        ),
+    ];
+
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = Vec::new();
+        for file_backed in [false, true] {
+            let label = if file_backed { "file" } else { "memory" };
+            for (index, (name, steps, checks)) in scenarios.iter().enumerate() {
+                let dir = tempfile::tempdir().unwrap();
+                let (f, r) = if file_backed {
+                    let fpath = dir.path().join(format!("f_stream_{index}.db"));
+                    let rpath = dir.path().join(format!("r_stream_{index}.db"));
+                    (
+                        Connection::open(fpath.to_str().unwrap()).await.unwrap(),
+                        rusqlite::Connection::open(rpath).unwrap(),
+                    )
+                } else {
+                    (
+                        Connection::open(":memory:").await.unwrap(),
+                        rusqlite::Connection::open_in_memory().unwrap(),
+                    )
+                };
+                r.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+                for sql in steps {
+                    let fr = fq(&f, sql).await;
+                    let rr = rq(&r, &stock_sql(sql));
+                    if fr != rr {
+                        diffs.push(format!(
+                            "  [{label}: {name}] `{sql}`\n     frank= {fr:?}\n     stock= {rr:?}"
+                        ));
+                    }
+                    let fc = fq(&f, COUNTERS).await;
+                    let rc = rq(&r, COUNTERS);
+                    if fc != rc {
+                        diffs.push(format!(
+                            "  [{label}: {name}] counters after `{sql}`\n     frank= {fc:?}\n     stock= {rc:?}"
+                        ));
+                    }
+                }
+                for check in checks {
+                    let fr = fq(&f, check).await;
+                    let rr = rq(&r, check);
+                    if fr != rr {
+                        diffs.push(format!(
+                            "  [{label}: {name}] check `{check}`\n     frank= {fr:?}\n     stock= {rr:?}"
+                        ));
+                    }
+                }
+                f.close().await.unwrap();
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "bd-qdve2 per-row streaming {} divergence(s) from rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}
