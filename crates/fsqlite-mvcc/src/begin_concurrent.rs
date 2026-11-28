@@ -1264,6 +1264,16 @@ enum OwnerAllocationDomain {
     External,
 }
 
+/// A map of the registry keyed by a session id the registry mints itself from
+/// `next_session_id` (bd-fuwx0, O-C1).
+///
+/// No caller chooses a key, so SipHash's flooding resistance buys nothing,
+/// while every concurrent commit makes about fourteen lookups here. Readers
+/// that iterate sort, take a min, count, or set per-handle flags one handle at
+/// a time; the history-bound abort pick breaks ties among equally old sessions
+/// in iteration order, which the randomly seeded std hasher left arbitrary too.
+type RegistryKeyedMap<V> = HashMap<u64, V, foldhash::fast::FixedState>;
+
 /// Registry tracking all active concurrent writers for a database.
 ///
 /// Enforces the soft limit on concurrent writers and provides the shared
@@ -1271,10 +1281,10 @@ enum OwnerAllocationDomain {
 #[derive(Debug)]
 pub struct ConcurrentRegistry {
     /// Active concurrent handles, keyed by an opaque session id.
-    active: HashMap<u64, SharedConcurrentHandle>,
+    active: RegistryKeyedMap<SharedConcurrentHandle>,
     /// Cached `snapshot.high` per registered session so GC-horizon queries do
     /// not need to lock and scan every handle.
-    active_snapshot_highs: HashMap<u64, CommitSeq>,
+    active_snapshot_highs: RegistryKeyedMap<CommitSeq>,
     /// Refcounted index of registered session snapshot highs.
     gc_horizon_counts: BTreeMap<CommitSeq, usize>,
     /// Committed-reader history (RCRI-like) for SSI edge discovery.
@@ -1306,8 +1316,8 @@ impl ConcurrentRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            active: HashMap::new(),
-            active_snapshot_highs: HashMap::new(),
+            active: RegistryKeyedMap::default(),
+            active_snapshot_highs: RegistryKeyedMap::default(),
             gc_horizon_counts: BTreeMap::new(),
             committed_readers: CommittedHistory::new(),
             committed_writers: CommittedHistory::new(),
