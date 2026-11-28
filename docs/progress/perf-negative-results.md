@@ -94,6 +94,44 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-28 - WIN (landed as d3dc34786; exact instruction counts, inside its prediction band, past its gain kill line: -2,354 Ir per FULL autocommit INSERT, x8.20 -> x8.09 stock 3.54.1; time cells VOID (judge A/A fails; bd-j0jc0/bd-gvews), not needed for the verdict): the mvcc ConcurrentRegistry's session maps hash their minted ids with foldhash instead of SipHash (bd-fuwx0, commit-path lane rounds 2-4, lever L4 = option O-C1, hashing part 3)
+
+- Target: the autocommit one-row INSERT's commit path. After L1 (56e28f1df) about 14 SipHash-1-3 lookups per
+  concurrent commit landed in ConcurrentRegistry.active (session id -> handle) and .active_snapshot_highs (session
+  id -> snapshot high): prepare_concurrent_commit_with_ssi 292, ConcurrentRegistry::remove 292, core
+  plan_concurrent_commit_with_registry 292 and eleven more of 146: about 2.05k Ir per INSERT (callgrind
+  --tree=caller on L1's arm). core's schema_index_of / table_name_is_virtual hash table NAMES, which SQL text
+  chooses, and keep SipHash.
+- Ledger preflight: no entry rejects it; L1 (ff82c2f0c entry) named this registry as the next site and asked for its
+  own order argument first, given below.
+- Files: crates/fsqlite-mvcc/src/begin_concurrent.rs only (alias RegistryKeyedMap = HashMap with
+  foldhash::fast::FixedState, the two fields and their constructors; foldhash 0.2.0 was already an fsqlite-mvcc
+  dependency). No test changes.
+- Soundness: same maps, keys and operations. The registry mints the keys from next_session_id; no caller chooses one.
+  Iterations sort (active_snapshot_entries), take a min (history_retention_horizon), count, collect conflicting
+  pages into a set, or set per-handle SSI flags one handle at a time. The one order-sensitive read is the
+  MAX_HISTORY_ENTRIES abort pick (oldest active session by a strict `<`): ties among equally old sessions break in
+  iteration order, which the randomly seeded std hasher left arbitrary too, and the loop marks until the bound
+  holds. Concurrency defaults, writer serialization, SSI rules, certificates (v5) and on-disk bytes unchanged.
+- Evidence: arms A (origin/main f3d7d812c) and B4 in ONE rch job on hz2 (CLI fbd3d5c0230fe8e5 / 50b4e607f25db344,
+  mt-mvcc-bench 5467821d49ffb3b4 / c3715a0a6e500058); stock 3.54.1 (84a5d033) live. Callgrind per unit
+  (N800 - N400)/400: FULL 7 pairs median -2,354 (-1.35%; pairwise -1,921, pairs +108 .. -2,869), prediction -1.4k
+  to -1.9k, gain kill -0.9k; NORMAL -1,728 (x8.04 -> x7.96); txn10 -2,877 per commit (-0.51%); point SELECT +137
+  (+0.16%; prediction 0 to -0.6k missed by +0.14k, under its +0.5% regression line). The registry's SipHash
+  hash_one is gone in B4's profile. Time: judge v2b under the performance governor, runs 1 and 3 valid (run 2 VOID,
+  replaced); its cells are VOID under the owner's time-void policy (2026-11-28); the valid pair had no replicated
+  LOSE, so the policy was not needed. mt-mvcc FULL separate, rows-per-transaction 5, A/B/Q: 4w 0.968 / 1.044 TIE,
+  8w VOID / 0.982 TIE; no failed write.
+- Gate (origin/main 53d937509 + L4, every red rerun on the lever and on the parent in the same job): clippy -D
+  warnings fsqlite-mvcc --all-targets rc 0; mvcc lib 1690/0/15; core keepers20 130/0/5 (20 targets, no red) (hz4);
+  e2e multiprocess 12/0 (hz2); fsqlite batches 1-7 (hz4, hz2) green except reds identical on the parent in the same
+  job: agg_leading_eq_residual_matches_sqlite ("leading eq + rowid residual must seek the index prefix"), bd-qrn03,
+  and six minmax_* oracles ("must decline the index-end / DESC seek" class). Re-gate on origin/main 6861feaf8 + L4
+  (begin_concurrent.rs had moved by a doc comment, 7a2d60fe8): clippy rc 0, mvcc lib 1690/0/15, e2e concurrent incl.
+  SSI 19 targets 121/0/13 (hz2); e2e cross-process 15 targets 111/0/3 (vmi1227854; its first run, r3's had died at
+  its time limit); no red.
+- Retry / widen: core's session maps (connection-side) hash minted ids too; the table-name maps must keep SipHash.
+
 ## 2026-11-28 - LANDED (robustness, not a perf lever; admitted under the time-void policy, owner 2026-11-28; originally killed on a time LOSE at Ir 1.0000, 5623baec2): the 5 s io_uring read deadline and late-write report in the shared ring driver (bd-2sf0f)
 
 - Supersedes the 2026-11-26 entry "A 5 s io_uring read deadline and late-write report in the shared ring driver
