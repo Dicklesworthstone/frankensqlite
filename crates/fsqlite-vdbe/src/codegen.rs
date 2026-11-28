@@ -14852,14 +14852,41 @@ fn is_join_key_expr_over(
     other: &TableSchema,
     other_alias: Option<&str>,
 ) -> bool {
+    is_join_key_expr_over_tables(expr, &[(table, alias)], other, other_alias)
+}
+
+/// bd-vjwd1: whether `expr` is a join key computed from the already-bound
+/// `tables` and literals using only arithmetic, bitwise, or concatenation
+/// operators. Those operators carry no affinity or collation, so SQLite
+/// compares the result under the lookup column's rules. Any column that
+/// resolves in `right_table`, is unqualified and exists in `right_table`, or
+/// resolves ambiguously across `tables` is refused.
+fn is_join_key_expr_over_tables(
+    expr: &Expr,
+    tables: &[(&TableSchema, Option<&str>)],
+    right_table: &TableSchema,
+    right_alias: Option<&str>,
+) -> bool {
     let operand = |expr: &Expr| match expr {
         Expr::Literal(..) => true,
         Expr::Column(col_ref, _) => {
-            resolve_column_ref(expr, table, alias).is_some()
-                && (col_ref.table.is_some() || other.column_index(&col_ref.column).is_none())
-                && resolve_column_ref(expr, other, other_alias).is_none()
+            if col_ref.schema.is_some() {
+                return false;
+            }
+            if resolve_column_ref(expr, right_table, right_alias).is_some()
+                || (col_ref.table.is_none()
+                    && (right_table.column_index(&col_ref.column).is_some()
+                        || right_table.resolves_to_hidden_rowid(&col_ref.column)))
+            {
+                return false;
+            }
+            tables
+                .iter()
+                .filter(|(table, alias)| resolve_column_ref(expr, table, *alias).is_some())
+                .count()
+                == 1
         }
-        _ => is_join_key_expr_over(expr, table, alias, other, other_alias),
+        _ => is_join_key_expr_over_tables(expr, tables, right_table, right_alias),
     };
     match expr {
         Expr::BinaryOp {
@@ -17522,11 +17549,18 @@ struct MultiJoinLookupPlan<'a> {
 struct MultiJoinLookupStep<'a> {
     join_kind: fsqlite_ast::JoinKind,
     /// Which already-introduced table (0 = driver / left_table,
-    /// 1..=i = join_tables[0..i]) carries the probe expression.
+    /// 1..=i = join_tables[0..i]) carries the probe column when `probe_expr`
+    /// is `None`.
     probe_table_index: usize,
     probe_source: SortKeySource,
+    /// bd-vjwd1: when set, the lookup key is an arithmetic/bitwise/concat
+    /// expression over the already-bound tables (`t.id = u.id * 17`,
+    /// `c.id = u.id + t.id`), evaluated via `emit_join_expr` instead of reading
+    /// a single column from `probe_table_index`.
+    probe_expr: Option<&'a Expr>,
     /// Optional affinity coercion applied to the probe before `SeekGE`
-    /// (e.g. TEXT probe into an INTEGER index -> NUMERIC `'C'`).
+    /// (e.g. TEXT probe into an INTEGER index -> NUMERIC `'C'`, or an
+    /// expression key coerced to the indexed column's affinity).
     probe_affinity: Option<char>,
     lookup_target: SingleJoinLookupTarget<'a>,
     /// True when the lookup matches at most one row (rowid or unique
@@ -17554,14 +17588,15 @@ struct MultiJoinEqCandidate<'a> {
     rank: MultiJoinCandidateRank,
     probe_table_index: usize,
     probe_source: SortKeySource,
+    probe_expr: Option<&'a Expr>,
     probe_affinity: Option<char>,
     lookup_target: SingleJoinLookupTarget<'a>,
     is_unique_lookup: bool,
     prefix_probe: bool,
 }
 
-/// Resolve an equality `left = right` between `right_table` and one of the
-/// already-bound `tables`, returning the best lookup step candidate.
+/// Resolve an equality `left = right` between `right_table` and one or more of
+/// the already-bound `tables`, returning the best lookup step candidate.
 fn resolve_multi_join_eq_candidate<'a>(
     left: &'a Expr,
     right: &'a Expr,
@@ -17597,6 +17632,7 @@ fn resolve_multi_join_eq_candidate<'a>(
         return None;
     }
 
+    let mut probe_expr = None;
     let mut found: Option<(usize, SortKeySource, SortKeySource)> = None;
     for (probe_idx, (probe_table, probe_alias)) in tables.iter().enumerate() {
         if let (Some(left_probe), Some(right_lookup)) = (
@@ -17614,6 +17650,24 @@ fn resolve_multi_join_eq_candidate<'a>(
             break;
         }
     }
+    if found.is_none()
+        && let Some((lookup, key)) =
+            [(left, right), (right, left)]
+                .into_iter()
+                .find_map(|(column, key)| {
+                    // The lookup side must be a bare right-table column: a COLLATE
+                    // wrapper would change the comparison the seek has to honor.
+                    if !matches!(column, Expr::Column(..)) {
+                        return None;
+                    }
+                    let lookup = resolve_column_ref(column, right_table, right_alias)?;
+                    is_join_key_expr_over_tables(key, tables, right_table, right_alias)
+                        .then_some((lookup, key))
+                })
+    {
+        probe_expr = Some(key);
+        found = Some((0, SortKeySource::Rowid, lookup));
+    }
 
     let (probe_table_index, probe_source, lookup_source) = found?;
     let comparison_collation = join_lookup_effective_collation(left, right, &comparison_tables);
@@ -17623,21 +17677,27 @@ fn resolve_multi_join_eq_candidate<'a>(
             rank: MultiJoinCandidateRank::Rowid,
             probe_table_index,
             probe_source,
+            probe_expr,
             probe_affinity: None,
             lookup_target: SingleJoinLookupTarget::Rowid,
             is_unique_lookup: true,
             prefix_probe: false,
         }),
         SortKeySource::Column(col_idx) => {
-            let probe_affinity = match join_lookup_column_pair_probe(
-                tables.get(probe_table_index)?.0,
-                &probe_source,
-                right_table,
-                col_idx,
-            )? {
-                JoinLookupProbe::Raw => None,
-                JoinLookupProbe::Coerce(affinity) => Some(affinity),
-                JoinLookupProbe::RawThenNumericText => return None,
+            let probe_affinity = if probe_expr.is_some() {
+                let affinity = right_table.columns.get(col_idx)?.affinity;
+                Some(index_key_affinity(affinity))
+            } else {
+                match join_lookup_column_pair_probe(
+                    tables.get(probe_table_index)?.0,
+                    &probe_source,
+                    right_table,
+                    col_idx,
+                )? {
+                    JoinLookupProbe::Raw => None,
+                    JoinLookupProbe::Coerce(affinity) => Some(affinity),
+                    JoinLookupProbe::RawThenNumericText => return None,
+                }
             };
             let column_name = &right_table.columns.get(col_idx)?.name;
             let (index, is_unique_lookup, prefix_probe) =
@@ -17653,6 +17713,7 @@ fn resolve_multi_join_eq_candidate<'a>(
                 rank,
                 probe_table_index,
                 probe_source,
+                probe_expr,
                 probe_affinity,
                 lookup_target: SingleJoinLookupTarget::Index(index),
                 is_unique_lookup,
@@ -17798,6 +17859,7 @@ fn resolve_multi_join_lookup_plan<'a>(
             join_kind: normalized_kind,
             probe_table_index: chosen.probe_table_index,
             probe_source: chosen.probe_source,
+            probe_expr: chosen.probe_expr,
             probe_affinity: chosen.probe_affinity,
             lookup_target: chosen.lookup_target,
             is_unique_lookup: chosen.is_unique_lookup,
@@ -18167,10 +18229,12 @@ fn codegen_multi_join_lookup_select(
             }
             let table_idx = i + 1;
             let (table, alias) = all_tables[table_idx];
-            plan.steps
-                .iter()
-                .skip(i + 1)
-                .any(|later| later.probe_table_index == table_idx)
+            plan.steps.iter().skip(i + 1).any(|later| {
+                later.probe_expr.map_or(
+                    later.probe_table_index == table_idx,
+                    |expr| expr_references_scan(expr, table, alias),
+                )
+            })
                 || plan.steps.iter().any(|s| {
                     s.on_residual
                         .iter()
@@ -18378,17 +18442,24 @@ fn codegen_multi_join_lookup_select(
         .is_some_and(|step| matches!(step.join_kind, JoinKind::Left));
 
     let emit_probe_value =
-        |b: &mut ProgramBuilder, step: &MultiJoinLookupStep<'_>, probe_base: i32| {
-            let probe_cursor = step.probe_table_index as i32;
-            let probe_scan = ScanCtx {
-                cursor: probe_cursor,
-                table: all_tables[step.probe_table_index].0,
-                table_alias: all_tables[step.probe_table_index].1,
-                schema: None,
-                register_base: None,
-                secondaries: &[],
-            };
-            emit_resolved_column(b, &step.probe_source, probe_cursor, probe_base, &probe_scan);
+        |b: &mut ProgramBuilder,
+         step: &MultiJoinLookupStep<'_>,
+         probe_base: i32|
+         -> Result<(), CodegenError> {
+            if let Some(key) = step.probe_expr {
+                emit_join_expr(b, key, probe_base, &all_tables, ctx, None)?;
+            } else {
+                let probe_cursor = step.probe_table_index as i32;
+                let probe_scan = ScanCtx {
+                    cursor: probe_cursor,
+                    table: all_tables[step.probe_table_index].0,
+                    table_alias: all_tables[step.probe_table_index].1,
+                    schema: None,
+                    register_base: None,
+                    secondaries: &[],
+                };
+                emit_resolved_column(b, &step.probe_source, probe_cursor, probe_base, &probe_scan);
+            }
             if let Some(affinity) = step.probe_affinity {
                 b.emit_op(
                     Opcode::Affinity,
@@ -18399,6 +18470,7 @@ fn codegen_multi_join_lookup_select(
                     0,
                 );
             }
+            Ok(())
         };
 
     let last_step_idx = plan.steps.len() - 1;
@@ -18414,7 +18486,7 @@ fn codegen_multi_join_lookup_select(
             let after_search_label = b.emit_label();
             let final_where_placeholder_base;
 
-            emit_probe_value(b, step, probe_base);
+            emit_probe_value(b, step, probe_base)?;
 
             match &step.lookup_target {
                 SingleJoinLookupTarget::Auto { .. } => {
@@ -18423,6 +18495,24 @@ fn codegen_multi_join_lookup_select(
                     ));
                 }
                 SingleJoinLookupTarget::Rowid => {
+                    if step.probe_expr.is_some() {
+                        b.emit_jump_to_label(
+                            Opcode::IsNull,
+                            probe_base,
+                            0,
+                            after_search_label,
+                            P4::None,
+                            0,
+                        );
+                        b.emit_jump_to_label(
+                            Opcode::MustBeInt,
+                            probe_base,
+                            0,
+                            after_search_label,
+                            P4::None,
+                            0,
+                        );
+                    }
                     // SeekRowid natively jumps on NULL, non-integer REAL/TEXT,
                     // and BLOB, while coercing exact numeric values ('2', 2.0)
                     // identically to IsNull + MustBeInt.
@@ -18616,7 +18706,7 @@ fn codegen_multi_join_lookup_select(
         }
 
         // INNER step: probe and seek (unique or non-unique index loop).
-        emit_probe_value(b, step, probe_base);
+        emit_probe_value(b, step, probe_base)?;
 
         match &step.lookup_target {
             SingleJoinLookupTarget::Auto { .. } => {
@@ -18625,6 +18715,24 @@ fn codegen_multi_join_lookup_select(
                 ));
             }
             SingleJoinLookupTarget::Rowid => {
+                if step.probe_expr.is_some() {
+                    b.emit_jump_to_label(
+                        Opcode::IsNull,
+                        probe_base,
+                        0,
+                        current_advance,
+                        P4::None,
+                        0,
+                    );
+                    b.emit_jump_to_label(
+                        Opcode::MustBeInt,
+                        probe_base,
+                        0,
+                        current_advance,
+                        P4::None,
+                        0,
+                    );
+                }
                 // SeekRowid natively jumps on NULL, non-integer REAL/TEXT, and
                 // BLOB, while coercing exact numeric values ('2', 2.0)
                 // identically to IsNull + MustBeInt.
@@ -19554,6 +19662,31 @@ fn emit_join_expr(
             );
             Ok(())
         }
+        Expr::UnaryOp {
+            op, expr: operand, ..
+        } => match op {
+            fsqlite_ast::UnaryOp::Negate => {
+                emit_join_expr(b, operand, target, tables, _ctx, outer_row)?;
+                let tmp = b.alloc_temp();
+                b.emit_op(Opcode::Integer, -1, tmp, 0, P4::None, 0);
+                b.emit_op(Opcode::Multiply, tmp, target, target, P4::None, 0);
+                b.free_temp(tmp);
+                Ok(())
+            }
+            fsqlite_ast::UnaryOp::BitNot => {
+                emit_join_expr(b, operand, target, tables, _ctx, outer_row)?;
+                b.emit_op(Opcode::BitNot, target, target, 0, P4::None, 0);
+                Ok(())
+            }
+            fsqlite_ast::UnaryOp::Not => {
+                emit_join_expr(b, operand, target, tables, _ctx, outer_row)?;
+                b.emit_op(Opcode::Not, target, target, 0, P4::None, 0);
+                Ok(())
+            }
+            fsqlite_ast::UnaryOp::Plus => Err(CodegenError::Unsupported(
+                "unary + in JOIN codegen".to_owned(),
+            )),
+        },
         _ => Err(CodegenError::Unsupported(format!(
             "expression {expr:?} in JOIN codegen"
         ))),
@@ -70457,7 +70590,7 @@ mod tests {
              LEFT JOIN agents a ON a.id = c.agent_id",
             "SELECT count(*) FROM messages m \
              JOIN conversations c ON c.id = m.conversation_id \
-             JOIN agents a ON a.id = c.agent_id + 1",
+             JOIN agents a ON a.id = abs(c.agent_id)",
             "SELECT count(DISTINCT m.id) FROM messages m \
              JOIN conversations c ON c.id = m.conversation_id \
              JOIN agents a ON a.id = c.agent_id",
@@ -70475,6 +70608,39 @@ mod tests {
                 "unsupported aggregate shape must use the general evaluator: {sql}",
             );
         }
+
+        // Arithmetic expression join keys (`a.id = c.agent_id + 1`) now compile
+        // via MustBeInt + SeekRowid on the multi-join lookup path (bd-vjwd1).
+        let expr_key_stmt = select_sql(
+            "SELECT count(*) FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             JOIN agents a ON a.id = c.agent_id + 1",
+        );
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &expr_key_stmt, &schema, &CodegenContext::default()).unwrap();
+        let expr_key_prog = b.finish().unwrap();
+        assert_eq!(
+            expr_key_prog
+                .ops()
+                .iter()
+                .filter(|op| op.opcode == Opcode::Rewind)
+                .count(),
+            1
+        );
+        assert!(
+            expr_key_prog
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::MustBeInt),
+            "arithmetic rowid expression key must emit MustBeInt"
+        );
+        assert!(
+            expr_key_prog
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::AggStep),
+            "arithmetic rowid expression key aggregate must emit AggStep"
+        );
 
         // Conjunctive ON residual (`AND c.agent_id > 0`) now compiles cleanly
         // with an inline IfNot filter on the lookup path (bd-knibh).
@@ -70662,6 +70828,179 @@ mod tests {
             null_row_count, 0,
             "pure INNER JOIN chain must not emit NullRow stubs"
         );
+    }
+
+    /// bd-vjwd1: 3-table joins with expression keys (`t.id = u.id * 17`,
+    /// indexed column = expr, cross-bound-table expr, unary `-`/`~`, terminal
+    /// LEFT JOIN, and count-only aggregate whose middle table row is needed
+    /// only by a later `probe_expr`) must use the multi-join lookup plan, while
+    /// COLLATE-wrapped lookup columns, right-table expressions, and unary `+`
+    /// stay off it.
+    #[test]
+    fn test_codegen_multi_join_expression_keys_use_lookup_path_bd_vjwd1() {
+        let schema = test_schema_issue_62_fts_rebuild();
+        let ctx = CodegenContext::default();
+
+        // 1. Rowid expression keys (including cross-bound-table expression):
+        //    1 outer Rewind, MustBeInt + SeekRowid per expression step.
+        let rowid_expr_sql = "SELECT m.id, a.slug FROM messages m \
+            JOIN conversations c ON c.id = m.conversation_id * 17 \
+            JOIN agents a ON a.id = c.agent_id + m.id";
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &select_sql(rowid_expr_sql), &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        assert_eq!(
+            prog.ops()
+                .iter()
+                .filter(|op| op.opcode == Opcode::Rewind)
+                .count(),
+            1,
+            "3-table rowid expression chain must only rewind driver"
+        );
+        assert_eq!(
+            prog.ops()
+                .iter()
+                .filter(|op| op.opcode == Opcode::MustBeInt)
+                .count(),
+            2,
+            "each rowid expression step must emit MustBeInt"
+        );
+        assert_eq!(
+            prog.ops()
+                .iter()
+                .filter(|op| op.opcode == Opcode::SeekRowid)
+                .count(),
+            2,
+            "each rowid expression step must emit SeekRowid"
+        );
+
+        // 2. Indexed expression keys + unary negation + terminal LEFT JOIN.
+        let idx_schema = test_schema_multi_join_prefers_unique_single_column_lookup();
+        let idx_expr_sql = "SELECT count(*) FROM messages m \
+            JOIN conversations c ON c.id = -m.conversation_id + 2 * m.conversation_id \
+            LEFT JOIN agents a ON a.tenant_id = c.tenant_id + 1";
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &select_sql(idx_expr_sql), &idx_schema, &ctx).unwrap();
+        let idx_prog = b.finish().unwrap();
+        assert_eq!(
+            idx_prog
+                .ops()
+                .iter()
+                .filter(|op| op.opcode == Opcode::Rewind)
+                .count(),
+            1
+        );
+        assert!(
+            idx_prog.ops().iter().any(|op| op.opcode == Opcode::Affinity),
+            "indexed expression key must apply column affinity"
+        );
+        assert!(
+            idx_prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
+            "indexed expression key must emit SeekGE"
+        );
+        assert!(
+            idx_prog
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::MustBeInt),
+            "rowid expression step must emit MustBeInt"
+        );
+
+        // 3. Count-only aggregate where middle indexed table's non-key column
+        //    is read ONLY by the trailing step's probe_expr: must SeekRowid
+        //    the middle table so its cursor holds the row for probe_expr.
+        let count_schema = vec![
+            TableSchema {
+                name: "u".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("a", 'D', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                without_rowid_pk_conflict: None,
+                without_rowid_pk_terms: Vec::new(),
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "t".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("a", 'D', false),
+                    ColumnInfo::basic("c", 'D', false),
+                ],
+                indexes: vec![IndexSchema {
+                    name: "t_a".to_owned(),
+                    root_page: 4,
+                    columns: vec!["a".to_owned()],
+                    key_expressions: vec!["a".to_owned()],
+                    key_sort_directions: vec![],
+                    where_clause: None,
+                    is_unique: false,
+                    key_collations: vec![],
+                    conflict_action: None,
+                }],
+                strict: false,
+                without_rowid: false,
+                without_rowid_pk_conflict: None,
+                without_rowid_pk_terms: Vec::new(),
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "w".to_owned(),
+                root_page: 5,
+                columns: vec![ColumnInfo::basic("id", 'D', true)],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                without_rowid_pk_conflict: None,
+                without_rowid_pk_terms: Vec::new(),
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+        ];
+        let count_sql = "SELECT count(*) FROM u JOIN t ON t.a = u.a JOIN w ON w.id = t.c * 2";
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &select_sql(count_sql), &count_schema, &ctx).unwrap();
+        let count_prog = b.finish().unwrap();
+        assert!(
+            count_prog
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::SeekRowid && op.p1 == 1),
+            "middle indexed table referenced by later probe_expr must seek its table cursor"
+        );
+
+        // 4. Negative controls: COLLATE wrapper on lookup column, unary +, and
+        //    expression referencing the right table must decline lookup planning.
+        for negative_sql in [
+            "SELECT count(*) FROM messages m \
+             JOIN conversations c ON c.id = +m.conversation_id \
+             JOIN agents a ON a.id = c.agent_id",
+            "SELECT count(*) FROM messages m \
+             JOIN conversations c ON c.id = c.agent_id + m.conversation_id \
+             JOIN agents a ON a.id = c.agent_id",
+            "SELECT count(*) FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             JOIN agents a ON a.tenant_id COLLATE NOCASE = c.tenant_id + 1",
+        ] {
+            let mut b = ProgramBuilder::new();
+            assert!(
+                matches!(
+                    codegen_select(&mut b, &select_sql(negative_sql), &idx_schema, &ctx),
+                    Err(CodegenError::Unsupported(_))
+                ),
+                "negative control must decline multi-join expression lookup: {negative_sql}"
+            );
+        }
     }
 
     /// A non-terminal LEFT JOIN (LEFT followed by another join) must NOT

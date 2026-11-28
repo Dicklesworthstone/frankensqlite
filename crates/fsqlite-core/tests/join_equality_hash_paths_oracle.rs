@@ -150,3 +150,197 @@ fn join_equalities_on_hash_paths_match_sqlite() {
         });
     }
 }
+
+async fn explain_opcodes(conn: &Connection, sql: &str) -> Vec<String> {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap_or_else(|e| panic!("EXPLAIN `{sql}` failed: {e:?}"))
+        .iter()
+        .map(|row| match &row.values()[1] {
+            SqliteValue::Text(opcode) => opcode.to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+/// bd-vjwd1: multi-table joins (3+ tables) with expression join keys
+/// (`t.id = u.id * 2`, `w.k = t.a + 0`, cross-table `c.id = u.id + t.id`,
+/// unary `-`, concat `|| ''`, inexact keys, typed/typeless/NOCASE/composite
+/// indexes) must use the multi-join lookup plan (single outer Rewind +
+/// MustBeInt/SeekRowid or Affinity/SeekGE) instead of Cartesian nested loops,
+/// and match live bundled `rusqlite` across memory and file-backed DBs, ad hoc
+/// and prepared.
+#[test]
+fn multi_join_expression_keys_use_lookup_plan_and_match_sqlite() {
+    const EXTRA_SETUP: &[&str] = &[
+        "CREATE TABLE wc(k INTEGER, v TEXT)",
+        "INSERT INTO wc VALUES (1,'a'),(2,'b'),(2,'c'),(4,'d'),(4,'e'),(NULL,'z')",
+    ];
+    const MULTI_INDEXES: &[&str] = &[
+        "CREATE INDEX t_a ON t(a)",
+        "CREATE INDEX t_b ON t(b)",
+        "CREATE INDEX t_c ON t(c)",
+        "CREATE INDEX t_d ON t(d)",
+        "CREATE INDEX t_n ON t(n)",
+        "CREATE INDEX w_k ON w(k)",
+        "CREATE INDEX wc_kv ON wc(k, v)",
+    ];
+    const MULTI_QUERIES: &[&str] = &[
+        // Rowid expression keys across 3 tables (chained, reversed, cross-bound-table).
+        "SELECT u.id, t.id, w.v FROM u JOIN t ON t.id = u.id * 2 JOIN w ON w.k = t.a + 0 \
+         ORDER BY 1, 2, 3",
+        "SELECT u.id, t.id, c.id FROM u JOIN t ON t.id = u.id * 2 JOIN t AS c ON c.id = t.id + 2 \
+         ORDER BY 1, 2, 3",
+        "SELECT u.id, t.id, c.id FROM u JOIN t ON t.id = u.id * 2 \
+         JOIN t AS c ON c.id = u.id + t.id ORDER BY 1, 2, 3",
+        "SELECT u.id, t.id, c.id FROM u JOIN t ON u.id * 2 = t.id \
+         JOIN t AS c ON t.a + 1 = c.id ORDER BY 1, 2, 3",
+        // Inexact rowid keys (1.5, 'a', '05', NULL, BLOB) must never truncate to a wrong rowid.
+        "SELECT u.id, t.id, w.v FROM u JOIN t ON t.id = u.r * 1 JOIN w ON w.k = t.a + 0 \
+         ORDER BY 1, 2, 3",
+        "SELECT u.id, t.id, c.id FROM u JOIN t ON t.id = u.id * 2 \
+         LEFT JOIN t AS c ON c.id = u.r * 1 ORDER BY 1, 2, 3",
+        "SELECT u.id, t.id, c.id FROM u JOIN t ON t.id = u.id + 0 \
+         LEFT JOIN t AS c ON c.id = u.d || '' ORDER BY 1, 2, 3",
+        "SELECT u.id, t.id, c.id FROM u JOIN t ON t.id = u.id + 0 \
+         LEFT JOIN t AS c ON c.id = u.b || '' ORDER BY 1, 2, 3",
+        // Indexed expression keys across INTEGER, TEXT, REAL, typeless/BLOB, NOCASE, composite.
+        "SELECT count(*), sum(t.c) FROM u JOIN t ON t.b = u.id || '' JOIN w ON w.k = t.a + 0",
+        "SELECT count(*), sum(t.c) FROM u JOIN t ON t.a = u.b || '' JOIN w ON w.k = t.a + 0",
+        "SELECT count(*), sum(t.c) FROM u JOIN t ON t.c = u.r * 2 JOIN w ON w.k = t.a + 0",
+        "SELECT count(*), sum(t.c) FROM u JOIN t ON t.d = u.id + 0 JOIN w ON w.k = t.a + 0",
+        "SELECT count(*), sum(t.c) FROM u JOIN t ON t.d = u.d || '' JOIN w ON w.k = t.a + 0",
+        "SELECT count(*), sum(t.c) FROM u JOIN t ON t.n = u.b || '' JOIN w ON w.k = t.a + 0",
+        "SELECT count(*), sum(t.c) FROM u JOIN t ON t.id = u.id * 2 JOIN wc ON wc.k = t.a + 0",
+        // Unary negation and bitwise ops in expression keys.
+        "SELECT count(*), sum(t.c) FROM u JOIN t ON t.a = -u.a + 2 * u.a JOIN w ON w.k = t.a + 0",
+        "SELECT u.id, t.id, w.v FROM u JOIN t ON t.a = -u.a + 2 * u.a JOIN w ON w.k = t.a + 0 \
+         ORDER BY 1, 2, 3",
+        // Count-only aggregate where middle table's non-indexed column is read ONLY by later probe_expr.
+        "SELECT count(*) FROM u JOIN t ON t.a = u.a JOIN w ON w.k = t.c * 2",
+        "SELECT count(*) FROM u JOIN t ON t.a = u.a JOIN w ON w.k = t.id + 0",
+        // Terminal LEFT JOIN with indexed expression key, ON residual, and WHERE.
+        "SELECT count(*), count(w.v), sum(t.c) FROM u JOIN t ON t.id = u.id * 2 \
+         LEFT JOIN w ON w.k = t.a + 0 AND w.v <> 'FOUR'",
+        "SELECT count(*), sum(t.id) FROM u JOIN t ON t.id = u.id * 2 \
+         LEFT JOIN w ON w.k = t.a + 0 WHERE w.v IS NULL",
+        // Implicit comma join with expression keys in WHERE.
+        "SELECT count(*), sum(t.c) FROM u, t, w WHERE t.id = u.id * 2 AND w.k = t.a + 0",
+        // Negative controls (explicit COLLATE on lookup column, unary +, right-table self-expr).
+        "SELECT u.id, t.id, w.v FROM u JOIN t ON t.b COLLATE NOCASE = u.b || '' \
+         JOIN w ON w.k = t.a ORDER BY 1, 2, 3",
+        "SELECT u.id, t.id, w.v FROM u JOIN t ON t.id = +u.id JOIN w ON w.k = t.a \
+         ORDER BY 1, 2, 3",
+        "SELECT u.id, t.id, w.v FROM u JOIN t ON t.id = t.a + u.id JOIN w ON w.k = t.a \
+         ORDER BY 1, 2, 3",
+    ];
+
+    for (path, indexed) in [
+        (None, false),
+        (Some("multi_join_expr_keys.db"), false),
+        (None, true),
+        (Some("multi_join_expr_keys_indexed.db"), true),
+    ] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let target = path.map_or_else(
+                || ":memory:".to_owned(),
+                |name| dir.path().join(name).to_string_lossy().into_owned(),
+            );
+            let f = Connection::open(&target).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let indexes: &[&str] = if indexed { MULTI_INDEXES } else { &[] };
+            for sql in SETUP.iter().chain(EXTRA_SETUP).chain(indexes) {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in MULTI_QUERIES {
+                assert_agree(&f, &r, sql).await;
+                let prep_rows: Vec<Vec<String>> = f
+                    .prepare(sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("prepare `{sql}`: {e:?}"))
+                    .query()
+                    .await
+                    .unwrap_or_else(|e| panic!("prepared query `{sql}`: {e:?}"))
+                    .iter()
+                    .map(|row| row.values().iter().map(tag_f).collect())
+                    .collect();
+                let direct_rows: Vec<Vec<String>> = f
+                    .query(sql)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().iter().map(tag_f).collect())
+                    .collect();
+                assert_eq!(prep_rows, direct_rows, "prepared vs direct on `{sql}`");
+            }
+
+            if indexed {
+                // Non-vacuity: 3-table rowid expression chain must compile to 1 outer Rewind
+                // + MustBeInt + SeekRowid per step (NOT 3-way Cartesian Rewind).
+                let rowid_chain = "SELECT u.id, t.id, c.id FROM u \
+                    JOIN t ON t.id = u.id * 2 JOIN t AS c ON c.id = u.id + t.id";
+                let ops = explain_opcodes(&f, rowid_chain).await;
+                assert_eq!(
+                    ops.iter().filter(|op| *op == "Rewind").count(),
+                    1,
+                    "rowid expr 3-join must rewind only driver: {ops:?}"
+                );
+                assert!(
+                    ops.iter().filter(|op| *op == "MustBeInt").count() >= 2,
+                    "rowid expr 3-join must emit MustBeInt per expr rowid step: {ops:?}"
+                );
+                assert!(
+                    ops.iter().filter(|op| *op == "SeekRowid").count() >= 2,
+                    "rowid expr 3-join must emit SeekRowid per step: {ops:?}"
+                );
+
+                // Non-vacuity: 3-table indexed expression aggregates must emit Affinity + SeekGE
+                // + AggStep and execute with zero fallback.
+                for agg_sql in [
+                    "SELECT count(*), sum(t.c) FROM u JOIN t ON t.b = u.id || '' \
+                     JOIN w ON w.k = t.a + 0",
+                    "SELECT count(*), sum(t.c) FROM u JOIN t ON t.a = -u.a + 2 * u.a \
+                     JOIN w ON w.k = t.a + 0",
+                    "SELECT count(*), sum(t.c) FROM u JOIN t ON t.n = u.b || '' \
+                     JOIN w ON w.k = t.a + 0",
+                    "SELECT count(*), sum(t.c) FROM u JOIN t ON t.id = u.id * 2 \
+                     JOIN wc ON wc.k = t.a + 0",
+                    "SELECT count(*) FROM u JOIN t ON t.a = u.a JOIN w ON w.k = t.c * 2",
+                ] {
+                    let ops = explain_opcodes(&f, agg_sql).await;
+                    assert_eq!(
+                        ops.iter().filter(|op| *op == "Rewind").count(),
+                        1,
+                        "`{agg_sql}` expected 1 outer Rewind: {ops:?}"
+                    );
+                    assert!(
+                        ops.iter().any(|op| op == "SeekGE"),
+                        "`{agg_sql}` expected SeekGE: {ops:?}"
+                    );
+                    assert!(
+                        ops.iter().any(|op| op == "Affinity"),
+                        "`{agg_sql}` expected Affinity on expr index key: {ops:?}"
+                    );
+                    assert!(
+                        ops.iter().any(|op| op == "AggStep")
+                            && ops.iter().any(|op| op == "AggFinal"),
+                        "`{agg_sql}` expected AggStep+AggFinal: {ops:?}"
+                    );
+                    f.set_fallback_capture_enabled(true);
+                    f.reset_fallback_decision_evidence();
+                    f.query(agg_sql).await.unwrap();
+                    let fell_back = f
+                        .fallback_decision_snapshot()
+                        .decisions
+                        .iter()
+                        .any(|d| d.decision_reason == "group_by_join_fallback");
+                    assert!(!fell_back, "`{agg_sql}` must not fall back");
+                    f.set_fallback_capture_enabled(false);
+                }
+            }
+            f.close().await.unwrap();
+        });
+    }
+}

@@ -137000,6 +137000,11 @@ fn join_aggregate_condition_is_vdbe_candidate(expr: &Expr) -> bool {
                 && join_aggregate_condition_is_vdbe_candidate(right)
         }
         Expr::IsNull { expr, .. } => join_aggregate_condition_is_vdbe_candidate(expr),
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Negate | fsqlite_ast::UnaryOp::BitNot,
+            expr,
+            ..
+        } => join_aggregate_condition_is_vdbe_candidate(expr),
         _ => !expr_has_any_subquery(expr) && join_expr_is_vdbe_eligible(expr),
     }
 }
