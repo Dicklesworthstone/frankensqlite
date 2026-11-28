@@ -954,15 +954,16 @@ fn grouping_on_the_rowid_alias_streams_in_rowid_order_without_a_sorter() {
 /// every statement's sorter writes dozens of runs. Each ordered answer
 /// equals stock's. A merge takes at most one head comparison per tree level
 /// per row, plus the tree's build, where scanning every run's head took one
-/// per run; a sorter over an INTEGER key never calls the record comparator
-/// in its merge. Rows with equal keys in different runs come out in scan
-/// order, as stock's merge gives them, so a merge that took a tie from the
-/// wrong run would reorder an answer. Keys holding NULLs, REALs or TEXT, and
-/// tied INTEGERs before a second key column, do call the comparator: those
-/// statements are the counter's non-vacuity controls. Every aggregate reads a column that varies inside
-/// its group, so no sorter folds its records into runs of copies instead of
-/// spilling. Every statement runs before the test fails, and the failure
-/// lists each one that broke.
+/// per run; a sorter over a single INTEGER or non-NaN REAL key never calls the
+/// record comparator in its merge (bd-ku484, extended to REAL heads by
+/// bd-imwu9). Rows with equal keys in different runs come out in scan order, as
+/// stock's merge gives them, so a merge that took a tie from the wrong run
+/// would reorder an answer. Keys holding NULLs, mixed types, or TEXT, and tied
+/// INTEGERs before a second key column, do call the comparator: those
+/// statements are the counter's non-vacuity controls. Every aggregate reads a
+/// column that varies inside its group, so no sorter folds its records into
+/// runs of copies instead of spilling. Every statement runs before the test
+/// fails, and the failure lists each one that broke.
 #[test]
 fn a_spilled_sort_merges_its_runs_by_integer_heads_in_a_winner_tree() {
     let _serial = serial();
@@ -989,8 +990,8 @@ fn a_spilled_sort_merges_its_runs_by_integer_heads_in_a_winner_tree() {
         f.set_strict_mem_fallback_rejection(true);
         f.execute("PRAGMA cache_size = -16").await.unwrap();
         let mut failures: Vec<String> = Vec::new();
-        // (statement, whether its merge compares INTEGER heads only)
-        for (sql, integer_heads) in [
+        // (statement, whether its merge compares INTEGER or non-NaN REAL heads directly)
+        for (sql, direct_numeric_heads) in [
             ("SELECT id % 1000, count(*), sum(a) FROM s GROUP BY id % 1000", true),
             ("SELECT a, count(*), total(c) FROM s GROUP BY a", true),
             ("SELECT (id * 7919) % 12007 AS k, a FROM s ORDER BY k", true),
@@ -1007,7 +1008,7 @@ fn a_spilled_sort_merges_its_runs_by_integer_heads_in_a_winner_tree() {
             ("SELECT n, count(*), sum(id) FROM s GROUP BY n", false),
             ("SELECT m, count(*), sum(id) FROM s GROUP BY m", false),
             ("SELECT b, id FROM s ORDER BY b, id", false),
-            ("SELECT c, id FROM s ORDER BY c DESC", false),
+            ("SELECT c, id FROM s ORDER BY c DESC", true),
         ] {
             let expected = rq(&stock, sql);
             if expected.len() < 2 {
@@ -1069,12 +1070,12 @@ fn a_spilled_sort_merges_its_runs_by_integer_heads_in_a_winner_tree() {
                     metrics.sort_rows_total
                 ));
             }
-            if integer_heads && generic != 0 {
+            if direct_numeric_heads && generic != 0 {
                 failures.push(format!(
                     "{sql}: {generic} of {comparisons} merge comparisons called the comparator"
                 ));
             }
-            if !integer_heads && generic == 0 {
+            if !direct_numeric_heads && generic == 0 {
                 failures.push(format!("{sql}: no merge comparison called the comparator"));
             }
         }

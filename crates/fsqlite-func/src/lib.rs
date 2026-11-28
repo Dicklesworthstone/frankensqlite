@@ -62,6 +62,13 @@ pub fn record_func_call_count_only() {
     FSQLITE_FUNC_CALLS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record a batch of function calls without timing (statement-batched fast path).
+pub fn record_func_calls(count: u64) {
+    if count > 0 {
+        FSQLITE_FUNC_CALLS_TOTAL.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
 // ── UDF registration metrics (bd-2wt.3) ────────────────────────────────
 
 /// Total number of UDF registrations.

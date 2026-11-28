@@ -94,6 +94,56 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-28 - WIN: hot-lane `Opcode::Function` via `ScalarSites`, batched func call metrics, zero-alloc spilled 1-col key decode, and REAL fast paths in sorter/merge/index-prefix compare (bd-imwu9 / GH#489)
+
+- Target: GH#489 (`CREATE TABLE t AS SELECT * FROM generate_series(1, 1000000); CREATE INDEX a ON t (round(log10(value)));`),
+  plus general scalar-function loops and REAL-keyed sorts/merges/bulk index builds.
+  Touched: `crates/fsqlite-func/src/lib.rs` (`record_func_calls`),
+  `crates/fsqlite-btree/src/cursor.rs` (`compare_index_key_prefixes` `(Float, Float)` fast path),
+  `crates/fsqlite-vdbe/src/engine.rs` (`ScalarSites`, `execute_function_hot` in `try_execute_hot_opcode_sync`,
+  statement-batched `pending_func_calls`, `sort_rows_by_single_float_key`, `SorterMergeHead::Float`,
+  `RunIterator::advance` inline 1-col UTF-8 key decode),
+  `crates/fsqlite-core/tests/create_index_sorted_bulk_build_oracle.rs`,
+  `crates/fsqlite-core/tests/bd_group_by_depth_oracle_probe.rs`.
+- Ledger preflight: mirrors `2026-11-12 - WIN: AggStep finds its site and its accumulator by index`
+  (`AggregateSites` + `try_execute_hot_opcode_sync`) and builds on `2026-11-11 - WIN: CREATE INDEX`
+  (`bd-reality-check-1022-llk6g.8`); does not touch integral-REAL storage (`bd-wbefq` REJECT) or
+  `ColumnOctetLength` (`length(col)` REJECT).
+- Baseline (`66876248e`, `hz2` AMD EPYC-Genoa, `release-perf`, binary sha256 `cc25e1d649db8045...`,
+  load 7.04, 3 interleaved reps against live bundled `rusqlite` 3.54.1 in the same invocation):
+  - `:memory: plain` (`CREATE INDEX idx_plain ON t(value)`): `345.3 ms` `[328.0–351.3]` vs stock `182.5 ms` (`1.89x`).
+  - `:memory: expr` (`CREATE INDEX a ON t (round(log10(value)))`): `490.3 ms` `[483.0–491.3]` vs stock `209.9 ms` (`2.34x`).
+  - `:memory: expr - plain` delta: **`145.1 ms`** vs stock `27.4 ms` (`5.30x`).
+  - `file expr`: `1522.4 ms` vs stock `311.5 ms` (`4.89x`).
+  - `strace -c` + code inspection attributed the `+117.7 ms` excess `expr - plain` delta to: (1)
+    `Opcode::Function | Opcode::PureFunc` exiting `run_hot_opcodes_sync` 2M times, probing a SipHash
+    `HashMap`, doing `Arc::clone`/`Arc::drop` + global `FSQLITE_FUNC_CALLS_TOTAL.fetch_add(1)` +
+    unconditional `arg_subtypes` `SmallVec` + 2 extra vtable calls + schema-safety validation per call;
+    (2) `Float` keys missing the `Integer` fast paths in `SorterCursor::sort`, `SorterMergeHead`
+    (~6M generic `compare_sorter_rows` calls across 46 spilled runs), and `compare_index_key_prefixes`
+    (1M `collation_registry` mutex locks in `bulk_load_index_from_sorter`); and (3) `RunIterator::advance`
+    allocating 1M heap `Vec`s via `parse_record_prefix_with_encoding` instead of inline `parse_record_column`.
+- Candidate (same `hz2` host, `release-perf`, binary sha256 `643c02550af0e8af...`, load 6.56, 2 back-to-back
+  runs × 3 interleaved reps against live bundled `rusqlite` 3.54.1):
+  - Run 1: `:memory: plain` `347.6 ms` `[336.2–351.6]` vs stock `179.1 ms` (`1.94x`); `:memory: expr`
+    **`411.0 ms`** `[401.4–416.6]` vs stock `182.7 ms` (`2.25x`); `expr - plain` delta **`63.4 ms`**;
+    `file expr` `995.3 ms` vs stock `245.3 ms` (`4.06x`).
+  - Run 2: `:memory: plain` `320.9 ms` `[314.7–335.2]` vs stock `161.8 ms` (`1.98x`); `:memory: expr`
+    **`393.9 ms`** `[392.4–405.6]` vs stock `181.7 ms` (`2.17x`); `expr - plain` delta **`73.0 ms`**
+    vs stock `19.9 ms` (`3.66x`); `file expr` `1378.6 ms` vs stock `251.5 ms` (`5.48x`).
+  - Net: `:memory: expr` improved `-79` to `-96 ms` (`-16%` to `-20%`, zero range overlap: `[483.0–491.3]`
+    vs `[392.4–416.6]`), cutting the `expr - plain` delta more than in half (`145.1 ms -> 63.4–73.0 ms`,
+    `-50%` to `-56%`), and bringing GH#489 from the reported `5.3 s` down to `0.39–0.41 s` (`~2.2x` stock
+    3.54.1). Index content matches live stock identically (`PRAGMA integrity_check = ok`, stock reads
+    the 1M-row fsqlite-written file cleanly).
+- Remaining gap & retry condition: `:memory: plain` (`1.89x–1.98x` stock) and `file expr` (`4.1x–5.5x`
+  stock) are now dominated by (a) 46 separate `/data/tmp/fsqlite_*.db` spill files per 1M-row sort
+  (default `cache_size = -2000` / 2 MiB budget against ~96-byte `SorterRow`, where stock uses compact
+  ~15-byte PMA records and opens 0 temp files on `:memory:`) and (b) file-backed WAL/pager I/O
+  (`io_uring` + reactor polling on page cache misses/evictions, tracked separately by `bd-w4pr1.11` /
+  `bd-w4pr1.13.18`). Retry further `CREATE INDEX` work only with a single-file/compact-PMA sorter
+  redesign or file-pager miss-path improvement measured against live stock.
+
 ## 2026-11-28 - WIN (landed as 5ce7d3abd; inside its prediction band in gain, past its gain kill line: join_no_index_5k_x_5k 211.23M -> 105.42M Ir, x9.04 -> x4.51 stock 3.54.1; time cells VOID under the time-void policy): an ephemeral index's staged build and IN / DISTINCT membership set are bounded by the temp budget instead of refused under 100 MiB (bd-w4pr1.13.9, serial read lane rounds 17-19, lever TB)
 
 - Target: join_no_index_5k_x_5k, the worst read row (x9.0 stock) no lever covered. d081a0f87 (bd-dwjnq.5) admitted the

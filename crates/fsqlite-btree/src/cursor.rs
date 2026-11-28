@@ -6297,9 +6297,10 @@ impl<P: PageReader> BtCursor<P> {
     ///
     /// The bulk index build proves with this that its input is in index order
     /// before it writes a page, so it has to decide exactly as a seek does.
-    /// Two INTEGER terms order the same under every collation and are decided
-    /// here without the registry lock; any other pair of terms goes through
-    /// [`Self::compare_index_key_values`]. `None` when two terms have no order.
+    /// Two INTEGER or non-NaN REAL terms order the same under every collation
+    /// and are decided here without the registry lock; any other pair of terms
+    /// goes through [`Self::compare_index_key_values`]. `None` when two terms
+    /// have no order.
     #[must_use]
     pub fn compare_index_key_prefixes(
         &self,
@@ -6307,10 +6308,16 @@ impl<P: PageReader> BtCursor<P> {
         rhs: &[SqliteValue],
     ) -> Option<std::cmp::Ordering> {
         for (idx, (left, right)) in lhs.iter().zip(rhs).enumerate() {
-            let (SqliteValue::Integer(left), SqliteValue::Integer(right)) = (left, right) else {
-                return self.compare_index_key_values(lhs, rhs, IndexSeekBias::LowerBound);
+            let ord = match (left, right) {
+                (SqliteValue::Integer(l), SqliteValue::Integer(r)) => l.cmp(r),
+                (SqliteValue::Float(l), SqliteValue::Float(r)) if !l.is_nan() && !r.is_nan() => {
+                    // SQLite orders -0.0 equal to +0.0 under every collation.
+                    let l = if *l == 0.0 { 0.0 } else { *l };
+                    let r = if *r == 0.0 { 0.0 } else { *r };
+                    l.total_cmp(&r)
+                }
+                _ => return self.compare_index_key_values(lhs, rhs, IndexSeekBias::LowerBound),
             };
-            let ord = left.cmp(right);
             if ord != std::cmp::Ordering::Equal {
                 return Some(
                     if self.index_desc_flags.get(idx).copied().unwrap_or(false) {
@@ -29660,5 +29667,42 @@ mod tests {
             let p4 = store.read_page_data(&cx, root).await.unwrap();
             assert_eq!(p3.as_bytes().as_ptr(), p4.as_bytes().as_ptr());
         });
+    }
+
+    #[test]
+    fn test_compare_index_key_prefixes_float_fast_path() {
+        let store = MemPageStore::with_empty_table(pn(2), USABLE);
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        let values = [
+            SqliteValue::Float(f64::NEG_INFINITY),
+            SqliteValue::Float(-1.5),
+            SqliteValue::Float(-0.0),
+            SqliteValue::Float(0.0),
+            SqliteValue::Float(1.5),
+            SqliteValue::Float(f64::INFINITY),
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(2),
+        ];
+        for asc_desc in [vec![false], vec![true]] {
+            cursor.index_desc_flags = asc_desc;
+            for lhs in &values {
+                for rhs in &values {
+                    let fast = cursor.compare_index_key_prefixes(&[lhs.clone()], &[rhs.clone()]);
+                    let slow = cursor.compare_index_key_values(
+                        &[lhs.clone()],
+                        &[rhs.clone()],
+                        IndexSeekBias::LowerBound,
+                    );
+                    assert_eq!(fast, slow, "mismatch for {lhs:?} vs {rhs:?}");
+                }
+            }
+        }
+        assert_eq!(
+            cursor.compare_index_key_prefixes(
+                &[SqliteValue::Float(-0.0)],
+                &[SqliteValue::Float(0.0)],
+            ),
+            Some(std::cmp::Ordering::Equal)
+        );
     }
 }

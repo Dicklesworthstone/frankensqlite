@@ -168,7 +168,7 @@ use fsqlite_func::collation::{CollationFunction, CollationRegistry};
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{
     ApplicationFunctionKind, ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry,
-    ResolvedScalarFunction, TypedAggregateStep, set_statement_text_encoding,
+    ScalarFunction, TypedAggregateStep, set_statement_text_encoding,
 };
 use fsqlite_mvcc::ConcurrentPageState;
 use fsqlite_mvcc::{
@@ -3080,7 +3080,9 @@ impl SorterCursor {
                 counts,
             ))
         } else {
-            if !Self::sort_rows_by_single_integer_key(key_columns, &orders, &mut self.rows) {
+            if !Self::sort_rows_by_single_integer_key(key_columns, &orders, &mut self.rows)
+                && !Self::sort_rows_by_single_float_key(key_columns, &orders, &mut self.rows)
+            {
                 self.rows.sort_by(|lhs, rhs| {
                     compare_sorter_rows(
                         &lhs.values,
@@ -3221,6 +3223,63 @@ impl SorterCursor {
         true
     }
 
+    /// Sort `rows` when the sort key is a single column holding a non-NaN REAL
+    /// in every row. Returns `false`, with `rows` untouched, for any other key.
+    ///
+    /// Mirrors [`Self::sort_rows_by_single_integer_key`] for REAL expression
+    /// and column keys (e.g. `round(log10(value))`, bd-imwu9): maps every
+    /// non-NaN `f64` (with `-0.0` canonicalized to `+0.0`) to an
+    /// order-preserving `u64`, sorting `(key, position)` pairs stably with no
+    /// comparator call.
+    fn sort_rows_by_single_float_key(
+        key_columns: usize,
+        sort_key_orders: &[SortKeyOrder],
+        rows: &mut [SorterRow],
+    ) -> bool {
+        if key_columns != 1 || rows.len() < 2 {
+            return false;
+        }
+        if u32::try_from(rows.len()).is_err() {
+            return false;
+        }
+        if !matches!(rows[0].values.first(), Some(SqliteValue::Float(_))) {
+            return false;
+        }
+        let descending = matches!(
+            sort_key_orders.first(),
+            Some(SortKeyOrder::Desc | SortKeyOrder::DescNullsFirst)
+        );
+        let mut keyed: Vec<(u64, u32)> = Vec::with_capacity(rows.len());
+        for (position, row) in rows.iter().enumerate() {
+            let Some(SqliteValue::Float(value)) = row.values.first() else {
+                return false;
+            };
+            let Some(ordered) = float_sort_key(*value, descending) else {
+                return false;
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            keyed.push((ordered, position as u32));
+        }
+        keyed.sort_unstable();
+
+        for start in 0..keyed.len() {
+            let mut current = start;
+            loop {
+                let source = keyed[current].1 as usize;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    keyed[current].1 = current as u32;
+                }
+                if source == start {
+                    break;
+                }
+                rows.swap(current, source);
+                current = source;
+            }
+        }
+        true
+    }
+
     /// Sort the sorter, merging any spilled runs with in-memory rows.
     ///
     /// After this call, `self.rows` contains the fully sorted result and
@@ -3288,6 +3347,10 @@ impl SorterCursor {
                 self.key_columns,
                 &self.sort_key_orders,
                 &mut self.rows,
+            ) && !Self::sort_rows_by_single_float_key(
+                self.key_columns,
+                &self.sort_key_orders,
+                &mut self.rows,
             ) {
                 let key_columns = self.key_columns;
                 let orders = self.sort_key_orders.clone();
@@ -3314,7 +3377,9 @@ impl SorterCursor {
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
         let text_encoding = self.text_encoding;
-        if !Self::sort_rows_by_single_integer_key(key_columns, &orders, &mut self.rows) {
+        if !Self::sort_rows_by_single_integer_key(key_columns, &orders, &mut self.rows)
+            && !Self::sort_rows_by_single_float_key(key_columns, &orders, &mut self.rows)
+        {
             self.rows.sort_by(|lhs, rhs| {
                 compare_sorter_rows(
                     &lhs.values,
@@ -3604,17 +3669,29 @@ impl RunIterator {
                 }
                 // Decode only the sort-key prefix — not all columns — and
                 // under the DB encoding so a spilled UTF-16 key sorts the
-                // same as the in-memory path (bd-7c6g7 #5).
-                let values = fsqlite_types::record::parse_record_prefix_with_encoding(
-                    &blob,
-                    *key_columns,
-                    *text_encoding,
-                )
+                // same as the in-memory path (bd-7c6g7 #5). On the common
+                // 1-column UTF-8 key, decode straight into the inline SmallVec
+                // slot to avoid a heap Vec allocation per spilled row.
+                #[allow(clippy::disallowed_methods)] // UTF-8 branch only
+                let values = if *key_columns == 1 && matches!(*text_encoding, TextEncoding::Utf8) {
+                    match fsqlite_types::record::parse_record_column(&blob, 0) {
+                        Some(key) => Some(smallvec::smallvec![key]),
+                        None => fsqlite_types::record::parse_record_prefix(&blob, 1)
+                            .map(SorterKeyValues::from_vec),
+                    }
+                } else {
+                    fsqlite_types::record::parse_record_prefix_with_encoding(
+                        &blob,
+                        *key_columns,
+                        *text_encoding,
+                    )
+                    .map(SorterKeyValues::from_vec)
+                }
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: "sorter run: malformed record".to_owned(),
                 })?;
                 *current = Some(SorterRow {
-                    values: SorterKeyValues::from_vec(values),
+                    values,
                     blob,
                     source_sequence: 0,
                 });
@@ -3627,6 +3704,22 @@ impl RunIterator {
     }
 }
 
+/// Map a non-NaN IEEE-754 `f64` to an order-preserving `u64` matching SQLite's
+/// numeric ordering (`-0.0 == +0.0`), reversed when `descending` is set.
+#[inline]
+fn float_sort_key(value: f64, descending: bool) -> Option<u64> {
+    if value.is_nan() {
+        return None;
+    }
+    let bits = (if value == 0.0 { 0.0_f64 } else { value }).to_bits();
+    let ordered = if (bits >> 63) != 0 {
+        !bits
+    } else {
+        bits ^ (1_u64 << 63)
+    };
+    Some(if descending { !ordered } else { ordered })
+}
+
 /// A run's current row as a sorter merge compares it (bd-ku484).
 #[derive(Debug, Clone, Copy)]
 enum SorterMergeHead {
@@ -3636,6 +3729,9 @@ enum SorterMergeHead {
     /// descending column, so ascending order of these numbers is the key's
     /// order.
     Integer(i64),
+    /// The first key column holds a non-NaN REAL encoded via [`float_sort_key`],
+    /// so ascending `u64` order matches the key's order.
+    Float(u64),
     /// The first key column holds anything else.
     Other,
 }
@@ -3649,12 +3745,14 @@ struct SorterMergeCounts {
 }
 
 /// The order a sorter merge compares run heads in (bd-ku484): the order of
-/// `compare_sorter_rows`, with two INTEGER heads in the first key column
-/// compared as integers. That is the comparator's own answer for them: an
-/// INTEGER is never NULL and compares numerically under every collation, so
-/// the key order only reverses it for a descending column, which the
-/// complement does without overflow. Equal integers decide nothing when
-/// another key column follows; the comparator then compares the whole key.
+/// `compare_sorter_rows`, with two INTEGER heads or two non-NaN REAL heads in
+/// the first key column compared directly. That is the comparator's own answer
+/// for them: INTEGER and non-NaN REAL values are never NULL and compare
+/// numerically under every collation, so the key order only reverses them for a
+/// descending column, which the bitwise complement does without overflow. Equal
+/// heads decide nothing when another key column follows; the comparator then
+/// compares the whole key. Mixed INTEGER vs REAL heads also fall through to the
+/// comparator.
 struct SorterMergeOrder<'a> {
     key_columns: usize,
     orders: &'a [SortKeyOrder],
@@ -3673,6 +3771,8 @@ impl SorterMergeOrder<'_> {
                 Some(SqliteValue::Integer(key)) => {
                     SorterMergeHead::Integer(if self.first_descending { !*key } else { *key })
                 }
+                Some(SqliteValue::Float(key)) => float_sort_key(*key, self.first_descending)
+                    .map_or(SorterMergeHead::Other, SorterMergeHead::Float),
                 _ => SorterMergeHead::Other,
             },
         }
@@ -3698,6 +3798,12 @@ impl SorterMergeOrder<'_> {
             (_, SorterMergeHead::Exhausted) => false,
             (SorterMergeHead::Exhausted, _) => true,
             (SorterMergeHead::Integer(lhs), SorterMergeHead::Integer(rhs))
+                if lhs != rhs || self.key_columns <= 1 =>
+            {
+                counts.comparisons += 1;
+                rhs < lhs
+            }
+            (SorterMergeHead::Float(lhs), SorterMergeHead::Float(rhs))
                 if lhs != rhs || self.key_columns <= 1 =>
             {
                 counts.comparisons += 1;
@@ -10068,8 +10174,11 @@ pub struct VdbeEngine {
     storage_cursor_memdb_count_shortcuts_safe: bool,
     /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
     func_registry: Option<Arc<FunctionRegistry>>,
-    /// Resolved scalar functions keyed by opcode address.
-    scalar_function_cache: HashMap<usize, ResolvedScalarFunction>,
+    /// Resolved scalar functions by opcode address (bd-imwu9).
+    scalar_function_cache: ScalarSites,
+    /// Statement-batched scalar function call count flushed into
+    /// `FSQLITE_FUNC_CALLS_TOTAL` on statement exit/reset/drop.
+    pending_func_calls: u64,
     /// Resolved aggregate functions by opcode address.
     aggregate_function_cache: AggregateSites,
     /// Collation registry for compare, sort, DISTINCT, and grouping semantics.
@@ -10506,6 +10615,53 @@ struct ResolvedAggregate {
     typed_step: Option<TypedAggregateStep>,
 }
 
+/// The scalar function resolved for the `Function` or `PureFunc` at one opcode
+/// address, along with cached metadata so repeated calls avoid registry probes,
+/// `Arc::clone`/`Arc::drop`, and redundant subtype/schema-safety vtable queries
+/// (bd-imwu9).
+struct ResolvedScalarSite {
+    function: Arc<dyn ScalarFunction>,
+    schema_safety: fsqlite_func::ScalarSchemaSafety,
+    consumes_argument_collation: bool,
+    subtype_varies: bool,
+    static_result_subtype: Option<u32>,
+    /// True when the site uses no argument collation, carries neither varying
+    /// nor static result subtypes, and needs no per-row schema-safety check.
+    plain_fast: bool,
+}
+
+/// The resolved scalar function of each `Function`/`PureFunc`, in a slot per
+/// opcode address so hot calls find their site by index instead of a hash probe
+/// (mirroring [`AggregateSites`], bd-imwu9).
+#[derive(Default)]
+struct ScalarSites {
+    slots: Vec<Option<ResolvedScalarSite>>,
+}
+
+impl ScalarSites {
+    #[inline]
+    fn get(&self, pc: usize) -> Option<&ResolvedScalarSite> {
+        self.slots.get(pc).and_then(Option::as_ref)
+    }
+
+    fn insert(&mut self, pc: usize, site: ResolvedScalarSite) {
+        if self.slots.len() <= pc {
+            self.slots.resize_with(pc + 1, || None);
+        }
+        self.slots[pc] = Some(site);
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+    }
+}
+
+impl Drop for VdbeEngine {
+    fn drop(&mut self) {
+        self.flush_pending_func_calls();
+    }
+}
+
 /// The resolved aggregate of each `AggStep` and `AggFinal`, in a slot per
 /// opcode address, so a step finds its site by index instead of a hash probe
 /// (bd-w4pr1.13).
@@ -10905,7 +11061,8 @@ impl VdbeEngine {
             memdb_rows_loaded: false,
             storage_cursor_memdb_count_shortcuts_safe: false,
             func_registry: None,
-            scalar_function_cache: HashMap::new(),
+            scalar_function_cache: ScalarSites::default(),
+            pending_func_calls: 0,
             aggregate_function_cache: AggregateSites::default(),
             collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
             builtin_collations_overridden_cache: None,
@@ -10998,6 +11155,12 @@ impl VdbeEngine {
                 cold_state.has_subtypes = false;
             }
         }
+    }
+
+    #[inline]
+    fn has_register_subtypes(&self) -> bool {
+        self.cold_state()
+            .is_some_and(|cold_state| cold_state.has_subtypes)
     }
 
     #[inline]
@@ -11274,6 +11437,7 @@ impl VdbeEngine {
         // different functions at the same PCs. (The old code skipped this
         // when preserving runtime setup, but that caused SUM/AVG/TOTAL
         // cross-contamination when the cached engine ran different programs.)
+        self.flush_pending_func_calls();
         self.scalar_function_cache.clear();
         self.aggregate_function_cache.clear();
         // Keep the existing collation_registry Arc — don't allocate a new one.
@@ -14210,6 +14374,14 @@ impl VdbeEngine {
             .await
     }
 
+    #[inline]
+    fn flush_pending_func_calls(&mut self) {
+        if self.pending_func_calls > 0 {
+            fsqlite_func::record_func_calls(self.pending_func_calls);
+            self.pending_func_calls = 0;
+        }
+    }
+
     async fn execute_with_borrowed_bindings_internal(
         &mut self,
         program: &VdbeProgram,
@@ -14219,6 +14391,7 @@ impl VdbeEngine {
         let outcome = self
             .execute_program_body(program, borrowed_bindings, row_handler)
             .await;
+        self.flush_pending_func_calls();
         // Bead .33: stock's next `OP_NewRowid` is `max(rowid) + 1`, so a
         // failed statement leaves no gap at a rowid it allocated and never
         // kept (a NOT NULL or CHECK failure after `NewRowid`, or a UNIQUE
@@ -19088,227 +19261,10 @@ impl VdbeEngine {
                 // Function/PureFunc: p1 = constant-p5-flags, p2 = first-arg register,
                 // p3 = output register, p4 = FuncName, p5 = arg count.
                 // Arguments are in registers p2..p2+p5.
+                // The synchronous hot lane executes this directly; this arm
+                // keeps the statement loop's match complete.
                 Opcode::Function | Opcode::PureFunc => {
-                    let func_name = match &op.p4 {
-                        P4::FuncName(name) | P4::FuncNameCollated(name, _) => name.as_str(),
-                        _ => {
-                            return Err(FrankenError::Internal(
-                                "Function opcode missing P4::FuncName".to_owned(),
-                            ));
-                        }
-                    };
-                    let arg_count = op.p5 as usize;
-                    let first_arg_reg = op.p2;
-                    let output_reg = op.p3;
-
-                    let func_pc = pc;
-                    #[allow(clippy::cast_possible_wrap)]
-                    let (func, schema_safety, function_consumes_argument_collation) =
-                        if let Some(resolved) = self.scalar_function_cache.get(&func_pc) {
-                            (
-                                resolved.function(),
-                                resolved.schema_safety(),
-                                resolved.consumes_argument_collation(),
-                            )
-                        } else {
-                            let registry = self.func_registry.as_ref().ok_or_else(|| {
-                                FrankenError::Internal(
-                                    "Function opcode executed without function registry".to_owned(),
-                                )
-                            })?;
-                            let resolved = registry
-                                .resolve_scalar_precanonical(func_name, arg_count as i32)
-                                .or_else(|| registry.resolve_scalar(func_name, arg_count as i32))
-                                .ok_or_else(|| {
-                                    registry
-                                        .resolve_application_function(func_name, arg_count as i32)
-                                        .filter(|resolution| {
-                                            resolution.kind() != ApplicationFunctionKind::Scalar
-                                        })
-                                        .map_or_else(
-                                            || {
-                                                FrankenError::Internal(format!(
-                                                    "no such function: {func_name}/{arg_count}",
-                                                ))
-                                            },
-                                            |resolution| {
-                                                FrankenError::function_error(format!(
-                                                    "misuse of {} function {}()",
-                                                    resolution.kind().label(),
-                                                    func_name.to_ascii_lowercase(),
-                                                ))
-                                            },
-                                        )
-                                })?;
-                            let func = resolved.function();
-                            let schema_safety = resolved.schema_safety();
-                            let consumes_argument_collation =
-                                resolved.consumes_argument_collation();
-                            self.scalar_function_cache.insert(func_pc, resolved);
-                            (func, schema_safety, consumes_argument_collation)
-                        };
-
-                    // Gather per-argument subtypes (cheap when none are set:
-                    // `has_subtypes` short-circuits before any HashMap probes).
-                    // JSON constructors consume these so a `json('[1]')` argument
-                    // is embedded as a JSON value instead of a quoted string.
-                    let arg_subtypes: smallvec::SmallVec<[u32; 4]> = (0..arg_count)
-                        .map(|i| {
-                            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                            let reg = first_arg_reg + i as i32;
-                            self.register_subtype(reg).unwrap_or(0)
-                        })
-                        .collect();
-                    let any_arg_subtype = arg_subtypes.iter().any(|&st| st != 0);
-                    let function_collation = if function_consumes_argument_collation {
-                        match &op.p4 {
-                            P4::FuncNameCollated(_, collation_name) => {
-                                let registry = self
-                                    .collation_registry
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                Some(registry.find(collation_name).ok_or_else(|| {
-                                    FrankenError::function_error(format!(
-                                        "no such collation sequence: {collation_name}"
-                                    ))
-                                })?)
-                            }
-                            P4::FuncName(_) => None,
-                            _ => unreachable!("function P4 was validated above"),
-                        }
-                    } else {
-                        None
-                    };
-
-                    // bd-iubwb: project this database's TEXT encoding so
-                    // `octet_length()` reports byte lengths in the DB encoding
-                    // (UTF-16 = two bytes per code unit). `self.text_encoding`
-                    // is authoritative once a cursor has adopted it from the
-                    // page-1 header. It is only left at the `Utf8` default when
-                    // this engine never opened a table cursor (e.g. a FROM-less
-                    // scalar `SELECT octet_length(...)`); in that case the
-                    // Connection has already projected the real encoding into
-                    // the thread-local (see `sync_change_tracking_context`), so
-                    // we must NOT clobber it back to `Utf8`.
-                    if self.text_encoding != TextEncoding::Utf8 {
-                        set_statement_text_encoding(self.text_encoding);
-                    }
-
-                    // Use a direct slice into the register file instead of
-                    // allocating a SmallVec via collect_reg_range.  Same pattern as
-                    // AggStep.  Falls back to collect_reg_range only when the
-                    // register range is out of bounds or negative.
-                    let subtype_varies = func.result_subtype_varies();
-                    let mut call_subtype = None;
-                    // bd-u7sv8: if an earlier Opcode::Insert in this VDBE program
-                    // assigned a rowid, project it into the thread-local
-                    // `last_insert_rowid()` slot for the duration of this scalar
-                    // call (e.g. `INSERT ... RETURNING last_insert_rowid()`) and
-                    // restore the previous value immediately afterward so an
-                    // error or mid-statement rollback cannot leak it.
-                    let saved_last_insert_rowid = if self.last_insert_rowid_valid {
-                        let prev = fsqlite_func::get_last_insert_rowid();
-                        fsqlite_func::set_last_insert_rowid(self.last_insert_rowid);
-                        Some(prev)
-                    } else {
-                        None
-                    };
-                    let invoke_result: Result<SqliteValue> = (|| {
-                        if first_arg_reg >= 0
-                            && (first_arg_reg as usize).saturating_add(arg_count)
-                                <= self.registers.len()
-                        {
-                            let start_idx = first_arg_reg as usize;
-                            let end_idx = start_idx + arg_count;
-                            let args = &self.registers[start_idx..end_idx];
-                            if let Some(context) = SchemaEvaluationContext::from_function_p1(op.p1)
-                            {
-                                validate_schema_function_invocation(
-                                    context,
-                                    func_name,
-                                    schema_safety,
-                                    args,
-                                )?;
-                            }
-                            observe_requested_execution_cancellation(&self.execution_cx)?;
-                            if function_consumes_argument_collation {
-                                func.invoke_with_collation(args, function_collation.as_deref())
-                            } else if subtype_varies {
-                                let (value, subtype) =
-                                    func.invoke_with_result_subtype(args, &arg_subtypes)?;
-                                call_subtype = subtype;
-                                Ok(value)
-                            } else if any_arg_subtype {
-                                func.invoke_with_arg_subtypes(args, &arg_subtypes)
-                            } else {
-                                func.invoke(args)
-                            }
-                        } else {
-                            let args = self.collect_reg_range(first_arg_reg, arg_count);
-                            if let Some(context) = SchemaEvaluationContext::from_function_p1(op.p1)
-                            {
-                                validate_schema_function_invocation(
-                                    context,
-                                    func_name,
-                                    schema_safety,
-                                    &args,
-                                )?;
-                            }
-                            observe_requested_execution_cancellation(&self.execution_cx)?;
-                            if function_consumes_argument_collation {
-                                func.invoke_with_collation(&args, function_collation.as_deref())
-                            } else if subtype_varies {
-                                let (value, subtype) =
-                                    func.invoke_with_result_subtype(&args, &arg_subtypes)?;
-                                call_subtype = subtype;
-                                Ok(value)
-                            } else if any_arg_subtype {
-                                func.invoke_with_arg_subtypes(&args, &arg_subtypes)
-                            } else {
-                                func.invoke(&args)
-                            }
-                        }
-                    })();
-                    if let Some(prev) = saved_last_insert_rowid {
-                        fsqlite_func::set_last_insert_rowid(prev);
-                    }
-                    let result = invoke_result?;
-                    observe_requested_execution_cancellation(&self.execution_cx)?;
-
-                    // Propagate this function's result subtype (e.g. JSON) to the
-                    // destination register so a nested `json(...)` keeps its tag.
-                    let result_subtype = if subtype_varies {
-                        call_subtype
-                    } else {
-                        func.result_subtype()
-                    };
-
-                    if self.trace_opcodes {
-                        let result_type = match &result {
-                            SqliteValue::Null => "null",
-                            SqliteValue::Integer(_) => "integer",
-                            SqliteValue::Float(_) => "real",
-                            SqliteValue::Text(_) => "text",
-                            SqliteValue::Blob(_) => "blob",
-                        };
-                        tracing::trace!(
-                            target: "fsqlite_func::eval",
-                            func_name,
-                            arg_count,
-                            result_type,
-                            "func_eval",
-                        );
-                    }
-
-                    // Update global call count (fast path: no Instant::now).
-                    fsqlite_func::record_func_call_count_only();
-
-                    self.set_reg(output_reg, result);
-                    // set_reg clears any prior subtype on the destination, so
-                    // (re)apply this function's result subtype afterwards.
-                    if let Some(subtype) = result_subtype {
-                        self.set_register_subtype(output_reg, subtype);
-                    }
+                    self.execute_function_hot(ops, pc)?;
                     pc += 1;
                 }
 
@@ -20481,6 +20437,258 @@ impl VdbeEngine {
         Ok(true)
     }
 
+    /// Synchronous execution of `Opcode::Function | Opcode::PureFunc` at
+    /// `ops[pc]`, keeping scalar-function loops inside `run_hot_opcodes_sync`
+    /// without leaving for the outer statement future (bd-imwu9).
+    #[inline(never)]
+    #[allow(clippy::cast_sign_loss, clippy::too_many_lines)]
+    fn execute_function_hot(&mut self, ops: &[VdbeOp], pc: usize) -> Result<()> {
+        let op = &ops[pc];
+        let arg_count = usize::from(op.p5);
+        let first_arg_reg = op.p2;
+        let output_reg = op.p3;
+
+        // Fast lane: cached plain scalar function (no collation, no varying or
+        // static result subtype, no per-row schema check), no active subtypes,
+        // no last_insert_rowid projection, UTF-8 text encoding, tracing off,
+        // and argument registers in bounds. Avoids HashMap probing, Arc clone/
+        // drop, SmallVec subtype collection, vtable subtype queries, and global
+        // atomic metric contention.
+        if let Some(site) = self.scalar_function_cache.get(pc)
+            && site.plain_fast
+            && !self.has_register_subtypes()
+            && !self.last_insert_rowid_valid
+            && self.text_encoding == TextEncoding::Utf8
+            && !self.trace_opcodes
+            && first_arg_reg >= 0
+            && (first_arg_reg as usize).saturating_add(arg_count) <= self.registers.len()
+        {
+            let start_idx = first_arg_reg as usize;
+            let args = &self.registers[start_idx..start_idx + arg_count];
+            observe_requested_execution_cancellation(&self.execution_cx)?;
+            let result = site.function.invoke(args)?;
+            observe_requested_execution_cancellation(&self.execution_cx)?;
+            self.pending_func_calls += 1;
+            match result {
+                SqliteValue::Integer(v)
+                    if output_reg >= 0 && (output_reg as usize) < self.registers.len() =>
+                {
+                    self.set_reg_int(output_reg, v);
+                }
+                SqliteValue::Float(v) => self.set_reg_real(output_reg, v),
+                SqliteValue::Null => self.set_reg_null(output_reg),
+                other => self.set_reg_fast(output_reg, other),
+            }
+            return Ok(());
+        }
+
+        let func_name = match &op.p4 {
+            P4::FuncName(name) | P4::FuncNameCollated(name, _) => name.as_str(),
+            _ => {
+                return Err(FrankenError::Internal(
+                    "Function opcode missing P4::FuncName".to_owned(),
+                ));
+            }
+        };
+
+        if self.scalar_function_cache.get(pc).is_none() {
+            let registry = self.func_registry.as_ref().ok_or_else(|| {
+                FrankenError::Internal(
+                    "Function opcode executed without function registry".to_owned(),
+                )
+            })?;
+            let arg_count_i32 = i32::from(op.p5);
+            let resolved = registry
+                .resolve_scalar_precanonical(func_name, arg_count_i32)
+                .or_else(|| registry.resolve_scalar(func_name, arg_count_i32))
+                .ok_or_else(|| {
+                    registry
+                        .resolve_application_function(func_name, arg_count_i32)
+                        .filter(|resolution| resolution.kind() != ApplicationFunctionKind::Scalar)
+                        .map_or_else(
+                            || {
+                                FrankenError::Internal(format!(
+                                    "no such function: {func_name}/{arg_count}",
+                                ))
+                            },
+                            |resolution| {
+                                FrankenError::function_error(format!(
+                                    "misuse of {} function {}()",
+                                    resolution.kind().label(),
+                                    func_name.to_ascii_lowercase(),
+                                ))
+                            },
+                        )
+                })?;
+            let function = resolved.function();
+            let schema_safety = resolved.schema_safety();
+            let consumes_argument_collation = resolved.consumes_argument_collation();
+            let subtype_varies = function.result_subtype_varies();
+            let static_result_subtype = if subtype_varies {
+                None
+            } else {
+                function.result_subtype()
+            };
+            let needs_schema_check = SchemaEvaluationContext::from_function_p1(op.p1).is_some()
+                && schema_safety != fsqlite_func::ScalarSchemaSafety::Always;
+            let plain_fast = !consumes_argument_collation
+                && !subtype_varies
+                && static_result_subtype.is_none()
+                && !needs_schema_check;
+            self.scalar_function_cache.insert(
+                pc,
+                ResolvedScalarSite {
+                    function,
+                    schema_safety,
+                    consumes_argument_collation,
+                    subtype_varies,
+                    static_result_subtype,
+                    plain_fast,
+                },
+            );
+        }
+
+        let in_bounds = first_arg_reg >= 0
+            && (first_arg_reg as usize).saturating_add(arg_count) <= self.registers.len();
+        let collected_args = (!in_bounds).then(|| self.collect_reg_range(first_arg_reg, arg_count));
+
+        let site = self
+            .scalar_function_cache
+            .get(pc)
+            .expect("scalar function site just populated");
+        let schema_safety = site.schema_safety;
+        let function_consumes_argument_collation = site.consumes_argument_collation;
+        let subtype_varies = site.subtype_varies;
+        let static_result_subtype = site.static_result_subtype;
+
+        // Gather per-argument subtypes only when subtypes exist in the register
+        // file or the function explicitly inspects per-argument subtypes.
+        let mut arg_subtypes_buf: smallvec::SmallVec<[u32; 4]> = smallvec::SmallVec::new();
+        let (arg_subtypes, any_arg_subtype): (&[u32], bool) = if self.has_register_subtypes() {
+            for i in 0..arg_count {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let reg = first_arg_reg + i as i32;
+                arg_subtypes_buf.push(self.register_subtype(reg).unwrap_or(0));
+            }
+            let any = arg_subtypes_buf.iter().any(|&st| st != 0);
+            (arg_subtypes_buf.as_slice(), any)
+        } else if subtype_varies {
+            if arg_count <= NO_ARG_SUBTYPES.len() {
+                (&NO_ARG_SUBTYPES[..arg_count], false)
+            } else {
+                arg_subtypes_buf.resize(arg_count, 0);
+                (arg_subtypes_buf.as_slice(), false)
+            }
+        } else {
+            (&[], false)
+        };
+
+        let function_collation = if function_consumes_argument_collation {
+            match &op.p4 {
+                P4::FuncNameCollated(_, collation_name) => {
+                    let registry = self
+                        .collation_registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    Some(registry.find(collation_name).ok_or_else(|| {
+                        FrankenError::function_error(format!(
+                            "no such collation sequence: {collation_name}"
+                        ))
+                    })?)
+                }
+                P4::FuncName(_) => None,
+                _ => unreachable!("function P4 was validated above"),
+            }
+        } else {
+            None
+        };
+
+        // bd-iubwb: project this database's TEXT encoding so `octet_length()`
+        // reports byte lengths in the DB encoding without clobbering the
+        // Connection's pre-projected encoding for FROM-less scalar queries.
+        if self.text_encoding != TextEncoding::Utf8 {
+            set_statement_text_encoding(self.text_encoding);
+        }
+
+        let mut call_subtype = None;
+        // bd-u7sv8: project statement-local last_insert_rowid() for the
+        // duration of this call and restore immediately afterward.
+        let saved_last_insert_rowid = if self.last_insert_rowid_valid {
+            let prev = fsqlite_func::get_last_insert_rowid();
+            fsqlite_func::set_last_insert_rowid(self.last_insert_rowid);
+            Some(prev)
+        } else {
+            None
+        };
+        let func = &*site.function;
+        let args: &[SqliteValue] = match &collected_args {
+            Some(collected) => collected.as_slice(),
+            None => {
+                let start_idx = first_arg_reg as usize;
+                &self.registers[start_idx..start_idx + arg_count]
+            }
+        };
+        let invoke_result: Result<SqliteValue> = (|| {
+            if let Some(context) = SchemaEvaluationContext::from_function_p1(op.p1) {
+                validate_schema_function_invocation(context, func_name, schema_safety, args)?;
+            }
+            observe_requested_execution_cancellation(&self.execution_cx)?;
+            if function_consumes_argument_collation {
+                func.invoke_with_collation(args, function_collation.as_deref())
+            } else if subtype_varies {
+                let (value, subtype) = func.invoke_with_result_subtype(args, arg_subtypes)?;
+                call_subtype = subtype;
+                Ok(value)
+            } else if any_arg_subtype {
+                func.invoke_with_arg_subtypes(args, arg_subtypes)
+            } else {
+                func.invoke(args)
+            }
+        })();
+        if let Some(prev) = saved_last_insert_rowid {
+            fsqlite_func::set_last_insert_rowid(prev);
+        }
+        let result = invoke_result?;
+        observe_requested_execution_cancellation(&self.execution_cx)?;
+
+        // Propagate this function's result subtype (e.g. JSON) to the
+        // destination register so a nested `json(...)` keeps its tag.
+        let result_subtype = if subtype_varies {
+            call_subtype
+        } else {
+            static_result_subtype
+        };
+
+        if self.trace_opcodes {
+            let result_type = match &result {
+                SqliteValue::Null => "null",
+                SqliteValue::Integer(_) => "integer",
+                SqliteValue::Float(_) => "real",
+                SqliteValue::Text(_) => "text",
+                SqliteValue::Blob(_) => "blob",
+            };
+            tracing::trace!(
+                target: "fsqlite_func::eval",
+                func_name,
+                arg_count,
+                result_type,
+                "func_eval",
+            );
+        }
+
+        // Accumulate into the statement-local counter; flushed once on
+        // statement exit/reset/drop to avoid per-row atomic contention.
+        self.pending_func_calls += 1;
+
+        self.set_reg(output_reg, result);
+        // set_reg clears any prior subtype on the destination, so
+        // (re)apply this function's result subtype afterwards.
+        if let Some(subtype) = result_subtype {
+            self.set_register_subtype(output_reg, subtype);
+        }
+        Ok(())
+    }
+
     /// `AggStep`/`AggStep1` at `ops[pc]`: fold the argument registers into the
     /// aggregate whose accumulator is register `p3`.
     #[allow(clippy::cast_sign_loss)]
@@ -21283,6 +21491,14 @@ impl VdbeEngine {
                     return Ok(false);
                 }
                 self.clear_register_subtype(op.p1);
+                *pc += 1;
+                Ok(true)
+            }
+            // A scalar function call never awaits. Keeping it on the hot lane
+            // avoids bouncing back to the statement future on every row of an
+            // expression index build or scalar-function scan (bd-imwu9).
+            Opcode::Function | Opcode::PureFunc => {
+                self.execute_function_hot(ops, *pc)?;
                 *pc += 1;
                 Ok(true)
             }
@@ -45616,6 +45832,182 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_sorter_single_float_key_and_merge_tree_fast_paths_bd_imwu9() {
+        let float_values = [
+            f64::INFINITY,
+            1e300,
+            2.0,
+            0.0,
+            -0.0,
+            -2.5,
+            -1e300,
+            f64::NEG_INFINITY,
+            0.0,
+            2.0,
+        ];
+        let all_orders = [
+            SortKeyOrder::Asc,
+            SortKeyOrder::Desc,
+            SortKeyOrder::AscNullsLast,
+            SortKeyOrder::DescNullsFirst,
+        ];
+        let registry = CollationRegistry::new();
+
+        for order in all_orders {
+            let orders = vec![order];
+            let collations = vec![None];
+            let mut expected: Vec<(Vec<SqliteValue>, u8)> = float_values
+                .iter()
+                .enumerate()
+                .map(|(idx, &v)| (vec![SqliteValue::Float(v)], u8::try_from(idx).unwrap()))
+                .collect();
+            expected.sort_by(|(lhs, _), (rhs, _)| {
+                compare_sorter_rows(lhs, rhs, 1, &orders, &collations, &registry, TextEncoding::Utf8)
+            });
+            let expected_seq: Vec<u8> = expected.into_iter().map(|(_, idx)| idx).collect();
+
+            let mut sorter = SorterCursor::new(1, orders.clone(), collations.clone());
+            for (idx, &v) in float_values.iter().enumerate() {
+                sorter
+                    .insert_row(vec![SqliteValue::Float(v)], vec![u8::try_from(idx).unwrap()])
+                    .expect("insert");
+            }
+            assert!(
+                SorterCursor::sort_rows_by_single_float_key(
+                    sorter.key_columns,
+                    &sorter.sort_key_orders,
+                    &mut sorter.rows,
+                ),
+                "pure-float single key should take fast path for {order:?}"
+            );
+            let actual_seq: Vec<u8> = sorter.rows.iter().map(|r| r.blob[0]).collect();
+            assert_eq!(actual_seq, expected_seq, "single-float fast sort order for {order:?}");
+
+            // Spilled K-way merge over pure-Float runs must use SorterMergeHead::Float
+            // with zero generic comparator calls.
+            let mut spilled = SorterCursor::new(1, orders.clone(), collations.clone());
+            spilled.spill_threshold = 1;
+            for (idx, &v) in float_values.iter().enumerate() {
+                let record = serialize_record(&[
+                    SqliteValue::Float(v),
+                    SqliteValue::Integer(i64::try_from(idx).unwrap()),
+                ]);
+                spilled
+                    .insert_row(vec![SqliteValue::Float(v)], record)
+                    .expect("insert spilled");
+            }
+            assert!(spilled.spill_runs.len() >= 2);
+            spilled.sort().expect("spilled float sort");
+            let merged_seq: Vec<u8> = spilled
+                .rows
+                .iter()
+                .map(|r| {
+                    let rec = parse_record(&r.blob).expect("decode record");
+                    u8::try_from(rec[1].to_integer()).unwrap()
+                })
+                .collect();
+            assert_eq!(merged_seq, expected_seq, "spilled float merge order for {order:?}");
+            assert_eq!(
+                spilled.merge_generic_comparisons_total, 0,
+                "pure-float merge heads must not fall back to generic comparator for {order:?}"
+            );
+        }
+
+        // Mixed Float + Integer must decline the single-float fast path untouched.
+        let mut mixed = SorterCursor::new(1, vec![SortKeyOrder::Asc], vec![None]);
+        for (idx, v) in [SqliteValue::Float(1.5), SqliteValue::Integer(1)]
+            .into_iter()
+            .enumerate()
+        {
+            mixed
+                .insert_row(vec![v], vec![u8::try_from(idx).unwrap()])
+                .expect("insert mixed");
+        }
+        assert!(!SorterCursor::sort_rows_by_single_float_key(
+            mixed.key_columns,
+            &mixed.sort_key_orders,
+            &mut mixed.rows,
+        ));
+        assert_eq!(
+            mixed.rows.iter().map(|r| r.blob[0]).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn test_scalar_function_hot_lane_and_batched_metrics_bd_imwu9() {
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+
+        let mut b = ProgramBuilder::new();
+        let r_counter = b.alloc_reg();
+        let r_limit = b.alloc_reg();
+        let r_one = b.alloc_reg();
+        let r_log = b.alloc_reg();
+        let r_out = b.alloc_reg();
+
+        b.emit_op(Opcode::Integer, 1, r_counter, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 10, r_limit, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 1, r_one, 0, P4::None, 0);
+
+        let loop_start = b.current_addr();
+        let done_label = b.emit_label();
+        b.emit_jump_to_label(Opcode::Gt, r_limit, r_counter, done_label, P4::None, 0);
+        b.emit_op(
+            Opcode::Function,
+            0,
+            r_counter,
+            r_log,
+            P4::FuncName("log10".to_owned()),
+            1,
+        );
+        b.emit_op(
+            Opcode::Function,
+            0,
+            r_log,
+            r_out,
+            P4::FuncName("round".to_owned()),
+            1,
+        );
+        b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Add, r_one, r_counter, r_counter, P4::None, 0);
+        b.emit_op(
+            Opcode::Goto,
+            0,
+            i32::try_from(loop_start).unwrap(),
+            0,
+            P4::None,
+            0,
+        );
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = b.finish().expect("valid scalar loop program");
+
+        let mut engine = VdbeEngine::new(program.register_count());
+        engine.set_function_registry(Arc::new(registry));
+        let calls_before = fsqlite_func::func_metrics_snapshot().calls_total;
+        let outcome = run_async(engine.execute(&program)).expect("execute scalar loop");
+        assert!(matches!(outcome, ExecOutcome::Done));
+        let calls_after = fsqlite_func::func_metrics_snapshot().calls_total;
+        assert!(
+            calls_after >= calls_before + 20,
+            "batched func call counter must flush at least 20 calls ({calls_before} -> {calls_after})"
+        );
+        let expected: Vec<f64> = (1..=10)
+            .map(|n| (f64::from(n).log10() + 0.5).floor())
+            .collect();
+        let actual: Vec<f64> = engine
+            .results()
+            .iter()
+            .map(|row| match row.first() {
+                Some(SqliteValue::Float(v)) => *v,
+                other => panic!("expected Float result, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     /// `SorterInsert` copies a short record into the sorter row and gives

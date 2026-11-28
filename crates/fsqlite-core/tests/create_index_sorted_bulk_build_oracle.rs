@@ -1143,3 +1143,215 @@ fn unique_index_builds_fail_and_succeed_as_stock() {
         assert!(failures.is_empty(), "{failures:#?}");
     });
 }
+
+/// bd-imwu9 (GH#489): `CREATE INDEX a ON t (round(log10(value)))` over
+/// `1..=20_000` matches live bundled `rusqlite` 3.54.1 on both `:memory:` and
+/// file-backed databases, passes `PRAGMA integrity_check`, and stock reads the
+/// fsqlite-written file and gets identical indexed query results.
+#[test]
+fn bd_imwu9_gh489_expression_index_round_log10_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let frank_path = dir.path().join("gh489_frank.db");
+        let stock_path = dir.path().join("gh489_stock.db");
+        let frank_str = frank_path.to_str().expect("utf-8").to_owned();
+
+        let seed_sql = "CREATE TABLE t(value INTEGER); \
+            WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 20000) \
+            INSERT INTO t SELECT x FROM n;";
+        let index_sql = "CREATE INDEX a ON t (round(log10(value)));";
+        let queries = [
+            "SELECT round(log10(value)), count(*), min(value), max(value) \
+             FROM t INDEXED BY a GROUP BY round(log10(value)) ORDER BY 1",
+            "SELECT value FROM t INDEXED BY a WHERE round(log10(value)) = 3.0 ORDER BY value LIMIT 20",
+            "SELECT count(*) FROM t INDEXED BY a WHERE round(log10(value)) BETWEEN 2.0 AND 4.0",
+        ];
+
+        for is_file in [false, true] {
+            let frank = if is_file {
+                Connection::open(&frank_str).await.expect("open frank file")
+            } else {
+                Connection::open(":memory:").await.expect("open frank mem")
+            };
+            let stock = if is_file {
+                rusqlite::Connection::open(&stock_path).expect("open stock file")
+            } else {
+                rusqlite::Connection::open_in_memory().expect("open stock mem")
+            };
+
+            frank.execute_batch(seed_sql).await.expect("frank seed");
+            stock.execute_batch(seed_sql).expect("stock seed");
+            frank.execute(index_sql).await.expect("frank create index");
+            stock.execute_batch(index_sql).expect("stock create index");
+
+            let f_ic = frank_rows(&frank, "PRAGMA integrity_check").await;
+            assert_eq!(f_ic, vec![vec!["'ok'".to_owned()]], "fsqlite integrity_check");
+
+            for q in queries {
+                let expected = stock_rows(&stock, q);
+                let actual = frank_rows(&frank, q).await;
+                assert_eq!(actual, expected, "mode_file={is_file} query `{q}`");
+            }
+            frank.close().await.expect("close frank");
+
+            if is_file {
+                let reread =
+                    rusqlite::Connection::open(&frank_path).expect("stock opens fsqlite file");
+                assert_eq!(
+                    stock_rows(&reread, "PRAGMA integrity_check"),
+                    vec![vec!["'ok'".to_owned()]],
+                    "stock integrity_check of fsqlite GH#489 file"
+                );
+                for q in queries {
+                    assert_eq!(
+                        stock_rows(&reread, q),
+                        stock_rows(&stock, q),
+                        "stock reading fsqlite file query `{q}`"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// bd-imwu9 (GH#489): live release-perf A/B benchmark splitting plain-column
+/// `CREATE INDEX` vs expression `CREATE INDEX a ON t (round(log10(value)))`
+/// over 1,000,000 rows against live bundled `rusqlite` 3.54.1 in the same run.
+#[test]
+#[ignore = "live release-perf A/B benchmark for bd-imwu9 (GH#489)"]
+fn bd_imwu9_gh489_expression_index_1m_ab_live() {
+    use std::time::Instant;
+
+    const ROWS: i64 = 1_000_000;
+    const REPS: usize = 3;
+
+    asupersync::test_utils::run_test(|| async {
+        let seed_frank = format!(
+            "CREATE TABLE t AS SELECT value FROM generate_series(1, {ROWS});"
+        );
+        let seed_stock = format!(
+            "CREATE TABLE t(value INTEGER); \
+             WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {ROWS}) \
+             INSERT INTO t SELECT x FROM n;"
+        );
+
+        let mut f_mem_plain = Vec::with_capacity(REPS);
+        let mut s_mem_plain = Vec::with_capacity(REPS);
+        let mut f_mem_expr = Vec::with_capacity(REPS);
+        let mut s_mem_expr = Vec::with_capacity(REPS);
+
+        for rep in 0..REPS {
+            // Interleaved :memory: plain-column CREATE INDEX
+            {
+                let f = Connection::open(":memory:").await.expect("open f mem");
+                f.execute(&seed_frank).await.expect("seed f mem");
+                let t0 = Instant::now();
+                f.execute("CREATE INDEX idx_plain ON t(value);")
+                    .await
+                    .expect("f plain index");
+                f_mem_plain.push(t0.elapsed().as_secs_f64() * 1000.0);
+                f.close().await.expect("close f");
+
+                let s = rusqlite::Connection::open_in_memory().expect("open s mem");
+                s.execute_batch(&seed_stock).expect("seed s mem");
+                let t0 = Instant::now();
+                s.execute_batch("CREATE INDEX idx_plain ON t(value);")
+                    .expect("s plain index");
+                s_mem_plain.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+
+            // Interleaved :memory: expression CREATE INDEX (exact GH#489 query)
+            {
+                let f = Connection::open(":memory:").await.expect("open f mem");
+                f.execute(&seed_frank).await.expect("seed f mem");
+                let t0 = Instant::now();
+                f.execute("CREATE INDEX a ON t (round(log10(value)));")
+                    .await
+                    .expect("f expr index");
+                f_mem_expr.push(t0.elapsed().as_secs_f64() * 1000.0);
+                if rep == 0 {
+                    assert_eq!(
+                        frank_rows(&f, "PRAGMA integrity_check").await,
+                        vec![vec!["'ok'".to_owned()]]
+                    );
+                }
+                f.close().await.expect("close f");
+
+                let s = rusqlite::Connection::open_in_memory().expect("open s mem");
+                s.execute_batch(&seed_stock).expect("seed s mem");
+                let t0 = Instant::now();
+                s.execute_batch("CREATE INDEX a ON t (round(log10(value)));")
+                    .expect("s expr index");
+                s_mem_expr.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+
+        // File-backed 1M-row expression index + stock readback + integrity_check.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f_file = dir.path().join("gh489_1m_frank.db");
+        let s_file = dir.path().join("gh489_1m_stock.db");
+        let f_file_str = f_file.to_str().expect("utf-8").to_owned();
+
+        let f = Connection::open(&f_file_str).await.expect("open f file");
+        f.execute(&seed_frank).await.expect("seed f file");
+        let t0 = Instant::now();
+        f.execute("CREATE INDEX a ON t (round(log10(value)));")
+            .await
+            .expect("f file expr index");
+        let f_file_expr_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let f_file_summary = frank_rows(
+            &f,
+            "SELECT round(log10(value)), count(*) FROM t INDEXED BY a GROUP BY 1 ORDER BY 1",
+        )
+        .await;
+        f.close().await.expect("close f file");
+
+        let s = rusqlite::Connection::open(&s_file).expect("open s file");
+        s.execute_batch(&seed_stock).expect("seed s file");
+        let t0 = Instant::now();
+        s.execute_batch("CREATE INDEX a ON t (round(log10(value)));")
+            .expect("s file expr index");
+        let s_file_expr_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let s_file_summary = stock_rows(
+            &s,
+            "SELECT round(log10(value)), count(*) FROM t INDEXED BY a GROUP BY 1 ORDER BY 1",
+        );
+        assert_eq!(f_file_summary, s_file_summary, "1M file summary mismatch");
+
+        let reread = rusqlite::Connection::open(&f_file).expect("stock opens 1M fsqlite file");
+        assert_eq!(
+            stock_rows(&reread, "PRAGMA integrity_check"),
+            vec![vec!["'ok'".to_owned()]]
+        );
+        assert_eq!(
+            stock_rows(
+                &reread,
+                "SELECT round(log10(value)), count(*) FROM t INDEXED BY a GROUP BY 1 ORDER BY 1",
+            ),
+            s_file_summary
+        );
+
+        let median = |vals: &[f64]| -> f64 {
+            let mut sorted = vals.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[sorted.len() / 2]
+        };
+        let fm_plain = median(&f_mem_plain);
+        let sm_plain = median(&s_mem_plain);
+        let fm_expr = median(&f_mem_expr);
+        let sm_expr = median(&s_mem_expr);
+        eprintln!(
+            "BD_IMWU9_GH489_1M:\n\
+             \x20 :memory: plain  fsqlite={fm_plain:.1}ms {f_mem_plain:?}  stock={sm_plain:.1}ms {s_mem_plain:?}  ratio={:.2}x\n\
+             \x20 :memory: expr   fsqlite={fm_expr:.1}ms {f_mem_expr:?}  stock={sm_expr:.1}ms {s_mem_expr:?}  ratio={:.2}x\n\
+             \x20 :memory: expr-plain delta: fsqlite={:.1}ms  stock={:.1}ms  delta_ratio={:.2}x\n\
+             \x20 file     expr   fsqlite={f_file_expr_ms:.1}ms  stock={s_file_expr_ms:.1}ms  ratio={:.2}x",
+            fm_plain / sm_plain,
+            fm_expr / sm_expr,
+            fm_expr - fm_plain,
+            sm_expr - sm_plain,
+            (fm_expr - fm_plain) / (sm_expr - sm_plain).max(0.1),
+            f_file_expr_ms / s_file_expr_ms,
+        );
+    });
+}
